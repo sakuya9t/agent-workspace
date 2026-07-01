@@ -104,6 +104,33 @@ pub struct Session {
     pub last_activity_at: i64,
 }
 
+/// A registered source workspace (repo or plain folder). The set of registered
+/// workspaces is the allowlist for workspace-scoped sessions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Workspace {
+    pub id: String,
+    pub name: String,
+    pub root_path: String,
+    pub is_git: bool,
+    pub created_at: i64,
+}
+
+/// An isolated working directory assigned to one session. For Git workspaces
+/// this is a managed worktree; otherwise it is the source root (direct/plain).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceInstance {
+    pub id: String,
+    pub workspace_id: String,
+    pub session_id: Option<String>,
+    pub path: String,
+    pub branch: Option<String>,
+    /// "worktree" | "direct" | "plain"
+    pub isolation: String,
+    /// "active" | "released"
+    pub status: String,
+    pub created_at: i64,
+}
+
 /// Structural session summary written on exit / segment boundary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {

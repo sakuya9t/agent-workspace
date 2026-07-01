@@ -7,6 +7,7 @@ mod plugins;
 mod session_manager;
 mod source_control;
 mod util;
+mod workspace;
 
 use std::sync::Arc;
 
@@ -44,7 +45,8 @@ async fn main() -> Result<()> {
 
     let registry = Arc::new(PluginRegistry::with_builtins());
     let backend = Arc::new(NativePtyBackend::new(db.events()));
-    let manager = Arc::new(SessionManager::new(db, registry, backend));
+    let worktree_root = config.data_dir.join("worktrees");
+    let manager = Arc::new(SessionManager::new(db, registry, backend, worktree_root));
 
     let state = AppState {
         manager,

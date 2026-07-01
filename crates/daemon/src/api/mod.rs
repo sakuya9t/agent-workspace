@@ -37,11 +37,15 @@ pub fn router(state: AppState) -> Router {
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/api/plugins", get(list_plugins))
+        .route("/api/workspaces", get(list_workspaces).post(add_workspace))
+        .route("/api/workspaces/:id/init-git", post(init_workspace_git))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:id", get(get_session))
         .route("/api/sessions/:id/summary", get(get_summary))
+        .route("/api/sessions/:id/workspace", get(get_session_workspace))
         .route("/api/sessions/:id/stop", post(stop_session))
         .route("/api/sessions/:id/archive", post(archive_session))
+        .route("/api/sessions/:id/cleanup", post(cleanup_instance))
         .route("/api/sessions/:id/resize", post(resize_session))
         .route("/api/sessions/:id/ack", post(ack_attention))
         .route("/api/sessions/:id/stream", get(ws::stream))
@@ -77,6 +81,57 @@ async fn list_plugins(State(state): State<AppState>) -> Json<serde_json::Value> 
     Json(json!({ "plugins": state.manager.registry.describe() }))
 }
 
+async fn list_workspaces(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(json!({ "workspaces": state.manager.list_workspaces()? })))
+}
+
+#[derive(Debug, Deserialize)]
+struct AddWorkspaceBody {
+    name: String,
+    root_path: String,
+}
+
+async fn add_workspace(
+    State(state): State<AppState>,
+    Json(body): Json<AddWorkspaceBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let w = state.manager.register_workspace(body.name, body.root_path)?;
+    Ok(Json(json!({ "workspace": w })))
+}
+
+async fn init_workspace_git(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let w = state.manager.init_workspace_git(&id)?;
+    Ok(Json(json!({ "workspace": w })))
+}
+
+async fn get_session_workspace(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let instance = state.manager.get_instance_for_session(&id)?;
+    Ok(Json(json!({ "instance": instance })))
+}
+
+#[derive(Debug, Deserialize)]
+struct CleanupParams {
+    #[serde(default)]
+    force: bool,
+}
+
+async fn cleanup_instance(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<CleanupParams>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    state.manager.cleanup_instance(&id, params.force)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
 async fn list_sessions(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
     let sessions = state.manager.list_sessions()?;
     Ok(Json(json!({ "sessions": sessions })))
@@ -85,6 +140,8 @@ async fn list_sessions(State(state): State<AppState>) -> Result<Json<serde_json:
 #[derive(Debug, Deserialize)]
 struct CreateSessionBody {
     agent_plugin_id: String,
+    /// Required unless `workspace_id` is provided (then the instance path is used).
+    #[serde(default)]
     cwd: String,
     #[serde(default)]
     command: Option<String>,
@@ -100,6 +157,8 @@ struct CreateSessionBody {
     workspace_id: Option<String>,
     #[serde(default)]
     approve_custom: bool,
+    #[serde(default)]
+    direct_checkout: bool,
 }
 
 async fn create_session(
@@ -116,6 +175,7 @@ async fn create_session(
         cols: body.cols.unwrap_or(80),
         workspace_id: body.workspace_id,
         approve_custom: body.approve_custom,
+        direct_checkout: body.direct_checkout,
     };
     let session = state.manager.create_session(req)?;
     Ok(Json(json!({ "session": session })))

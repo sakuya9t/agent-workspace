@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, ChangedFile, Session } from "../api";
 import { DiffModal } from "./DiffModal";
 
@@ -22,11 +22,24 @@ const STATUS_COLOR: Record<string, string> = {
  * session ends, and the Git changed-files list with click-to-diff.
  */
 export function RightPanel({ session }: Props) {
+  const qc = useQueryClient();
   const [diffTarget, setDiffTarget] = useState<ChangedFile | null>(null);
 
   const terminal =
     session &&
     ["exited", "failed", "stopped", "archived"].includes(session.status);
+
+  const { data: instance } = useQuery({
+    queryKey: ["instance", session?.id],
+    queryFn: () => api.sessionWorkspace(session!.id),
+    enabled: !!session,
+    retry: false,
+  });
+
+  const cleanup = useMutation({
+    mutationFn: (force: boolean) => api.cleanupInstance(session!.id, force),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["instance", session?.id] }),
+  });
 
   const { data: summary } = useQuery({
     queryKey: ["summary", session?.id],
@@ -62,6 +75,35 @@ export function RightPanel({ session }: Props) {
         <Field label="Status" value={session.status} />
         <Field label="Command" value={[session.command, ...session.args].join(" ")} mono />
         <Field label="Directory" value={session.working_directory} mono />
+        {instance && (
+          <>
+            <Field
+              label="Workspace instance"
+              value={`${instance.isolation}${instance.branch ? ` · ${instance.branch}` : ""}${
+                instance.status === "released" ? " · released" : ""
+              }`}
+            />
+            {instance.isolation === "worktree" && instance.status !== "released" && terminal && (
+              <div className="instance-actions">
+                <button
+                  className="btn tiny"
+                  disabled={cleanup.isPending}
+                  onClick={() => cleanup.mutate(false)}
+                >
+                  clean up worktree
+                </button>
+                <button
+                  className="btn tiny"
+                  disabled={cleanup.isPending}
+                  onClick={() => cleanup.mutate(true)}
+                >
+                  force
+                </button>
+              </div>
+            )}
+            {cleanup.error && <div className="error">{String(cleanup.error)}</div>}
+          </>
+        )}
         <Field label="Size" value={`${session.cols}×${session.rows}`} />
         {session.exit_code !== null && (
           <Field label="Exit code" value={String(session.exit_code)} />

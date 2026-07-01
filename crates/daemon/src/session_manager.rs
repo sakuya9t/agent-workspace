@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
@@ -8,9 +9,12 @@ use uuid::Uuid;
 
 use crate::backend::{BackendSession, BackendSpawnSpec, BackendStatus, SessionBackend};
 use crate::db::Db;
-use crate::domain::{AttentionState, Session, SessionStatus, SessionSummary};
+use crate::domain::{
+    AttentionState, Session, SessionStatus, SessionSummary, Workspace, WorkspaceInstance,
+};
 use crate::plugins::{AgentContext, PluginRegistry};
 use crate::util::now_millis;
+use crate::workspace;
 
 /// Request to start a new session.
 #[derive(Debug, Clone)]
@@ -25,6 +29,8 @@ pub struct CreateSessionRequest {
     pub workspace_id: Option<String>,
     /// Explicit approval, required for the `custom_command` plugin.
     pub approve_custom: bool,
+    /// Run directly in the source checkout instead of an isolated worktree.
+    pub direct_checkout: bool,
 }
 
 /// Owns session lifecycle: plugin resolution, backend spawn, persistence, and
@@ -34,15 +40,23 @@ pub struct SessionManager {
     pub registry: Arc<PluginRegistry>,
     backend: Arc<dyn SessionBackend>,
     live: Mutex<HashMap<String, Arc<dyn BackendSession>>>,
+    /// Base directory under which per-session Git worktrees are created.
+    worktree_root: PathBuf,
 }
 
 impl SessionManager {
-    pub fn new(db: Db, registry: Arc<PluginRegistry>, backend: Arc<dyn SessionBackend>) -> Self {
+    pub fn new(
+        db: Db,
+        registry: Arc<PluginRegistry>,
+        backend: Arc<dyn SessionBackend>,
+        worktree_root: PathBuf,
+    ) -> Self {
         Self {
             db,
             registry,
             backend,
             live: Mutex::new(HashMap::new()),
+            worktree_root,
         }
     }
 
@@ -76,8 +90,13 @@ impl SessionManager {
             .get(&req.agent_plugin_id)
             .ok_or_else(|| anyhow!("unknown agent plugin `{}`", req.agent_plugin_id))?;
 
+        let id = Uuid::new_v4().to_string();
+
+        // Resolve the working directory and (optionally) an isolated instance.
+        let (resolved_cwd, instance) = self.resolve_workspace(&id, &req)?;
+
         let ctx = AgentContext {
-            cwd: req.cwd.clone(),
+            cwd: resolved_cwd.clone(),
             command: req.command.clone(),
             extra_args: req.args.clone(),
             extra_env: req.env.clone(),
@@ -88,20 +107,18 @@ impl SessionManager {
             bail!("launch requires explicit approval (custom command)");
         }
 
-        let cwd_path = std::path::Path::new(&req.cwd);
-        if !cwd_path.is_dir() {
-            bail!("working directory does not exist: {}", req.cwd);
+        if !Path::new(&resolved_cwd).is_dir() {
+            bail!("working directory does not exist: {resolved_cwd}");
         }
 
         let now = now_millis();
-        let id = Uuid::new_v4().to_string();
         let session = Session {
             id: id.clone(),
             agent_plugin_id: plugin.id().to_string(),
             command: launch.command.clone(),
             args: launch.args.clone(),
             env: launch.env.clone(),
-            working_directory: req.cwd.clone(),
+            working_directory: resolved_cwd.clone(),
             workspace_id: req.workspace_id.clone(),
             status: SessionStatus::Starting,
             rows: req.rows,
@@ -115,13 +132,16 @@ impl SessionManager {
             last_activity_at: now,
         };
         self.db.insert_session(&session)?;
+        if let Some(inst) = &instance {
+            self.db.insert_instance(inst)?;
+        }
 
         let spec = BackendSpawnSpec {
             session_id: id.clone(),
             command: launch.command,
             args: launch.args,
             env: launch.env,
-            cwd: req.cwd,
+            cwd: resolved_cwd,
             rows: req.rows,
             cols: req.cols,
         };
@@ -150,6 +170,143 @@ impl SessionManager {
         self.db
             .get_session(&id)?
             .ok_or_else(|| anyhow!("session vanished after creation"))
+    }
+
+    /// Decide where a session runs: an isolated worktree for a Git workspace,
+    /// the source root for a direct/plain workspace, or a raw allowlisted path.
+    fn resolve_workspace(
+        &self,
+        session_id: &str,
+        req: &CreateSessionRequest,
+    ) -> Result<(String, Option<WorkspaceInstance>)> {
+        let now = now_millis();
+        match &req.workspace_id {
+            Some(ws_id) => {
+                let ws = self
+                    .db
+                    .get_workspace(ws_id)?
+                    .ok_or_else(|| anyhow!("unknown workspace `{ws_id}`"))?;
+                let root = PathBuf::from(&ws.root_path);
+                if !root.is_dir() {
+                    bail!("workspace root does not exist: {}", ws.root_path);
+                }
+
+                if ws.is_git && !req.direct_checkout {
+                    // Isolated managed worktree on an app-managed branch.
+                    let instance_path = self.worktree_root.join(session_id);
+                    let branch = format!("asm-session/{}", &session_id[..8.min(session_id.len())]);
+                    workspace::create_worktree(&root, &instance_path, &branch)?;
+                    let path = instance_path.to_string_lossy().into_owned();
+                    let inst = WorkspaceInstance {
+                        id: Uuid::new_v4().to_string(),
+                        workspace_id: ws.id.clone(),
+                        session_id: Some(session_id.to_string()),
+                        path: path.clone(),
+                        branch: Some(branch),
+                        isolation: "worktree".into(),
+                        status: "active".into(),
+                        created_at: now,
+                    };
+                    Ok((path, Some(inst)))
+                } else {
+                    // Direct source checkout (git override) or plain folder.
+                    let isolation = if ws.is_git { "direct" } else { "plain" };
+                    let inst = WorkspaceInstance {
+                        id: Uuid::new_v4().to_string(),
+                        workspace_id: ws.id.clone(),
+                        session_id: Some(session_id.to_string()),
+                        path: ws.root_path.clone(),
+                        branch: None,
+                        isolation: isolation.into(),
+                        status: "active".into(),
+                        created_at: now,
+                    };
+                    Ok((ws.root_path, Some(inst)))
+                }
+            }
+            None => {
+                if req.cwd.trim().is_empty() {
+                    bail!("cwd is required when no workspace is selected");
+                }
+                // Raw path: enforce the allowlist once any workspace is registered.
+                let workspaces = self.db.list_workspaces()?;
+                if !workspaces.is_empty() {
+                    let cwd_abs = canonical(&req.cwd);
+                    let allowed = workspaces
+                        .iter()
+                        .any(|w| cwd_abs.starts_with(canonical(&w.root_path)));
+                    if !allowed {
+                        bail!("working directory is outside all registered workspace roots");
+                    }
+                }
+                Ok((req.cwd.clone(), None))
+            }
+        }
+    }
+
+    pub fn register_workspace(&self, name: String, root_path: String) -> Result<Workspace> {
+        let root = PathBuf::from(&root_path);
+        if !root.is_dir() {
+            bail!("root path is not a directory: {root_path}");
+        }
+        let canonical_root = canonical(&root_path).to_string_lossy().into_owned();
+        let is_git = workspace::is_git_repo(&root);
+        let w = Workspace {
+            id: Uuid::new_v4().to_string(),
+            name,
+            root_path: canonical_root,
+            is_git,
+            created_at: now_millis(),
+        };
+        self.db.insert_workspace(&w)?;
+        Ok(w)
+    }
+
+    pub fn list_workspaces(&self) -> Result<Vec<Workspace>> {
+        self.db.list_workspaces()
+    }
+
+    pub fn init_workspace_git(&self, id: &str) -> Result<Workspace> {
+        let w = self
+            .db
+            .get_workspace(id)?
+            .ok_or_else(|| anyhow!("no such workspace"))?;
+        if w.is_git {
+            return Ok(w);
+        }
+        workspace::init_repo(Path::new(&w.root_path))?;
+        self.db.set_workspace_git(id, true)?;
+        self.db
+            .get_workspace(id)?
+            .ok_or_else(|| anyhow!("workspace vanished"))
+    }
+
+    pub fn get_instance_for_session(&self, session_id: &str) -> Result<Option<WorkspaceInstance>> {
+        self.db.get_instance_for_session(session_id)
+    }
+
+    /// Remove a session's managed worktree. Guards against dirty worktrees and
+    /// live sessions unless `force`.
+    pub fn cleanup_instance(&self, session_id: &str, force: bool) -> Result<()> {
+        let inst = self
+            .db
+            .get_instance_for_session(session_id)?
+            .ok_or_else(|| anyhow!("no workspace instance for session"))?;
+        if inst.status == "released" {
+            return Ok(());
+        }
+        if inst.isolation == "worktree" {
+            if self.live_handle(session_id).is_some() {
+                bail!("stop the session before cleaning up its worktree");
+            }
+            let ws = self
+                .db
+                .get_workspace(&inst.workspace_id)?
+                .ok_or_else(|| anyhow!("workspace record missing"))?;
+            workspace::remove_worktree(Path::new(&ws.root_path), Path::new(&inst.path), force)?;
+        }
+        self.db.set_instance_status(&inst.id, "released")?;
+        Ok(())
     }
 
     pub fn stop_session(&self, id: &str) -> Result<Session> {
@@ -353,6 +510,11 @@ impl SessionManager {
         self.live.lock().remove(id);
         tracing::info!(session = %id, status = %status_to_write.as_str(), "session finalized");
     }
+}
+
+/// Best-effort path canonicalization for allowlist comparisons.
+fn canonical(p: &str) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p))
 }
 
 /// Very small heuristic prompt/approval classifier over the decoded tail.

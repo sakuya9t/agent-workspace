@@ -92,15 +92,36 @@ export interface Health {
   active_sessions: number;
 }
 
+export interface Workspace {
+  id: string;
+  name: string;
+  root_path: string;
+  is_git: boolean;
+  created_at: number;
+}
+
+export interface WorkspaceInstance {
+  id: string;
+  workspace_id: string;
+  session_id: string | null;
+  path: string;
+  branch: string | null;
+  isolation: string;
+  status: string;
+  created_at: number;
+}
+
 export interface CreateSessionBody {
   agent_plugin_id: string;
-  cwd: string;
+  cwd?: string;
   command?: string | null;
   args?: string[];
   env?: Record<string, string>;
   rows?: number;
   cols?: number;
+  workspace_id?: string;
   approve_custom?: boolean;
+  direct_checkout?: boolean;
 }
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
@@ -162,6 +183,25 @@ export const api = {
     req<{ commits: Commit[] }>(`/api/sessions/${id}/scm/log?limit=${limit}`).then(
       (r) => r.commits,
     ),
+  listWorkspaces: () =>
+    req<{ workspaces: Workspace[] }>("/api/workspaces").then((r) => r.workspaces),
+  addWorkspace: (name: string, root_path: string) =>
+    req<{ workspace: Workspace }>("/api/workspaces", {
+      method: "POST",
+      body: JSON.stringify({ name, root_path }),
+    }).then((r) => r.workspace),
+  initWorkspaceGit: (id: string) =>
+    req<{ workspace: Workspace }>(`/api/workspaces/${id}/init-git`, {
+      method: "POST",
+    }).then((r) => r.workspace),
+  sessionWorkspace: (id: string) =>
+    req<{ instance: WorkspaceInstance | null }>(`/api/sessions/${id}/workspace`).then(
+      (r) => r.instance,
+    ),
+  cleanupInstance: (id: string, force: boolean) =>
+    req<{ ok: boolean }>(`/api/sessions/${id}/cleanup?force=${force}`, {
+      method: "POST",
+    }),
 };
 
 export function streamUrl(id: string): string {

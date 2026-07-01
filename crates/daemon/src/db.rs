@@ -7,7 +7,9 @@ use parking_lot::Mutex;
 use rusqlite::Connection;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::domain::{AttentionState, Session, SessionStatus, SessionSummary};
+use crate::domain::{
+    AttentionState, Session, SessionStatus, SessionSummary, Workspace, WorkspaceInstance,
+};
 
 /// Metadata store plus a handle to the high-volume terminal-event writer.
 ///
@@ -261,6 +263,96 @@ impl Db {
         }
     }
 
+    // ---- workspaces ----
+
+    pub fn insert_workspace(&self, w: &Workspace) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO workspaces (id, name, root_path, is_git, created_at)
+             VALUES (?1,?2,?3,?4,?5)",
+            rusqlite::params![w.id, w.name, w.root_path, w.is_git as i64, w.created_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_workspaces(&self) -> Result<Vec<Workspace>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, root_path, is_git, created_at FROM workspaces ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], row_to_workspace)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    pub fn get_workspace(&self, id: &str) -> Result<Option<Workspace>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, root_path, is_git, created_at FROM workspaces WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map([id], row_to_workspace)?;
+        rows.next().transpose().map_err(Into::into)
+    }
+
+    pub fn set_workspace_git(&self, id: &str, is_git: bool) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE workspaces SET is_git = ?2 WHERE id = ?1",
+            rusqlite::params![id, is_git as i64],
+        )?;
+        Ok(())
+    }
+
+    // ---- workspace instances ----
+
+    pub fn insert_instance(&self, i: &WorkspaceInstance) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO workspace_instances
+                (id, workspace_id, session_id, path, branch, isolation, status, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            rusqlite::params![
+                i.id,
+                i.workspace_id,
+                i.session_id,
+                i.path,
+                i.branch,
+                i.isolation,
+                i.status,
+                i.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_instance_for_session(&self, session_id: &str) -> Result<Option<WorkspaceInstance>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, workspace_id, session_id, path, branch, isolation, status, created_at
+             FROM workspace_instances WHERE session_id = ?1 ORDER BY created_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map([session_id], row_to_instance)?;
+        rows.next().transpose().map_err(Into::into)
+    }
+
+    pub fn list_instances(&self) -> Result<Vec<WorkspaceInstance>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, workspace_id, session_id, path, branch, isolation, status, created_at
+             FROM workspace_instances ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], row_to_instance)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    pub fn set_instance_status(&self, id: &str, status: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE workspace_instances SET status = ?2 WHERE id = ?1",
+            rusqlite::params![id, status],
+        )?;
+        Ok(())
+    }
+
     /// On startup, any session left in a live state is reconciled: since the
     /// MVP native backend is in-process, a daemon restart means its PTYs are
     /// gone, so those sessions become `failed` (never silently relaunched).
@@ -302,6 +394,29 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
     })
 }
 
+fn row_to_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspace> {
+    Ok(Workspace {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        root_path: row.get(2)?,
+        is_git: row.get::<_, i64>(3)? != 0,
+        created_at: row.get(4)?,
+    })
+}
+
+fn row_to_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceInstance> {
+    Ok(WorkspaceInstance {
+        id: row.get(0)?,
+        workspace_id: row.get(1)?,
+        session_id: row.get(2)?,
+        path: row.get(3)?,
+        branch: row.get(4)?,
+        isolation: row.get(5)?,
+        status: row.get(6)?,
+        created_at: row.get(7)?,
+    })
+}
+
 fn configure(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -316,6 +431,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA_V1)?;
         conn.pragma_update(None, "user_version", 1)?;
         tracing::info!("applied schema migration v1");
+    }
+    if version < 2 {
+        conn.execute_batch(SCHEMA_V2)?;
+        conn.pragma_update(None, "user_version", 2)?;
+        tracing::info!("applied schema migration v2");
     }
     Ok(())
 }
@@ -361,6 +481,30 @@ CREATE TABLE session_summaries (
     terminal_event_start INTEGER NOT NULL,
     terminal_event_end INTEGER NOT NULL
 );
+"#;
+
+const SCHEMA_V2: &str = r#"
+CREATE TABLE workspaces (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    root_path TEXT NOT NULL,
+    is_git INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE workspace_instances (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    session_id TEXT,
+    path TEXT NOT NULL,
+    branch TEXT,
+    isolation TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX idx_instances_session ON workspace_instances(session_id);
+CREATE INDEX idx_instances_workspace ON workspace_instances(workspace_id);
 "#;
 
 /// Batches terminal events into transactions to keep write amplification low.

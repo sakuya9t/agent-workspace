@@ -29,6 +29,9 @@ Implemented:
   (custom commands require explicit approval).
 - No silent relaunch: a daemon restart reconciles lingering sessions to
   `failed` rather than pretending they continued.
+- Workspace registration + allowlist, guided `git init` for plain folders,
+  and per-session Git worktree isolation so concurrent agents on one repo get
+  separate working trees; instance cleanup is guarded against dirty/live state.
 
 Next iterations (see `docs/mvp-execution-plan.md`): out-of-process sidecars,
 Git worktree isolation + change tracking, the Electron shell, and rich output.
@@ -57,12 +60,17 @@ Environment overrides: `ASM_BIND`, `ASM_DATA_DIR`, `ASM_CONFIG_DIR`,
 | --- | --- | --- |
 | GET | `/health` | version, platform, uptime, backend, active sessions |
 | GET | `/api/plugins` | list agent plugins + binary detection |
+| GET | `/api/workspaces` | list registered workspaces |
+| POST | `/api/workspaces` | register a workspace (`{name, root_path}`) |
+| POST | `/api/workspaces/:id/init-git` | guided `git init` for a plain folder |
 | GET | `/api/sessions` | list sessions |
 | POST | `/api/sessions` | create a session |
 | GET | `/api/sessions/:id` | session detail |
 | GET | `/api/sessions/:id/summary` | structural summary record |
+| GET | `/api/sessions/:id/workspace` | this session's isolated instance |
 | POST | `/api/sessions/:id/stop` | stop a live session |
 | POST | `/api/sessions/:id/archive` | archive a terminal session |
+| POST | `/api/sessions/:id/cleanup?force=` | remove the session's worktree |
 | POST | `/api/sessions/:id/resize` | resize (`{rows, cols}`) |
 | POST | `/api/sessions/:id/ack` | acknowledge/clear attention |
 | GET (WS) | `/api/sessions/:id/stream` | terminal stream |
