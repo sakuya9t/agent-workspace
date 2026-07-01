@@ -269,6 +269,15 @@ body {
   color: var(--dim);
 }
 
+.vscode-btn {
+  width: 100%;
+  margin-bottom: 12px;
+  background: var(--accent-2);
+  border-color: var(--accent);
+  color: var(--text);
+  font-weight: 600;
+}
+
 /* segmented control + workspace register box */
 .seg {
   display: flex;

@@ -41,6 +41,10 @@ export function RightPanel({ session }: Props) {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["instance", session?.id] }),
   });
 
+  const openVscode = useMutation({
+    mutationFn: () => api.openVscode(session!.id),
+  });
+
   const { data: summary } = useQuery({
     queryKey: ["summary", session?.id],
     queryFn: () => api.getSummary(session!.id),
@@ -71,6 +75,19 @@ export function RightPanel({ session }: Props) {
     <div className="panel right">
       <div className="panel-header">Details</div>
       <div className="panel-body details">
+        <button
+          className="btn vscode-btn"
+          disabled={openVscode.isPending}
+          onClick={() => openVscode.mutate()}
+          title="Open this session's workspace in VS Code"
+        >
+          {openVscode.isPending ? "Opening…" : "Continue in VS Code"}
+        </button>
+        {openVscode.data && (
+          <div className="dim small">Opened {openVscode.data.path}</div>
+        )}
+        {openVscode.error && <div className="error">{String(openVscode.error)}</div>}
+
         <Field label="Agent" value={session.agent_plugin_id} />
         <Field label="Status" value={session.status} />
         <Field label="Command" value={[session.command, ...session.args].join(" ")} mono />

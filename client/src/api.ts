@@ -202,6 +202,10 @@ export const api = {
     req<{ ok: boolean }>(`/api/sessions/${id}/cleanup?force=${force}`, {
       method: "POST",
     }),
+  openVscode: (id: string) =>
+    req<{ opened: boolean; path: string }>(`/api/sessions/${id}/open-vscode`, {
+      method: "POST",
+    }),
 };
 
 export function streamUrl(id: string): string {

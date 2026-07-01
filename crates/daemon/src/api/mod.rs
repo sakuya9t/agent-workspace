@@ -48,6 +48,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/:id/cleanup", post(cleanup_instance))
         .route("/api/sessions/:id/resize", post(resize_session))
         .route("/api/sessions/:id/ack", post(ack_attention))
+        .route("/api/sessions/:id/open-vscode", post(open_vscode))
         .route("/api/sessions/:id/stream", get(ws::stream))
         .route("/api/sessions/:id/scm/status", get(scm::status))
         .route("/api/sessions/:id/scm/diff", get(scm::diff))
@@ -238,6 +239,41 @@ async fn ack_attention(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let s = state.manager.acknowledge_attention(&id)?;
     Ok(Json(json!({ "session": s })))
+}
+
+/// Open the session's isolated workspace instance in VS Code. Opening the
+/// editor does not touch the running agent session; the working directory is
+/// already the isolated instance (worktree) for isolated sessions.
+async fn open_vscode(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = state
+        .manager
+        .get_session(&id)?
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "no such session".into()))?;
+    let target = session.working_directory;
+
+    let code = crate::plugins::find_in_path("code").ok_or_else(|| {
+        AppError(
+            StatusCode::BAD_REQUEST,
+            "VS Code CLI `code` not found in PATH on the daemon host. For a remote daemon, \
+             use VS Code Remote-SSH to open this path."
+                .into(),
+        )
+    })?;
+
+    std::process::Command::new(code)
+        .arg(&target)
+        .spawn()
+        .map_err(|e| {
+            AppError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to launch VS Code: {e}"),
+            )
+        })?;
+
+    Ok(Json(json!({ "opened": true, "path": target })))
 }
 
 // ---------- error type ----------
