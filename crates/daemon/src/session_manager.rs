@@ -551,3 +551,173 @@ fn classify_attention(tail: &str, bell: bool) -> (AttentionState, Option<String>
     }
     (AttentionState::Activity, None)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Snapshot;
+    use std::sync::atomic::AtomicU64;
+    use tokio::sync::{broadcast, watch};
+
+    // ---- attention classifier ----
+
+    #[test]
+    fn detects_approval_prompt() {
+        let (a, reason) = classify_attention("Proceed? (y/n)", false);
+        assert_eq!(a, AttentionState::ApprovalNeeded);
+        assert!(reason.is_some());
+    }
+
+    #[test]
+    fn bell_is_likely_blocked() {
+        let (a, _) = classify_attention("just some output", true);
+        assert_eq!(a, AttentionState::LikelyBlocked);
+    }
+
+    #[test]
+    fn plain_output_is_activity() {
+        let (a, reason) = classify_attention("building project...", false);
+        assert_eq!(a, AttentionState::Activity);
+        assert!(reason.is_none());
+    }
+
+    // ---- mock backend proving the SessionBackend boundary ----
+
+    struct MockSession {
+        tx: broadcast::Sender<Arc<[u8]>>,
+        status_tx: watch::Sender<BackendStatus>,
+        status_rx: watch::Receiver<BackendStatus>,
+        seq: AtomicU64,
+    }
+
+    impl BackendSession for MockSession {
+        fn attach(&self) -> (Snapshot, broadcast::Receiver<Arc<[u8]>>) {
+            (self.snapshot(), self.tx.subscribe())
+        }
+        fn snapshot(&self) -> Snapshot {
+            Snapshot {
+                rows: 24,
+                cols: 80,
+                repaint: Arc::from(Vec::new().into_boxed_slice()),
+                last_seq: self.seq.load(std::sync::atomic::Ordering::SeqCst),
+            }
+        }
+        fn send_input(&self, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn resize(&self, _rows: u16, _cols: u16) -> Result<()> {
+            Ok(())
+        }
+        fn stop(&self) -> Result<()> {
+            let _ = self.status_tx.send(BackendStatus::Exited(0));
+            Ok(())
+        }
+        fn status(&self) -> BackendStatus {
+            self.status_rx.borrow().clone()
+        }
+        fn watch_status(&self) -> watch::Receiver<BackendStatus> {
+            self.status_rx.clone()
+        }
+        fn last_seq(&self) -> u64 {
+            self.seq.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    struct MockBackend;
+
+    impl SessionBackend for MockBackend {
+        fn id(&self) -> &'static str {
+            "mock"
+        }
+        fn create(&self, _spec: BackendSpawnSpec) -> Result<Arc<dyn BackendSession>> {
+            let (tx, _) = broadcast::channel(16);
+            let (status_tx, status_rx) = watch::channel(BackendStatus::Running);
+            Ok(Arc::new(MockSession {
+                tx,
+                status_tx,
+                status_rx,
+                seq: AtomicU64::new(0),
+            }))
+        }
+    }
+
+    fn test_manager() -> (Arc<SessionManager>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("asm-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("test.sqlite3")).unwrap();
+        let registry = Arc::new(PluginRegistry::with_builtins());
+        let manager = Arc::new(SessionManager::new(
+            db,
+            registry,
+            Arc::new(MockBackend),
+            dir.join("worktrees"),
+        ));
+        (manager, dir)
+    }
+
+    fn shell_req() -> CreateSessionRequest {
+        CreateSessionRequest {
+            agent_plugin_id: "shell".into(),
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            command: None,
+            args: vec![],
+            env: vec![],
+            rows: 24,
+            cols: 80,
+            workspace_id: None,
+            approve_custom: false,
+            direct_checkout: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_marks_stopped_and_writes_summary() {
+        let (manager, dir) = test_manager();
+
+        let s = manager.create_session(shell_req()).unwrap();
+        assert_eq!(s.status, SessionStatus::Running);
+
+        let stopped = manager.stop_session(&s.id).unwrap();
+        assert_eq!(stopped.status, SessionStatus::Stopped);
+
+        // Let the monitor task observe the backend exit and finalize.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        let reloaded = manager.get_session(&s.id).unwrap().unwrap();
+        assert_eq!(reloaded.status, SessionStatus::Stopped);
+
+        let summary = manager.get_summary(&s.id).unwrap();
+        assert!(summary.is_some(), "a structural summary must be written");
+        assert_eq!(summary.unwrap().session_id, s.id);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn custom_command_without_approval_is_rejected() {
+        let (manager, dir) = test_manager();
+        let mut req = shell_req();
+        req.agent_plugin_id = "custom_command".into();
+        req.command = Some("echo hi".into());
+        req.approve_custom = false;
+
+        let err = manager.create_session(req).unwrap_err();
+        assert!(err.to_string().contains("approval"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn archive_requires_terminal_state() {
+        let (manager, dir) = test_manager();
+        let s = manager.create_session(shell_req()).unwrap();
+        // Live session cannot be archived.
+        assert!(manager.archive_session(&s.id).is_err());
+        // After stop it can.
+        manager.stop_session(&s.id).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let archived = manager.archive_session(&s.id).unwrap();
+        assert_eq!(archived.status, SessionStatus::Archived);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

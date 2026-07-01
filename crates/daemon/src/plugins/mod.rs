@@ -151,3 +151,53 @@ fn is_executable(path: &std::path::Path) -> bool {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_has_all_builtins() {
+        let reg = PluginRegistry::with_builtins();
+        for id in ["shell", "codex", "claude", "custom_command"] {
+            assert!(reg.get(id).is_some(), "missing builtin {id}");
+        }
+        assert!(reg.get("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn custom_command_requires_approval() {
+        let reg = PluginRegistry::with_builtins();
+        let plugin = reg.get("custom_command").unwrap();
+        let ctx = AgentContext {
+            cwd: "/tmp".into(),
+            command: Some("echo hi".into()),
+            ..Default::default()
+        };
+        let launch = plugin.build_launch(&ctx).unwrap();
+        assert!(launch.requires_approval);
+    }
+
+    #[test]
+    fn shell_does_not_require_approval() {
+        let reg = PluginRegistry::with_builtins();
+        let plugin = reg.get("shell").unwrap();
+        let launch = plugin.build_launch(&AgentContext::default()).unwrap();
+        assert!(!launch.requires_approval);
+    }
+
+    #[test]
+    fn custom_command_without_command_errors() {
+        let reg = PluginRegistry::with_builtins();
+        let plugin = reg.get("custom_command").unwrap();
+        assert!(plugin.build_launch(&AgentContext::default()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_in_path_resolves_absolute() {
+        // /bin/sh exists on any POSIX host.
+        assert_eq!(find_in_path("/bin/sh"), Some("/bin/sh".to_string()));
+        assert!(find_in_path("/nonexistent/binary/xyz").is_none());
+    }
+}

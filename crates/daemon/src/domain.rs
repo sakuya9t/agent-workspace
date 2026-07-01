@@ -144,3 +144,48 @@ pub struct SessionSummary {
     pub terminal_event_start: u64,
     pub terminal_event_end: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_status_round_trips() {
+        for s in [
+            SessionStatus::Starting,
+            SessionStatus::Running,
+            SessionStatus::Exited,
+            SessionStatus::Failed,
+            SessionStatus::Stopped,
+            SessionStatus::Archived,
+        ] {
+            assert_eq!(SessionStatus::from_str(s.as_str()), s);
+        }
+    }
+
+    #[test]
+    fn attention_state_round_trips() {
+        for a in [
+            AttentionState::None,
+            AttentionState::Activity,
+            AttentionState::LikelyBlocked,
+            AttentionState::ApprovalNeeded,
+            AttentionState::Failed,
+        ] {
+            assert_eq!(AttentionState::from_str(a.as_str()), a);
+        }
+    }
+
+    #[test]
+    fn terminal_states_are_terminal() {
+        assert!(SessionStatus::Exited.is_terminal());
+        assert!(SessionStatus::Stopped.is_terminal());
+        assert!(!SessionStatus::Running.is_terminal());
+        assert!(!SessionStatus::Starting.is_terminal());
+    }
+
+    #[test]
+    fn unknown_status_maps_to_failed() {
+        assert_eq!(SessionStatus::from_str("bogus"), SessionStatus::Failed);
+    }
+}

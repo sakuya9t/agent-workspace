@@ -232,3 +232,53 @@ fn guard_path(path: &str) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_all_change_kinds() {
+        let text = " M src/a.rs\nM  src/b.rs\nA  src/c.rs\n D src/d.rs\nR  old.rs -> new.rs\n?? src/e.rs\n";
+        let files = parse_porcelain(text);
+        assert_eq!(files.len(), 6);
+
+        // unstaged modification
+        assert_eq!(files[0].path, "src/a.rs");
+        assert_eq!(files[0].status, "M");
+        assert!(!files[0].staged);
+        assert!(!files[0].untracked);
+
+        // staged modification
+        assert_eq!(files[1].status, "M");
+        assert!(files[1].staged);
+
+        // staged add
+        assert_eq!(files[2].status, "A");
+        assert!(files[2].staged);
+
+        // unstaged delete
+        assert_eq!(files[3].status, "D");
+        assert!(!files[3].staged);
+
+        // rename keeps both paths
+        assert_eq!(files[4].status, "R");
+        assert_eq!(files[4].path, "new.rs");
+        assert_eq!(files[4].orig_path.as_deref(), Some("old.rs"));
+        assert!(files[4].staged);
+
+        // untracked
+        assert_eq!(files[5].status, "?");
+        assert!(files[5].untracked);
+        assert!(!files[5].staged);
+    }
+
+    #[test]
+    fn guard_rejects_traversal_and_absolute() {
+        assert!(guard_path("src/main.rs").is_ok());
+        assert!(guard_path("").is_err());
+        assert!(guard_path("../secret").is_err());
+        assert!(guard_path("a/../../b").is_err());
+        assert!(guard_path("/etc/passwd").is_err());
+    }
+}

@@ -106,6 +106,16 @@ npm install
 npm run dev   # Vite dev server, proxies /api and /health to the daemon
 ```
 
+## Tests
+
+```bash
+cargo test                 # daemon unit + mock-backend integration tests
+```
+
+The integration tests swap a mock `SessionBackend` for the native PTY backend,
+exercising the manager lifecycle (create → stop → summary, approval gate,
+archive state machine) without spawning real processes.
+
 ## End-to-end smoke test
 
 With a daemon running, exercise the full loop (create → attach → run →
