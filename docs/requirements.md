@@ -2,294 +2,406 @@
 
 ## Overview
 
-The product is a cross-platform personal tool for managing long-running coding agent sessions on remote servers. Users should be able to start an agent in a remote directory, disconnect their client, reconnect later, and continue the exact same session with no lost terminal output.
+The product is a cross-platform personal tool for managing long-running coding agent sessions on remote servers. A user can start an agent in a remote workspace, disconnect, reconnect later, and continue the same live session with no lost terminal output.
 
-The product intentionally does not provide shared team sessions. If teammates collaborate, they do so through repository workflows and each person maintains their own private agent sessions.
+The product is not a team session system. Teammates collaborate through repository workflows and maintain their own private agents, sessions, servers, and memory copies.
 
-Supported agent targets include Claude Code, Codex, opencode, myclaw, Hermes, and custom terminal commands.
+Supported agent targets:
+
+```text
+Codex
+Claude Code
+opencode
+myclaw
+Hermes
+custom terminal command
+```
 
 ## Product Principles
 
-- Sessions are durable remote objects.
-- Client connections are temporary views into those sessions.
-- Remote workspaces may be Git repositories or plain directories.
-- Networking must work for public servers, private servers, and multi-hop private networks.
-- Server-side components should be efficient, lightweight, and safe to run continuously.
-- Server daemons should run natively on Linux, macOS, and Windows.
-- Windows server support must not require WSL.
-- Long term, users should manage a personal hybrid pool of machines instead of manually choosing a host for every agent session.
-- New agent sessions should be placed automatically on the most suitable available machine when possible.
-- The first client should be useful as a real control center, not just a terminal wrapper.
-- Long-term agent memory should survive terminal session boundaries.
-- Agent sessions are private and personal.
-- Collaboration happens through repositories, not shared live sessions.
-- Agent memory can be exported and imported, but memory is not a live shared team resource.
-- Agent TUIs are integrated through plugins.
-- Source-control panels are integrated through plugins.
-- Changed-file diffing is Git-backed in the MVP, including folders that the app initializes as local Git repositories.
-- Concurrent agents working on the same repo should be isolated in separate workspace instances by default.
-- Mature existing components should be used when they satisfy the requirement better than custom implementation.
+- Sessions are durable server-side objects.
+- Client connections are temporary views into sessions.
+- Session continuity is never simulated through automatic relaunch.
+- Fresh-client resume uses server-side terminal emulator state.
+- Native sessions are owned by per-session sidecars that survive daemon restart.
+- Remote workspaces can start as Git repositories or plain directories.
+- Plain directories use guided local `git init` for full change tracking.
+- Server daemons run natively on Linux, macOS, and Windows.
+- Windows server support does not require WSL.
+- Agent TUIs, session backends, and source-control panels use plugin boundaries.
+- Concurrent agents on the same repo use separate workspace instances by default.
+- Isolated workspace instances support setup hooks for secrets, caches, dependency installation, and generated files.
+- The first client is a real control center, not a thin terminal wrapper.
+- The control center highlights sessions with new activity or likely user-blocking prompts.
+- Long-term memory belongs to an agent profile and survives terminal session boundaries.
+- Mature dependencies are preferred behind replaceable internal interfaces.
+- Long-term operations are transparent through a personal hybrid machine pool.
 
-## User Personas
+## Personas
 
 ### Solo Developer
 
-Runs agents on a workstation, cloud VM, homelab server, or laptop and wants to check progress from multiple devices.
+Runs agents on a workstation, laptop, cloud VM, or homelab server and checks progress from multiple devices.
 
 ### Power User With Private Networks
 
-Runs agents on machines behind NAT, bastion hosts, VPNs, or nested private networks.
+Runs agents behind NAT, bastion hosts, VPNs, or nested private networks such as `local -> 10.0.0.5 -> 192.168.122.10`.
 
-## Primary User Stories
+## User Stories
 
 ### Session Management
 
-- As a user, I can register a remote server.
+- As a user, I can register a server.
 - As a user, I can register or select a remote workspace directory.
 - As a user, I can start an agent session in a selected workspace.
-- As a user, I can see all active, exited, and archived sessions.
+- As a user, I can see active, detached, exited, failed, stopped, and archived sessions.
 - As a user, I can attach to an existing session.
-- As a user, I can detach from a session without stopping it.
+- As a user, I can detach without stopping the session.
 - As a user, I can stop or archive a session intentionally.
-- As a user, I can resize a terminal and have the remote PTY reflect the new size.
-- As a user, I can eventually start an agent from intent, such as "run Codex on this repo", without choosing a host manually.
-- As a user, I can see which machine was selected for a new session and why.
-- As a user, I can override automatic placement when I want direct control.
+- As a user, I can resize a terminal and have the backend session resize.
+- As a user, I can trust that the app never silently restarts an agent as the same session.
+- As a user, I can create an explicit follow-up session from the same profile and workspace.
 
 ### Reconnect And Continuity
 
-- As a user, I can disconnect my client while an agent keeps running on the server.
+- As a user, I can disconnect while an agent keeps running.
 - As a user, I can reconnect and see output produced while I was away.
-- As a user, I can resume the same session rather than creating a new one.
-- As a user, I can switch devices and continue controlling the same session.
+- As a user, I can switch devices and continue the same session.
 - As a user, I can recover the terminal screen after a client crash.
+- As a user, I can recover session history after daemon restart when the backend session is still alive.
+- As a user, I can attach from a fresh device and see the current TUI screen without replaying the whole session from the beginning.
 
 ### Agent Support
 
 - As a user, I can launch Codex from a workspace.
 - As a user, I can launch Claude Code from a workspace.
-- As a user, I can launch opencode from a workspace.
-- As a user, I can launch myclaw from a workspace.
-- As a user, I can launch Hermes from a workspace.
 - As a user, I can define a custom agent command.
-- As a user, I can pass environment variables and launch arguments safely.
-- As a user, I can add support for future agent-like TUIs through plugins.
-- As a user, I can configure an agent plugin without changing the core app.
+- As a user, I can pass launch arguments and environment variables safely.
+- As a user, I can add future agent-like TUIs through plugins.
+- As a user, I can configure agent plugins without changing the core app.
 
 ### Workspace And Source Control
 
 - As a user, I can run an agent in any allowed remote directory.
-- As a user, I can use the tool even if the directory is not connected to version control.
-- As a user, I can see Git branch, status, changed files, and diffs when Git is available.
-- As a user, I can view a complete Git commit graph with branches and tags.
-- As a user, I can understand what changed while the agent was working.
-- As a user, I can collaborate with teammates by committing, pushing, pulling, and reviewing repository changes outside the private agent session.
-- As a user, I can add support for other source-control systems such as SVN through plugins.
+- As a user, I can initialize a plain folder as a local Git repository.
+- As a user, I can see Git branch, status, changed files, diffs, and commit graph.
 - As a user, I can click any changed file and see what changed.
-- As a user, I can let the app initialize a plain folder as a local Git repository to enable change tracking.
-- As a user, I can see changes since the session opened the folder after the app creates a Git-backed baseline.
-- As a user, I can create a new session with `/new` and have the change checkpoint update for the next session segment.
-- As a user, I can run multiple agents against the same repository without them sharing one writable working tree.
-- As a user, I can see which isolated workspace instance or worktree each agent session is using.
-- As a user, I can merge, rebase, or apply changes between isolated agent workspaces through source-control flows.
+- As a user, I can see changes since the active session checkpoint.
+- As a user, I can update a checkpoint manually.
+- As a user, I can create a new session segment with `/new` and advance the checkpoint.
+- As a user, I can run multiple agents against the same repository without sharing one writable working tree.
+- As a user, I can see which isolated workspace instance each session uses.
+- As a user, I can merge, rebase, apply, or export changes through source-control workflows.
+- As a user, I can configure workspace setup rules for copied local files, linked caches, and bootstrap commands.
 
 ### TUI Control Center
 
-- As a user, I can use a three-panel interface:
-  - left: sessions and workspaces,
+- As a user, I can use a three-panel control center:
+  - left: sessions, workspaces, agent profiles,
   - middle: large agent TUI,
-  - right: changed files, source-control history, and workspace state.
-- As a user, I can switch between sessions quickly.
+  - right: changed files, source-control history, status, and diffs.
+- As a user, I can switch sessions quickly.
 - As a user, I can search or inspect terminal history.
 - As a user, I can tell which sessions have new activity.
+- As a user, I can tell which sessions likely need my approval or input.
 
-### Human-In-The-Loop Mode
+### Human-In-The-Loop
 
 - As a user, I can continue the current session in VS Code.
-- As a user, I can open the same isolated workspace instance while keeping the agent session alive.
-- As a user, I can eventually pair program in a richer GUI with editor, terminal, file tree, and diffs.
+- As a user, I can open the session's isolated workspace instance in VS Code.
+- As a user, I can keep the agent session alive while editing files.
 
 ### Networking
 
-- As a user, I can connect directly to a server with a reachable IP or hostname.
-- As a user, I can connect to a server without a public IP through a reverse relay.
-- As a user, I can connect through a gateway host into a private network.
-- As a user, I can support routes such as `local -> 10.0.0.5 -> 192.168.122.10`.
-- As a user, I can use SSH or a jump host as an early fallback.
-
-### Personal Hybrid Agent Pool
-
-- As a user, I can enroll multiple personal machines into a pool.
-- As a user, I can include local, LAN, private, and cloud machines in that pool.
-- As a user, I can see health, reachability, platform, installed agent plugins, and capacity for each machine.
-- As a user, I can set placement preferences such as prefer local, avoid battery-powered machines, or allow cloud machines.
-- As a user, I can let the app choose the best machine for a new agent session.
-- As a user, I can pin a workspace or agent profile to a preferred machine when needed.
+- As a user, I can connect directly to a reachable server.
+- As a user, I can connect to a remote server through an SSH local port-forward.
+- As a user, I can connect to private servers through relay, gateway, or SSH routes.
+- As a user, I can resume after transient network loss.
 
 ### Long-Term Memory
 
-- As a user, I can create a logical agent profile that survives multiple terminal sessions.
-- As a user, I can start a new chat/session with `/new` while preserving useful project context.
-- As a user, I can review or clear remembered information.
-- As a user, I can keep memory scoped to a workspace, agent profile, and owner.
-- As a user, I can export an agent's memory into a portable bundle.
-- As a user, I can import a memory bundle into another personal agent profile.
-- As a user, I can duplicate useful project context for a teammate without exposing my live sessions.
-- As a user, I can choose whether exported memory includes only durable memory entries or also selected session summaries.
+- As a user, I can create an agent profile that survives multiple terminal sessions.
+- As a user, I can preserve project context across `/new` and follow-up sessions.
+- As a user, I can review, edit, or clear remembered information.
+- As a user, I can export an agent memory bundle.
+- As a user, I can import a memory bundle into a private agent profile.
+- As a user, I can duplicate useful project context for a teammate without exposing live sessions.
 
-### Personal Collaboration Model
+### Personal Pool Placement
 
-- As a user, my agent sessions are private to me.
-- As a user, I do not share live terminal control with teammates.
-- As a user, I collaborate with teammates through the repository and normal code review workflows.
-- As a user, I can choose to export memory so another person can import a copy into their own agent.
-- As a user, importing another person's memory bundle creates a private copy for my agent.
+- As a user, I can enroll multiple personal machines into a pool.
+- As a user, I can see health, reachability, platform, installed plugins, and capacity for each machine.
+- As a user, I can launch by intent, such as `Start Codex on repo X`.
+- As a user, I can inspect why a machine was selected.
+- As a user, I can override automatic placement.
 
 ## Functional Requirements
 
 ### Server Daemon
 
-The server daemon must:
+The daemon must:
 
 - run as a native background process on Linux, macOS, and Windows,
-- expose an API for clients,
-- create and supervise PTY-backed agent sessions,
-- use native PTY mechanisms, including ConPTY on Windows and Unix PTYs on Linux/macOS,
-- continue running sessions after client disconnect,
+- run as a user-scoped background process by default,
+- expose authenticated APIs for clients,
+- coordinate sessions through pluggable session backends,
+- ship a native PTY per-session sidecar backend using Unix PTYs on Linux/macOS and ConPTY on Windows,
+- reattach to live sidecar-owned backend sessions after daemon restart,
 - persist session metadata,
 - persist terminal output events,
-- produce terminal snapshots for recovery,
-- support workspace registration,
+- persist terminal emulator snapshots for history, inspection, diagnostics, and fallback recovery,
+- persist structural session summary records,
+- enforce workspace allowlists,
+- register workspaces,
+- create isolated workspace instances,
 - support agent plugins,
+- support session backend plugins,
 - support source-control plugins,
-- support Git inspection through the built-in Git plugin,
-- support guided local Git initialization when no source-control plugin applies,
-- support Git-backed checkpoint change tracking,
-- support isolated workspace instances for concurrent sessions,
-- prevent unrelated sessions from writing into the same working tree by default,
-- support server/device authentication,
-- provide logs and basic health information.
+- support the built-in Git plugin,
+- support guided local Git initialization,
+- provide logs, health, and diagnostics.
 
-The Windows daemon must be Windows-native. It should not require WSL, a Linux userspace, or POSIX-only shell behavior. If a user wants to manage a WSL workspace later, that should be an optional workspace adapter rather than the foundation of Windows support.
+The daemon must not:
 
-The daemon should isolate platform-specific behavior behind internal abstractions for:
+- require WSL for Windows-native operation,
+- bind live session lifetime to a client socket,
+- silently relaunch an exited or failed agent as the same session,
+- allow unrelated sessions to write into the same workspace instance by default.
 
-- PTY management,
-- process supervision and termination,
-- background service installation,
-- filesystem watching,
-- path normalization,
-- permissions,
-- local IPC.
+### Session Backend Plugins
 
-### Dependency Strategy
+The system must support replaceable session backend plugins.
 
-The system should prefer proven existing components over custom implementation when they satisfy the product requirements.
+The native backend must:
 
-Dependency candidates include:
+- use Unix PTYs on Linux and macOS,
+- use ConPTY on Windows,
+- run out of process from the daemon,
+- run one sidecar per live session,
+- own live PTY masters or ConPTY handles and child process handles,
+- maintain a headless terminal emulator per session,
+- expose backend operations over local IPC,
+- publish per-session IPC sockets in a well-known per-user runtime directory,
+- maintain terminal continuity across client disconnects,
+- drain output generated while the daemon reconnects.
 
-- terminal rendering,
-- PTY handling,
-- source-control operations,
-- storage,
-- filesystem watching,
-- service installation,
-- relay/tunnel transport,
-- diff rendering,
-- UI framework components.
+Backend plugins must provide:
 
-Dependencies must:
+- create session,
+- attach session,
+- query session,
+- stream output,
+- drain events,
+- send input,
+- resize session,
+- stop session,
+- export snapshot,
+- report health,
+- report exit state.
 
-- support required target platforms,
-- avoid making Windows server support depend on WSL,
-- preserve product-owned session lifecycle and reconnect semantics,
-- preserve private personal-session behavior,
-- support plugin and replacement boundaries,
-- have acceptable licensing,
-- have acceptable security and maintenance posture,
-- be observable and debuggable enough for long-running daemon use.
+Backend plugin constraints:
 
-If a component satisfies most requirements but not all, the architecture should wrap it behind an internal interface and document the gap, fallback, or replacement path.
+- no client socket owns backend lifetime,
+- no automatic relaunch as continuity,
+- no workspace allowlist bypass,
+- no workspace isolation bypass.
 
-### Session Lifecycle
+Sidecar lifetime requirements:
 
-The system must support these session states:
-
-```text
-starting
-running
-detached
-exited
-failed
-stopped
-archived
-```
-
-State rules:
-
-- A running session may have zero or more attached clients owned by the same user.
-- A detached session is still running but has no active client.
-- An exited session preserves metadata, terminal history, and summary.
-- A stopped session was intentionally terminated by a user or policy.
-- An archived session is hidden from default active views but can be reopened for history.
+- daemon restart leaves sidecar-owned sessions running,
+- daemon upgrade leaves sidecar-owned sessions running,
+- existing sidecars keep their original binary until their sessions exit,
+- newly created sessions use the currently installed sidecar binary,
+- daemon startup scans the sidecar runtime directory and reconciles live sidecars with session records,
+- live sidecars without matching session records become orphaned sidecar records,
+- orphaned sidecars are visible to the owner and can be adopted or terminated,
+- sidecar crash marks its owned session failed,
+- sidecar maintenance that terminates a live session is explicit and session-scoped.
 
 ### Terminal Persistence
 
 The system must:
 
-- capture all PTY output while the server daemon is running,
-- assign sequence numbers to terminal events,
-- allow clients to resume from their last seen sequence number,
-- store periodic terminal snapshots,
-- recover from missing old events by sending a snapshot,
-- preserve enough scrollback for useful review,
+- capture terminal output while the backend session is alive,
+- assign monotonic sequence numbers to terminal events,
+- allow resume from `last_seen_event_seq`,
+- store terminal emulator snapshots,
+- restore fresh clients from a fresh live sidecar snapshot plus later events,
+- deliver terminal snapshots as synthesized ANSI repaint streams with cursor and mode metadata,
+- retain useful scrollback,
 - handle terminal resize events.
 
-The system should:
+The system must not:
 
-- compress older terminal logs,
-- support retention policies per workspace or server,
-- provide terminal output search,
-- redact obvious secrets where possible.
+- replay raw bytes from an arbitrary mid-stream offset as the primary resume mechanism,
+- treat full event replay from session start as the normal attach path,
+- lose output silently during writer stalls or disk-full conditions.
+
+The system must support retention policy for:
+
+- terminal events,
+- terminal snapshots,
+- backend output spools,
+- local lifecycle events.
+
+Backpressure and gap requirements:
+
+- event writes use bounded buffers,
+- stalled event writes apply backpressure to PTY reading after buffers are full,
+- default behavior stalls the agent rather than dropping output,
+- dropped output occurs only for unrecoverable storage failure or an explicit per-session never-stall policy,
+- every dropped range creates an explicit gap marker,
+- clients display gap markers in terminal history,
+- soak tests cover long-running high-volume output.
+
+### Same-Owner Multi-Device Attach
+
+The system must:
+
+- allow the same owner to attach multiple clients to one session,
+- accept shared concurrent input from attached clients,
+- treat the client that most recently attached or sent terminal input as the active client,
+- resize the backend terminal to match the active client,
+- request a backend repaint after active-client resize,
+- surface attached-client count and active terminal size in diagnostics.
+
+Explicit input locks are outside MVP.
+
+### Session Summary Records
+
+The system must write a structural session summary record on session exit and explicit segment boundaries.
+
+The MVP summary record must include:
+
+- session ID,
+- agent plugin,
+- workspace and workspace instance,
+- start and end timestamps,
+- duration,
+- exit status,
+- final checkpoint,
+- terminal event range,
+- changed-file counts by basic change type.
+
+The MVP summary record must not require LLM summarization.
 
 ### Client
 
-The first client should:
+The first client must be an Electron desktop app with a shared web UI.
 
-- run on macOS, Windows, and Linux through Electron,
-- use the same core UI in a web browser where possible,
-- render terminals through `xterm.js`,
-- provide session list, TUI panel, and changes/source-control panel,
+Chosen MVP frontend stack:
+
+| Layer | Requirement |
+| --- | --- |
+| App framework | React 19 + TypeScript + Vite |
+| Desktop shell | Electron |
+| Terminal | xterm.js |
+| Local UI state | Zustand |
+| Server state | TanStack Query |
+| Components | shadcn/ui + Tailwind |
+| Layout | Dockview |
+| Code and diff view | CodeMirror |
+| Markdown parsing | Marked |
+| Syntax highlighting | Shiki |
+| Diagrams | Mermaid |
+| Math | KaTeX |
+| Sanitization | DOMPurify |
+| Icons | lucide-react |
+
+Client requirements:
+
+- run on macOS, Windows, and Linux,
+- share UI code with a browser client,
+- store persistent device enrollment credentials in Electron for MVP,
+- use session-only browser enrollment in MVP,
+- render terminals through xterm.js,
+- support the three-panel control center,
+- persist Dockview layout locally,
+- use Zustand for local UI state,
+- use TanStack Query for server-derived state,
+- render code and diffs with CodeMirror,
+- render markdown, syntax highlighting, diagrams, and math through a sanitized rich-output pipeline,
 - support reconnect and resume,
 - support launching configured agents,
-- support opening a session or workspace in VS Code.
+- support opening the isolated workspace instance in VS Code.
 
-Mobile should initially be supported through a responsive web/PWA client unless there is a strong reason to build native mobile clients earlier.
+Electron requirements:
+
+- `contextIsolation` enabled,
+- `nodeIntegration` disabled,
+- narrow preload API,
+- strict content security policy,
+- no direct renderer access to daemon credentials beyond scoped client APIs.
+
+Markdown and rich output requirements:
+
+- define rich-output sources as repo markdown files, agent transcripts exposed by agent plugins, session summary records, and memory summary records,
+- render session summary and memory summary records as rich-output inputs,
+- sanitize untrusted markdown HTML before rendering,
+- run Mermaid with a strict security posture by default,
+- lazy-load Shiki, Mermaid, and KaTeX,
+- avoid blocking terminal rendering on markdown rendering.
+
+Terminal output security requirements:
+
+- disable OSC 52 clipboard writes by default,
+- gate OSC 8 hyperlinks through link policy,
+- prevent terminal title sequences from controlling trusted app chrome,
+- treat terminal output as untrusted content,
+- expose terminal escape policy in diagnostics.
 
 ### Agent Plugins
 
-The system must support agent integrations through plugins.
+Agent plugins must define:
 
-Agent plugins must be able to define:
-
-- agent display metadata,
+- display metadata,
 - binary detection,
 - launch command and arguments,
 - supported operating systems,
 - environment requirements,
-- PTY startup behavior,
-- optional memory injection behavior,
-- optional session-boundary detection such as `/new`.
+- terminal startup behavior,
+- session-boundary detection such as `/new`,
+- transcript location and parser behavior when the agent writes structured transcripts,
+- memory injection behavior,
+- readiness and health detection.
 
-Agent plugins must be able to provide platform-specific launch behavior without forcing Windows users through WSL.
+MVP plugin implementation:
 
-The MVP should ship built-in plugins for Codex and Claude Code. Additional built-in plugins for opencode, myclaw, and Hermes should follow the same plugin interface.
+- compiled-in Rust traits,
+- static plugin registry,
+- no untrusted plugin package loading,
+- no dynamic code loading.
+
+MVP built-ins:
+
+```text
+codex
+claude
+custom_command
+```
+
+Post-MVP built-ins:
+
+```text
+opencode
+myclaw
+hermes
+```
 
 ### Source Control And Change Tracking
 
-The system must support source-control integrations through plugins.
+The source-control plugin interface must support:
 
-The MVP must support a Git plugin with read and workspace-isolation operations:
+- repository detection,
+- status,
+- branch, tag, or revision metadata,
+- history graph or provider-specific history,
+- changed-file list,
+- file diff,
+- workspace isolation strategy,
+- checkpoint creation and update.
+
+The Git plugin must support:
 
 - repository detection,
 - per-session Git worktree creation and cleanup,
@@ -299,89 +411,94 @@ The MVP must support a Git plugin with read and workspace-isolation operations:
 - working tree status,
 - staged and unstaged changes,
 - commit graph,
-- file and commit diffs.
+- file and commit diffs,
+- app-managed checkpoint refs or tree objects.
 
-The source-control plugin model should support other providers later, including SVN.
+Change tracking requirements:
 
-Source-control plugins must handle platform-specific executable discovery, path formats, and line endings.
+- every changed file in the UI is clickable,
+- existing Git repositories use Git status and diff,
+- plain folders can be initialized with local `git init`,
+- checkpoint refs stay out of user-facing branch history,
+- checkpoint updates preserve prior session history,
+- explicit "New segment" action advances the active checkpoint,
+- the "New segment" action sends the configured agent command such as `/new`,
+- plugin-provided input sniffing augments explicit segment actions,
+- ignored, generated, binary, and large files use explicit display policy.
 
-Source-control plugins should declare their workspace isolation strategy. If a provider cannot create isolated working directories itself, the system should use an explicit clone/copy fallback or mark concurrent isolated sessions unsupported for that provider.
-
-Every changed file in the UI must be clickable and show a diff.
-
-Diff behavior:
-
-- If a source-control plugin applies, use that provider's status and diff capabilities.
-- If no source-control plugin applies and no supported repository is detected, offer to initialize the folder as a local Git repository.
-- After Git initialization, compare against the active Git-backed workspace checkpoint.
-- The default checkpoint is the folder state when the session opened the workspace.
-- When the agent creates a new session segment with `/new`, the active checkpoint updates.
-- Users should be able to manually update the active checkpoint.
-
-For Git-backed checkpoints, the system must:
-
-- track created, modified, and deleted files since the checkpoint,
-- show text diffs for changed files,
-- avoid tracking ignored, generated, or very large files by default,
-- preserve prior session history when a checkpoint is updated,
-- avoid creating user-facing commits unless the user explicitly asks,
-- use app-managed Git checkpoint refs, commits, or tree objects for baseline state.
-
-If a user declines Git initialization for a plain folder, agent sessions should still run, but full changed-file diff tracking is unavailable until Git is initialized.
-
-User-facing Git write operations such as commit, checkout, rebase, merge, and stash are optional after MVP. Internal worktree and checkpoint management are part of the MVP infrastructure.
+Folders without Git support agent sessions. Full diff tracking requires Git initialization.
 
 ### Workspace Isolation
 
-The system must isolate concurrent agent sessions that target the same repository on the same host.
+The system must distinguish:
 
-Definitions:
-
-- Source workspace: the registered repository or folder selected by the user.
-- Workspace instance: the isolated working directory assigned to one agent session.
+- source workspace: registered repo or folder selected by the user,
+- workspace instance: isolated working directory assigned to one independent agent session.
 
 The system must:
 
-- create a separate writable workspace instance for each independent agent session by default,
-- allow multiple clients owned by the same user to attach to the same session and same workspace instance,
-- prevent a new independent session from writing into another running session's workspace instance by default,
-- show the workspace instance path or label in the session UI,
-- retain stopped or exited workspace instances until changes are merged, exported, discarded, or explicitly cleaned up.
+- create one writable workspace instance per independent session by default,
+- attach multiple same-owner clients to the same session and instance,
+- block accidental writes into another running session's instance,
+- show the workspace instance path or label in the UI,
+- retain dirty instances until merged, exported, discarded, or cleaned up by explicit action,
+- run configured setup hooks after instance creation.
 
-For Git-backed workspaces, the MVP should use Git worktrees as the default isolation mechanism.
+Workspace setup hooks must support:
+
+- copied files such as `.env`,
+- symlinked caches such as dependency stores,
+- bootstrap commands such as install or code generation,
+- environment variables for bootstrap commands,
+- per-workspace setup status in the UI.
 
 Git worktree isolation must:
 
-- give each agent session a separate working directory and Git index,
-- avoid relying on branch selection alone for isolation,
-- create app-managed branches, detached heads, or refs when needed,
-- support merge/rebase/apply workflows between isolated instances,
-- detect and surface worktree creation failures clearly.
+- use a separate working directory and index per session,
+- avoid relying on branch selection alone,
+- create app-managed branches, detached heads, or refs as needed,
+- surface worktree failures clearly,
+- detect submodule, LFS, custom hook path, nested repo, and required ignored-file issues.
 
-Fallback isolation options may include local clones, reflink/copy-on-write copies, or full directory copies. These fallbacks should be explicit because they can use more disk space and may have different cleanup behavior.
+Fallback isolation order:
+
+```text
+local clone -> reflink/copy-on-write copy -> full copy -> unsupported
+```
 
 ### Networking
 
 The system must support:
 
-- direct client-to-server connections,
+- direct local/LAN client-to-server connection,
+- SSH local port-forward connection for MVP remote access,
+- authenticated and encrypted transport,
+- connection resume after transient loss.
+
+Connectivity extensions:
+
 - reverse relay for NAT/private servers,
 - gateway routing for private subnets,
-- connection resumption after transient network loss,
-- authenticated and encrypted transport.
-
-The system should support:
-
+- SSH jump route for advanced users,
 - route discovery,
 - route health checks,
-- fallback to alternate routes,
-- SSH transport for early advanced-user workflows.
+- alternate route fallback.
+
+### Attention Signals
+
+The daemon must compute MVP attention signals from:
+
+- terminal event stream activity,
+- decoded recent output text,
+- bell events,
+- backend health events,
+- process exit or failure events.
+
+Agent plugins may contribute prompt and approval patterns that match recent output text. MVP attention detection must not require direct plugin access to sidecar terminal screen state.
 
 ### Personal Hybrid Pool And Placement
 
-Long term, the system should support automatic placement across a user's personal hybrid machine pool.
-
-Each enrolled node should report:
+Each enrolled node reports:
 
 - platform and architecture,
 - reachable routes,
@@ -389,49 +506,41 @@ Each enrolled node should report:
 - source-control plugin support,
 - configured workspace roots,
 - CPU, memory, disk, and process load,
-- power state where available,
+- power state,
 - recent health and heartbeat data.
 
-When launching a new agent session, the placement service should consider:
+Placement evaluates:
 
 - requested agent plugin,
 - workspace or repository location,
-- whether the repo already exists on a node,
-- cost of cloning, fetching, or syncing the repo,
-- availability of required credentials and secrets,
-- node load and disk availability,
+- repo locality,
+- clone or sync cost,
+- required credentials and secrets,
+- load and disk availability,
 - route quality and latency,
-- operating system compatibility,
-- user placement preferences,
-- recent node failures.
-
-The system should:
-
-- preview where a session will run before launch when useful,
-- explain why a node was selected,
-- support manual override,
-- provide fallback candidates if the selected node fails,
-- keep placement personal to the user-owned pool.
+- OS compatibility,
+- user placement policy,
+- recent failures.
 
 ### Memory
 
-The system must separate:
+The memory system must separate:
 
 - terminal session,
 - agent profile,
 - workspace,
 - owner.
 
-The memory system should:
+The memory system must:
 
-- summarize completed or crossed sessions,
+- summarize completed sessions and `/new` boundaries,
 - preserve project decisions,
 - preserve user preferences,
-- link summaries to file changes and commits when available,
+- link summaries to file changes and commits,
 - inject relevant memory into future sessions,
-- allow memory review and deletion,
-- export memory as a portable bundle,
-- import memory into a different personal agent profile,
+- support review, edit, and delete,
+- export memory bundles,
+- import memory bundles as private copies,
 - record provenance for imported memory.
 
 ### Security
@@ -441,64 +550,84 @@ The system must:
 - authenticate clients,
 - authenticate servers,
 - encrypt client-server transport,
+- enroll devices with per-device keys,
 - restrict accessible workspaces,
-- require explicit user approval for dangerous setup actions,
-- log local session lifecycle events,
-- avoid exposing secrets through relay infrastructure.
+- require explicit approval for arbitrary custom commands,
+- log session lifecycle events,
+- prevent relay infrastructure from requiring plaintext terminal access.
 
-The system should:
+MVP secrets-at-rest disclosure:
 
-- support device revocation,
-- support workspace allowlists,
-- support secret redaction in logs and summaries.
+- terminal logs can contain secrets printed by agents or commands,
+- logs are stored on the daemon host,
+- retention defaults limit stored history,
+- encryption-at-rest and production-grade redaction remain hardening items.
+
+The system supports:
+
+- device revocation,
+- workspace allowlists,
+- secret redaction in logs and summaries.
 
 ## Non-Functional Requirements
 
 ### Performance
 
-- Server daemon should be lightweight enough to run on small VMs.
-- Idle sessions should consume minimal CPU.
-- Terminal streaming should feel interactive over normal network latency.
-- Reconnect should restore a typical session within a few seconds.
-- Git graph generation should be cached or incremental for large repositories.
+- The daemon runs comfortably on small VMs.
+- Idle sessions consume minimal CPU.
+- Terminal streaming remains interactive over normal network latency.
+- Reconnect restores a typical session within a few seconds.
+- Git graph generation is cached or incremental for large repositories.
+- Rich markdown rendering does not block terminal interaction.
 
 ### Reliability
 
-- Agent sessions should survive client disconnects.
-- Server daemon restart recovery should restore metadata and terminal history.
-- If an agent process exits, the session record should preserve exit status and output.
-- Relay disconnects should not kill local server sessions.
+- Agent sessions survive client disconnects.
+- Daemon restart reattaches to live session backends when available.
+- Daemon restart restores metadata and terminal history.
+- Agent exit preserves status, output, and summary.
+- Relay disconnects do not kill local server sessions.
 
 ### Portability
 
 - Server target: native Linux, macOS, and Windows.
-- Windows server target must use native Windows APIs and ConPTY rather than WSL.
-- Service management should support systemd on Linux, launchd on macOS, and Windows Service Control Manager on Windows.
-- Plugin APIs should expose OS/platform capabilities so plugins can adapt launch and diff behavior per platform.
-- MVP desktop target: macOS, Windows, Linux.
-- Web client should work in modern Chromium, Firefox, and Safari.
-- Mobile web should be usable on iOS and Android.
+- Windows server target uses native Windows APIs and ConPTY.
+- Desktop target: macOS, Windows, Linux.
+- Web target: modern Chromium, Firefox, and Safari.
+- Mobile target: responsive web/PWA.
+- Service management target: systemd user units, launchd LaunchAgents, and Windows per-user startup mechanisms.
+- Client and daemon APIs carry explicit protocol versions.
+
+### Installed Service Scope
+
+- Default daemon installation runs as the enrolled OS user.
+- Linux uses `systemd --user`; sessions that survive logout require `loginctl enable-linger`.
+- macOS uses LaunchAgents.
+- Windows uses a per-user scheduled task or equivalent user-session startup path with restart-on-failure recovery.
+- Agent login and authentication flows must work from the installed daemon context on each supported OS.
 
 ### Observability
 
-The server should expose:
+The server exposes:
 
 - health endpoint,
 - active session count,
 - session state,
 - last activity time,
+- backend health,
 - relay/gateway connection state,
 - node capability and health summary,
-- placement eligibility status,
+- placement eligibility,
 - storage usage,
 - recent errors.
 
 ### Data Retention
 
-The product should define retention policies for:
+The product defines retention policies for:
 
 - terminal event logs,
 - terminal snapshots,
+- backend output spools,
 - session summaries,
 - local event logs,
 - memory entries,
@@ -509,142 +638,87 @@ The product should define retention policies for:
 - node health history,
 - placement decisions.
 
-MVP can use conservative local retention defaults with manual cleanup.
-
 ## Excluded Product Scope
 
-The product should not support:
+The product does not support:
 
 - shared live agent sessions,
 - multi-person terminal control,
 - team permission models,
 - organization administration,
-- live session transfer between teammates.
+- live session transfer between teammates,
+- Windows-native daemon dependency on WSL,
+- automatic relaunch presented as session continuity.
 
 ## MVP Scope
 
 ### Included
 
 - Native server daemon for Linux, macOS, and Windows.
-- Electron desktop client.
-- Web client from shared UI.
+- Electron desktop client with shared web UI.
+- React 19 + TypeScript frontend stack.
 - Direct local/LAN connection.
-- Persistent PTY sessions.
-- Reconnect and replay terminal output.
-- Basic terminal snapshot recovery.
-- Workspace registration.
+- SSH local port-forward connection.
+- Basic server/device auth.
+- Persistent sessions through the session backend interface.
+- Built-in native PTY per-session sidecar backend.
+- Reconnect with emulator snapshot resume and tail replay.
+- Structural session summary records.
+- Workspace registration and allowlist.
 - Agent plugin registry.
-- Built-in agent plugins for at least Codex and Claude Code.
-- Custom command launch.
+- Built-in Codex, Claude Code, and custom command plugins.
 - Source-control plugin interface.
 - Built-in Git plugin with status, diffs, and commit graph.
 - Git-worktree isolation for concurrent sessions on the same repo.
 - Changed-file list with click-to-diff behavior.
-- Local Git initialization for folders without Git.
+- Local Git initialization for plain folders.
 - Git-backed workspace checkpoints.
-- Basic server/device auth.
+- Workspace setup hooks.
+- Session activity and needs-attention signals.
+- Terminal escape-sequence security policy.
 - Early "Continue in VS Code" action.
 
 ### Deferred
 
 - Native mobile apps.
-- Full relay service production hardening.
-- Full gateway route manager.
+- Production relay service.
+- Production gateway route manager.
+- Production tmux backend.
 - Automatic personal pool placement.
-- Repository sync orchestration across multiple nodes.
+- Repository sync orchestration across nodes.
 - Browser-based full editor replacement.
 - User-facing Git write operations.
 - Advanced memory UI.
 
-## Suggested Milestones
+## Milestones
 
-### Milestone 1: Local Session Prototype
-
-- Evaluate ready-to-go components for PTY handling, terminal rendering, storage, filesystem watching, and service installation.
-- Server daemon creates PTY sessions through a platform abstraction.
-- Prototype native PTY support for Unix PTYs and Windows ConPTY.
-- Client lists and attaches to sessions.
-- Session survives client disconnect.
-- Terminal output is replayed after reconnect.
-
-### Milestone 2: Durable Resume
-
-- Add SQLite metadata store.
-- Add terminal event persistence.
-- Add terminal snapshots.
-- Add session state transitions.
-
-### Milestone 3: Plugin Foundation And Control Center UI
-
-- Add three-panel Electron UI.
-- Add session search/filter.
-- Add workspace registration.
-- Add agent plugin registry.
-- Add built-in Codex and Claude Code plugins.
-
-### Milestone 4: Source Control And Change Tracking
-
-- Add source-control plugin interface.
-- Add Git repository detection.
-- Add Git worktree creation for isolated workspace instances.
-- Add workspace leases to prevent accidental shared working tree writes.
-- Add status and diff views.
-- Add commit graph view.
-- Add changed-file click-to-diff behavior.
-- Add guided local Git initialization for folders without Git.
-- Add Git-backed workspace checkpoints.
-- Handle plain directories gracefully when users decline Git initialization.
-
-### Milestone 5: Remote Connectivity
-
-- Add authenticated remote server connections.
-- Add reverse relay MVP.
-- Add gateway or SSH-jump proof of concept.
-
-### Milestone 6: Human-In-The-Loop
-
-- Add VS Code continuation.
-- Add extension or deep-link flow.
-- Preserve session identity between client and editor.
-- Open the editor in the isolated workspace instance for that session.
-
-### Milestone 7: Memory
-
-- Add agent profiles.
-- Add session summaries.
-- Add memory review/edit/delete.
-- Add memory injection adapter for supported agents.
-- Add memory export/import bundles.
-
-### Milestone 8: Personal Pool Placement
-
-- Add node capability and health inventory.
-- Add route-aware placement preview.
-- Add placement scoring based on agent support, repo locality, load, route quality, and user policy.
-- Add automatic placement for new sessions.
-- Add manual placement override and placement explanation.
-- Add repository sync/clone workflow for nodes that do not already have the workspace.
+1. Local session prototype.
+2. Durable resume.
+3. Plugin foundation and control center UI.
+4. Source control and change tracking.
+5. Remote connectivity.
+6. Human-in-the-loop continuation.
+7. Memory.
+8. Personal pool placement.
 
 ## Open Decisions
 
-- Use WebSocket, gRPC, or QUIC for the first streaming protocol?
-- Store terminal output as raw PTY bytes, parsed terminal operations, or both?
-- Use SQLite only, or add log segment files for large terminal histories?
-- Should the first relay be self-hosted, managed, or both?
-- Should same-owner multi-device attach use a single active input lock?
-- How much user-facing Git write functionality belongs in the app?
-- How should memory be injected for each supported agent?
-- What is the initial agent plugin manifest and capability API?
-- What is the initial source-control plugin manifest and panel API?
-- How should checkpoint updates interact with `/new` for each agent plugin?
-- How should app-managed Git checkpoint refs be named, retained, and garbage-collected?
-- How should Git-backed checkpoints handle binary files, large files, generated files, and ignored paths?
-- How should app-managed Git worktrees, branches, and refs be named, retained, and garbage-collected?
-- When should workspace isolation fall back to a local clone, reflink/copy-on-write copy, full copy, or unsupported state?
-- Which Rust PTY/process library gives the best native Windows ConPTY behavior without weakening Unix support?
-- How should Windows service installation, upgrades, and log collection work?
-- What should the default placement policy optimize for: repo locality, lowest latency, lowest load, local-first, or cost?
-- How should repository sync and secret availability affect placement eligibility?
-- How much placement explanation should be shown by default versus tucked into diagnostics?
-- Which requirements are best satisfied by existing components versus product-owned implementation?
-- What replacement boundary is required for each major dependency?
+- First streaming protocol after WebSocket.
+- Terminal event representation.
+- Terminal log segment storage.
+- Memory injection strategy per agent.
+- Agent plugin trait and capability API.
+- Source-control plugin trait and panel API.
+- Session backend process manifest and local IPC protocol.
+- Production tmux backend scope after MVP validation spike.
+- Backend-local output spool storage.
+- Server-side terminal emulator crate selection.
+- Persisted terminal snapshot cadence.
+- Checkpoint naming, retention, and garbage collection.
+- Worktree naming, retention, and garbage collection.
+- Large-file, binary-file, generated-file, and ignored-path diff policy.
+- User-scoped service installation, upgrades, and log collection.
+- Client/daemon protocol compatibility during version skew.
+- Cross-machine repository identity for future placement.
+- Placement scoring defaults.
+- Repository sync and secret availability rules for placement.

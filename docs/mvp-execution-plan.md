@@ -2,81 +2,135 @@
 
 ## Purpose
 
-This document turns the architecture and requirements into an execution plan for the first shippable MVP of the personal agent session manager.
+This document turns the architecture and requirements into an execution plan for the first shippable MVP.
 
-The MVP should prove the core product promise:
+The MVP proves one product loop:
 
-> A user can start an agent in a remote workspace, disconnect, reconnect later, resume the same live session with no lost terminal output, inspect code changes, and keep concurrent agents isolated from each other.
+```text
+start agent -> disconnect -> agent keeps working -> reconnect -> resume terminal -> inspect changed files
+```
 
 ## MVP Definition
 
 ### Included
 
 - Native daemon builds for Linux, macOS, and Windows.
-- Windows daemon uses native Windows APIs and ConPTY, not WSL.
+- Windows daemon uses native APIs and ConPTY.
 - Direct local/LAN client-to-server connection.
+- SSH local port-forward remote connection.
 - Basic server/device authentication.
-- Persistent PTY-backed sessions.
-- Terminal event replay and basic snapshot restore.
+- Persistent sessions through a pluggable session backend interface.
+- Built-in native PTY per-session sidecar backend.
+- Local daemon-to-backend IPC.
+- Backend event drain or backend-local output spool.
+- Terminal event replay.
+- Server-side terminal emulator snapshots.
+- Structural session summary records.
 - Electron desktop client with shared web UI.
-- Session list, attach/detach, resize, stop, and archive.
+- React 19 + TypeScript frontend stack.
+- Session list, attach, detach, resize, stop, and archive.
 - Agent plugin registry.
 - Built-in agent plugins for Codex and Claude Code.
 - Custom command plugin.
 - Workspace registration and allowlist.
 - Git-backed workspace model.
 - Guided `git init` for plain folders.
-- Per-session Git worktree isolation for concurrent agents on the same repo.
+- Per-session Git worktree isolation.
+- Workspace setup hooks.
 - Source-control plugin interface.
 - Built-in Git plugin with status, branch, commit graph, changed files, and diffs.
 - Click changed file to view diff.
-- Early "Continue in VS Code" action that opens the isolated workspace instance.
-- Local logs, health endpoint, and basic diagnostics.
+- Session activity and needs-attention signals.
+- Early "Continue in VS Code" action.
+- Electron hardening and terminal escape-sequence policy.
+- Local logs, health endpoint, and diagnostics export.
 
 ### Not Included
 
 - Native mobile apps.
-- Production relay/gateway service.
+- Production relay service.
+- Production gateway route manager.
+- Production tmux backend.
 - Automatic personal pool placement.
-- Repository sync orchestration across multiple machines.
+- Repository sync orchestration across machines.
 - Browser-based full editor replacement.
-- User-facing Git write workflows such as commit, checkout, rebase, merge, and stash.
+- User-facing Git write workflows.
 - Team/session sharing.
 - Advanced memory UI.
 - Production-grade secret redaction.
 
-## Delivery Strategy
+## Product-Owned Boundaries
 
-Build the MVP around four product-owned boundaries:
+The MVP keeps these semantics under product control:
 
-- Session lifecycle and reconnect semantics.
-- Terminal event log and snapshot state.
-- Workspace instance isolation.
-- Plugin contracts for agents and source control.
+- session identity and lifecycle,
+- reconnect and terminal replay,
+- terminal event log and snapshots,
+- server-side terminal emulator state,
+- session backend contract,
+- workspace instance isolation,
+- agent and source-control plugin contracts,
+- Git-backed checkpoints,
+- rich-output sanitization,
+- terminal escape-sequence policy.
 
-Use proven dependencies wherever they fit, but keep these boundaries under product control.
+Dependencies are wrapped behind internal interfaces.
 
-Early component decisions should be made through short spikes, then wrapped behind internal interfaces so replacements remain possible.
+## Baseline Technology Decisions
+
+### Daemon
+
+| Area | Decision |
+| --- | --- |
+| Language | Rust |
+| Runtime | tokio |
+| Local database | SQLite with WAL and batched writer |
+| SQLite access | `rusqlite` behind daemon-owned storage workers |
+| Native PTY | Out-of-process per-session sidecars owning Unix PTYs and ConPTY handles |
+| Terminal state | Headless VT emulator snapshots in each session sidecar |
+| API | HTTP control API + WebSocket terminal input/output stream |
+| Local IPC | Unix domain sockets, Windows AF_UNIX where reliable, Windows named pipes fallback |
+| Git | `git` CLI behind Git plugin interface |
+
+### Frontend
+
+| Area | Decision |
+| --- | --- |
+| App framework | React 19 + TypeScript + Vite |
+| Desktop shell | Electron |
+| Terminal | xterm.js |
+| Local UI state | Zustand |
+| Server state | TanStack Query |
+| Components | shadcn/ui + Tailwind |
+| Layout | Dockview |
+| Code and diff view | CodeMirror |
+| Markdown | Marked |
+| Syntax highlighting | Shiki |
+| Diagrams | Mermaid |
+| Math | KaTeX |
+| Sanitization | DOMPurify |
+| Icons | lucide-react |
 
 ## Workstreams
 
 ### 1. Platform And Daemon Foundation
 
-Goal: create a small native daemon that can run on Linux, macOS, and Windows.
+Goal: create a small native daemon that starts reliably on Linux, macOS, and Windows.
 
 Deliverables:
 
 - Rust workspace scaffold.
-- Cross-platform daemon binary.
-- Internal platform abstraction layer.
-- Local config directory and data directory resolution.
+- Daemon binary.
+- Platform abstraction layer.
+- Config and data directory resolution.
 - Structured logging.
 - Health endpoint.
-- Local HTTP/WebSocket API.
-- SQLite database connection and migration runner.
-- Basic service install strategy for systemd, launchd, and Windows Service Control Manager.
+- HTTP/WebSocket API skeleton.
+- SQLite connection and migrations.
+- User-scoped service install approach for systemd user units, launchd LaunchAgents, and Windows per-user startup.
+- Windows user-mode restart-on-failure recovery.
 
-Key interfaces:
+Key interface:
 
 ```text
 Platform
@@ -86,121 +140,169 @@ Platform
   spawn_pty()
   kill_process_tree()
   watch_files()
-  install_service()
+  install_user_service()
   open_local_ipc()
 ```
 
 Acceptance criteria:
 
 - Daemon starts on Linux, macOS, and Windows.
-- Daemon exposes `/health`.
-- Daemon can read/write SQLite state.
-- Daemon logs startup, shutdown, and errors.
-- Windows path handling works with drive-letter and space-containing paths.
-- No Windows path requires WSL.
+- `/health` returns version, platform, uptime, and database status.
+- SQLite migrations run on startup.
+- Windows paths with drive letters and spaces work.
+- No Windows path depends on WSL.
+- Installed daemon can launch Codex and Claude Code authentication flows in the enrolled user's context.
+- Installed daemon restarts after a simulated crash on each supported OS.
 
-Primary risks:
+### 2. Session Backend Engine
 
-- PTY behavior differs across platforms.
-- Windows service and ConPTY behavior may require deeper platform-specific code.
-- Some dependencies may not support all targets cleanly.
-
-### 2. PTY Session Engine
-
-Goal: durable agent sessions that survive client disconnect.
+Goal: durable sessions survive client disconnect and use a replaceable backend contract.
 
 Deliverables:
 
 - Session create/list/get/stop/archive APIs.
-- PTY spawn and resize.
-- Terminal input API.
-- Terminal output WebSocket stream.
-- Client attach/detach model.
+- Session backend process manifest schema.
+- Session backend registry.
+- Daemon-to-backend IPC.
+- Built-in native PTY per-session sidecar backend.
+- Sidecar process lifetime model.
+- Per-user sidecar runtime directory.
+- Sidecar socket naming by session ID.
+- Daemon startup sidecar scan.
+- Orphaned sidecar detection.
+- Orphaned sidecar adopt and terminate actions.
+- Sidecar-owned PTY and ConPTY handles.
+- Headless VT emulator in the sidecar.
+- Emulator snapshot export.
+- Backend session handle mapping.
+- Backend health API.
+- Backend event cursor tracking.
+- Backend event drain or append-only output spool.
+- Backpressure and gap marker policy.
+- Terminal input over WebSocket.
+- Terminal output over WebSocket.
+- Attach/detach flow.
 - Session state machine.
 - Process exit tracking.
 - Terminal event sequence numbers.
 - Append-only terminal event persistence.
-- Replay from `last_seen_event_seq`.
-- Basic terminal snapshot creation and restore.
+- Replay after snapshot sequence.
+- Emulator snapshot creation and restore.
+- Structural session summary record on exit and segment boundary.
 
-Session states:
+Backend IPC operations:
 
 ```text
-starting
-running
-detached
-exited
-failed
-stopped
-archived
+RegisterBackend
+CreateBackendSession
+AttachBackendSession
+QueryBackendSession
+StreamBackendOutput
+DrainBackendEvents
+SendBackendInput
+ResizeBackendSession
+StopBackendSession
+ExportBackendSnapshot
+DetachDaemon
 ```
 
 Acceptance criteria:
 
-- Start a shell-backed session from the API.
-- Attach from a client and see live output.
-- Detach the client while the process keeps running.
-- Reconnect with a cursor and receive missed output.
-- Reconnect without a cursor and receive latest snapshot plus newer events.
-- Resize terminal from the client and propagate size to PTY.
-- Stop session and preserve exit status/output.
-- Restarting the client does not affect server sessions.
-
-Primary risks:
-
-- Terminal event volume can grow quickly.
-- Snapshot fidelity may be imperfect at first.
-- Some TUIs may use terminal features that need iterative support.
+- Start a shell-backed session through the native backend.
+- Attach and see live output.
+- Detach while the process keeps running.
+- Fresh client attach receives a current sidecar emulator snapshot as an ANSI repaint stream.
+- Reconnect receives snapshot plus newer events.
+- Resize propagates to the backend PTY.
+- Stop preserves exit status and terminal output.
+- Client restart does not affect server sessions.
+- Daemon restart reattaches to a live backend session.
+- Daemon startup detects orphaned sidecars.
+- Agent or backend exit records `exited` or `failed` without relaunch.
+- Agent exit writes a structural session summary record.
+- A mock backend can replace the native backend in tests.
+- Mid-session attach to a full-screen TUI renders a coherent current screen.
+- A terminal parser panic or sidecar crash affects only the owned session.
 
 ### 3. Desktop/Web Client Shell
 
-Goal: first usable control center.
+Goal: build the first usable control center.
 
 Deliverables:
 
-- Electron app.
-- Shared web app shell.
-- Connection setup to local/LAN daemon.
-- Basic device/server enrollment UI.
+- Electron app shell.
+- Vite React 19 + TypeScript app.
+- shadcn/ui and Tailwind setup.
+- Dockview layout shell.
+- Zustand stores for UI state.
+- TanStack Query client for daemon state.
+- Connection setup for local/LAN daemon.
+- Device/server enrollment UI.
 - Three-panel layout:
-  - left: sessions and workspaces,
-  - middle: xterm.js TUI,
-  - right: changes/source-control panel.
+  - left: sessions, workspaces, agent profiles,
+  - middle: xterm.js terminal,
+  - right: changed files and source-control panel.
 - Session list with status, agent plugin, workspace, branch, and last activity.
 - Attach/detach flow.
-- Terminal input/output via xterm.js.
+- Terminal input/output through xterm.js.
 - Terminal resize handling.
-- Reconnect behavior after app restart.
-- Basic error and loading states.
+- Basic error, loading, and reconnect states.
 
 Acceptance criteria:
 
-- User can connect to a daemon.
-- User can create a session.
-- User can attach to an existing session.
-- User can close the app, reopen it, and resume the same session.
-- User sees session status changes without refreshing.
-- UI remains usable at common desktop sizes.
+- User connects to a daemon.
+- User creates a session.
+- User attaches to an existing session.
+- User closes and reopens the app, then resumes the session.
+- Session status updates without manual refresh.
+- Terminal sizing works at common desktop sizes.
+- Dockview layout persists locally.
 
-Primary risks:
+### 4. Rich Output And Code Viewing
 
-- Terminal fit/resize bugs.
-- Electron packaging differences across operating systems.
-- UI complexity can expand too early.
-
-### 4. Plugin Foundation
-
-Goal: agent and source-control behavior is extensible from the beginning.
+Goal: render agent output, files, and diffs without compromising terminal responsiveness or security.
 
 Deliverables:
 
-- Plugin manifest schema.
-- Plugin registry table.
+- CodeMirror read-only file viewer.
+- CodeMirror diff viewer or focused diff component.
+- Repo markdown file preview.
+- Agent transcript preview through agent plugin transcript parsers.
+- Session summary record renderer.
+- Marked markdown parser.
+- DOMPurify sanitization boundary.
+- Shiki syntax highlighting with lazy-loaded themes/languages.
+- Mermaid rendering with strict security defaults.
+- KaTeX math rendering.
+- Markdown render worker or deferred render path for large content.
+
+Acceptance criteria:
+
+- Repo markdown files render safely.
+- Agent transcript content renders safely when a plugin exposes a transcript parser.
+- Session summary records render safely.
+- Markdown output renders safely.
+- Raw HTML from untrusted markdown is sanitized.
+- Shiki highlighting loads on demand.
+- Mermaid diagrams render without enabling unsafe HTML by default.
+- KaTeX renders math blocks and inline math.
+- Large markdown output does not freeze terminal input.
+- File and diff views render with line numbers and copy/select behavior.
+
+### 5. Plugin Foundation
+
+Goal: agent, session backend, and source-control behavior are extensible from the beginning.
+
+Deliverables:
+
+- Rust trait interfaces for built-in plugin kinds.
+- Static plugin registry.
 - Built-in plugin loading.
+- Session backend plugin interface.
 - Agent plugin interface.
 - Source-control plugin interface.
 - Platform capability checks.
-- Plugin config validation.
+- Typed plugin configuration validation.
 - Custom command plugin.
 - Codex plugin.
 - Claude Code plugin.
@@ -216,6 +318,25 @@ build_launch_command
 default_env
 memory_injection_support
 session_boundary_detection
+transcript_location
+transcript_parser
+```
+
+Session backend plugin capabilities:
+
+```text
+id
+display_name
+supported_platforms
+ipc_transport
+create_session
+attach_session
+stream_output
+send_input
+resize_session
+stop_session
+drain_events
+export_snapshot
 ```
 
 Source-control plugin capabilities:
@@ -235,20 +356,17 @@ update_checkpoint
 
 Acceptance criteria:
 
-- Built-in plugins can be listed by API.
-- Codex and Claude Code plugins can detect missing binaries and report actionable errors.
-- Custom command plugin can launch arbitrary configured commands after explicit approval.
+- Built-in plugins are listed by API.
+- Codex and Claude Code plugins detect missing binaries.
+- Custom command launch requires approval.
 - Plugin launch behavior can vary by OS.
-- Adding another built-in agent does not require changes to session engine code.
+- Native backend is registered through the plugin registry.
+- Adding another agent plugin does not change session engine code.
+- Dynamic third-party plugin loading is not part of MVP.
 
-Primary risks:
+### 6. Workspace Registration And Isolation
 
-- Over-designing the plugin API before real usage.
-- Agent tools may differ in CLI behavior across platforms.
-
-### 5. Workspace Registration And Isolation
-
-Goal: independent agent sessions never collide in one writable working tree by default.
+Goal: independent agent sessions never collide in one writable working tree.
 
 Deliverables:
 
@@ -256,76 +374,64 @@ Deliverables:
 - Workspace allowlist.
 - Workspace inspection.
 - Git repository detection.
-- Guided `git init` for plain folders.
+- Guided `git init` flow for plain folders.
 - Workspace instance table.
 - Workspace lease table.
 - Per-session Git worktree creation.
+- Workspace setup hook model.
+- Copy rules for local files such as `.env`.
+- Symlink rules for dependency caches.
+- Bootstrap command execution.
 - Worktree cleanup flow.
-- Direct-source-working-tree override with explicit warning.
-- Session metadata links to `workspace_instance_id`.
-
-Default behavior:
-
-- Registered source workspace is the source of truth.
-- Independent sessions get isolated workspace instances.
-- Multiple clients attached to the same session share the same workspace instance.
-- Existing workspace instances are retained until user cleanup or retention policy allows deletion.
+- Direct-source-working-tree override.
+- Session metadata linked to `workspace_instance_id`.
 
 Acceptance criteria:
 
 - Register an existing Git repo.
-- Start first agent session and receive an isolated worktree.
-- Start second agent session for the same repo and receive a different worktree.
-- The two sessions can edit the same file without overwriting each other.
-- UI shows the workspace instance for each session.
-- Attempting to run directly in the source working tree requires explicit override.
-- Worktree with uncommitted changes is not deleted silently.
+- Start first agent session in an isolated worktree.
+- Start second agent session for the same repo in a different worktree.
+- Two sessions can edit the same file without overwriting each other.
+- UI shows each session's workspace instance.
+- Setup hook status is visible in the UI.
+- Direct source checkout mode requires explicit override.
+- Dirty worktree cleanup is blocked without confirmation.
+- Submodule, LFS, custom hook path, and required ignored-file issues are detected or surfaced.
 
-Primary risks:
+### 7. Git Plugin And Change Tracking
 
-- Git worktree limitations with submodules, bare repos, nested repos, or locked worktrees.
-- Disk usage from retained instances.
-- Users may expect direct edits in the original checkout.
-
-### 6. Git Plugin And Change Tracking
-
-Goal: changed files and diffs are visible for every MVP workspace.
+Goal: changed files and diffs are visible for every MVP workspace that uses Git.
 
 Deliverables:
 
 - Git source-control plugin.
-- Repository status.
-- Current branch and HEAD.
-- Remotes.
-- Changed files list.
-- Staged/unstaged distinction.
+- Repository status API.
+- Current branch and HEAD API.
+- Remotes API.
+- Changed files API.
+- Staged and unstaged distinction.
 - File diff API.
 - Commit graph API.
-- App-managed checkpoint refs/objects.
-- Checkpoint update on explicit action.
-- Checkpoint update hook for future `/new` detection.
+- App-managed checkpoint refs or objects.
+- Manual checkpoint update.
+- Explicit "New segment" checkpoint update.
+- Optional plugin boundary detection hook.
 - Right-panel changed-file UI.
-- Click changed file to open diff.
+- Click-to-diff behavior.
 
 Acceptance criteria:
 
-- Git repo shows branch, status, changed files, and diff.
+- Git repo shows branch, status, changed files, and diffs.
 - Plain folder can be initialized as a local Git repo.
 - App initialization does not require a remote.
 - Checkpoint refs do not appear as normal user-facing commits.
 - Clicking a changed file opens a readable diff.
-- Created, modified, and deleted files are represented.
+- Created, modified, deleted, and renamed files are represented.
 - Basic commit graph renders for a typical repo.
 
-Primary risks:
+### 8. Basic Auth And Security
 
-- Commit graph performance on large repos.
-- Hidden refs/checkpoints need careful naming and cleanup.
-- Binary and very large file behavior needs clear UX.
-
-### 7. Basic Auth And Security
-
-Goal: personal but not wide-open.
+Goal: keep personal servers private.
 
 Deliverables:
 
@@ -334,107 +440,154 @@ Deliverables:
 - Local credential storage in client.
 - Scoped session token.
 - Workspace allowlist enforcement.
-- Explicit approval for custom command launch.
+- Custom command approval.
 - Local lifecycle event log.
-- TLS/mTLS or equivalent encrypted transport plan for non-local connections.
+- TLS/mTLS or equivalent plan for non-local connections.
+- Markdown and Mermaid security defaults.
+- Electron hardening checklist.
+- Terminal escape-sequence policy.
 
 Acceptance criteria:
 
-- Unknown client cannot attach to server sessions.
-- Enrolled device can reconnect without re-enrolling each launch.
-- Revoking a device prevents future attach.
+- Unknown clients cannot attach to sessions.
+- Enrolled devices reconnect without re-enrollment each launch.
+- Revoked devices cannot attach.
 - Session creation fails outside allowlisted workspace roots.
 - Custom command launch requires visible approval.
+- Untrusted markdown is sanitized.
+- Electron renderer has no Node integration.
+- OSC 52 clipboard writes are disabled by default.
 
-Primary risks:
+### 9. Attention Signals
 
-- Security can sprawl quickly.
-- Local/LAN transport needs a pragmatic MVP posture without blocking later relay.
-
-### 8. VS Code Continuation
-
-Goal: user can move from TUI control center to editor workflow.
+Goal: surface sessions that need user action.
 
 Deliverables:
 
-- "Continue in VS Code" button.
+- Attention state field on session records.
+- New-output-after-idle detection.
+- Bell-character detection.
+- Plugin-provided prompt or approval pattern hook.
+- Agent exit/failure attention event.
+- Session list badges and filters.
+
+Acceptance criteria:
+
+- Sessions with new activity are visible in the list.
+- Sessions likely waiting for user approval are highlighted.
+- Failed sessions are highlighted.
+- Attention state clears when the user views or acknowledges the session.
+
+### 10. VS Code Continuation
+
+Goal: user can move from control center to editor workflow.
+
+Deliverables:
+
+- "Continue in VS Code" action.
 - Open VS Code at the session's isolated workspace instance.
-- Pass session/server context through a deep link, local file, or extension command.
+- Pass server/session context through deep link, local file, or extension command.
 - Minimal VS Code extension or documented deep-link fallback.
+- Local daemon continuation path.
+- Remote daemon continuation path using VS Code Remote-SSH prerequisites.
 
 Acceptance criteria:
 
 - Button opens VS Code in the correct workspace instance.
 - Opening VS Code does not create a new agent session.
 - Session remains visible and attachable in the control center.
-- The original source workspace is not opened accidentally when an isolated instance exists.
+- Original source workspace is not opened when an isolated instance exists.
+- Remote continuation displays Remote-SSH setup requirements when unavailable.
 
-Primary risks:
+### 11. Packaging And Install
 
-- VS Code URI behavior differs across platforms.
-- Extension packaging may not be worth MVP complexity; fallback may be enough.
-
-### 9. Packaging And Install
-
-Goal: a user can install and run the MVP on their own machines.
+Goal: user can install and run the MVP on personal machines.
 
 Deliverables:
 
-- Daemon binary packages for Linux, macOS, Windows.
-- Electron desktop packages for Linux, macOS, Windows.
+- Daemon packages for Linux, macOS, and Windows.
+- Electron packages for Linux, macOS, and Windows.
 - First-run setup flow.
 - Local/LAN connection instructions.
+- User-scoped service installation scripts.
 - Basic upgrade path.
-- Logs and diagnostics export.
+- Diagnostics export.
+- Quickstart docs.
 
 Acceptance criteria:
 
-- Fresh install can enroll a local server and launch a test shell session.
-- Linux service can run in background.
-- macOS launchd service can run in background.
-- Windows service can run in background.
-- User can find logs from the UI.
-
-Primary risks:
-
-- Platform signing/notarization can take time.
-- Service installation permissions differ by OS.
+- Fresh install enrolls a local server and launches a test shell session.
+- Linux user-scoped background service works.
+- macOS LaunchAgent works.
+- Windows per-user startup works.
+- Windows daemon crash recovery restarts the daemon without killing live sidecars.
+- User can find and export logs from the UI.
 
 ## Suggested Sequence
 
+Planning baseline for a solo developer is 8-12 months. The first three phases carry the highest technical risk because they establish the cross-platform session engine, terminal snapshot model, and installed service behavior.
+
 ### Phase 0: Component Evaluation
 
-Duration: 1-2 weeks.
+Duration: 2-3 weeks.
 
-Tasks:
+Critical path tasks:
 
-- Evaluate PTY libraries with Linux/macOS PTY and Windows ConPTY.
-- Evaluate xterm.js integration and serialization options.
-- Evaluate SQLite layer.
-- Evaluate Git implementation strategy: shelling out to `git` versus library.
+- Evaluate local IPC: Unix domain sockets, Windows AF_UNIX, Windows named pipes.
+- Evaluate backend process lifetime under user-scoped systemd, launchd, and Windows startup mechanisms.
+- Evaluate sidecar-owned PTY survival across daemon restart.
+- Evaluate PTY libraries for Unix PTY and Windows ConPTY.
+- Evaluate headless terminal emulator crates with alternate-screen TUIs.
+- Spike fresh-client mid-session attach against Codex or a representative full-screen TUI.
+- Spike terminal parser fuzzing with hostile escape-sequence input.
+- Smoke-test Codex and Claude Code login/auth flows from installed daemon context.
+- Evaluate service installation helpers, including Windows user-mode restart-on-failure recovery.
+
+Backend-contract validation:
+
+- Timebox tmux control-mode or capture spike to one day.
+
+Phase-local validation tasks:
+
+- Evaluate xterm.js attach, resize, fit, search, and WebGL addons.
+- Evaluate Dockview layout persistence.
+- Evaluate CodeMirror diff approach.
+- Evaluate markdown pipeline: Marked, DOMPurify, Shiki, Mermaid, KaTeX.
+- Evaluate terminal escape-sequence policy in xterm.js.
+- Validate SQLite WAL and batched `rusqlite` writer behavior.
+- Validate `git` CLI behavior behind the Git plugin interface.
 - Evaluate file watching library.
-- Evaluate service installation helpers.
-- Evaluate diff rendering component.
-- Decide internal wrapper interfaces.
 
 Exit criteria:
 
+- Critical path decision records are complete.
 - Dependency decision record for each major component.
+- Decision record for session backend IPC and process lifetime.
+- Decision record for terminal emulator snapshot strategy.
 - Prototype proves PTY output on Linux, macOS, and Windows.
+- Prototype proves daemon-to-backend communication.
+- Prototype proves fresh-client TUI attach from emulator snapshot.
 - Prototype proves xterm.js attach to daemon stream.
+- Prototype proves Dockview + xterm.js sizing.
+- Prototype proves sanitized markdown rendering.
 
 ### Phase 1: Session Engine Prototype
 
-Duration: 2-3 weeks.
+Duration: 4-6 weeks.
 
 Tasks:
 
 - Build daemon skeleton.
 - Implement local API.
-- Implement platform PTY abstraction.
+- Implement session backend registry.
+- Implement backend IPC client/server.
+- Implement native PTY per-session sidecar backend.
+- Implement sidecar-owned PTY lifetime.
+- Implement per-user sidecar runtime directory and socket naming.
+- Implement headless terminal emulator snapshot export as ANSI repaint stream.
 - Implement session create/list/attach/resize/stop.
 - Implement terminal stream WebSocket.
-- Build minimal web page with xterm.js attach.
+- Build minimal React page with xterm.js attach.
 
 Exit criteria:
 
@@ -442,55 +595,108 @@ Exit criteria:
 - Disconnect browser/client.
 - Session keeps running.
 - Reconnect and continue interacting.
+- Mock backend replaces native backend in tests.
+- Fresh client attach restores a coherent full-screen TUI.
 
 ### Phase 2: Durable Resume
 
-Duration: 2-3 weeks.
+Duration: 4-6 weeks.
 
 Tasks:
 
 - Add SQLite migrations.
 - Add sessions table.
+- Add backend session table.
 - Add terminal event log table.
+- Add backend event cursor/spool storage.
+- Add terminal emulator snapshot table.
 - Add sequence-number replay.
-- Add terminal snapshots.
+- Add backend event drain.
+- Add daemon startup sidecar scan.
+- Add orphaned sidecar records.
+- Add emulator snapshot restore.
+- Add backpressure and gap marker behavior.
 - Add archive and exited session states.
-- Add restart recovery behavior.
+- Add daemon restart reattach.
+- Add explicit follow-up session creation.
+- Add structural session summary record writer.
 
 Exit criteria:
 
 - Reconnect receives missed output.
-- Server restart preserves session history and exited state.
+- Daemon restart preserves session history and exited state.
+- Daemon restart does not silently relaunch sessions.
+- Orphaned sidecars are surfaced for adopt or terminate.
 - Snapshot restore works when replay window is unavailable.
+- Writer stall and disk-full behavior produces explicit health events or gap markers.
+- Session exit writes a structural summary record.
 
 ### Phase 3: Control Center Client
 
-Duration: 2-3 weeks.
+Duration: 3-4 weeks.
 
 Tasks:
 
 - Build Electron app shell.
-- Add shared web UI.
+- Add React 19 + TypeScript + Vite.
+- Add shadcn/ui, Tailwind, and lucide-react.
+- Add Dockview shell.
+- Add Zustand stores.
+- Add TanStack Query client.
 - Add device/server enrollment flow.
+- Add SSH tunnel connection profile flow.
 - Add session list.
-- Add TUI center panel.
+- Add activity and attention badges.
+- Add xterm.js center panel.
 - Add placeholder source-control panel.
 - Add reconnect and error states.
 
 Exit criteria:
 
-- User can create and resume sessions from desktop app.
+- User creates and resumes sessions from the desktop app.
+- User connects through a documented SSH local port-forward profile.
 - UI supports at least two simultaneous sessions.
-- Terminal sizing works reliably.
+- Sessions with new activity are visible.
+- Terminal sizing works reliably in Dockview.
+- Layout persists across app restart.
 
-### Phase 4: Plugins And Agent Launch
+### Phase 4: Rich Output And Source Viewing
 
 Duration: 2 weeks.
 
 Tasks:
 
-- Add plugin manifest schema.
-- Add plugin registry.
+- Add CodeMirror file viewer.
+- Add diff viewer.
+- Add repo markdown preview.
+- Add agent transcript preview through plugin-provided transcript locators and parsers.
+- Add session summary record renderer.
+- Add Marked parser.
+- Add DOMPurify sanitization.
+- Add Shiki highlighting.
+- Add Mermaid renderer.
+- Add KaTeX renderer.
+- Lazy-load rich-output dependencies.
+
+Exit criteria:
+
+- Markdown output renders safely.
+- Repo markdown files render safely.
+- Agent transcript files render safely when exposed by an agent plugin.
+- Code blocks are highlighted.
+- Diagrams and math render on demand.
+- Terminal responsiveness remains intact during large markdown renders.
+- Diff viewer is usable for changed files.
+
+### Phase 5: Plugins And Agent Launch
+
+Duration: 2-3 weeks.
+
+Tasks:
+
+- Add Rust trait interfaces for plugin kinds.
+- Add static plugin registry.
+- Add native session backend plugin registration.
 - Add custom command plugin.
 - Add Codex plugin.
 - Add Claude Code plugin.
@@ -499,14 +705,15 @@ Tasks:
 
 Exit criteria:
 
-- User can launch Codex if installed.
-- User can launch Claude Code if installed.
-- User can launch a custom command after approval.
+- User launches Codex when installed.
+- User launches Claude Code when installed.
+- User launches a custom command after approval.
 - Missing binary errors are clear.
+- Dynamic third-party plugin package loading remains out of MVP.
 
-### Phase 5: Workspace Isolation
+### Phase 6: Workspace Isolation
 
-Duration: 2-3 weeks.
+Duration: 3-4 weeks.
 
 Tasks:
 
@@ -515,6 +722,10 @@ Tasks:
 - Add `git init` flow for plain folders.
 - Add workspace instance and lease tables.
 - Add managed Git worktree creation.
+- Add workspace setup hook model.
+- Add copy rules for `.env` and similar local files.
+- Add symlink rules for dependency caches.
+- Add bootstrap command execution.
 - Link sessions to workspace instances.
 - Add cleanup guard for dirty instances.
 - Add UI labels for source workspace and active instance.
@@ -522,12 +733,14 @@ Tasks:
 Exit criteria:
 
 - Two agents on the same repo run in separate worktrees.
+- Workspace setup hooks run and report status.
 - Dirty worktree cleanup is blocked without confirmation.
 - Direct source checkout mode requires explicit override.
+- Submodule, LFS, and required ignored-file issues are surfaced.
 
-### Phase 6: Git Panel And Diffs
+### Phase 7: Git Panel And Diffs
 
-Duration: 2-3 weeks.
+Duration: 3-4 weeks.
 
 Tasks:
 
@@ -536,50 +749,92 @@ Tasks:
 - Add file diff API.
 - Add commit graph API.
 - Add checkpoint refs/objects.
+- Add explicit "New segment" checkpoint action.
+- Add optional plugin boundary detection hook.
 - Add right-panel changed-files UI.
-- Add diff viewer.
+- Wire changed files to diff viewer.
 - Add commit graph view.
 
 Exit criteria:
 
-- User can click any changed file and see the diff.
-- Created/modified/deleted files display correctly.
+- User clicks any changed file and sees the diff.
+- Created, modified, deleted, and renamed files display correctly.
 - Plain folder initialized by the app gets the same diff workflow.
 - Commit graph is usable on a medium-sized repo.
+- New segment advances the active checkpoint.
 
-### Phase 7: VS Code Continuation And Packaging
+### Phase 8: Attention Signals
 
-Duration: 2-3 weeks.
+Duration: 1-2 weeks.
 
 Tasks:
 
-- Add VS Code continuation button.
+- Add attention state to session records.
+- Add new-output-after-idle detection.
+- Add terminal bell detection.
+- Add daemon-side recent-output text matcher for plugin prompt patterns.
+- Add approval-needed and failed-state badges.
+- Add attention filters to the session list.
+
+Exit criteria:
+
+- New activity appears in the session list.
+- Likely blocked sessions are highlighted.
+- Plugin prompt patterns match recent output text without direct sidecar screen access.
+- Failed sessions are highlighted.
+- Viewing or acknowledging a session clears attention state.
+
+### Phase 9: VS Code Continuation And Packaging
+
+Duration: 3-4 weeks.
+
+Tasks:
+
+- Add VS Code continuation action.
 - Open isolated workspace instance.
-- Add optional VS Code extension/deep-link support.
+- Add local-daemon deep-link or minimal extension support.
+- Add Remote-SSH prerequisite messaging for remote daemon workspaces.
 - Package daemon and desktop app.
-- Add service installation scripts.
+- Add user-scoped service installation scripts.
 - Add diagnostics export.
 - Write install and quickstart docs.
 
 Exit criteria:
 
-- Fresh install can launch daemon and desktop client.
-- User can start an agent, inspect diffs, open VS Code, disconnect, and reconnect.
+- Fresh install launches daemon and desktop client.
+- User starts an agent, inspects diffs, opens VS Code, disconnects, and reconnects.
+- Local daemon continuation opens the isolated workspace instance.
+- Remote daemon continuation shows Remote-SSH requirements when unavailable.
 - MVP works on Linux, macOS, and Windows at smoke-test level.
 
 ## Verification Plan
 
 ### Automated Tests
 
-- Unit tests for session state transitions.
-- Unit tests for plugin manifest parsing.
-- Unit tests for workspace lease rules.
-- Unit tests for Git worktree path generation.
-- Unit tests for checkpoint ref naming.
-- Integration tests for PTY spawn and resize.
-- Integration tests for replay from event sequence.
-- Integration tests for Git status/diff/checkpoint APIs.
-- API tests for auth, workspace allowlist, and session lifecycle.
+- Session state transitions.
+- Session backend process manifest parsing.
+- Backend handle/session mapping.
+- Sidecar runtime directory scan.
+- Orphaned sidecar detection.
+- Static plugin registry behavior.
+- Workspace lease rules.
+- Git worktree path generation.
+- Checkpoint ref naming.
+- Workspace setup hook rules.
+- Frontend store selectors and layout persistence.
+- Markdown sanitization.
+- Terminal escape-sequence policy.
+- Terminal parser fuzz cases.
+- Terminal attach and resize.
+- Terminal emulator snapshot restore.
+- Daemon-to-backend IPC.
+- Backend event drain after daemon reconnect.
+- Replay from event sequence.
+- Backpressure and gap marker behavior.
+- Git status, diff, and checkpoint APIs.
+- Attention state transitions.
+- Structural session summary record creation.
+- Auth, workspace allowlist, and session lifecycle APIs.
 
 ### Manual Smoke Tests
 
@@ -588,11 +843,28 @@ Exit criteria:
 - Launch shell session on Windows native ConPTY.
 - Launch Codex plugin.
 - Launch Claude Code plugin.
+- Complete Codex and Claude Code authentication flows from installed daemon context.
 - Disconnect desktop client during active output.
 - Reconnect and confirm missed output appears.
-- Start two sessions on same repo and edit same file in both.
+- Attach a fresh client mid-session to a full-screen TUI and confirm coherent screen state.
+- Restart daemon while backend session remains alive.
+- Restart daemon on Windows and confirm sidecar reattach.
+- Delete a session row, restart daemon, and confirm orphaned sidecar detection.
+- Adopt or terminate an orphaned sidecar from the UI.
+- Crash the installed Windows daemon and confirm user-mode recovery without killing live sidecars.
+- Kill an agent process and confirm no automatic relaunch.
+- Connect through an SSH local port-forward.
+- Attach two clients to one session and verify shared input plus most-recently-active resize policy.
+- Confirm attach and terminal input update the active client for resize policy.
+- Start two sessions on the same repo and edit the same file.
 - Confirm separate worktrees and separate diffs.
+- Run workspace setup hooks for a repo with required local files.
 - Initialize plain folder as Git and show changed-file diff.
+- Trigger an attention signal for a blocked or approval-needed session.
+- Confirm plugin attention patterns match recent output text without sidecar screen access.
+- Confirm session exit writes a structural summary record.
+- Render markdown with code, Mermaid, and KaTeX.
+- Verify OSC 52 clipboard writes are disabled.
 - Open session workspace in VS Code.
 
 ### Performance Checks
@@ -600,9 +872,12 @@ Exit criteria:
 - Idle daemon CPU usage.
 - Memory usage with 1, 5, and 20 sessions.
 - Terminal output throughput.
+- 24-hour session soak with high event count.
+- Backpressure behavior during slow storage writes.
 - Reconnect time with large scrollback.
 - Git graph generation time on small, medium, and large repos.
 - Disk usage from terminal logs and retained worktrees.
+- Frontend responsiveness during terminal output and rich markdown rendering.
 
 ## Release Gates
 
@@ -611,8 +886,9 @@ Exit criteria:
 - Linux/macOS/Windows daemon starts.
 - Basic shell sessions work.
 - Client attach/detach works.
-- Terminal replay works.
-- No Git or plugin polish required.
+- Terminal emulator snapshot attach works.
+- Tail replay after snapshot works.
+- Minimal React/xterm.js client works.
 
 ### Beta Gate
 
@@ -621,14 +897,22 @@ Exit criteria:
 - Git worktree isolation works.
 - Changed-file diffs work.
 - Basic auth works.
+- SSH tunnel connection works.
+- Attention signals work.
+- Rich markdown rendering is sanitized.
 - VS Code continuation works.
 
 ### MVP Gate
 
 - End-to-end workflow works on Linux, macOS, and Windows.
-- Two concurrent agents on same repo are isolated.
+- Two concurrent agents on the same repo are isolated.
 - Reconnect restores live session output.
+- Fresh-client attach restores full-screen TUI state.
+- Orphaned sidecar recovery works.
+- Structural session summaries are written and rendered.
 - Plain folders can be initialized as Git for diff tracking.
+- Workspace setup hooks work on a real project.
+- Frontend stack is packaged in Electron.
 - Packaging and quickstart docs are complete.
 - Known limitations are documented.
 
@@ -636,38 +920,50 @@ Exit criteria:
 
 | Risk | Mitigation |
 | --- | --- |
-| Windows ConPTY behavior is inconsistent | Spike first, wrap PTY backend, keep platform-specific tests |
-| Terminal snapshot fidelity is hard | Start with replay-first recovery and simple snapshots |
-| Git worktrees fail for edge-case repos | Detect clearly, offer clone/copy fallback, document unsupported cases |
-| Plugin API over-design | Ship built-in plugins first, keep manifest small |
-| Commit graph is slow | Cache results and defer advanced graph features |
-| Service installation is painful | Provide foreground dev mode and background service mode separately |
-| Security scope expands | Keep MVP to personal auth, device enrollment, and workspace allowlist |
-| Electron packaging takes longer than expected | Keep web client runnable independently for testing |
+| Windows ConPTY behavior is inconsistent | Spike first, wrap backend, keep Windows smoke tests |
+| Sidecar process lifetime differs by OS/service manager | Use per-session sidecars and test restart behavior per OS |
+| Sidecars outlive daemon metadata | Scan the sidecar runtime directory and surface orphaned sidecars |
+| Local IPC differs across platforms | Wrap IPC transport and test UDS, AF_UNIX, and named pipes |
+| Terminal emulator fidelity is hard | Spike full-screen TUI attach in Phase 0, fuzz parser input, and keep emulator snapshots as the primary resume path |
+| Event storage stalls or disk fills | Apply backpressure, emit health events, and mark output gaps explicitly |
+| Dockview and xterm.js sizing is fragile | Prototype layout and resize behavior in Phase 0 |
+| Markdown/diagram rendering creates XSS risk | Sanitize HTML and keep Mermaid strict by default |
+| Terminal escape sequences create client-side risk | Disable OSC 52 by default and gate links/title behavior |
+| Rich rendering hurts terminal responsiveness | Lazy-load and defer markdown rendering |
+| Git worktrees fail for edge-case repos | Detect clearly, run setup hooks, and use explicit isolation fallback |
+| Plugin API over-design | Ship static built-in traits first |
+| Commit graph is slow | Cache results and defer graph polish |
+| Service installation is painful | Provide foreground dev mode, user-scoped background mode, and crash recovery |
+| Electron packaging takes longer than expected | Keep web client runnable independently |
 
 ## MVP Cut Rules
 
-If schedule pressure appears, keep:
+Keep:
 
-- durable PTY sessions,
-- reconnect/replay,
+- durable backend-managed sessions,
+- per-session sidecar-owned PTY model,
+- sidecar orphan detection,
+- server-side terminal emulator snapshots,
+- structural session summary records,
+- session backend contract,
+- reconnect and tail replay,
 - native Windows daemon support,
-- basic desktop client,
+- basic Electron client,
+- xterm.js terminal panel,
 - workspace isolation,
-- changed-file diffs.
+- workspace setup hooks,
+- changed-file diffs,
+- attention signals,
+- safe markdown rendering.
 
-Cut or defer:
+Cut under schedule pressure:
 
 - commit graph polish,
-- VS Code extension beyond a simple open action,
+- user-scoped service install polish,
+- VS Code extension beyond open action,
 - advanced terminal search,
 - production relay/gateway,
 - personal pool placement,
 - memory UI,
-- user-facing Git write workflows.
-
-The MVP wins only if the core loop feels reliable:
-
-```text
-start agent -> disconnect -> agent keeps working -> reconnect -> inspect terminal and code changes
-```
+- user-facing Git write workflows,
+- advanced markdown rendering features.
