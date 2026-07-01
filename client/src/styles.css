@@ -269,6 +269,88 @@ body {
   color: var(--dim);
 }
 
+/* source control */
+.branch-pill {
+  float: right;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.changed-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 2px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.changed-file:hover {
+  background: var(--panel-2);
+}
+.change-badge {
+  width: 14px;
+  text-align: center;
+  font-weight: 700;
+  font-family: ui-monospace, monospace;
+  flex: none;
+}
+.change-path {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.staged-dot {
+  margin-left: auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: none;
+}
+
+/* diff viewer */
+.diff-modal {
+  width: 900px;
+  max-width: calc(100vw - 40px);
+}
+.diff-modal .modal-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.diff-view {
+  max-height: 70vh;
+  overflow: auto;
+  background: #0b0e14;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.diff-line {
+  white-space: pre;
+  padding: 0 4px;
+}
+.diff-line.add {
+  background: rgba(158, 206, 106, 0.12);
+  color: #b9e08a;
+}
+.diff-line.del {
+  background: rgba(247, 118, 142, 0.12);
+  color: #f7a1b0;
+}
+.diff-line.hunk {
+  color: #7aa2f7;
+  background: rgba(122, 162, 247, 0.08);
+}
+.diff-line.meta {
+  color: var(--dim);
+}
+
 /* modal */
 .modal-backdrop {
   position: fixed;

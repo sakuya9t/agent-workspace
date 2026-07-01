@@ -66,6 +66,9 @@ Environment overrides: `ASM_BIND`, `ASM_DATA_DIR`, `ASM_CONFIG_DIR`,
 | POST | `/api/sessions/:id/resize` | resize (`{rows, cols}`) |
 | POST | `/api/sessions/:id/ack` | acknowledge/clear attention |
 | GET (WS) | `/api/sessions/:id/stream` | terminal stream |
+| GET | `/api/sessions/:id/scm/status` | repo status, branch, changed files |
+| GET | `/api/sessions/:id/scm/diff?path=&untracked=` | unified diff for a file |
+| GET | `/api/sessions/:id/scm/log?limit=` | commit history |
 
 WebSocket protocol: the server sends binary frames of terminal output (the
 first frame is the snapshot repaint). The client sends terminal input as binary
@@ -93,4 +96,13 @@ Create-session body:
 cd client
 npm install
 npm run dev   # Vite dev server, proxies /api and /health to the daemon
+```
+
+## End-to-end smoke test
+
+With a daemon running, exercise the full loop (create → attach → run →
+disconnect → reconnect snapshot resume → scm status → stop → summary):
+
+```bash
+node scripts/smoke.mjs 127.0.0.1:4600 /path/to/a/git/repo
 ```

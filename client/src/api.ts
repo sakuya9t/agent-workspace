@@ -56,6 +56,32 @@ export interface SessionSummary {
   terminal_event_end: number;
 }
 
+export interface ChangedFile {
+  path: string;
+  status: string;
+  staged: boolean;
+  untracked: boolean;
+  orig_path: string | null;
+}
+
+export interface ScmStatus {
+  is_repo: boolean;
+  provider: string;
+  branch: string | null;
+  head: string | null;
+  detached: boolean;
+  changed_files: ChangedFile[];
+}
+
+export interface Commit {
+  hash: string;
+  short: string;
+  subject: string;
+  author: string;
+  timestamp: number;
+  parents: string[];
+}
+
 export interface Health {
   status: string;
   version: string;
@@ -126,6 +152,16 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ rows, cols }),
     }),
+  scmStatus: (id: string) =>
+    req<{ status: ScmStatus }>(`/api/sessions/${id}/scm/status`).then((r) => r.status),
+  scmDiff: (id: string, path: string, untracked: boolean) =>
+    req<{ path: string; diff: string }>(
+      `/api/sessions/${id}/scm/diff?path=${encodeURIComponent(path)}&untracked=${untracked}`,
+    ).then((r) => r.diff),
+  scmLog: (id: string, limit = 30) =>
+    req<{ commits: Commit[] }>(`/api/sessions/${id}/scm/log?limit=${limit}`).then(
+      (r) => r.commits,
+    ),
 };
 
 export function streamUrl(id: string): string {

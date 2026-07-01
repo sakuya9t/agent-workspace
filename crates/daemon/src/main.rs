@@ -5,6 +5,7 @@ mod db;
 mod domain;
 mod plugins;
 mod session_manager;
+mod source_control;
 mod util;
 
 use std::sync::Arc;
@@ -48,6 +49,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         manager,
         config: Arc::new(config.clone()),
+        scm: Arc::new(source_control::GitSourceControl),
         started_at: now_millis(),
     };
     let app = api::router(state);

@@ -14,8 +14,10 @@ use tower_http::services::ServeDir;
 use crate::config::Config;
 use crate::plugins::current_platform;
 use crate::session_manager::{CreateSessionRequest, SessionManager};
+use crate::source_control::SourceControl;
 use crate::util::now_millis;
 
+mod scm;
 mod ws;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -25,6 +27,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct AppState {
     pub manager: Arc<SessionManager>,
     pub config: Arc<Config>,
+    pub scm: Arc<dyn SourceControl>,
     pub started_at: i64,
 }
 
@@ -41,7 +44,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/:id/archive", post(archive_session))
         .route("/api/sessions/:id/resize", post(resize_session))
         .route("/api/sessions/:id/ack", post(ack_attention))
-        .route("/api/sessions/:id/stream", get(ws::stream));
+        .route("/api/sessions/:id/stream", get(ws::stream))
+        .route("/api/sessions/:id/scm/status", get(scm::status))
+        .route("/api/sessions/:id/scm/diff", get(scm::diff))
+        .route("/api/sessions/:id/scm/log", get(scm::log));
 
     // Optionally serve a packaged web client.
     if let Some(dir) = static_dir {

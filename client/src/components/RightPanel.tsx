@@ -1,16 +1,29 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { api, Session } from "../api";
+import { api, ChangedFile, Session } from "../api";
+import { DiffModal } from "./DiffModal";
 
 interface Props {
   session: Session | undefined;
 }
 
+const STATUS_COLOR: Record<string, string> = {
+  A: "#9ece6a",
+  M: "#e0af68",
+  D: "#f7768e",
+  R: "#7aa2f7",
+  C: "#7aa2f7",
+  U: "#f7768e",
+  "?": "#7b86a1",
+};
+
 /**
- * Right control-center panel. Shows session metadata and the structural
- * summary once a session ends. The Git changed-files / diff panel lands here
- * in the next iteration (Phase 6-7).
+ * Right control-center panel: session metadata, the structural summary once a
+ * session ends, and the Git changed-files list with click-to-diff.
  */
 export function RightPanel({ session }: Props) {
+  const [diffTarget, setDiffTarget] = useState<ChangedFile | null>(null);
+
   const terminal =
     session &&
     ["exited", "failed", "stopped", "archived"].includes(session.status);
@@ -19,6 +32,14 @@ export function RightPanel({ session }: Props) {
     queryKey: ["summary", session?.id],
     queryFn: () => api.getSummary(session!.id),
     enabled: !!session && !!terminal,
+    retry: false,
+  });
+
+  const { data: scm } = useQuery({
+    queryKey: ["scm", session?.id],
+    queryFn: () => api.scmStatus(session!.id),
+    enabled: !!session,
+    refetchInterval: 2500,
     retry: false,
   });
 
@@ -42,7 +63,6 @@ export function RightPanel({ session }: Props) {
         <Field label="Command" value={[session.command, ...session.args].join(" ")} mono />
         <Field label="Directory" value={session.working_directory} mono />
         <Field label="Size" value={`${session.cols}×${session.rows}`} />
-        <Field label="Events" value={String(session.last_event_seq)} />
         {session.exit_code !== null && (
           <Field label="Exit code" value={String(session.exit_code)} />
         )}
@@ -67,11 +87,55 @@ export function RightPanel({ session }: Props) {
           </>
         )}
 
-        <div className="section-title">Source control</div>
-        <div className="dim small">
-          Git changed-files &amp; diffs arrive in the next iteration.
+        <div className="section-title">
+          Source control
+          {scm?.is_repo && (
+            <span className="branch-pill mono">
+              {scm.detached ? "detached" : scm.branch}
+              {scm.head ? ` · ${scm.head}` : ""}
+            </span>
+          )}
         </div>
+
+        {!scm?.is_repo && (
+          <div className="dim small">
+            Not a Git repository. `git init` support arrives with workspace
+            isolation.
+          </div>
+        )}
+
+        {scm?.is_repo && scm.changed_files.length === 0 && (
+          <div className="dim small">Working tree clean.</div>
+        )}
+
+        {scm?.is_repo &&
+          scm.changed_files.map((f) => (
+            <div
+              key={f.path}
+              className="changed-file"
+              onClick={() => setDiffTarget(f)}
+              title="View diff"
+            >
+              <span
+                className="change-badge"
+                style={{ color: STATUS_COLOR[f.status] ?? "#c7d0e0" }}
+              >
+                {f.status}
+              </span>
+              <span className="mono change-path">{shortPath(f.path)}</span>
+              {f.staged && <span className="staged-dot" title="staged" />}
+            </div>
+          ))}
       </div>
+
+      {diffTarget && (
+        <DiffModal
+          sessionId={session.id}
+          path={diffTarget.path}
+          untracked={diffTarget.untracked}
+          onClose={() => setDiffTarget(null)}
+        />
+      )}
     </div>
   );
 }
@@ -83,4 +147,10 @@ function Field({ label, value, mono }: { label: string; value: string; mono?: bo
       <div className={"field-value" + (mono ? " mono" : "")}>{value}</div>
     </div>
   );
+}
+
+function shortPath(p: string): string {
+  const parts = p.split("/");
+  if (parts.length <= 3) return p;
+  return ".../" + parts.slice(-2).join("/");
 }

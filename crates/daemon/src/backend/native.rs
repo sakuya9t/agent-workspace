@@ -65,7 +65,7 @@ impl SessionBackend for NativePtyBackend {
             cmd.env("TERM", "xterm-256color");
         }
 
-        let mut child = pair
+        let child = pair
             .slave
             .spawn_command(cmd)
             .with_context(|| format!("spawning `{}`", spec.command))?;
@@ -203,7 +203,7 @@ fn reader_loop(
     session_id: String,
     seq: Arc<AtomicU64>,
     status_tx: watch::Sender<BackendStatus>,
-    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    mut child: Box<dyn Child + Send + Sync>,
 ) {
     let mut buf = [0u8; READ_BUF];
     let mut parser_ok = true;
