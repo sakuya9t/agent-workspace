@@ -89,10 +89,11 @@ items below are additional, tracked here so we don't forget.
   sandbox, inside the session's worktree/cwd on the daemon host.
 - **Current mitigation:** off by default; each toggle is opt-in per session,
   rendered with a "dangerous" affordance, and the exact flag is persisted in the
-  session's `args` (auditable). Isolation still comes from the per-session Git
-  worktree.
+  session's `args` (auditable). Sessions started this way carry a persisted
+  `risky` flag (schema v4) and are surfaced with an **⚠ UNSAFE badge** in the
+  session list plus a warning banner in the details panel. Isolation still comes
+  from the per-session Git worktree.
 - **Guidance:** consider a host-level policy to disable these toggles (env/config
-  allowlist), surface an at-a-glance "running unsandboxed" badge on such
-  sessions, and fold their use into the lifecycle audit log (item 7). Re-evaluate
-  once the worktree is the only isolation boundary (a bypassed sandbox can still
-  reach anything the daemon user can).
+  allowlist) and fold their use into the lifecycle audit log (item 7).
+  Re-evaluate once the worktree is the only isolation boundary (a bypassed
+  sandbox can still reach anything the daemon user can).

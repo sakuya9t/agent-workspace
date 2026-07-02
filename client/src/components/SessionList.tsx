@@ -107,6 +107,14 @@ export function SessionList() {
             title={s.status}
           />
           <span className="session-agent">{s.agent_plugin_id}</span>
+          {s.risky && (
+            <span
+              className="risk-badge"
+              title="Launched with guardrails disabled (skip-permissions / bypass-sandbox)"
+            >
+              ⚠ unsafe
+            </span>
+          )}
           {daemonLabel && <span className="daemon-tag">{daemonLabel}</span>}
           {s.attention_state !== "none" && (
             <span

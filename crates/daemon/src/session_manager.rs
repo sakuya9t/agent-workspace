@@ -118,6 +118,13 @@ impl SessionManager {
             bail!("launch requires explicit approval (custom command)");
         }
 
+        // A session is "risky" if it enabled any of the plugin's danger toggles
+        // (e.g. skip-permissions / bypass-sandbox), so the UI can badge it.
+        let risky = plugin
+            .options()
+            .iter()
+            .any(|o| o.danger && ctx.opt(&o.key));
+
         if !Path::new(&resolved_cwd).is_dir() {
             bail!("working directory does not exist: {resolved_cwd}");
         }
@@ -141,6 +148,7 @@ impl SessionManager {
             created_at: now,
             updated_at: now,
             last_activity_at: now,
+            risky,
         };
         self.db.insert_session(&session)?;
         if let Some(inst) = &instance {

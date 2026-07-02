@@ -33,6 +33,7 @@ export interface Session {
   created_at: number;
   updated_at: number;
   last_activity_at: number;
+  risky: boolean;
 }
 
 export interface AgentOption {

@@ -102,6 +102,9 @@ pub struct Session {
     pub created_at: i64,
     pub updated_at: i64,
     pub last_activity_at: i64,
+    /// Launched with a guardrail-disabling agent flag (e.g. skip-permissions /
+    /// bypass-sandbox). Surfaced as a risk badge in the UI.
+    pub risky: bool,
 }
 
 /// An enrolled client device. The `token` is the bearer credential and is

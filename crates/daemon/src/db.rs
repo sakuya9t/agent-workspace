@@ -78,8 +78,8 @@ impl Db {
             "INSERT INTO sessions (
                 id, agent_plugin_id, command, args, env, working_directory, workspace_id,
                 status, rows, cols, last_event_seq, exit_code, attention_state, attention_reason,
-                created_at, updated_at, last_activity_at
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                created_at, updated_at, last_activity_at, risky
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             rusqlite::params![
                 s.id,
                 s.agent_plugin_id,
@@ -98,6 +98,7 @@ impl Db {
                 s.created_at,
                 s.updated_at,
                 s.last_activity_at,
+                s.risky as i64,
             ],
         )?;
         Ok(())
@@ -108,7 +109,7 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT id, agent_plugin_id, command, args, env, working_directory, workspace_id,
                     status, rows, cols, last_event_seq, exit_code, attention_state, attention_reason,
-                    created_at, updated_at, last_activity_at
+                    created_at, updated_at, last_activity_at, risky
              FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
@@ -124,7 +125,7 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT id, agent_plugin_id, command, args, env, working_directory, workspace_id,
                     status, rows, cols, last_event_seq, exit_code, attention_state, attention_reason,
-                    created_at, updated_at, last_activity_at
+                    created_at, updated_at, last_activity_at, risky
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map([id], row_to_session)?;
@@ -472,6 +473,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         created_at: row.get(14)?,
         updated_at: row.get(15)?,
         last_activity_at: row.get(16)?,
+        risky: row.get::<_, i64>(17)? != 0,
     })
 }
 
@@ -533,6 +535,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA_V3)?;
         conn.pragma_update(None, "user_version", 3)?;
         tracing::info!("applied schema migration v3");
+    }
+    if version < 4 {
+        conn.execute_batch(SCHEMA_V4)?;
+        conn.pragma_update(None, "user_version", 4)?;
+        tracing::info!("applied schema migration v4");
     }
     Ok(())
 }
@@ -620,6 +627,10 @@ CREATE TABLE devices (
     last_seen_at INTEGER NOT NULL,
     revoked INTEGER NOT NULL DEFAULT 0
 );
+"#;
+
+const SCHEMA_V4: &str = r#"
+ALTER TABLE sessions ADD COLUMN risky INTEGER NOT NULL DEFAULT 0;
 "#;
 
 /// Batches terminal events into transactions to keep write amplification low.

@@ -99,6 +99,12 @@ export function RightPanel({ target, session }: Props) {
         )}
         {openVscode.error && <div className="error">{String(openVscode.error)}</div>}
 
+        {session.risky && (
+          <div className="risk-banner" title="This session was started with agent guardrails disabled">
+            ⚠ Unsafe session — agent guardrails disabled (skip-permissions / bypass-sandbox)
+          </div>
+        )}
+
         <Field label="Agent" value={session.agent_plugin_id} />
         <Field label="Status" value={session.status} />
         <Field label="Command" value={[session.command, ...session.args].join(" ")} mono />
