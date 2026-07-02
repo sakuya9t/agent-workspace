@@ -24,6 +24,20 @@ use util::now_millis;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Subcommands run without the tracing subscriber so stdout stays clean.
+    match std::env::args().nth(1).as_deref() {
+        Some("token") | Some("enrollment-token") => return print_enrollment_token(),
+        Some("help") | Some("--help") | Some("-h") => {
+            print_help();
+            return Ok(());
+        }
+        Some(other) if !other.starts_with('-') => {
+            eprintln!("unknown command `{other}` — try `asm-daemon help`");
+            std::process::exit(2);
+        }
+        _ => {}
+    }
+
     init_tracing();
 
     let config = Config::resolve()?;
@@ -43,13 +57,14 @@ async fn main() -> Result<()> {
     )?;
     let loopback_only = config.bind.ip().is_loopback();
     tracing::info!(server_id = %server_id, "server identity ready");
+    tracing::info!("enrollment token for new devices: {enrollment_token}");
+    tracing::info!("retrieve it anytime with `asm-daemon token`");
     if loopback_only {
         tracing::info!("bound to loopback: local clients are trusted; remote access via SSH port-forward needs no token");
     } else {
         tracing::warn!(
-            "bound off-loopback ({}). Remote devices must enroll. Enrollment token: {}",
-            config.bind,
-            enrollment_token
+            "bound off-loopback ({}). Remote devices must enroll with the token above.",
+            config.bind
         );
     }
 
@@ -95,4 +110,27 @@ fn init_tracing() {
     let filter =
         EnvFilter::try_from_env("ASM_LOG").unwrap_or_else(|_| EnvFilter::new("info,asm_daemon=debug"));
     fmt().with_env_filter(filter).init();
+}
+
+/// `asm-daemon token` — print this host's enrollment token to stdout so a user
+/// on the machine (or over SSH) can enroll another device.
+fn print_enrollment_token() -> Result<()> {
+    let config = Config::resolve()?;
+    let db = Db::open(&config.db_path()).context("opening database")?;
+    let (_, token) = db.get_or_create_identity(
+        &auth::gen_server_id(),
+        &auth::gen_enrollment_token(),
+        now_millis(),
+    )?;
+    println!("{token}");
+    Ok(())
+}
+
+fn print_help() {
+    println!("asm-daemon — Agent Session Manager daemon\n");
+    println!("USAGE:");
+    println!("  asm-daemon           run the daemon");
+    println!("  asm-daemon token     print this host's enrollment token");
+    println!("  asm-daemon help      show this help\n");
+    println!("ENV: ASM_BIND, ASM_DATA_DIR, ASM_CONFIG_DIR, ASM_RUNTIME_DIR, ASM_STATIC_DIR, ASM_LOG");
 }

@@ -144,11 +144,17 @@ Bind the daemon off-loopback and enroll a device:
 ASM_BIND=0.0.0.0:4600 asm-daemon      # logs the enrollment token on startup
 ```
 
-The enrollment token is also visible in the client's **Connect** dialog when
-you're connected locally (loopback-only endpoint). In the dialog on the remote
-device, enter `http://<host>:4600` plus the enrollment token; the client
-receives a device token stored locally for future connections. Revoke devices
-via `POST /api/auth/devices/:id/revoke`.
+Retrieve the enrollment token in any of these ways:
+
+```bash
+asm-daemon token          # print it on the host (or over SSH)
+```
+
+It's also logged on startup and shown in the client's **Connect** dialog when
+you're connected locally (a loopback-only endpoint). On the remote device,
+enter `http://<host>:4600` plus the enrollment token in the Connect dialog; the
+client receives a device token stored locally for future connections. Revoke
+devices via `POST /api/auth/devices/:id/revoke`.
 
 > Direct off-loopback traffic is not TLS-encrypted in the MVP — prefer the SSH
 > tunnel for untrusted networks. Relay/gateway modes for NAT'd hosts are on the
