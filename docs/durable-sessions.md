@@ -1,8 +1,11 @@
 # Durable Sessions via an Out-of-Process Session Holder ("asmux")
 
-Status: **proposed / awaiting approval.** No implementation yet. This supersedes
-the earlier tmux-only sketch. It adapts the "acmux" design (from the
-agent-conductor project) to this codebase.
+Status: **design, refining before code.** No implementation yet. Adapts the
+"acmux" design (from the agent-conductor project) to this codebase.
+
+Locked decisions: sidecar crate/binary named **`asmux`**; wire encoding is
+**FlatBuffers** (schema frozen once shipped). The frozen contract lives in
+[`asmux-protocol.md`](asmux-protocol.md).
 
 ## The two questions this answers
 
@@ -102,10 +105,10 @@ renumbered. MVP RPC subset:
 Later: `6/7 purge`, `10/11 updateMetadata`, `14/15 readBuffer`, `18/19 status`,
 `22/23 redraw`.
 
-**Encoding decision:** acmux uses FlatBuffers (zero-copy). For our MVP I lean
-toward starting with a simpler length-delimited encoding (e.g. `bincode` or
-`postcard`) behind `tag 0x00`, since the tag byte lets us introduce FlatBuffers
-later without breaking the frame. Open for discussion.
+**Encoding: FlatBuffers** (`tag 0x00`), matching acmux — zero-copy,
+language-neutral, and schema-versioned from day one. The full frozen schema,
+framing, RPC semantics, error codes, and never-crash lints are specified in
+[`asmux-protocol.md`](asmux-protocol.md).
 
 ## Ring buffer & cursors (seamless reconnect)
 
@@ -171,13 +174,15 @@ for users who prefer tmux's server; asmux is the default.
   `purge`, metadata RPCs, heartbeat/watchdog reconnect with backoff.
 - **M5 — Windows.** ConPTY + AF_UNIX.
 
-## Open decisions
+## Decisions
 
-1. Encoding: start with `bincode`/`postcard` behind `tag 0x00` (my lean) vs
-   FlatBuffers now.
-2. Crate/binary name: `asmux` vs `asm-sidecar`.
-3. Ring-buffer default size (2 MiB proposed).
-4. Relationship to the SQLite event log: asmux ring = hot/live replay, SQLite =
-   cold/exited history. Keep both (proposed) — the ring is not durable across
-   host reboot and shouldn't try to be.
-5. Update `architecture.md` to move the VT emulator from sidecar to daemon.
+Settled: **asmux** name; **FlatBuffers** encoding. Ring default **2 MiB**
+(range 16 KiB–32 MiB). asmux ring = hot/live replay; SQLite = cold/exited
+history — keep both (the ring is not durable across host reboot and shouldn't
+try to be).
+
+Still open (see [`asmux-protocol.md`](asmux-protocol.md) → Open protocol
+questions): FlatBuffers Rust toolchain (`flatc` + `flatbuffers` crate vs pure-
+Rust `planus`); protocol-version negotiation policy; exact error-code set;
+tombstone rules for `kill`/`input` after exit. Also pending: update
+`architecture.md` to move the VT emulator from sidecar to daemon.
