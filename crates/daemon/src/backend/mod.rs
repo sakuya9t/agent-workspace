@@ -33,6 +33,11 @@ impl BackendStatus {
 
 /// A server-side terminal snapshot: an ANSI repaint stream plus geometry.
 /// Written through the same xterm.js path as live output on the client.
+///
+/// `rows`/`cols`/`last_seq` are part of the snapshot resume contract (they will
+/// feed persisted-snapshot history and the client resume point); only
+/// `repaint` is consumed today.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub rows: u16,
@@ -61,7 +66,6 @@ pub trait BackendSession: Send + Sync {
     fn send_input(&self, data: &[u8]) -> Result<()>;
     fn resize(&self, rows: u16, cols: u16) -> Result<()>;
     fn stop(&self) -> Result<()>;
-    fn status(&self) -> BackendStatus;
     fn watch_status(&self) -> watch::Receiver<BackendStatus>;
     fn last_seq(&self) -> u64;
 }

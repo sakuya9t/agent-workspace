@@ -84,13 +84,11 @@ impl SessionBackend for NativePtyBackend {
         let seq = Arc::new(AtomicU64::new(0));
 
         let session = Arc::new(NativeSession {
-            session_id: spec.session_id.clone(),
             parser: parser.clone(),
             tx: tx.clone(),
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
             killer: Mutex::new(killer),
-            status_tx: status_tx.clone(),
             status_rx,
             seq: seq.clone(),
         });
@@ -111,13 +109,11 @@ impl SessionBackend for NativePtyBackend {
 }
 
 struct NativeSession {
-    session_id: String,
     parser: Arc<Mutex<vt100::Parser>>,
     tx: broadcast::Sender<Arc<[u8]>>,
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
-    status_tx: watch::Sender<BackendStatus>,
     status_rx: watch::Receiver<BackendStatus>,
     seq: Arc<AtomicU64>,
 }
@@ -179,10 +175,6 @@ impl BackendSession for NativeSession {
     fn stop(&self) -> Result<()> {
         self.killer.lock().kill().context("killing child process")?;
         Ok(())
-    }
-
-    fn status(&self) -> BackendStatus {
-        self.status_rx.borrow().clone()
     }
 
     fn watch_status(&self) -> watch::Receiver<BackendStatus> {

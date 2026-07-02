@@ -12,7 +12,11 @@ use directories::ProjectDirs;
 pub struct Config {
     pub bind: SocketAddr,
     pub data_dir: PathBuf,
+    /// Reserved platform dirs: `config_dir` for future config files,
+    /// `runtime_dir` for per-user sidecar sockets. Created at resolve time.
+    #[allow(dead_code)]
     pub config_dir: PathBuf,
+    #[allow(dead_code)]
     pub runtime_dir: PathBuf,
     /// Optional path to a built web client (client/dist) for packaged serving.
     pub static_dir: Option<PathBuf>,

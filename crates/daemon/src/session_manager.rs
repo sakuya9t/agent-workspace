@@ -96,7 +96,6 @@ impl SessionManager {
         let (resolved_cwd, instance) = self.resolve_workspace(&id, &req)?;
 
         let ctx = AgentContext {
-            cwd: resolved_cwd.clone(),
             command: req.command.clone(),
             extra_args: req.args.clone(),
             extra_env: req.env.clone(),
@@ -656,9 +655,6 @@ mod tests {
         fn stop(&self) -> Result<()> {
             let _ = self.status_tx.send(BackendStatus::Exited(0));
             Ok(())
-        }
-        fn status(&self) -> BackendStatus {
-            self.status_rx.borrow().clone()
         }
         fn watch_status(&self) -> watch::Receiver<BackendStatus> {
             self.status_rx.clone()

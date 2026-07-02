@@ -334,16 +334,6 @@ impl Db {
         rows.next().transpose().map_err(Into::into)
     }
 
-    pub fn list_instances(&self) -> Result<Vec<WorkspaceInstance>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, workspace_id, session_id, path, branch, isolation, status, created_at
-             FROM workspace_instances ORDER BY created_at DESC",
-        )?;
-        let rows = stmt.query_map([], row_to_instance)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
-    }
-
     pub fn set_instance_status(&self, id: &str, status: &str) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(

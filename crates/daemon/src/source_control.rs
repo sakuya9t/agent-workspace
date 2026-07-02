@@ -41,7 +41,6 @@ pub struct Commit {
 /// Source-control plugin boundary. The Git provider is the MVP built-in;
 /// other VCS providers implement the same trait behind the same panel.
 pub trait SourceControl: Send + Sync {
-    fn id(&self) -> &'static str;
     fn detect(&self, cwd: &Path) -> bool;
     fn status(&self, cwd: &Path) -> Result<ScmStatus>;
     /// Unified diff for one path. `untracked` files diff against /dev/null.
@@ -52,10 +51,6 @@ pub trait SourceControl: Send + Sync {
 pub struct GitSourceControl;
 
 impl SourceControl for GitSourceControl {
-    fn id(&self) -> &'static str {
-        "git"
-    }
-
     fn detect(&self, cwd: &Path) -> bool {
         matches!(
             git(cwd, &["rev-parse", "--is-inside-work-tree"]),

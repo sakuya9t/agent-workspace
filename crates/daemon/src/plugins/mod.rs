@@ -6,10 +6,10 @@ use serde::Serialize;
 
 pub mod builtin;
 
-/// Where the agent should run and any user-supplied launch inputs.
+/// User-supplied launch inputs for an agent. The working directory is resolved
+/// separately by the session manager and passed to the backend spawn spec.
 #[derive(Debug, Clone, Default)]
 pub struct AgentContext {
-    pub cwd: String,
     /// For `custom_command`: the program to execute.
     pub command: Option<String>,
     pub extra_args: Vec<String>,
@@ -57,10 +57,6 @@ impl PluginRegistry {
         Self {
             agents: builtin::all(),
         }
-    }
-
-    pub fn agents(&self) -> &[Arc<dyn AgentPlugin>] {
-        &self.agents
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<dyn AgentPlugin>> {
@@ -170,7 +166,6 @@ mod tests {
         let reg = PluginRegistry::with_builtins();
         let plugin = reg.get("custom_command").unwrap();
         let ctx = AgentContext {
-            cwd: "/tmp".into(),
             command: Some("echo hi".into()),
             ..Default::default()
         };
