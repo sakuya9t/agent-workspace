@@ -1,0 +1,81 @@
+# Security Follow-Ups (Hardening Backlog)
+
+Next-step guidance for security gaps that are **known and accepted for the
+current MVP** but must be addressed before this is exposed on untrusted
+networks or multi-user hosts. Ordered roughly by priority. Keep this list in
+sync as items land.
+
+The MVP already discloses (see `architecture.md` → Security Model): terminal
+logs can contain secrets, logs live on the daemon host, retention is
+conservative, and encryption-at-rest + production redaction are deferred. The
+items below are additional, tracked here so we don't forget.
+
+## 1. No transport encryption for direct off-loopback access — HIGH
+
+- **What:** direct LAN/remote HTTP + WebSocket is plaintext. Device bearer
+  tokens, terminal input/output, and diffs travel unencrypted over the network.
+- **Current mitigation:** loopback-trust means the recommended remote path is an
+  **SSH local port-forward**, which encrypts the channel. Direct off-loopback
+  bind is opt-in and documented as untrusted-network-unsafe.
+- **Guidance:** implement the Phase 8 "TLS/mTLS or equivalent" deliverable for
+  direct mode — self-signed cert + client pinning, or an ACME path; consider
+  mTLS so the device token isn't the only credential on the wire. Until then,
+  keep the SSH-tunnel recommendation prominent.
+
+## 2. `/api/fs/list` exposes the whole host filesystem — HIGH
+
+- **What:** the directory-picker endpoint lets any loopback client or enrolled
+  device browse the daemon host's directory tree (directories only, but
+  arbitrary paths). Combined with workspace registration (any client can
+  register any root) and `custom_command`, this is broad host access.
+- **Guidance:** constrain browsing + workspace registration to a server-side
+  configured set of allowed roots that a client cannot expand without host-side
+  approval; treat "browse anywhere" as an explicit, host-granted capability.
+  Enforce the workspace allowlist for the picker, not just for raw-cwd sessions.
+
+## 3. Enrollment token is a static, non-expiring shared secret — MEDIUM
+
+- **What:** one long-lived enrollment token mints device tokens for anyone who
+  can reach `POST /api/auth/enroll` with it. No expiry, rotation, or use limit.
+- **Guidance:** one-time / short-TTL enrollment codes, an owner-approval step
+  for new devices, token rotation, and rate-limiting on the enroll endpoint.
+
+## 4. Tokens stored in plaintext at rest — MEDIUM
+
+- **What:** device tokens and the enrollment token are stored as plaintext in
+  SQLite. DB read = full account takeover.
+- **Guidance:** store only a hash of device tokens (compare hash on auth);
+  fold into the broader encryption-at-rest work; add secret redaction for
+  terminal logs and summaries.
+
+## 5. Permissive CORS — MEDIUM
+
+- **What:** the daemon uses `CorsLayer::permissive()` (any origin). Risk is
+  limited because auth uses bearer tokens (not auto-sent cookies), but any web
+  page can call the API and would succeed if it obtained a token.
+- **Guidance:** restrict allowed origins to the configured client origin(s);
+  never enable credentialed CORS; keep tokens out of URLs where avoidable
+  (the WS `?access_token=` is a pragmatic exception — scope/short-TTL it later).
+
+## 6. Loopback is fully trusted — MEDIUM (context-dependent)
+
+- **What:** any process able to originate a loopback connection gets full,
+  tokenless access. Fine for a single-user personal host; broad on shared or
+  multi-user machines.
+- **Guidance:** offer an optional "always require a token" mode that disables
+  loopback trust; document the multi-user caveat.
+
+## 7. No auth rate-limiting / lifecycle audit log — LOW
+
+- **What:** enroll and token checks aren't rate-limited; lifecycle audit events
+  (create/attach/input/stop/delete) listed in the docs aren't emitted yet.
+- **Guidance:** add rate-limiting on `/api/auth/*`; emit and persist the
+  lifecycle audit events; surface them in diagnostics.
+
+## 8. Terminal-escape policy is client-side only — LOW
+
+- **What:** OSC 52 / OSC 8 / title-sequence policy is planned at the xterm.js
+  layer; the daemon currently stores and replays raw bytes without a
+  capture-side escape filter, and the parser hasn't been fuzzed.
+- **Guidance:** enforce dangerous-sequence policy at capture/replay too, and
+  add the hostile-escape fuzz tests called for in the plan.

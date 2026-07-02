@@ -152,7 +152,8 @@ via `POST /api/auth/devices/:id/revoke`.
 
 > Direct off-loopback traffic is not TLS-encrypted in the MVP — prefer the SSH
 > tunnel for untrusted networks. Relay/gateway modes for NAT'd hosts are on the
-> roadmap.
+> roadmap. Known security gaps and the plan to close them are tracked in
+> [`docs/security-followups.md`](docs/security-followups.md).
 
 ## Running the client
 
