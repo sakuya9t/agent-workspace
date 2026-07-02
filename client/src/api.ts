@@ -138,10 +138,47 @@ export interface CreateSessionBody {
   direct_checkout?: boolean;
 }
 
+import { connection } from "./connectionStore";
+
+function apiBase(): string {
+  const b = connection().baseUrl;
+  return b ? b.replace(/\/$/, "") : "";
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
-    ...init,
-    headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
+  const { token } = connection();
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    ...((init?.headers as Record<string, string>) ?? {}),
+  };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  const res = await fetch(apiBase() + path, { ...init, headers });
+  if (!res.ok) {
+    let msg = `${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      if (body?.error) msg = body.error;
+    } catch {
+      /* ignore */
+    }
+    if (res.status === 401) msg = `unauthorized — enroll or reconnect (${msg})`;
+    throw new Error(msg);
+  }
+  return res.json() as Promise<T>;
+}
+
+/** Enroll a device against a specific daemon; returns its device token. */
+export async function enrollDevice(
+  baseUrl: string,
+  enrollmentToken: string,
+  deviceName: string,
+): Promise<{ server_id: string; device_id: string; device_token: string }> {
+  const b = baseUrl ? baseUrl.replace(/\/$/, "") : "";
+  const res = await fetch(b + "/api/auth/enroll", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ enrollment_token: enrollmentToken, device_name: deviceName }),
   });
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`;
@@ -153,7 +190,17 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw new Error(msg);
   }
-  return res.json() as Promise<T>;
+  return res.json();
+}
+
+/** Probe a daemon's /health (used to validate a connection). */
+export async function probeHealth(baseUrl: string, token: string | null): Promise<Health> {
+  const b = baseUrl ? baseUrl.replace(/\/$/, "") : "";
+  const headers: Record<string, string> = {};
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  const res = await fetch(b + "/health", { headers });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
 }
 
 export const api = {
@@ -227,6 +274,18 @@ export const api = {
 };
 
 export function streamUrl(id: string): string {
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  return `${proto}://${location.host}/api/sessions/${id}/stream`;
+  const { baseUrl, token } = connection();
+  let host: string;
+  let secure: boolean;
+  if (baseUrl) {
+    const u = new URL(baseUrl);
+    host = u.host;
+    secure = u.protocol === "https:";
+  } else {
+    host = location.host;
+    secure = location.protocol === "https:";
+  }
+  let url = `${secure ? "wss" : "ws"}://${host}/api/sessions/${id}/stream`;
+  if (token) url += `?access_token=${encodeURIComponent(token)}`;
+  return url;
 }

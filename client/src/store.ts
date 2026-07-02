@@ -8,6 +8,8 @@ interface UiState {
   /// Workspace to preselect when the new-session dialog opens (null = none).
   newSessionWorkspaceId: string | null;
   openNewSession: (workspaceId?: string | null) => void;
+  showConnection: boolean;
+  setShowConnection: (v: boolean) => void;
 }
 
 /** Local UI-only state. Server-derived data lives in TanStack Query. */
@@ -19,4 +21,6 @@ export const useUiStore = create<UiState>((set) => ({
   newSessionWorkspaceId: null,
   openNewSession: (workspaceId = null) =>
     set({ showNewSession: true, newSessionWorkspaceId: workspaceId }),
+  showConnection: false,
+  setShowConnection: (v) => set({ showConnection: v }),
 }));

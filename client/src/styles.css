@@ -175,6 +175,23 @@ body {
   letter-spacing: 0.4px;
 }
 
+.conn-btn {
+  margin-left: 10px;
+}
+.conn-current {
+  margin-bottom: 10px;
+}
+.conn-divider {
+  text-align: center;
+  color: var(--dim);
+  font-size: 11px;
+  margin: 14px 0 6px;
+}
+.conn-hint {
+  margin-top: 10px;
+  line-height: 1.5;
+}
+
 /* host -> workspace -> agent tree */
 .tree {
   padding: 4px 0;
