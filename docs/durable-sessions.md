@@ -181,8 +181,14 @@ Settled: **asmux** name; **FlatBuffers** encoding. Ring default **2 MiB**
 history — keep both (the ring is not durable across host reboot and shouldn't
 try to be).
 
-Still open (see [`asmux-protocol.md`](asmux-protocol.md) → Open protocol
-questions): FlatBuffers Rust toolchain (`flatc` + `flatbuffers` crate vs pure-
-Rust `planus`); protocol-version negotiation policy; exact error-code set;
-tombstone rules for `kill`/`input` after exit. Also pending: update
-`architecture.md` to move the VT emulator from sidecar to daemon.
+Also settled at the protocol layer (see
+[`asmux-protocol.md`](asmux-protocol.md) → Resolved protocol decisions):
+`planus` for FlatBuffers codegen; single-attacher **with takeover** (a new
+attach evicts the old one — this is how "continue on another device" force-
+closes the prior client); `kill` on a dead session is idempotent; slow clients
+are dropped and resync via `attach FromCursor`.
+
+Deferred: whether/how **multiple sessions may share one branch** (collides with
+Git's one-worktree-per-branch rule — tracked in the branch/worktree model, not
+asmux). Pending: update `architecture.md` to move the VT emulator from sidecar
+to daemon.

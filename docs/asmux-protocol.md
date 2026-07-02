@@ -52,6 +52,7 @@ Companion: [`durable-sessions.md`](durable-sessions.md) (architecture & rational
 | 16 / 17 | `AttachRequest` / `AttachResponse` | rpc |
 | 20 / 21 | `DetachRequest` / `DetachResponse` | rpc |
 | 100 | `SessionExited` | event |
+| 101 | `SessionDetached` | event (server-initiated eviction) |
 | 200 | `Error` | error |
 | 300 | `SessionInput` | data (client → asmux) |
 | 301 | `SessionOutput` | data (asmux → client) |
@@ -67,6 +68,14 @@ Ordinals 18/19, 22/23 (`status`, `redraw`) are reserved for later milestones.
 namespace asmux.wire;
 
 enum AttachMode : byte { FromCursor = 0, LiveOnly = 1 }
+
+// Why asmux ended a connection's attachment without a DetachRequest.
+enum DetachReason : byte {
+  Superseded = 0,     // another attach took over this session (takeover)
+  Killed = 1,         // the session was killed
+  Backpressure = 2,   // the connection could not drain output; resync on reconnect
+  ServerShutdown = 3,
+}
 
 table KV { key: string (id: 0); value: string (id: 1); }
 
@@ -185,6 +194,12 @@ table SessionExited {                 // 100 (event)
   head_cursor: uint64 (id: 3);        // final cursor
 }
 
+table SessionDetached {               // 101 (event, server -> evicted client)
+  session_id: string (id: 0);
+  reason: DetachReason (id: 1);
+  last_cursor: uint64 (id: 2);        // resume point for a later attach FromCursor
+}
+
 table SessionInput {                  // 300 (data, client -> asmux)
   session_id: string (id: 0);
   data: [ubyte] (id: 1);
@@ -210,6 +225,23 @@ table Heartbeat { unix_ms: int64 (id: 0); }  // 400
 - `attach LiveOnly`: stream new bytes from current `head`.
 - The daemon persists the last cursor it consumed per session; after a daemon
   restart it re-attaches `FromCursor(last)` for a zero-flicker resume.
+
+## Attach model: single-attacher with takeover
+
+A session has **at most one attached connection at a time**. This mirrors the
+product rule "one session, one client": if the user continues a session on
+another device, the existing device is forcibly detached.
+
+- A new `AttachRequest` for a session that already has an attacher **supersedes**
+  it. asmux sends the previous connection a `SessionDetached{reason=Superseded,
+  last_cursor}` event, stops streaming to it, and grants the new attach. No
+  error is returned to either side — takeover is the defined behaviour.
+- The evicted client may reconnect later and `attach FromCursor(last_cursor)` to
+  resume from where it left off (subject to `BUFFER_GAP` if it waited too long).
+- This same mechanism covers the daemon-restart case: a fresh daemon attaching
+  over a still-half-open previous connection simply takes over.
+- Because there is only ever one attacher, input has a single writer — there is
+  no interleaving/authority question.
 
 ## Session lifecycle & tombstones
 
@@ -252,6 +284,17 @@ of any kind for 3 s treats the connection as broken and tears it down (the
 daemon then reconnects with backoff). asmux sends heartbeats from a **dedicated
 OS thread**, not a tokio task, so a busy async runtime can't delay them.
 
+## Backpressure
+
+The session's ring buffer is the source of truth; the socket is a best-effort
+delivery of it. If a connection cannot drain `SessionOutput` fast enough (its
+send queue exceeds a bound), asmux **drops that connection** — it does not block
+the reader thread or grow memory unbounded. The PTY keeps running and the ring
+keeps filling. The daemon reconnects and `attach FromCursor(last)` resyncs from
+exactly where it stopped (or `BUFFER_GAP` if it fell behind by more than the
+ring capacity, which forces a fresh snapshot). This keeps a slow/stuck client
+from ever stalling other sessions.
+
 ## Version negotiation
 
 `hello` carries `[protocol_min, protocol_max]`; asmux replies with a single
@@ -280,18 +323,28 @@ root:
 - No file writes (no logs/PID/state files); state is in-memory, logs go to
   stdout for the daemon to capture.
 
-## Open protocol questions
+## Resolved protocol decisions
 
-1. **FlatBuffers Rust toolchain:** `flatc` + `flatbuffers` crate (canonical,
-   needs the `flatc` binary at build time) vs pure-Rust `planus` (no external
-   toolchain, generates from `.fbs` in `build.rs`). Leaning `planus` for a
-   self-contained build.
-2. **Attach fan-out to multiple connections** of the same session: allowed
-   (broadcast) — confirm that's desired vs single-attacher.
-3. **Input authority:** if two clients attach and both send input, asmux
-   interleaves bytes as received (no locking). Acceptable?
-4. **`kill` on an already-dead session:** idempotent success (proposed) vs
-   `UNKNOWN`/`NOT_ALIVE`.
-5. **Backpressure:** if a client can't drain `SessionOutput` fast enough, do we
-   drop the connection, or drop frames and force a `readBuffer` resync? (acmux
-   relies on cursor resync.)
+1. **Toolchain: `planus`** (pure-Rust FlatBuffers). Codegen from `schema/
+   asmux.fbs` at build time via `build.rs` — no external `flatc` binary. Fall
+   back to `flatc` + the `flatbuffers` crate only if planus can't express
+   something we need; the wire bytes are identical either way, so this choice is
+   not part of the frozen contract.
+2. **Single-attacher with takeover** (not broadcast). See "Attach model" above —
+   a new attach supersedes the current one via `SessionDetached{Superseded}`.
+3. **One client per session**, enforced by (2). Input therefore has a single
+   writer; no interleaving question. (Product layer: continuing a session on a
+   new device forcibly detaches the old one — the takeover event is how.)
+4. **`kill` on a dead session: idempotent success.** No error.
+5. **Backpressure: drop the slow connection**, let it resync via `attach
+   FromCursor(last)` on reconnect. See "Backpressure" above.
+
+## Deferred (not protocol-frozen)
+
+- **"Multiple sessions on the same branch"** is a *workspace/worktree* decision,
+  not an asmux concern — and it collides with Git's rule that a branch can be
+  checked out in only one worktree at once (we already surface that as a clean
+  error). Options to resolve in `durable-sessions.md`/the branch model: (a) many
+  sessions *based on* one branch, each in its own branch/worktree (already
+  supported via `base_ref`); (b) several sessions sharing one worktree (no
+  isolation); (c) shared-branch multi-worktree via `--force`. Tracked separately.
