@@ -1,4 +1,5 @@
 mod api;
+mod auth;
 mod backend;
 mod config;
 mod db;
@@ -34,6 +35,24 @@ async fn main() -> Result<()> {
 
     let db = Db::open(&config.db_path()).context("opening database")?;
 
+    // Server identity + enrollment token (created once, persisted).
+    let (server_id, enrollment_token) = db.get_or_create_identity(
+        &auth::gen_server_id(),
+        &auth::gen_enrollment_token(),
+        now_millis(),
+    )?;
+    let loopback_only = config.bind.ip().is_loopback();
+    tracing::info!(server_id = %server_id, "server identity ready");
+    if loopback_only {
+        tracing::info!("bound to loopback: local clients are trusted; remote access via SSH port-forward needs no token");
+    } else {
+        tracing::warn!(
+            "bound off-loopback ({}). Remote devices must enroll. Enrollment token: {}",
+            config.bind,
+            enrollment_token
+        );
+    }
+
     // A daemon restart means the in-process native PTYs are gone. Never
     // silently relaunch: reconcile any lingering live rows to `failed`.
     let orphaned = db.reconcile_orphans_on_startup(now_millis())?;
@@ -61,9 +80,13 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding {}", config.bind))?;
     tracing::info!("listening on http://{}", config.bind);
 
-    axum::serve(listener, app)
-        .await
-        .context("http server error")?;
+    // Connect-info exposes the peer address so auth can trust loopback.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .context("http server error")?;
     Ok(())
 }
 

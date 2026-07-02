@@ -17,6 +17,7 @@ use crate::session_manager::{CreateSessionRequest, SessionManager};
 use crate::source_control::SourceControl;
 use crate::util::now_millis;
 
+mod auth;
 mod fs;
 mod scm;
 mod ws;
@@ -37,6 +38,10 @@ pub fn router(state: AppState) -> Router {
 
     let mut app = Router::new()
         .route("/health", get(health))
+        .route("/api/auth/status", get(auth::status))
+        .route("/api/auth/enroll", post(auth::enroll))
+        .route("/api/auth/devices", get(auth::list_devices))
+        .route("/api/auth/devices/:id/revoke", post(auth::revoke_device))
         .route("/api/fs/list", get(fs::list))
         .route("/api/plugins", get(list_plugins))
         .route("/api/workspaces", get(list_workspaces).post(add_workspace))
@@ -63,7 +68,13 @@ pub fn router(state: AppState) -> Router {
         }
     }
 
-    app.layer(CorsLayer::permissive()).with_state(state)
+    // Auth runs inside CORS so preflight is handled before token checks.
+    app.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::auth::require_auth,
+    ))
+    .layer(CorsLayer::permissive())
+    .with_state(state)
 }
 
 // ---------- handlers ----------

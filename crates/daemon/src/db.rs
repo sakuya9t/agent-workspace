@@ -8,7 +8,7 @@ use rusqlite::Connection;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::domain::{
-    AttentionState, Session, SessionStatus, SessionSummary, Workspace, WorkspaceInstance,
+    AttentionState, Device, Session, SessionStatus, SessionSummary, Workspace, WorkspaceInstance,
 };
 
 /// Metadata store plus a handle to the high-volume terminal-event writer.
@@ -353,6 +353,97 @@ impl Db {
         Ok(())
     }
 
+    // ---- auth: server identity + devices ----
+
+    /// Load the server identity, creating it (with a fresh enrollment token)
+    /// on first run. Returns (server_id, enrollment_token).
+    pub fn get_or_create_identity(
+        &self,
+        server_id: &str,
+        enrollment_token: &str,
+        now: i64,
+    ) -> Result<(String, String)> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT OR IGNORE INTO server_identity (id, server_id, enrollment_token, created_at)
+             VALUES (1, ?1, ?2, ?3)",
+            rusqlite::params![server_id, enrollment_token, now],
+        )?;
+        let mut stmt =
+            conn.prepare("SELECT server_id, enrollment_token FROM server_identity WHERE id = 1")?;
+        let row = stmt.query_row([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        Ok(row)
+    }
+
+    /// (server_id, enrollment_token). Identity is created at startup.
+    pub fn identity(&self) -> Result<(String, String)> {
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT server_id, enrollment_token FROM server_identity WHERE id = 1")?;
+        let row = stmt.query_row([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        Ok(row)
+    }
+
+    pub fn insert_device(&self, d: &Device) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO devices (id, name, token, created_at, last_seen_at, revoked)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![
+                d.id,
+                d.name,
+                d.token,
+                d.created_at,
+                d.last_seen_at,
+                d.revoked as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Return a non-revoked device by its bearer token, if any.
+    pub fn device_by_token(&self, token: &str) -> Result<Option<Device>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, token, created_at, last_seen_at, revoked
+             FROM devices WHERE token = ?1 AND revoked = 0",
+        )?;
+        let mut rows = stmt.query_map([token], row_to_device)?;
+        rows.next().transpose().map_err(Into::into)
+    }
+
+    pub fn list_devices(&self) -> Result<Vec<Device>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, token, created_at, last_seen_at, revoked
+             FROM devices ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], row_to_device)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    pub fn revoke_device(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE devices SET revoked = 1 WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn touch_device(&self, id: &str, now: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE devices SET last_seen_at = ?2 WHERE id = ?1",
+            rusqlite::params![id, now],
+        )?;
+        Ok(())
+    }
+
     /// On startup, any session left in a live state is reconciled: since the
     /// MVP native backend is in-process, a daemon restart means its PTYs are
     /// gone, so those sessions become `failed` (never silently relaunched).
@@ -391,6 +482,17 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         created_at: row.get(14)?,
         updated_at: row.get(15)?,
         last_activity_at: row.get(16)?,
+    })
+}
+
+fn row_to_device(row: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
+    Ok(Device {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        token: row.get(2)?,
+        created_at: row.get(3)?,
+        last_seen_at: row.get(4)?,
+        revoked: row.get::<_, i64>(5)? != 0,
     })
 }
 
@@ -436,6 +538,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA_V2)?;
         conn.pragma_update(None, "user_version", 2)?;
         tracing::info!("applied schema migration v2");
+    }
+    if version < 3 {
+        conn.execute_batch(SCHEMA_V3)?;
+        conn.pragma_update(None, "user_version", 3)?;
+        tracing::info!("applied schema migration v3");
     }
     Ok(())
 }
@@ -505,6 +612,24 @@ CREATE TABLE workspace_instances (
 
 CREATE INDEX idx_instances_session ON workspace_instances(session_id);
 CREATE INDEX idx_instances_workspace ON workspace_instances(workspace_id);
+"#;
+
+const SCHEMA_V3: &str = r#"
+CREATE TABLE server_identity (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    server_id TEXT NOT NULL,
+    enrollment_token TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE devices (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    token TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0
+);
 "#;
 
 /// Batches terminal events into transactions to keep write amplification low.

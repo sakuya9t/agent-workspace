@@ -104,6 +104,40 @@ pub struct Session {
     pub last_activity_at: i64,
 }
 
+/// An enrolled client device. The `token` is the bearer credential and is
+/// never serialized back to clients (see `DeviceInfo`).
+#[derive(Debug, Clone)]
+pub struct Device {
+    pub id: String,
+    pub name: String,
+    pub token: String,
+    pub created_at: i64,
+    pub last_seen_at: i64,
+    pub revoked: bool,
+}
+
+/// Public device metadata (no token).
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceInfo {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub last_seen_at: i64,
+    pub revoked: bool,
+}
+
+impl From<&Device> for DeviceInfo {
+    fn from(d: &Device) -> Self {
+        DeviceInfo {
+            id: d.id.clone(),
+            name: d.name.clone(),
+            created_at: d.created_at,
+            last_seen_at: d.last_seen_at,
+            revoked: d.revoked,
+        }
+    }
+}
+
 /// A registered source workspace (repo or plain folder). The set of registered
 /// workspaces is the allowlist for workspace-scoped sessions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
