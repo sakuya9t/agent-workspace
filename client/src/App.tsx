@@ -1,55 +1,49 @@
-import { useQuery } from "@tanstack/react-query";
-import { api } from "./api";
 import { useUiStore } from "./store";
-import { useConnStore } from "./connectionStore";
+import { targetOf } from "./connectionStore";
+import { useDaemonStates } from "./useDaemons";
+import { Session } from "./api";
 import { SessionList } from "./components/SessionList";
 import { TerminalView } from "./components/Terminal";
 import { RightPanel } from "./components/RightPanel";
 import { NewSessionDialog } from "./components/NewSessionDialog";
 import { ConnectionDialog } from "./components/ConnectionDialog";
 
+function isLive(s: Session): boolean {
+  return s.status === "running" || s.status === "starting";
+}
+
 export function App() {
-  const activeId = useUiStore((s) => s.activeSessionId);
+  const active = useUiStore((s) => s.activeSession);
   const setShowConnection = useUiStore((s) => s.setShowConnection);
-  const conn = useConnStore();
+  const states = useDaemonStates();
 
-  const { data: health } = useQuery({
-    queryKey: ["health"],
-    queryFn: api.health,
-    refetchInterval: 5000,
-  });
+  const reachable = states.filter((s) => s.data).length;
+  const totalLive = states.reduce(
+    (n, s) => n + (s.data?.sessions.filter(isLive).length ?? 0),
+    0,
+  );
 
-  const { data: sessions } = useQuery({
-    queryKey: ["sessions"],
-    queryFn: api.listSessions,
-    refetchInterval: 1500,
-  });
-
-  const active = sessions?.find((s) => s.id === activeId);
-  const live = active?.status === "running" || active?.status === "starting";
+  const activeState = active ? states.find((s) => s.daemon.id === active.daemonId) : undefined;
+  const activeSession = activeState?.data?.sessions.find(
+    (s) => s.id === active?.sessionId,
+  );
+  const target = activeState ? targetOf(activeState.daemon) : undefined;
+  const live = activeSession ? isLive(activeSession) : false;
 
   return (
     <div className="app">
       <header className="topbar">
         <div className="brand">Agent Session Manager</div>
         <div className="health">
-          {health ? (
-            <>
-              <span className="dot ok" /> {health.hostname} · {health.platform} · v
-              {health.version} · {health.active_sessions} live
-            </>
-          ) : (
-            <>
-              <span className="dot bad" /> daemon unreachable
-            </>
-          )}
+          <span className={"dot " + (reachable > 0 ? "ok" : "bad")} />
+          {states.length} daemon{states.length === 1 ? "" : "s"} · {reachable} reachable ·{" "}
+          {totalLive} live
           <button
             className="btn tiny conn-btn"
             onClick={() => setShowConnection(true)}
-            title="Change which daemon you're connected to"
+            title="Connect / manage daemons"
           >
-            {conn.baseUrl ? `remote: ${hostLabel(conn.label, conn.baseUrl)}` : "local"}
-            {conn.baseUrl && conn.token ? " 🔒" : ""}
+            manage
           </button>
         </div>
       </header>
@@ -59,17 +53,23 @@ export function App() {
 
         <div className="panel center">
           <div className="panel-header">
-            {active ? (
+            {activeSession ? (
               <span className="mono">
-                {active.agent_plugin_id} · {active.status}
+                {activeState?.daemon.label} · {activeSession.agent_plugin_id} ·{" "}
+                {activeSession.status}
               </span>
             ) : (
               <span>Terminal</span>
             )}
           </div>
           <div className="panel-body terminal-body">
-            {active ? (
-              <TerminalView key={active.id} sessionId={active.id} live={!!live} />
+            {activeSession && target ? (
+              <TerminalView
+                key={active!.daemonId + ":" + activeSession.id}
+                target={target}
+                sessionId={activeSession.id}
+                live={live}
+              />
             ) : (
               <div className="empty big">
                 Select or create a session to open its terminal.
@@ -78,20 +78,11 @@ export function App() {
           </div>
         </div>
 
-        <RightPanel session={active} />
+        <RightPanel target={target} session={activeSession} />
       </div>
 
       <NewSessionDialog />
       <ConnectionDialog />
     </div>
   );
-}
-
-function hostLabel(label: string | null, baseUrl: string): string {
-  if (label) return label;
-  try {
-    return new URL(baseUrl).host;
-  } catch {
-    return baseUrl;
-  }
 }

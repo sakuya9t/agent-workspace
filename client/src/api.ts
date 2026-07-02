@@ -138,22 +138,20 @@ export interface CreateSessionBody {
   direct_checkout?: boolean;
 }
 
-import { connection } from "./connectionStore";
+import { Target } from "./connectionStore";
 
-function apiBase(): string {
-  const b = connection().baseUrl;
-  return b ? b.replace(/\/$/, "") : "";
+function baseOf(t: Target): string {
+  return t.baseUrl ? t.baseUrl.replace(/\/$/, "") : "";
 }
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const { token } = connection();
+async function req<T>(t: Target, path: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = {
     "content-type": "application/json",
     ...((init?.headers as Record<string, string>) ?? {}),
   };
-  if (token) headers["Authorization"] = `Bearer ${token}`;
+  if (t.token) headers["Authorization"] = `Bearer ${t.token}`;
 
-  const res = await fetch(apiBase() + path, { ...init, headers });
+  const res = await fetch(baseOf(t) + path, { ...init, headers });
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`;
     try {
@@ -204,85 +202,81 @@ export async function probeHealth(baseUrl: string, token: string | null): Promis
 }
 
 export const api = {
-  health: () => req<Health>("/health"),
-  listPlugins: () => req<{ plugins: PluginInfo[] }>("/api/plugins").then((r) => r.plugins),
-  listSessions: () =>
-    req<{ sessions: Session[] }>("/api/sessions").then((r) => r.sessions),
-  getSession: (id: string) =>
-    req<{ session: Session }>(`/api/sessions/${id}`).then((r) => r.session),
-  getSummary: (id: string) =>
-    req<{ summary: SessionSummary }>(`/api/sessions/${id}/summary`).then((r) => r.summary),
-  createSession: (body: CreateSessionBody) =>
-    req<{ session: Session }>("/api/sessions", {
+  health: (t: Target) => req<Health>(t, "/health"),
+  listPlugins: (t: Target) =>
+    req<{ plugins: PluginInfo[] }>(t, "/api/plugins").then((r) => r.plugins),
+  listSessions: (t: Target) =>
+    req<{ sessions: Session[] }>(t, "/api/sessions").then((r) => r.sessions),
+  getSummary: (t: Target, id: string) =>
+    req<{ summary: SessionSummary }>(t, `/api/sessions/${id}/summary`).then((r) => r.summary),
+  createSession: (t: Target, body: CreateSessionBody) =>
+    req<{ session: Session }>(t, "/api/sessions", {
       method: "POST",
       body: JSON.stringify(body),
     }).then((r) => r.session),
-  stopSession: (id: string) =>
-    req<{ session: Session }>(`/api/sessions/${id}/stop`, { method: "POST" }).then(
+  stopSession: (t: Target, id: string) =>
+    req<{ session: Session }>(t, `/api/sessions/${id}/stop`, { method: "POST" }).then(
       (r) => r.session,
     ),
-  archiveSession: (id: string) =>
-    req<{ session: Session }>(`/api/sessions/${id}/archive`, { method: "POST" }).then(
+  archiveSession: (t: Target, id: string) =>
+    req<{ session: Session }>(t, `/api/sessions/${id}/archive`, { method: "POST" }).then(
       (r) => r.session,
     ),
-  ackAttention: (id: string) =>
-    req<{ session: Session }>(`/api/sessions/${id}/ack`, { method: "POST" }).then(
+  ackAttention: (t: Target, id: string) =>
+    req<{ session: Session }>(t, `/api/sessions/${id}/ack`, { method: "POST" }).then(
       (r) => r.session,
     ),
-  resizeSession: (id: string, rows: number, cols: number) =>
-    req<{ ok: boolean }>(`/api/sessions/${id}/resize`, {
+  resizeSession: (t: Target, id: string, rows: number, cols: number) =>
+    req<{ ok: boolean }>(t, `/api/sessions/${id}/resize`, {
       method: "POST",
       body: JSON.stringify({ rows, cols }),
     }),
-  scmStatus: (id: string) =>
-    req<{ status: ScmStatus }>(`/api/sessions/${id}/scm/status`).then((r) => r.status),
-  scmDiff: (id: string, path: string, untracked: boolean) =>
+  scmStatus: (t: Target, id: string) =>
+    req<{ status: ScmStatus }>(t, `/api/sessions/${id}/scm/status`).then((r) => r.status),
+  scmDiff: (t: Target, id: string, path: string, untracked: boolean) =>
     req<{ path: string; diff: string }>(
+      t,
       `/api/sessions/${id}/scm/diff?path=${encodeURIComponent(path)}&untracked=${untracked}`,
     ).then((r) => r.diff),
-  scmLog: (id: string, limit = 30) =>
-    req<{ commits: Commit[] }>(`/api/sessions/${id}/scm/log?limit=${limit}`).then(
-      (r) => r.commits,
-    ),
-  listWorkspaces: () =>
-    req<{ workspaces: Workspace[] }>("/api/workspaces").then((r) => r.workspaces),
-  addWorkspace: (name: string, root_path: string) =>
-    req<{ workspace: Workspace }>("/api/workspaces", {
+  listWorkspaces: (t: Target) =>
+    req<{ workspaces: Workspace[] }>(t, "/api/workspaces").then((r) => r.workspaces),
+  addWorkspace: (t: Target, name: string, root_path: string) =>
+    req<{ workspace: Workspace }>(t, "/api/workspaces", {
       method: "POST",
       body: JSON.stringify({ name, root_path }),
     }).then((r) => r.workspace),
-  initWorkspaceGit: (id: string) =>
-    req<{ workspace: Workspace }>(`/api/workspaces/${id}/init-git`, {
+  initWorkspaceGit: (t: Target, id: string) =>
+    req<{ workspace: Workspace }>(t, `/api/workspaces/${id}/init-git`, {
       method: "POST",
     }).then((r) => r.workspace),
-  sessionWorkspace: (id: string) =>
-    req<{ instance: WorkspaceInstance | null }>(`/api/sessions/${id}/workspace`).then(
+  sessionWorkspace: (t: Target, id: string) =>
+    req<{ instance: WorkspaceInstance | null }>(t, `/api/sessions/${id}/workspace`).then(
       (r) => r.instance,
     ),
-  cleanupInstance: (id: string, force: boolean) =>
-    req<{ ok: boolean }>(`/api/sessions/${id}/cleanup?force=${force}`, {
+  cleanupInstance: (t: Target, id: string, force: boolean) =>
+    req<{ ok: boolean }>(t, `/api/sessions/${id}/cleanup?force=${force}`, {
       method: "POST",
     }),
-  openVscode: (id: string) =>
-    req<{ opened: boolean; path: string }>(`/api/sessions/${id}/open-vscode`, {
+  openVscode: (t: Target, id: string) =>
+    req<{ opened: boolean; path: string }>(t, `/api/sessions/${id}/open-vscode`, {
       method: "POST",
     }),
-  fsList: (path: string, showHidden: boolean) =>
+  fsList: (t: Target, path: string, showHidden: boolean) =>
     req<FsListing>(
+      t,
       `/api/fs/list?path=${encodeURIComponent(path)}&show_hidden=${showHidden}`,
     ),
-  enrollmentToken: () =>
-    req<{ enrollment_token: string }>("/api/auth/enrollment-token").then(
+  enrollmentToken: (t: Target) =>
+    req<{ enrollment_token: string }>(t, "/api/auth/enrollment-token").then(
       (r) => r.enrollment_token,
     ),
 };
 
-export function streamUrl(id: string): string {
-  const { baseUrl, token } = connection();
+export function streamUrl(t: Target, id: string): string {
   let host: string;
   let secure: boolean;
-  if (baseUrl) {
-    const u = new URL(baseUrl);
+  if (t.baseUrl) {
+    const u = new URL(t.baseUrl);
     host = u.host;
     secure = u.protocol === "https:";
   } else {
@@ -290,6 +284,6 @@ export function streamUrl(id: string): string {
     secure = location.protocol === "https:";
   }
   let url = `${secure ? "wss" : "ws"}://${host}/api/sessions/${id}/stream`;
-  if (token) url += `?access_token=${encodeURIComponent(token)}`;
+  if (t.token) url += `?access_token=${encodeURIComponent(t.token)}`;
   return url;
 }

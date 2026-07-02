@@ -1,54 +1,58 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api";
+import { targetOf, useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
 import { DirectoryPicker } from "./DirectoryPicker";
 
-type Target = { kind: "workspace"; id: string } | { kind: "path" };
+type SessionTarget = { kind: "workspace"; id: string } | { kind: "path" };
 
 export function NewSessionDialog() {
   const qc = useQueryClient();
   const show = useUiStore((s) => s.showNewSession);
   const setShow = useUiStore((s) => s.setShowNewSession);
   const setActive = useUiStore((s) => s.setActive);
+  const presetDaemonId = useUiStore((s) => s.newSessionDaemonId);
   const presetWorkspaceId = useUiStore((s) => s.newSessionWorkspaceId);
+  const daemons = useConnStore((s) => s.daemons);
 
-  const { data: plugins } = useQuery({
-    queryKey: ["plugins"],
-    queryFn: api.listPlugins,
-    enabled: show,
-  });
-  const { data: workspaces } = useQuery({
-    queryKey: ["workspaces"],
-    queryFn: api.listWorkspaces,
-    enabled: show,
-  });
-
+  const [daemonId, setDaemonId] = useState("local");
   const [pluginId, setPluginId] = useState("shell");
-  const [target, setTarget] = useState<Target>({ kind: "path" });
+  const [target, setTarget] = useState<SessionTarget>({ kind: "path" });
   const [cwd, setCwd] = useState("");
   const [command, setCommand] = useState("");
   const [approve, setApprove] = useState(false);
   const [directCheckout, setDirectCheckout] = useState(false);
-
-  // Inline workspace registration.
   const [wsName, setWsName] = useState("");
   const [wsPath, setWsPath] = useState("");
-
-  // Which field the directory picker is currently editing (if any).
   const [picking, setPicking] = useState<null | "cwd" | "wsPath">(null);
 
-  // When opened from a workspace node, preselect that workspace.
+  const daemon = daemons.find((d) => d.id === daemonId) ?? daemons[0];
+  const conn = daemon ? targetOf(daemon) : { baseUrl: "", token: null };
+
+  // Apply presets when the dialog opens.
   useEffect(() => {
-    if (show && presetWorkspaceId) {
-      setTarget({ kind: "workspace", id: presetWorkspaceId });
-    }
-  }, [show, presetWorkspaceId]);
+    if (!show) return;
+    if (presetDaemonId) setDaemonId(presetDaemonId);
+    if (presetWorkspaceId) setTarget({ kind: "workspace", id: presetWorkspaceId });
+  }, [show, presetDaemonId, presetWorkspaceId]);
+
+  const { data: plugins } = useQuery({
+    queryKey: ["plugins", conn.baseUrl],
+    queryFn: () => api.listPlugins(conn),
+    enabled: show,
+  });
+  const { data: workspaces } = useQuery({
+    queryKey: ["workspaces", conn.baseUrl],
+    queryFn: () => api.listWorkspaces(conn),
+    enabled: show,
+  });
 
   const registerWs = useMutation({
-    mutationFn: () => api.addWorkspace(wsName, wsPath),
+    mutationFn: () => api.addWorkspace(conn, wsName, wsPath),
     onSuccess: (w) => {
-      qc.invalidateQueries({ queryKey: ["workspaces"] });
+      qc.invalidateQueries({ queryKey: ["workspaces", conn.baseUrl] });
+      qc.invalidateQueries({ queryKey: ["daemon"] });
       setTarget({ kind: "workspace", id: w.id });
       setWsName("");
       setWsPath("");
@@ -56,13 +60,13 @@ export function NewSessionDialog() {
   });
 
   const initGit = useMutation({
-    mutationFn: (id: string) => api.initWorkspaceGit(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["workspaces"] }),
+    mutationFn: (id: string) => api.initWorkspaceGit(conn, id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["workspaces", conn.baseUrl] }),
   });
 
   const create = useMutation({
     mutationFn: () =>
-      api.createSession({
+      api.createSession(conn, {
         agent_plugin_id: pluginId,
         cwd: target.kind === "path" ? cwd : undefined,
         workspace_id: target.kind === "workspace" ? target.id : undefined,
@@ -71,8 +75,8 @@ export function NewSessionDialog() {
         direct_checkout: directCheckout,
       }),
     onSuccess: (session) => {
-      qc.invalidateQueries({ queryKey: ["sessions"] });
-      setActive(session.id);
+      qc.invalidateQueries({ queryKey: ["daemon"] });
+      setActive({ daemonId, sessionId: session.id });
       setShow(false);
       setCommand("");
     },
@@ -94,6 +98,16 @@ export function NewSessionDialog() {
     <div className="modal-backdrop" onClick={() => setShow(false)}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-title">New session</div>
+
+        <label className="form-label">Daemon</label>
+        <select className="input" value={daemonId} onChange={(e) => setDaemonId(e.target.value)}>
+          {daemons.map((d) => (
+            <option key={d.id} value={d.id}>
+              {d.label}
+              {d.baseUrl ? ` (${d.baseUrl})` : ""}
+            </option>
+          ))}
+        </select>
 
         <label className="form-label">Agent</label>
         <select className="input" value={pluginId} onChange={(e) => setPluginId(e.target.value)}>
@@ -132,7 +146,7 @@ export function NewSessionDialog() {
 
         {target.kind === "path" && (
           <>
-            <label className="form-label">Working directory (on the daemon host)</label>
+            <label className="form-label">Working directory (on {daemon?.label})</label>
             <div className="path-row">
               <input
                 className="input mono"
@@ -164,9 +178,7 @@ export function NewSessionDialog() {
                 </option>
               ))}
             </select>
-            {selectedWs && (
-              <div className="dim small mono">{selectedWs.root_path}</div>
-            )}
+            {selectedWs && <div className="dim small mono">{selectedWs.root_path}</div>}
             {selectedWs && selectedWs.is_git && (
               <label className="checkbox">
                 <input
@@ -191,7 +203,7 @@ export function NewSessionDialog() {
             )}
 
             <div className="register-box">
-              <div className="dim small">Register a new workspace</div>
+              <div className="dim small">Register a new workspace on {daemon?.label}</div>
               <input
                 className="input"
                 placeholder="name"
@@ -201,7 +213,7 @@ export function NewSessionDialog() {
               <div className="path-row">
                 <input
                   className="input mono"
-                  placeholder="/absolute/path/on/server"
+                  placeholder="/absolute/path/on/that/host"
                   value={wsPath}
                   onChange={(e) => setWsPath(e.target.value)}
                 />
@@ -251,6 +263,7 @@ export function NewSessionDialog() {
 
       {picking && (
         <DirectoryPicker
+          target={conn}
           title={picking === "cwd" ? "Select working directory" : "Select workspace root"}
           initialPath={picking === "cwd" ? cwd : wsPath}
           onPick={(p) => {

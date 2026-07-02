@@ -34,6 +34,8 @@ Implemented:
   separate working trees; instance cleanup is guarded against dirty/live state.
 - Remote connectivity: device enrollment + bearer-token auth with loopback
   trust; the client connects to local, direct-LAN, or SSH-tunnelled daemons.
+- Multi-daemon: the client connects to several daemons at once and aggregates
+  all their sessions in one left-panel tree (host → workspace → agent).
 
 Next iterations (see `docs/mvp-execution-plan.md`): out-of-process sidecars,
 Git worktree isolation + change tracking, the Electron shell, and rich output.
@@ -119,10 +121,14 @@ The daemon authenticates by connection origin:
 `/health` and the auth bootstrap endpoints are always public; everything else
 under `/api` is gated.
 
+The client can hold **several daemons at once** — the left panel shows one host
+node per daemon, each with its own workspaces and sessions. Manage them from the
+header's **manage** button (the local daemon is always present).
+
 ### Local
 
-Run the daemon and open the client — same-origin, no setup. The connection
-button in the header shows `local`.
+Run the daemon and open the client — same-origin, no setup. It appears as
+"This machine" in the tree.
 
 ### Remote via SSH local port-forward (recommended for private hosts)
 

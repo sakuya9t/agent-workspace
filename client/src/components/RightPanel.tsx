@@ -1,9 +1,11 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, ChangedFile, Session } from "../api";
+import { Target } from "../connectionStore";
 import { DiffModal } from "./DiffModal";
 
 interface Props {
+  target: Target | undefined;
   session: Session | undefined;
 }
 
@@ -21,46 +23,47 @@ const STATUS_COLOR: Record<string, string> = {
  * Right control-center panel: session metadata, the structural summary once a
  * session ends, and the Git changed-files list with click-to-diff.
  */
-export function RightPanel({ session }: Props) {
+export function RightPanel({ target, session }: Props) {
   const qc = useQueryClient();
   const [diffTarget, setDiffTarget] = useState<ChangedFile | null>(null);
 
   const terminal =
     session &&
     ["exited", "failed", "stopped", "archived"].includes(session.status);
+  const base = target?.baseUrl ?? "";
 
   const { data: instance } = useQuery({
-    queryKey: ["instance", session?.id],
-    queryFn: () => api.sessionWorkspace(session!.id),
-    enabled: !!session,
+    queryKey: ["instance", base, session?.id],
+    queryFn: () => api.sessionWorkspace(target!, session!.id),
+    enabled: !!session && !!target,
     retry: false,
   });
 
   const cleanup = useMutation({
-    mutationFn: (force: boolean) => api.cleanupInstance(session!.id, force),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["instance", session?.id] }),
+    mutationFn: (force: boolean) => api.cleanupInstance(target!, session!.id, force),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["instance", base, session?.id] }),
   });
 
   const openVscode = useMutation({
-    mutationFn: () => api.openVscode(session!.id),
+    mutationFn: () => api.openVscode(target!, session!.id),
   });
 
   const { data: summary } = useQuery({
-    queryKey: ["summary", session?.id],
-    queryFn: () => api.getSummary(session!.id),
-    enabled: !!session && !!terminal,
+    queryKey: ["summary", base, session?.id],
+    queryFn: () => api.getSummary(target!, session!.id),
+    enabled: !!session && !!target && !!terminal,
     retry: false,
   });
 
   const { data: scm } = useQuery({
-    queryKey: ["scm", session?.id],
-    queryFn: () => api.scmStatus(session!.id),
-    enabled: !!session,
+    queryKey: ["scm", base, session?.id],
+    queryFn: () => api.scmStatus(target!, session!.id),
+    enabled: !!session && !!target,
     refetchInterval: 2500,
     retry: false,
   });
 
-  if (!session) {
+  if (!session || !target) {
     return (
       <div className="panel right">
         <div className="panel-header">Details</div>
@@ -189,6 +192,7 @@ export function RightPanel({ session }: Props) {
 
       {diffTarget && (
         <DiffModal
+          target={target}
           sessionId={session.id}
           path={diffTarget.path}
           untracked={diffTarget.untracked}

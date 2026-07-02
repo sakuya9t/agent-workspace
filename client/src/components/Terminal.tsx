@@ -2,8 +2,10 @@ import { useEffect, useRef } from "react";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { streamUrl } from "../api";
+import { Target } from "../connectionStore";
 
 interface Props {
+  target: Target;
   sessionId: string;
   live: boolean;
 }
@@ -16,7 +18,7 @@ interface Props {
  * forward keystrokes and resize; for terminal sessions we render the replayed
  * history read-only. Live sockets auto-reconnect after transient loss.
  */
-export function TerminalView({ sessionId, live }: Props) {
+export function TerminalView({ target, sessionId, live }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -52,7 +54,7 @@ export function TerminalView({ sessionId, live }: Props) {
 
     const connect = () => {
       if (!mounted) return;
-      const socket = new WebSocket(streamUrl(sessionId));
+      const socket = new WebSocket(streamUrl(target, sessionId));
       socket.binaryType = "arraybuffer";
       ws = socket;
 
@@ -102,7 +104,7 @@ export function TerminalView({ sessionId, live }: Props) {
       }
       term.dispose();
     };
-  }, [sessionId, live]);
+  }, [sessionId, live, target.baseUrl, target.token]);
 
   return <div className="terminal-host" ref={containerRef} />;
 }

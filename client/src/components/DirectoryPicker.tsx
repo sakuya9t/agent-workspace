@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../api";
+import { Target } from "../connectionStore";
 
 interface Props {
+  target: Target;
   initialPath?: string;
   title?: string;
   onPick: (path: string) => void;
@@ -14,15 +16,15 @@ interface Props {
  * without typing the full path. The working directory lives on the server,
  * so this uses the daemon's /api/fs/list rather than a native file dialog.
  */
-export function DirectoryPicker({ initialPath, title, onPick, onClose }: Props) {
+export function DirectoryPicker({ target, initialPath, title, onPick, onClose }: Props) {
   // `path` empty means "let the daemon default to home".
   const [path, setPath] = useState(initialPath ?? "");
   const [showHidden, setShowHidden] = useState(false);
   const [manual, setManual] = useState(initialPath ?? "");
 
   const { data, error, isFetching } = useQuery({
-    queryKey: ["fs", path, showHidden],
-    queryFn: () => api.fsList(path, showHidden),
+    queryKey: ["fs", target.baseUrl, path, showHidden],
+    queryFn: () => api.fsList(target, path, showHidden),
     retry: false,
   });
 
