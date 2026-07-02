@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, ChangedFile, Session } from "../api";
+import { api, ChangedFile, Commit, Session } from "../api";
 import { Target } from "../connectionStore";
 import { DiffModal } from "./DiffModal";
 
@@ -60,6 +60,14 @@ export function RightPanel({ target, session }: Props) {
     queryFn: () => api.scmStatus(target!, session!.id),
     enabled: !!session && !!target,
     refetchInterval: 2500,
+    retry: false,
+  });
+
+  const { data: commits } = useQuery({
+    queryKey: ["scmlog", base, session?.id],
+    queryFn: () => api.scmLog(target!, session!.id, 30),
+    enabled: !!session && !!target && !!scm?.is_repo,
+    refetchInterval: 5000,
     retry: false,
   });
 
@@ -188,6 +196,19 @@ export function RightPanel({ target, session }: Props) {
               {f.staged && <span className="staged-dot" title="staged" />}
             </div>
           ))}
+
+        {scm?.is_repo && (
+          <>
+            <div className="section-title">History</div>
+            {commits && commits.length > 0 ? (
+              <CommitGraph commits={commits} head={scm.head} />
+            ) : (
+              <div className="dim small">
+                {commits ? "No commits yet." : "Loading history…"}
+              </div>
+            )}
+          </>
+        )}
       </div>
 
       {diffTarget && (
@@ -201,6 +222,56 @@ export function RightPanel({ target, session }: Props) {
       )}
     </div>
   );
+}
+
+/**
+ * Simplified single-lane commit graph for the MVP (per the architecture doc's
+ * "closest history model"): a vertical rail with one dot per commit, newest at
+ * the top. Merge commits (>1 parent) get a hollow dot; the HEAD commit is
+ * highlighted.
+ */
+function CommitGraph({ commits, head }: { commits: Commit[]; head: string | null }) {
+  return (
+    <div className="commit-graph">
+      {commits.map((c, i) => {
+        const merge = c.parents.length > 1;
+        const isHead = !!head && c.short === head;
+        return (
+          <div className="commit-row" key={c.hash} title={c.hash}>
+            <div
+              className={
+                "commit-rail" +
+                (i === 0 ? " first" : "") +
+                (i === commits.length - 1 ? " last" : "")
+              }
+            >
+              <span className={"commit-dot" + (merge ? " merge" : "") + (isHead ? " head" : "")} />
+            </div>
+            <div className="commit-body">
+              <div className="commit-subject">
+                {c.subject || "(no message)"}
+                {isHead && <span className="head-pill">HEAD</span>}
+              </div>
+              <div className="commit-meta">
+                <span className="mono">{c.short}</span>
+                <span className="dim"> · {c.author} · {relTime(c.timestamp * 1000)}</span>
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function relTime(ms: number): string {
+  const d = Date.now() - ms;
+  if (d < 0) return "just now";
+  if (d < 60000) return `${Math.floor(d / 1000)}s ago`;
+  if (d < 3600000) return `${Math.floor(d / 60000)}m ago`;
+  if (d < 86400000) return `${Math.floor(d / 3600000)}h ago`;
+  if (d < 2592000000) return `${Math.floor(d / 86400000)}d ago`;
+  return `${Math.floor(d / 2592000000)}mo ago`;
 }
 
 function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {

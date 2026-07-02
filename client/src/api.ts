@@ -238,6 +238,10 @@ export const api = {
       t,
       `/api/sessions/${id}/scm/diff?path=${encodeURIComponent(path)}&untracked=${untracked}`,
     ).then((r) => r.diff),
+  scmLog: (t: Target, id: string, limit = 30) =>
+    req<{ commits: Commit[] }>(t, `/api/sessions/${id}/scm/log?limit=${limit}`).then(
+      (r) => r.commits,
+    ),
   listWorkspaces: (t: Target) =>
     req<{ workspaces: Workspace[] }>(t, "/api/workspaces").then((r) => r.workspaces),
   addWorkspace: (t: Target, name: string, root_path: string) =>
