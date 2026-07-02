@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, Session, SessionStatus, AttentionState } from "../api";
 import { useUiStore } from "../store";
@@ -34,7 +35,8 @@ function relTime(ms: number): string {
   if (d < 5000) return "just now";
   if (d < 60000) return `${Math.floor(d / 1000)}s ago`;
   if (d < 3600000) return `${Math.floor(d / 60000)}m ago`;
-  return `${Math.floor(d / 3600000)}h ago`;
+  if (d < 86400000) return `${Math.floor(d / 3600000)}h ago`;
+  return `${Math.floor(d / 86400000)}d ago`;
 }
 
 export function SessionList() {
@@ -42,6 +44,7 @@ export function SessionList() {
   const activeId = useUiStore((s) => s.activeSessionId);
   const setActive = useUiStore((s) => s.setActive);
   const setShowNew = useUiStore((s) => s.setShowNewSession);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   const { data: sessions, error } = useQuery({
     queryKey: ["sessions"],
@@ -67,6 +70,70 @@ export function SessionList() {
     if (s.attention_state !== "none") ack.mutate(s.id);
   };
 
+  // The backend returns sessions newest-first; keep that order in both groups.
+  const active = sessions?.filter((s) => isLive(s.status)) ?? [];
+  const history = sessions?.filter((s) => !isLive(s.status)) ?? [];
+
+  const row = (s: Session) => (
+    <div
+      key={s.id}
+      className={"session-row" + (s.id === activeId ? " active" : "")}
+      onClick={() => select(s)}
+    >
+      <div className="session-main">
+        <span
+          className="status-dot"
+          style={{ background: STATUS_COLOR[s.status] }}
+          title={s.status}
+        />
+        <span className="session-agent">{s.agent_plugin_id}</span>
+        {s.attention_state !== "none" && (
+          <span
+            className="attn-badge"
+            style={{ background: ATTENTION_COLOR[s.attention_state] }}
+          >
+            {ATTENTION_LABEL[s.attention_state]}
+          </span>
+        )}
+      </div>
+      <div className="session-sub">
+        <span className="mono">{basename(s.working_directory)}</span>
+        <span className="dim">{relTime(s.last_activity_at)}</span>
+      </div>
+      <div className="session-actions">
+        {isLive(s.status) ? (
+          <button
+            className="btn tiny"
+            onClick={(e) => {
+              e.stopPropagation();
+              stop.mutate(s.id);
+            }}
+          >
+            stop
+          </button>
+        ) : (
+          <>
+            <span className="ended-status" title={s.status}>
+              {s.status}
+              {s.exit_code !== null ? ` · ${s.exit_code}` : ""}
+            </span>
+            {s.status !== "archived" && (
+              <button
+                className="btn tiny"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  archive.mutate(s.id);
+                }}
+              >
+                archive
+              </button>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+
   return (
     <div className="panel sessions">
       <div className="panel-header">
@@ -75,65 +142,33 @@ export function SessionList() {
           + New
         </button>
       </div>
+
       <div className="panel-body">
         {error && <div className="error">Cannot reach daemon: {String(error)}</div>}
-        {sessions?.length === 0 && (
-          <div className="empty">No sessions yet. Create one to begin.</div>
-        )}
-        {sessions?.map((s) => (
-          <div
-            key={s.id}
-            className={"session-row" + (s.id === activeId ? " active" : "")}
-            onClick={() => select(s)}
-          >
-            <div className="session-main">
-              <span
-                className="status-dot"
-                style={{ background: STATUS_COLOR[s.status] }}
-                title={s.status}
-              />
-              <span className="session-agent">{s.agent_plugin_id}</span>
-              {s.attention_state !== "none" && (
-                <span
-                  className="attn-badge"
-                  style={{ background: ATTENTION_COLOR[s.attention_state] }}
-                >
-                  {ATTENTION_LABEL[s.attention_state]}
-                </span>
-              )}
-            </div>
-            <div className="session-sub">
-              <span className="mono">{basename(s.working_directory)}</span>
-              <span className="dim">{relTime(s.last_activity_at)}</span>
-            </div>
-            <div className="session-actions">
-              {isLive(s.status) ? (
-                <button
-                  className="btn tiny"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    stop.mutate(s.id);
-                  }}
-                >
-                  stop
-                </button>
-              ) : (
-                s.status !== "archived" && (
-                  <button
-                    className="btn tiny"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      archive.mutate(s.id);
-                    }}
-                  >
-                    archive
-                  </button>
-                )
-              )}
-            </div>
+        {!error && active.length === 0 && (
+          <div className="empty">
+            {history.length === 0
+              ? "No sessions yet. Create one to begin."
+              : "No active sessions."}
           </div>
-        ))}
+        )}
+        {active.map(row)}
       </div>
+
+      {history.length > 0 && (
+        <div className={"history-section" + (historyOpen ? " open" : "")}>
+          <div
+            className="history-header"
+            onClick={() => setHistoryOpen((v) => !v)}
+            title={historyOpen ? "Collapse history" : "Show past sessions"}
+          >
+            <span className="chevron">{historyOpen ? "▾" : "▸"}</span>
+            <span>History</span>
+            <span className="history-count">{history.length}</span>
+          </div>
+          {historyOpen && <div className="history-list">{history.map(row)}</div>}
+        </div>
+      )}
     </div>
   );
 }

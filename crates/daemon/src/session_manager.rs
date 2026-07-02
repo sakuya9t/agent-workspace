@@ -414,10 +414,7 @@ impl SessionManager {
     ) {
         // Maintain a small decoded tail for prompt/approval detection.
         tail.push_str(&String::from_utf8_lossy(bytes));
-        if tail.len() > 4096 {
-            let cut = tail.len() - 4096;
-            *tail = tail.split_off(cut);
-        }
+        trim_tail(tail, 4096);
         let bell = bytes.contains(&0x07);
         let (attention, reason) = classify_attention(tail, bell);
 
@@ -552,6 +549,23 @@ fn classify_attention(tail: &str, bell: bool) -> (AttentionState, Option<String>
     (AttentionState::Activity, None)
 }
 
+/// Bound `tail` to at most `max` bytes by dropping the oldest content.
+/// Trims only at a UTF-8 char boundary: a raw byte offset can land in the
+/// middle of a multi-byte character and panic `String::split_off`. Because we
+/// keep the newest bytes, we advance the cut point forward (yielding slightly
+/// fewer than `max` bytes when a boundary straddles the cut), which is always
+/// safe since `tail.len()` is itself a valid boundary.
+fn trim_tail(tail: &mut String, max: usize) {
+    if tail.len() <= max {
+        return;
+    }
+    let mut cut = tail.len() - max;
+    while cut < tail.len() && !tail.is_char_boundary(cut) {
+        cut += 1;
+    }
+    *tail = tail.split_off(cut);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,6 +593,37 @@ mod tests {
         let (a, reason) = classify_attention("building project...", false);
         assert_eq!(a, AttentionState::Activity);
         assert!(reason.is_none());
+    }
+
+    // ---- tail trimming ----
+
+    #[test]
+    fn trim_tail_leaves_short_input_untouched() {
+        let mut tail = "short".to_string();
+        trim_tail(&mut tail, 4096);
+        assert_eq!(tail, "short");
+    }
+
+    #[test]
+    fn trim_tail_does_not_split_multibyte_chars() {
+        // "€" is 3 bytes (0xE2 0x82 0xAC). Build a string whose byte length
+        // makes the naive cut (len - max) land inside a "€", the exact case
+        // that panicked `split_off` with `is_char_boundary` in production.
+        let mut tail = "€".repeat(2000); // 6000 bytes
+        trim_tail(&mut tail, 4096);
+        assert!(tail.len() <= 4096);
+        // Result is still valid UTF-8 made only of whole "€"s.
+        assert!(tail.chars().all(|c| c == '€'));
+        assert_eq!(tail.len() % 3, 0);
+    }
+
+    #[test]
+    fn trim_tail_keeps_the_newest_bytes() {
+        let mut tail = "a".repeat(4096); // ASCII filler
+        tail.push_str("TAILEND");
+        trim_tail(&mut tail, 4096);
+        assert!(tail.len() <= 4096);
+        assert!(tail.ends_with("TAILEND"));
     }
 
     // ---- mock backend proving the SessionBackend boundary ----

@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la ~/.cargo/bin 2>/dev/null; echo \"---\"; ls /usr/local/bin | grep -iE 'cargo|rust' 2>/dev/null; echo \"---\"; which rustup 2>/dev/null; find / -maxdepth 4 -name cargo -type f 2>/dev/null | head; echo \"--- target dir \\(prior build?\\) ---\"; ls -la target/ 2>/dev/null)",
+      "Read(//usr/local/bin/**)",
+      "Bash(node /home/sakuya/dev/agent-workspace/scripts/smoke.mjs 127.0.0.1:4600 __TRACKED_VAR__/testrepo)",
+      "Bash(node /home/sakuya/dev/agent-workspace/scripts/worktree-test.mjs 127.0.0.1:4600 __TRACKED_VAR__/testrepo)",
+      "Bash(pkill -f 'target/debug/asm-daemon')",
+      "Bash(curl -sf http://127.0.0.1:4600/health)",
+      "Bash(echo \"=== exit: $? ===\")",
+      "Bash(node --experimental-strip-types -e \"1\")",
+      "Bash(npx tsc *)",
+      "Bash(echo \"exit: $?\")"
+    ]
+  }
+}
