@@ -23,7 +23,7 @@ custom terminal command
 - Client connections are temporary views into sessions.
 - Session continuity is never simulated through automatic relaunch.
 - Fresh-client resume uses server-side terminal emulator state.
-- Native sessions are owned by per-session sidecars that survive daemon restart.
+- Native sessions are owned by a single out-of-process holder (`asmux`) that survives daemon restart.
 - Remote workspaces can start as Git repositories or plain directories.
 - Plain directories use guided local `git init` for full change tracking.
 - Server daemons run natively on Linux, macOS, and Windows.
@@ -145,8 +145,8 @@ The daemon must:
 - run as a user-scoped background process by default,
 - expose authenticated APIs for clients,
 - coordinate sessions through pluggable session backends,
-- ship a native PTY per-session sidecar backend using Unix PTYs on Linux/macOS and ConPTY on Windows,
-- reattach to live sidecar-owned backend sessions after daemon restart,
+- ship a native PTY backend via a single out-of-process holder (`asmux`) using Unix PTYs on Linux/macOS and ConPTY on Windows,
+- reattach to the live holder-owned backend sessions after daemon restart,
 - persist session metadata,
 - persist terminal output events,
 - persist terminal emulator snapshots for history, inspection, diagnostics, and fallback recovery,
@@ -177,11 +177,11 @@ The native backend must:
 - use Unix PTYs on Linux and macOS,
 - use ConPTY on Windows,
 - run out of process from the daemon,
-- run one sidecar per live session,
+- use a single out-of-process holder (`asmux`) for all live sessions, not one sidecar per session (see docs/durable-sessions.md),
 - own live PTY masters or ConPTY handles and child process handles,
-- maintain a headless terminal emulator per session,
+- keep the headless terminal emulator in the daemon, not the holder,
 - expose backend operations over local IPC,
-- publish per-session IPC sockets in a well-known per-user runtime directory,
+- publish one holder IPC socket in a well-known per-user runtime directory,
 - maintain terminal continuity across client disconnects,
 - drain output generated while the daemon reconnects.
 
@@ -206,17 +206,18 @@ Backend plugin constraints:
 - no workspace allowlist bypass,
 - no workspace isolation bypass.
 
-Sidecar lifetime requirements:
+Holder lifetime requirements (single out-of-process holder, `asmux` — see
+docs/durable-sessions.md):
 
-- daemon restart leaves sidecar-owned sessions running,
-- daemon upgrade leaves sidecar-owned sessions running,
-- existing sidecars keep their original binary until their sessions exit,
-- newly created sessions use the currently installed sidecar binary,
-- daemon startup scans the sidecar runtime directory and reconciles live sidecars with session records,
-- live sidecars without matching session records become orphaned sidecar records,
-- orphaned sidecars are visible to the owner and can be adopted or terminated,
-- sidecar crash marks its owned session failed,
-- sidecar maintenance that terminates a live session is explicit and session-scoped.
+- daemon restart leaves the holder and its sessions running,
+- daemon upgrade leaves the holder and its sessions running,
+- the holder keeps its original binary until a soft-reboot rotates it,
+- newly created sessions use the currently installed holder binary,
+- daemon startup scans the holder runtime directory and reconciles live sessions with session records,
+- live holder sessions without matching session records become orphaned session records,
+- orphaned sessions are visible to the owner and can be adopted or terminated,
+- a holder crash loses all live sessions but preserves history, reconciling them to `indeterminate` (not `failed`); the terminal emulator lives in the daemon, so a parser panic never takes the holder down,
+- holder maintenance that terminates a live session is explicit and session-scoped.
 
 ### Terminal Persistence
 
@@ -226,7 +227,7 @@ The system must:
 - assign monotonic sequence numbers to terminal events,
 - allow resume from `last_seen_event_seq`,
 - store terminal emulator snapshots,
-- restore fresh clients from a fresh live sidecar snapshot plus later events,
+- restore fresh clients from a daemon-side terminal snapshot plus later events,
 - deliver terminal snapshots as synthesized ANSI repaint streams with cursor and mode metadata,
 - retain useful scrollback,
 - handle terminal resize events.
@@ -254,18 +255,22 @@ Backpressure and gap requirements:
 - clients display gap markers in terminal history,
 - soak tests cover long-running high-volume output.
 
-### Same-Owner Multi-Device Attach
+### Single-Device Active Session (Takeover)
 
-The system must:
+A session has at most one attached client at a time. The system must:
 
-- allow the same owner to attach multiple clients to one session,
-- accept shared concurrent input from attached clients,
-- treat the client that most recently attached or sent terminal input as the active client,
-- resize the backend terminal to match the active client,
-- request a backend repaint after active-client resize,
-- surface attached-client count and active terminal size in diagnostics.
+- allow the same owner to attach from any of their devices,
+- when a new device attaches to a session that already has an active client,
+  forcibly detach the previous client (takeover) and grant the new one — so
+  continuing a session on another device closes it on the old device,
+- give the evicted client a clear "taken over on another device" signal and let
+  it re-attach later, resuming from where it left off,
+- resize the backend terminal to match the single active client,
+- request a backend repaint after resize,
+- surface the active device and terminal size in diagnostics.
 
-Explicit input locks are outside MVP.
+Concurrent multi-client input on one session is out of MVP scope (superseded by
+takeover); see docs/asmux-protocol.md → Attach model.
 
 ### Session Summary Records
 
@@ -494,7 +499,7 @@ The daemon must compute MVP attention signals from:
 - backend health events,
 - process exit or failure events.
 
-Agent plugins may contribute prompt and approval patterns that match recent output text. MVP attention detection must not require direct plugin access to sidecar terminal screen state.
+Agent plugins may contribute prompt and approval patterns that match recent output text. MVP attention detection must not require direct plugin access to daemon terminal screen state.
 
 ### Personal Hybrid Pool And Placement
 
@@ -661,7 +666,7 @@ The product does not support:
 - SSH local port-forward connection.
 - Basic server/device auth.
 - Persistent sessions through the session backend interface.
-- Built-in native PTY per-session sidecar backend.
+- Built-in native PTY backend via a single out-of-process holder (`asmux`).
 - Reconnect with emulator snapshot resume and tail replay.
 - Structural session summary records.
 - Workspace registration and allowlist.

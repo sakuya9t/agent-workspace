@@ -46,7 +46,7 @@ Repository collaboration remains outside the session layer:
 | --- | --- | --- |
 | Desktop client | Electron shared web UI | Native mobile, richer editor UI |
 | Terminal renderer | xterm.js | Addons and renderer tuning |
-| Session backend | Native PTY per-session sidecar with headless terminal emulator | tmux backend, future platform backends |
+| Session backend | Single out-of-process holder (`asmux`) owning all PTYs; VT emulator in the daemon | tmux backend, future platform backends |
 | Agent runtime | Built-in Codex, Claude Code, custom command | opencode, myclaw, Hermes, third-party plugins |
 | Source control | Git plugin | SVN, Mercurial, Perforce, custom panels |
 | Workspace isolation | Git worktrees | Clone, reflink, full-copy, provider-specific isolation |
@@ -159,9 +159,9 @@ Candidate implementation choices:
 
 - async runtime: `tokio`,
 - database: SQLite through `rusqlite` behind a batched writer task with WAL mode,
-- built-in native backend: per-session sidecar processes owning Unix PTYs on Linux/macOS and ConPTY handles on Windows,
-- headless terminal emulator: `alacritty_terminal`, `termwiz`, `vt100`, or equivalent behind an internal terminal-state interface inside each native sidecar,
-- PTY library candidate: `portable-pty` or native wrappers inside the sidecar,
+- built-in native backend: a single out-of-process holder (`asmux`) owning all sessions' Unix PTYs on Linux/macOS and ConPTY handles on Windows (see docs/durable-sessions.md),
+- headless terminal emulator: `vt100` (or equivalent) behind an internal terminal-state interface **in the daemon**, not the holder — a bad escape sequence must never destabilise the process holding every PTY,
+- PTY library candidate: `portable-pty` or native wrappers inside the holder,
 - Git operations: `git` CLI for MVP, `gix` evaluation behind the Git provider interface,
 - transport: HTTP for control APIs and WebSocket for terminal output and input streams,
 - serialization: JSON for control APIs, binary frames or protobuf-compatible shapes for high-volume streams.
@@ -252,6 +252,13 @@ hermes
 Agent plugins do not own session lifetime. They provide launch and interpretation behavior to the daemon and selected session backend.
 
 ### Session Backend Plugins
+
+> **Superseded in part by asmux** (see docs/durable-sessions.md and
+> docs/asmux-protocol.md): the native backend is a **single out-of-process holder
+> for all sessions** (`asmux`), not one sidecar per session; the **VT emulator
+> lives in the daemon**, not the holder; and attach is **single-client with
+> takeover**. The per-session-sidecar prose below predates that decision; where it
+> conflicts with the asmux docs, the asmux docs are authoritative.
 
 Session backend plugins own live terminal mechanics under daemon policy. The native backend uses one out-of-process sidecar per live session. Each sidecar holds that session's PTY master or ConPTY handle, child process handle, terminal emulator state, and backend-local output spool.
 
@@ -398,16 +405,18 @@ Reconnect flow:
 7. Client resumes input against the same backend session.
 ```
 
-Same-owner multi-device policy:
+Same-owner single-active-session policy (takeover):
 
 ```text
-input: shared concurrent input
-active client: the client that most recently attached or sent input
-resize: terminal size follows the active client
-repaint: backend repaint is requested after active-client resize
+attach: at most one attached client per session
+takeover: a new device attaching supersedes and forcibly detaches the prior client
+evicted client: receives a taken-over signal; may re-attach later and resume
+resize: terminal size follows the single active client
+repaint: backend repaint is requested after resize
 ```
 
-Explicit input locks are outside MVP.
+Concurrent multi-client input is superseded by takeover; see
+docs/asmux-protocol.md → Attach model.
 
 Daemon restart flow:
 

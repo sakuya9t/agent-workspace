@@ -20,7 +20,7 @@ start agent -> disconnect -> agent keeps working -> reconnect -> resume terminal
 - SSH local port-forward remote connection.
 - Basic server/device authentication.
 - Persistent sessions through a pluggable session backend interface.
-- Built-in native PTY per-session sidecar backend.
+- Built-in native PTY backend via a single out-of-process holder (`asmux`).
 - Local daemon-to-backend IPC.
 - Backend event drain or backend-local output spool.
 - Terminal event replay.
@@ -86,8 +86,8 @@ Dependencies are wrapped behind internal interfaces.
 | Runtime | tokio |
 | Local database | SQLite with WAL and batched writer |
 | SQLite access | `rusqlite` behind daemon-owned storage workers |
-| Native PTY | Out-of-process per-session sidecars owning Unix PTYs and ConPTY handles |
-| Terminal state | Headless VT emulator snapshots in each session sidecar |
+| Native PTY | Single out-of-process holder (`asmux`) owning all Unix PTYs and ConPTY handles |
+| Terminal state | Headless VT emulator snapshots in the daemon (not the holder) |
 | API | HTTP control API + WebSocket terminal input/output stream |
 | Local IPC | Unix domain sockets, Windows AF_UNIX where reliable, Windows named pipes fallback |
 | Git | `git` CLI behind Git plugin interface |
@@ -158,13 +158,20 @@ Acceptance criteria:
 
 Goal: durable sessions survive client disconnect and use a replaceable backend contract.
 
+> **Superseded by asmux** (see docs/durable-sessions.md, milestones M1–M5): the
+> native backend is a **single out-of-process holder (`asmux`)** — one socket, the
+> **VT emulator in the daemon**, and a holder crash that loses all live sessions
+> but preserves history (reconciled `indeterminate`). Per-session-sidecar task
+> wording below predates that decision; where it conflicts, the asmux docs are
+> authoritative.
+
 Deliverables:
 
 - Session create/list/get/stop/archive APIs.
 - Session backend process manifest schema.
 - Session backend registry.
 - Daemon-to-backend IPC.
-- Built-in native PTY per-session sidecar backend.
+- Built-in native PTY backend via a single out-of-process holder (`asmux`).
 - Sidecar process lifetime model.
 - Per-user sidecar runtime directory.
 - Sidecar socket naming by session ID.
@@ -222,7 +229,7 @@ Acceptance criteria:
 - Agent exit writes a structural session summary record.
 - A mock backend can replace the native backend in tests.
 - Mid-session attach to a full-screen TUI renders a coherent current screen.
-- A terminal parser panic or sidecar crash affects only the owned session.
+- A terminal parser panic is caught in the daemon; an asmux crash loses all live sessions but preserves history (docs/durable-sessions.md → Failure domain).
 
 ### 3. Desktop/Web Client Shell
 
@@ -854,8 +861,8 @@ Exit criteria:
 - Crash the installed Windows daemon and confirm user-mode recovery without killing live sidecars.
 - Kill an agent process and confirm no automatic relaunch.
 - Connect through an SSH local port-forward.
-- Attach two clients to one session and verify shared input plus most-recently-active resize policy.
-- Confirm attach and terminal input update the active client for resize policy.
+- Attach a second device to a live session and confirm takeover: the first client is forcibly detached and the second becomes the active client.
+- Confirm the evicted client can re-attach later and resume from where it left off.
 - Start two sessions on the same repo and edit the same file.
 - Confirm separate worktrees and separate diffs.
 - Run workspace setup hooks for a repo with required local files.
