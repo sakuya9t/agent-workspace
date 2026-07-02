@@ -83,7 +83,7 @@ async fn main() -> Result<()> {
     let manager = Arc::new(SessionManager::new(db, registry, backend, worktree_root));
 
     let state = AppState {
-        manager,
+        manager: manager.clone(),
         config: Arc::new(config.clone()),
         scm: Arc::new(source_control::GitSourceControl),
         started_at: now_millis(),
@@ -96,13 +96,54 @@ async fn main() -> Result<()> {
     tracing::info!("listening on http://{}", config.bind);
 
     // Connect-info exposes the peer address so auth can trust loopback.
-    axum::serve(
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await
-    .context("http server error")?;
+    );
+
+    // Race the server against a shutdown signal. We do NOT wait for open
+    // connections to drain — a live terminal WebSocket would block that
+    // indefinitely. Instead, on signal we kill every live child so no PTY (and,
+    // for a future out-of-process/tmux backend, no sidecar) is ever leaked, then
+    // exit; open sockets die with the process.
+    tokio::select! {
+        res = server => res.context("http server error")?,
+        _ = shutdown_signal() => {
+            let killed = manager.shutdown_all_live();
+            tracing::info!("shutdown signal received; stopped {killed} live session(s)");
+        }
+    }
     Ok(())
+}
+
+/// Resolve when the process is asked to terminate (Ctrl-C / SIGINT, or SIGTERM
+/// from a service manager). SIGTERM is Unix-only.
+async fn shutdown_signal() {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        let _ = signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!("could not install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 fn init_tracing() {

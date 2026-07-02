@@ -29,9 +29,14 @@ Implemented:
   (custom commands require explicit approval).
 - No silent relaunch: a daemon restart reconciles lingering sessions to
   `failed` rather than pretending they continued.
+- Clean shutdown: on `SIGINT`/`SIGTERM` the daemon kills every live session's
+  child before exiting, so no PTY process is leaked (the same hook will tear
+  down out-of-process/tmux sidecars once that backend lands).
 - Workspace registration + allowlist, guided `git init` for plain folders,
   and per-session Git worktree isolation so concurrent agents on one repo get
   separate working trees; instance cleanup is guarded against dirty/live state.
+- Per-session branch choice: auto-named worktree branch (default), a new named
+  branch off a chosen base, or checkout of an existing branch.
 - Remote connectivity: device enrollment + bearer-token auth with loopback
   trust; the client connects to local, direct-LAN, or SSH-tunnelled daemons.
 - Multi-daemon: the client connects to several daemons at once and aggregates
@@ -73,6 +78,7 @@ Environment overrides: `ASM_BIND`, `ASM_DATA_DIR`, `ASM_CONFIG_DIR`,
 | GET | `/api/workspaces` | list registered workspaces |
 | POST | `/api/workspaces` | register a workspace (`{name, root_path}`) |
 | POST | `/api/workspaces/:id/init-git` | guided `git init` for a plain folder |
+| GET | `/api/workspaces/:id/branches` | local branches + current HEAD (for the branch picker) |
 | GET | `/api/sessions` | list sessions |
 | POST | `/api/sessions` | create a session |
 | GET | `/api/sessions/:id` | session detail |
@@ -105,9 +111,20 @@ Create-session body:
   "env": {},
   "rows": 24,
   "cols": 80,
-  "approve_custom": false
+  "approve_custom": false,
+  "workspace_id": null,
+  "branch": null,
+  "create_branch": false,
+  "base_ref": null
 }
 ```
+
+For a Git workspace, the isolated worktree's branch is chosen with `branch` +
+`create_branch`: omit `branch` to auto-generate an `asm-session/<id>` branch off
+HEAD (the default); set `branch` with `create_branch: true` to create it off
+`base_ref` (defaults to HEAD); or set `branch` with `create_branch: false` to
+check out an existing branch. `direct_checkout: true` runs in the source
+checkout with no worktree.
 
 ## Connectivity & auth
 

@@ -47,6 +47,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/plugins", get(list_plugins))
         .route("/api/workspaces", get(list_workspaces).post(add_workspace))
         .route("/api/workspaces/:id/init-git", post(init_workspace_git))
+        .route("/api/workspaces/:id/branches", get(list_workspace_branches))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:id", get(get_session))
         .route("/api/sessions/:id/summary", get(get_summary))
@@ -139,6 +140,14 @@ async fn init_workspace_git(
     Ok(Json(json!({ "workspace": w })))
 }
 
+async fn list_workspace_branches(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (branches, head) = state.manager.list_workspace_branches(&id)?;
+    Ok(Json(json!({ "branches": branches, "head": head })))
+}
+
 async fn get_session_workspace(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -189,6 +198,12 @@ struct CreateSessionBody {
     approve_custom: bool,
     #[serde(default)]
     direct_checkout: bool,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    create_branch: bool,
+    #[serde(default)]
+    base_ref: Option<String>,
 }
 
 async fn create_session(
@@ -206,6 +221,9 @@ async fn create_session(
         workspace_id: body.workspace_id,
         approve_custom: body.approve_custom,
         direct_checkout: body.direct_checkout,
+        branch: body.branch,
+        create_branch: body.create_branch,
+        base_ref: body.base_ref,
     };
     let session = state.manager.create_session(req)?;
     Ok(Json(json!({ "session": session })))

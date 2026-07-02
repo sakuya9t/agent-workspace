@@ -22,9 +22,24 @@ pub fn init_repo(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Create a managed worktree at `instance_path` on a fresh app-managed branch.
-/// Falls back to a detached HEAD if the branch already exists.
-pub fn create_worktree(root: &Path, instance_path: &Path, branch: &str) -> Result<()> {
+/// How a managed worktree's branch is chosen.
+pub enum BranchSpec<'a> {
+    /// Create a fresh app-managed branch off HEAD; on name collision fall back
+    /// to a detached HEAD so session creation never blocks.
+    Auto { name: &'a str },
+    /// Create a new branch `name` starting at `base` (a branch, tag, or commit).
+    New { name: &'a str, base: &'a str },
+    /// Check out an existing branch `name` in the new worktree.
+    Existing { name: &'a str },
+}
+
+/// Create a managed worktree at `instance_path` following `spec`. Returns the
+/// branch that ended up checked out, or `None` for a detached-HEAD worktree.
+pub fn create_worktree(
+    root: &Path,
+    instance_path: &Path,
+    spec: BranchSpec<'_>,
+) -> Result<Option<String>> {
     if let Some(parent) = instance_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -32,18 +47,52 @@ pub fn create_worktree(root: &Path, instance_path: &Path, branch: &str) -> Resul
         .to_str()
         .ok_or_else(|| anyhow!("non-UTF8 worktree path"))?;
 
-    let with_branch = run(
-        root,
-        &["worktree", "add", "-b", branch, path_str, "HEAD"],
-    );
-    if with_branch.is_ok() {
-        return Ok(());
+    match spec {
+        BranchSpec::Auto { name } => {
+            if run(root, &["worktree", "add", "-b", name, path_str, "HEAD"]).is_ok() {
+                return Ok(Some(name.to_string()));
+            }
+            // Branch name may collide; fall back to a detached worktree.
+            run(root, &["worktree", "add", "--detach", path_str, "HEAD"])
+                .map_err(|e| anyhow!("worktree add failed: {e}"))?;
+            Ok(None)
+        }
+        BranchSpec::New { name, base } => {
+            run(root, &["worktree", "add", "-b", name, path_str, base])
+                .map_err(|e| anyhow!("could not create branch `{name}`: {e}"))?;
+            Ok(Some(name.to_string()))
+        }
+        BranchSpec::Existing { name } => {
+            // No -b: check out the existing branch. Git refuses if it is already
+            // checked out in another worktree, which surfaces as a clear error.
+            run(root, &["worktree", "add", path_str, name])
+                .map_err(|e| anyhow!("could not check out branch `{name}`: {e}"))?;
+            Ok(Some(name.to_string()))
+        }
     }
+}
 
-    // Branch name may collide; fall back to a detached worktree.
-    run(root, &["worktree", "add", "--detach", path_str, "HEAD"])
-        .map_err(|e| anyhow!("worktree add failed: {e}"))?;
-    Ok(())
+/// List local branch names plus the current HEAD branch (`None` if detached).
+pub fn list_branches(root: &Path) -> Result<(Vec<String>, Option<String>)> {
+    if !is_git_repo(root) {
+        return Ok((vec![], None));
+    }
+    let out = run(root, &["branch", "--format=%(refname:short)"])?;
+    let branches: Vec<String> = out
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let head_raw = run(root, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let head = if head_raw == "HEAD" || head_raw.is_empty() {
+        None
+    } else {
+        Some(head_raw)
+    };
+    Ok((branches, head))
 }
 
 /// True if the worktree has uncommitted changes (tracked or untracked).

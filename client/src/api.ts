@@ -136,6 +136,17 @@ export interface CreateSessionBody {
   workspace_id?: string;
   approve_custom?: boolean;
   direct_checkout?: boolean;
+  /** Branch for the isolated worktree; omit to auto-generate. */
+  branch?: string;
+  /** When `branch` is set: create it (true) or check out an existing one (false). */
+  create_branch?: boolean;
+  /** Start point for a newly created branch; defaults to HEAD. */
+  base_ref?: string;
+}
+
+export interface BranchList {
+  branches: string[];
+  head: string | null;
 }
 
 import { Target } from "./connectionStore";
@@ -253,6 +264,8 @@ export const api = {
     req<{ workspace: Workspace }>(t, `/api/workspaces/${id}/init-git`, {
       method: "POST",
     }).then((r) => r.workspace),
+  workspaceBranches: (t: Target, id: string) =>
+    req<BranchList>(t, `/api/workspaces/${id}/branches`),
   sessionWorkspace: (t: Target, id: string) =>
     req<{ instance: WorkspaceInstance | null }>(t, `/api/sessions/${id}/workspace`).then(
       (r) => r.instance,

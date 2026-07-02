@@ -31,6 +31,15 @@ pub struct CreateSessionRequest {
     pub approve_custom: bool,
     /// Run directly in the source checkout instead of an isolated worktree.
     pub direct_checkout: bool,
+    /// Branch for the isolated worktree. `None` auto-generates an app-managed
+    /// branch (the default). Otherwise it is created or checked out per
+    /// `create_branch`.
+    pub branch: Option<String>,
+    /// When `branch` is set: `true` creates it off `base_ref`, `false` checks
+    /// out an existing branch of that name.
+    pub create_branch: bool,
+    /// Start point for a newly created branch (branch/tag/commit). `None` = HEAD.
+    pub base_ref: Option<String>,
 }
 
 /// Owns session lifecycle: plugin resolution, backend spawn, persistence, and
@@ -191,17 +200,36 @@ impl SessionManager {
                 }
 
                 if ws.is_git && !req.direct_checkout {
-                    // Isolated managed worktree on an app-managed branch.
+                    // Isolated managed worktree. The caller may select an
+                    // existing branch, name a new one, or let us auto-generate.
                     let instance_path = self.worktree_root.join(session_id);
-                    let branch = format!("asm-session/{}", &session_id[..8.min(session_id.len())]);
-                    workspace::create_worktree(&root, &instance_path, &branch)?;
+                    let auto = format!("asm-session/{}", &session_id[..8.min(session_id.len())]);
+                    let requested = req
+                        .branch
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|b| !b.is_empty());
+                    let base = req
+                        .base_ref
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|b| !b.is_empty())
+                        .unwrap_or("HEAD");
+                    let spec = match requested {
+                        Some(name) if req.create_branch => {
+                            workspace::BranchSpec::New { name, base }
+                        }
+                        Some(name) => workspace::BranchSpec::Existing { name },
+                        None => workspace::BranchSpec::Auto { name: &auto },
+                    };
+                    let branch = workspace::create_worktree(&root, &instance_path, spec)?;
                     let path = instance_path.to_string_lossy().into_owned();
                     let inst = WorkspaceInstance {
                         id: Uuid::new_v4().to_string(),
                         workspace_id: ws.id.clone(),
                         session_id: Some(session_id.to_string()),
                         path: path.clone(),
-                        branch: Some(branch),
+                        branch,
                         isolation: "worktree".into(),
                         status: "active".into(),
                         created_at: now,
@@ -263,6 +291,19 @@ impl SessionManager {
 
     pub fn list_workspaces(&self) -> Result<Vec<Workspace>> {
         self.db.list_workspaces()
+    }
+
+    /// Local branches and current HEAD for a workspace, for the new-session
+    /// branch picker. Empty for non-Git workspaces.
+    pub fn list_workspace_branches(&self, id: &str) -> Result<(Vec<String>, Option<String>)> {
+        let w = self
+            .db
+            .get_workspace(id)?
+            .ok_or_else(|| anyhow!("no such workspace"))?;
+        if !w.is_git {
+            return Ok((vec![], None));
+        }
+        workspace::list_branches(Path::new(&w.root_path))
     }
 
     pub fn init_workspace_git(&self, id: &str) -> Result<Workspace> {
@@ -332,6 +373,28 @@ impl SessionManager {
         self.db
             .get_session(id)?
             .ok_or_else(|| anyhow!("session vanished"))
+    }
+
+    /// Tear down every live backend session. Called on daemon shutdown so no
+    /// child process is leaked — the native backend kills its PTY child, and a
+    /// future out-of-process/tmux backend would kill its sidecar the same way
+    /// through `BackendSession::stop`. Returns how many sessions were stopped.
+    pub fn shutdown_all_live(&self) -> usize {
+        // Drain under the lock so nothing else can grab a handle mid-shutdown.
+        let handles: Vec<(String, Arc<dyn BackendSession>)> =
+            self.live.lock().drain().collect();
+        let n = handles.len();
+        for (id, h) in &handles {
+            // Record intent first (like stop_session) so a racing monitor keeps
+            // `stopped` rather than reconciling to `failed`.
+            let _ = self
+                .db
+                .update_status(id, SessionStatus::Stopped, None, now_millis());
+            if let Err(e) = h.stop() {
+                tracing::warn!(session = %id, "failed to stop session on shutdown: {e}");
+            }
+        }
+        n
     }
 
     pub fn archive_session(&self, id: &str) -> Result<Session> {
@@ -708,6 +771,9 @@ mod tests {
             workspace_id: None,
             approve_custom: false,
             direct_checkout: false,
+            branch: None,
+            create_branch: false,
+            base_ref: None,
         }
     }
 
@@ -730,6 +796,30 @@ mod tests {
         let summary = manager.get_summary(&s.id).unwrap();
         assert!(summary.is_some(), "a structural summary must be written");
         assert_eq!(summary.unwrap().session_id, s.id);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_all_live_sessions() {
+        let (manager, dir) = test_manager();
+
+        let a = manager.create_session(shell_req()).unwrap();
+        let b = manager.create_session(shell_req()).unwrap();
+        assert_eq!(manager.live_count(), 2);
+
+        // Simulate daemon shutdown: every live session must be torn down.
+        let stopped = manager.shutdown_all_live();
+        assert_eq!(stopped, 2);
+        assert_eq!(manager.live_count(), 0, "no live handle may leak");
+
+        // Both are recorded terminal (stopped), so a restart won't need to
+        // reconcile them to `failed`.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        for id in [&a.id, &b.id] {
+            let s = manager.get_session(id).unwrap().unwrap();
+            assert_eq!(s.status, SessionStatus::Stopped);
+        }
 
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -23,6 +23,10 @@ export function NewSessionDialog() {
   const [command, setCommand] = useState("");
   const [approve, setApprove] = useState(false);
   const [directCheckout, setDirectCheckout] = useState(false);
+  const [branchMode, setBranchMode] = useState<"auto" | "new" | "existing">("auto");
+  const [branchName, setBranchName] = useState("");
+  const [baseRef, setBaseRef] = useState("");
+  const [existingBranch, setExistingBranch] = useState("");
   const [wsName, setWsName] = useState("");
   const [wsPath, setWsPath] = useState("");
   const [picking, setPicking] = useState<null | "cwd" | "wsPath">(null);
@@ -35,6 +39,10 @@ export function NewSessionDialog() {
     if (!show) return;
     if (presetDaemonId) setDaemonId(presetDaemonId);
     if (presetWorkspaceId) setTarget({ kind: "workspace", id: presetWorkspaceId });
+    setBranchMode("auto");
+    setBranchName("");
+    setBaseRef("");
+    setExistingBranch("");
   }, [show, presetDaemonId, presetWorkspaceId]);
 
   const { data: plugins } = useQuery({
@@ -47,6 +55,20 @@ export function NewSessionDialog() {
     queryFn: () => api.listWorkspaces(conn),
     enabled: show,
   });
+
+  // Selected workspace + whether an isolated worktree (with a branch choice)
+  // applies. Computed here (not after the early return) to keep hook order stable.
+  const activeWs =
+    target.kind === "workspace" ? workspaces?.find((w) => w.id === target.id) : undefined;
+  const isolatedGit = !!activeWs && activeWs.is_git && !directCheckout;
+
+  const { data: branchData } = useQuery({
+    queryKey: ["branches", conn.baseUrl, activeWs?.id],
+    queryFn: () => api.workspaceBranches(conn, activeWs!.id),
+    enabled: show && isolatedGit,
+  });
+  const branches = branchData?.branches ?? [];
+  const defaultBranch = branchData?.head ?? branches[0] ?? "";
 
   const registerWs = useMutation({
     mutationFn: () => api.addWorkspace(conn, wsName, wsPath),
@@ -65,15 +87,25 @@ export function NewSessionDialog() {
   });
 
   const create = useMutation({
-    mutationFn: () =>
-      api.createSession(conn, {
+    mutationFn: () => {
+      const base = baseRef || defaultBranch;
+      const existing = existingBranch || defaultBranch;
+      const branchArgs =
+        isolatedGit && branchMode === "new"
+          ? { branch: branchName.trim(), create_branch: true, base_ref: base || undefined }
+          : isolatedGit && branchMode === "existing"
+            ? { branch: existing, create_branch: false }
+            : {};
+      return api.createSession(conn, {
         agent_plugin_id: pluginId,
         cwd: target.kind === "path" ? cwd : undefined,
         workspace_id: target.kind === "workspace" ? target.id : undefined,
         command: pluginId === "custom_command" ? command : undefined,
         approve_custom: approve,
         direct_checkout: directCheckout,
-      }),
+        ...branchArgs,
+      });
+    },
     onSuccess: (session) => {
       qc.invalidateQueries({ queryKey: ["daemon"] });
       setActive({ daemonId, sessionId: session.id });
@@ -86,12 +118,18 @@ export function NewSessionDialog() {
 
   const selectedPlugin = plugins?.find((p) => p.id === pluginId);
   const isCustom = pluginId === "custom_command";
-  const selectedWs =
-    target.kind === "workspace" ? workspaces?.find((w) => w.id === target.id) : undefined;
+  const selectedWs = activeWs;
+
+  const branchOk =
+    !isolatedGit ||
+    branchMode === "auto" ||
+    (branchMode === "new" && branchName.trim().length > 0) ||
+    (branchMode === "existing" && (existingBranch || defaultBranch).length > 0);
 
   const canSubmit =
     (target.kind === "workspace" ? !!selectedWs : cwd.trim().length > 0) &&
     (!isCustom || (command.trim().length > 0 && approve)) &&
+    branchOk &&
     !create.isPending;
 
   return (
@@ -188,6 +226,83 @@ export function NewSessionDialog() {
                 />
                 Run in source checkout instead of an isolated worktree (override)
               </label>
+            )}
+
+            {isolatedGit && (
+              <>
+                <label className="form-label">Branch</label>
+                <div className="seg">
+                  <button
+                    className={"seg-btn" + (branchMode === "auto" ? " on" : "")}
+                    onClick={() => setBranchMode("auto")}
+                  >
+                    Auto
+                  </button>
+                  <button
+                    className={"seg-btn" + (branchMode === "new" ? " on" : "")}
+                    onClick={() => setBranchMode("new")}
+                  >
+                    New branch
+                  </button>
+                  <button
+                    className={"seg-btn" + (branchMode === "existing" ? " on" : "")}
+                    onClick={() => setBranchMode("existing")}
+                    disabled={branches.length === 0}
+                  >
+                    Existing
+                  </button>
+                </div>
+
+                {branchMode === "auto" && (
+                  <div className="dim small">
+                    A fresh <span className="mono">asm-session/…</span> branch is created off{" "}
+                    <span className="mono">{defaultBranch || "HEAD"}</span>.
+                  </div>
+                )}
+
+                {branchMode === "new" && (
+                  <>
+                    <input
+                      className="input mono"
+                      placeholder="feature/my-branch"
+                      value={branchName}
+                      onChange={(e) => setBranchName(e.target.value)}
+                    />
+                    <label className="form-label">Based on</label>
+                    <select
+                      className="input"
+                      value={baseRef || defaultBranch}
+                      onChange={(e) => setBaseRef(e.target.value)}
+                    >
+                      {branches.map((b) => (
+                        <option key={b} value={b}>
+                          {b}
+                        </option>
+                      ))}
+                    </select>
+                  </>
+                )}
+
+                {branchMode === "existing" && (
+                  <>
+                    <select
+                      className="input"
+                      value={existingBranch || defaultBranch}
+                      onChange={(e) => setExistingBranch(e.target.value)}
+                    >
+                      {branches.map((b) => (
+                        <option key={b} value={b}>
+                          {b}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="dim small">
+                      Checked out in a new worktree. A branch already checked out
+                      elsewhere can't be reused.
+                    </div>
+                  </>
+                )}
+              </>
             )}
             {selectedWs && !selectedWs.is_git && (
               <div className="hint">
