@@ -35,6 +35,14 @@ export interface Session {
   last_activity_at: number;
 }
 
+export interface AgentOption {
+  key: string;
+  label: string;
+  description: string;
+  danger: boolean;
+  default: boolean;
+}
+
 export interface PluginInfo {
   id: string;
   display_name: string;
@@ -42,6 +50,7 @@ export interface PluginInfo {
   available: boolean;
   binary_path: string | null;
   supported_on_this_platform: boolean;
+  options: AgentOption[];
 }
 
 export interface SessionSummary {
@@ -142,6 +151,8 @@ export interface CreateSessionBody {
   create_branch?: boolean;
   /** Start point for a newly created branch; defaults to HEAD. */
   base_ref?: string;
+  /** Selected agent-option toggles (e.g. permission-skipping flags), keyed by option key. */
+  options?: Record<string, boolean>;
 }
 
 export interface BranchList {

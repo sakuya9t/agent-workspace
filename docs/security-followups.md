@@ -79,3 +79,20 @@ items below are additional, tracked here so we don't forget.
   capture-side escape filter, and the parser hasn't been fuzzed.
 - **Guidance:** enforce dangerous-sequence policy at capture/replay too, and
   add the hostile-escape fuzz tests called for in the plan.
+
+## 9. Agent permission-skipping toggles — LOW (by design, user-gated)
+
+- **What:** the new-session dialog exposes per-agent "danger" toggles that
+  inject guardrail-disabling flags (`claude --dangerously-skip-permissions`,
+  `codex --dangerously-bypass-approvals-and-sandbox`). When enabled, the agent
+  edits files and runs commands with no approval prompt and (for codex) no
+  sandbox, inside the session's worktree/cwd on the daemon host.
+- **Current mitigation:** off by default; each toggle is opt-in per session,
+  rendered with a "dangerous" affordance, and the exact flag is persisted in the
+  session's `args` (auditable). Isolation still comes from the per-session Git
+  worktree.
+- **Guidance:** consider a host-level policy to disable these toggles (env/config
+  allowlist), surface an at-a-glance "running unsandboxed" badge on such
+  sessions, and fold their use into the lifecycle audit log (item 7). Re-evaluate
+  once the worktree is the only isolation boundary (a bypassed sandbox can still
+  reach anything the daemon user can).

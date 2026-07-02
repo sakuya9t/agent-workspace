@@ -204,6 +204,8 @@ struct CreateSessionBody {
     create_branch: bool,
     #[serde(default)]
     base_ref: Option<String>,
+    #[serde(default)]
+    options: HashMap<String, bool>,
 }
 
 async fn create_session(
@@ -224,6 +226,7 @@ async fn create_session(
         branch: body.branch,
         create_branch: body.create_branch,
         base_ref: body.base_ref,
+        options: body.options.into_iter().collect(),
     };
     let session = state.manager.create_session(req)?;
     Ok(Json(json!({ "session": session })))

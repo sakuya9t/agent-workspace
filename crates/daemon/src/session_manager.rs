@@ -40,6 +40,8 @@ pub struct CreateSessionRequest {
     pub create_branch: bool,
     /// Start point for a newly created branch (branch/tag/commit). `None` = HEAD.
     pub base_ref: Option<String>,
+    /// Selected agent-option toggles (see `AgentPlugin::options`).
+    pub options: Vec<(String, bool)>,
 }
 
 /// Owns session lifecycle: plugin resolution, backend spawn, persistence, and
@@ -108,6 +110,7 @@ impl SessionManager {
             command: req.command.clone(),
             extra_args: req.args.clone(),
             extra_env: req.env.clone(),
+            options: req.options.clone(),
         };
         let launch = plugin.build_launch(&ctx)?;
 
@@ -774,6 +777,7 @@ mod tests {
             branch: None,
             create_branch: false,
             base_ref: None,
+            options: vec![],
         }
     }
 

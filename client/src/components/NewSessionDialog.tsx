@@ -22,6 +22,7 @@ export function NewSessionDialog() {
   const [cwd, setCwd] = useState("");
   const [command, setCommand] = useState("");
   const [approve, setApprove] = useState(false);
+  const [agentOptions, setAgentOptions] = useState<Record<string, boolean>>({});
   const [directCheckout, setDirectCheckout] = useState(false);
   const [branchMode, setBranchMode] = useState<"auto" | "new" | "existing">("auto");
   const [branchName, setBranchName] = useState("");
@@ -43,6 +44,7 @@ export function NewSessionDialog() {
     setBranchName("");
     setBaseRef("");
     setExistingBranch("");
+    setAgentOptions({});
   }, [show, presetDaemonId, presetWorkspaceId]);
 
   const { data: plugins } = useQuery({
@@ -88,6 +90,11 @@ export function NewSessionDialog() {
 
   const create = useMutation({
     mutationFn: () => {
+      const plugin = plugins?.find((p) => p.id === pluginId);
+      const effectiveOptions: Record<string, boolean> = {};
+      for (const o of plugin?.options ?? []) {
+        effectiveOptions[o.key] = agentOptions[o.key] ?? o.default;
+      }
       const base = baseRef || defaultBranch;
       const existing = existingBranch || defaultBranch;
       const branchArgs =
@@ -103,6 +110,7 @@ export function NewSessionDialog() {
         command: pluginId === "custom_command" ? command : undefined,
         approve_custom: approve,
         direct_checkout: directCheckout,
+        options: effectiveOptions,
         ...branchArgs,
       });
     },
@@ -159,6 +167,24 @@ export function NewSessionDialog() {
         {selectedPlugin?.binary_path && (
           <div className="dim small mono">{selectedPlugin.binary_path}</div>
         )}
+
+        {selectedPlugin?.options?.map((o) => (
+          <label
+            key={o.key}
+            className={"checkbox" + (o.danger ? " danger" : "")}
+            title={o.description}
+          >
+            <input
+              type="checkbox"
+              checked={agentOptions[o.key] ?? o.default}
+              onChange={(e) =>
+                setAgentOptions((prev) => ({ ...prev, [o.key]: e.target.checked }))
+              }
+            />
+            <span>{o.label}</span>
+            {o.danger && <span className="danger-tag">dangerous</span>}
+          </label>
+        ))}
 
         <label className="form-label">Run in</label>
         <div className="seg">

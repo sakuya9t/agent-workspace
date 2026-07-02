@@ -535,6 +535,20 @@ body {
   margin: 6px 0;
   color: var(--dim);
 }
+.checkbox.danger {
+  color: #e0af68;
+}
+.danger-tag {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: #f7768e;
+  border: 1px solid #f7768e;
+  border-radius: 4px;
+  padding: 0 5px;
+}
 
 .vscode-btn {
   width: 100%;

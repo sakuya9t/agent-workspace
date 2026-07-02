@@ -14,6 +14,28 @@ pub struct AgentContext {
     pub command: Option<String>,
     pub extra_args: Vec<String>,
     pub extra_env: Vec<(String, String)>,
+    /// Selected agent-option toggles (see `AgentPlugin::options`), keyed by option key.
+    pub options: Vec<(String, bool)>,
+}
+
+impl AgentContext {
+    /// Whether a named agent option toggle is enabled.
+    pub fn opt(&self, key: &str) -> bool {
+        self.options.iter().any(|(k, v)| k == key && *v)
+    }
+}
+
+/// A user-facing toggle an agent exposes in the new-session UI — e.g. a
+/// permission-skipping flag. Selecting it makes the plugin inject the
+/// corresponding CLI flag at launch.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentOption {
+    pub key: String,
+    pub label: String,
+    pub description: String,
+    /// Render with a danger/warning affordance (disables the agent's guardrails).
+    pub danger: bool,
+    pub default: bool,
 }
 
 /// A resolved launch command produced by an agent plugin.
@@ -34,6 +56,11 @@ pub trait AgentPlugin: Send + Sync {
     /// Resolve the agent binary path if present on this host.
     fn detect_binary(&self) -> Option<String>;
     fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec>;
+    /// Optional per-agent toggles surfaced in the new-session dialog (e.g. a
+    /// permission-skipping flag). Empty by default.
+    fn options(&self) -> Vec<AgentOption> {
+        Vec::new()
+    }
 }
 
 /// Serializable plugin metadata for the client.
@@ -45,6 +72,7 @@ pub struct PluginInfo {
     pub available: bool,
     pub binary_path: Option<String>,
     pub supported_on_this_platform: bool,
+    pub options: Vec<AgentOption>,
 }
 
 /// Static registry of built-in agent plugins.
@@ -81,6 +109,7 @@ impl PluginRegistry {
                     available: supported && binary_path.is_some(),
                     binary_path,
                     supported_on_this_platform: supported,
+                    options: p.options(),
                 }
             })
             .collect()
