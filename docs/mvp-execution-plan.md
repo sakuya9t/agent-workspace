@@ -158,12 +158,11 @@ Acceptance criteria:
 
 Goal: durable sessions survive client disconnect and use a replaceable backend contract.
 
-> **Superseded by asmux** (see docs/durable-sessions.md, milestones M1–M5): the
-> native backend is a **single out-of-process holder (`asmux`)** — one socket, the
-> **VT emulator in the daemon**, and a holder crash that loses all live sessions
-> but preserves history (reconciled `indeterminate`). Per-session-sidecar task
-> wording below predates that decision; where it conflicts, the asmux docs are
-> authoritative.
+> **Backend model: single-holder `asmux`.** The native backend is a **single
+> out-of-process holder (`asmux`)** — one socket, the **VT emulator in the
+> daemon**, and a holder crash that loses all live sessions but preserves history
+> (reconciled `indeterminate`). The detailed backend plan and its milestones
+> (M1–M5) live in docs/durable-sessions.md.
 
 Deliverables:
 
@@ -172,14 +171,14 @@ Deliverables:
 - Session backend registry.
 - Daemon-to-backend IPC.
 - Built-in native PTY backend via a single out-of-process holder (`asmux`).
-- Sidecar process lifetime model.
-- Per-user sidecar runtime directory.
-- Sidecar socket naming by session ID.
-- Daemon startup sidecar scan.
-- Orphaned sidecar detection.
-- Orphaned sidecar adopt and terminate actions.
-- Sidecar-owned PTY and ConPTY handles.
-- Headless VT emulator in the sidecar.
+- Holder process lifetime model.
+- Per-user holder runtime directory.
+- Single holder socket; sessions multiplexed by session_id.
+- Daemon startup holder reconnect and session list.
+- Orphaned session detection.
+- Orphaned session adopt and terminate actions.
+- Holder-owned PTY and ConPTY handles.
+- Headless VT emulator in the daemon.
 - Emulator snapshot export.
 - Backend session handle mapping.
 - Backend health API.
@@ -218,13 +217,13 @@ Acceptance criteria:
 - Start a shell-backed session through the native backend.
 - Attach and see live output.
 - Detach while the process keeps running.
-- Fresh client attach receives a current sidecar emulator snapshot as an ANSI repaint stream.
+- Fresh client attach receives a current daemon emulator snapshot as an ANSI repaint stream.
 - Reconnect receives snapshot plus newer events.
 - Resize propagates to the backend PTY.
 - Stop preserves exit status and terminal output.
 - Client restart does not affect server sessions.
 - Daemon restart reattaches to a live backend session.
-- Daemon startup detects orphaned sidecars.
+- Daemon startup detects orphaned holder sessions.
 - Agent or backend exit records `exited` or `failed` without relaunch.
 - Agent exit writes a structural session summary record.
 - A mock backend can replace the native backend in tests.
@@ -527,7 +526,7 @@ Acceptance criteria:
 - Linux user-scoped background service works.
 - macOS LaunchAgent works.
 - Windows per-user startup works.
-- Windows daemon crash recovery restarts the daemon without killing live sidecars.
+- Windows daemon crash recovery restarts the daemon without killing the live holder.
 - User can find and export logs from the UI.
 
 ## Suggested Sequence
@@ -542,7 +541,7 @@ Critical path tasks:
 
 - Evaluate local IPC: Unix domain sockets, Windows AF_UNIX, Windows named pipes.
 - Evaluate backend process lifetime under user-scoped systemd, launchd, and Windows startup mechanisms.
-- Evaluate sidecar-owned PTY survival across daemon restart.
+- Evaluate holder-owned PTY survival across daemon restart.
 - Evaluate PTY libraries for Unix PTY and Windows ConPTY.
 - Evaluate headless terminal emulator crates with alternate-screen TUIs.
 - Spike fresh-client mid-session attach against Codex or a representative full-screen TUI.
@@ -588,9 +587,9 @@ Tasks:
 - Implement local API.
 - Implement session backend registry.
 - Implement backend IPC client/server.
-- Implement native PTY per-session sidecar backend.
-- Implement sidecar-owned PTY lifetime.
-- Implement per-user sidecar runtime directory and socket naming.
+- Implement the native PTY holder backend (`asmux`).
+- Implement holder-owned PTY lifetime.
+- Implement the holder runtime directory and socket path.
 - Implement headless terminal emulator snapshot export as ANSI repaint stream.
 - Implement session create/list/attach/resize/stop.
 - Implement terminal stream WebSocket.
@@ -619,8 +618,8 @@ Tasks:
 - Add terminal emulator snapshot table.
 - Add sequence-number replay.
 - Add backend event drain.
-- Add daemon startup sidecar scan.
-- Add orphaned sidecar records.
+- Add daemon startup holder reconnect.
+- Add orphaned session records.
 - Add emulator snapshot restore.
 - Add backpressure and gap marker behavior.
 - Add archive and exited session states.
@@ -633,7 +632,7 @@ Exit criteria:
 - Reconnect receives missed output.
 - Daemon restart preserves session history and exited state.
 - Daemon restart does not silently relaunch sessions.
-- Orphaned sidecars are surfaced for adopt or terminate.
+- Orphaned sessions are surfaced for adopt or terminate.
 - Snapshot restore works when replay window is unavailable.
 - Writer stall and disk-full behavior produces explicit health events or gap markers.
 - Session exit writes a structural summary record.
@@ -787,7 +786,7 @@ Exit criteria:
 
 - New activity appears in the session list.
 - Likely blocked sessions are highlighted.
-- Plugin prompt patterns match recent output text without direct sidecar screen access.
+- Plugin prompt patterns match recent output text without direct terminal-screen access.
 - Failed sessions are highlighted.
 - Viewing or acknowledging a session clears attention state.
 
@@ -821,8 +820,8 @@ Exit criteria:
 - Session state transitions.
 - Session backend process manifest parsing.
 - Backend handle/session mapping.
-- Sidecar runtime directory scan.
-- Orphaned sidecar detection.
+- Holder runtime directory scan.
+- Orphaned session detection.
 - Static plugin registry behavior.
 - Workspace lease rules.
 - Git worktree path generation.
@@ -855,10 +854,10 @@ Exit criteria:
 - Reconnect and confirm missed output appears.
 - Attach a fresh client mid-session to a full-screen TUI and confirm coherent screen state.
 - Restart daemon while backend session remains alive.
-- Restart daemon on Windows and confirm sidecar reattach.
-- Delete a session row, restart daemon, and confirm orphaned sidecar detection.
-- Adopt or terminate an orphaned sidecar from the UI.
-- Crash the installed Windows daemon and confirm user-mode recovery without killing live sidecars.
+- Restart daemon on Windows and confirm holder reattach.
+- Delete a session row, restart daemon, and confirm orphaned session detection.
+- Adopt or terminate an orphaned session from the UI.
+- Crash the installed Windows daemon and confirm user-mode recovery without killing the live holder.
 - Kill an agent process and confirm no automatic relaunch.
 - Connect through an SSH local port-forward.
 - Attach a second device to a live session and confirm takeover: the first client is forcibly detached and the second becomes the active client.
@@ -868,7 +867,7 @@ Exit criteria:
 - Run workspace setup hooks for a repo with required local files.
 - Initialize plain folder as Git and show changed-file diff.
 - Trigger an attention signal for a blocked or approval-needed session.
-- Confirm plugin attention patterns match recent output text without sidecar screen access.
+- Confirm plugin attention patterns match recent output text without terminal-screen access.
 - Confirm session exit writes a structural summary record.
 - Render markdown with code, Mermaid, and KaTeX.
 - Verify OSC 52 clipboard writes are disabled.
@@ -915,7 +914,7 @@ Exit criteria:
 - Two concurrent agents on the same repo are isolated.
 - Reconnect restores live session output.
 - Fresh-client attach restores full-screen TUI state.
-- Orphaned sidecar recovery works.
+- Orphaned session recovery works.
 - Structural session summaries are written and rendered.
 - Plain folders can be initialized as Git for diff tracking.
 - Workspace setup hooks work on a real project.
@@ -928,8 +927,8 @@ Exit criteria:
 | Risk | Mitigation |
 | --- | --- |
 | Windows ConPTY behavior is inconsistent | Spike first, wrap backend, keep Windows smoke tests |
-| Sidecar process lifetime differs by OS/service manager | Use per-session sidecars and test restart behavior per OS |
-| Sidecars outlive daemon metadata | Scan the sidecar runtime directory and surface orphaned sidecars |
+| Holder process lifetime differs by OS/service manager | Keep the holder outside the daemon kill path (systemd-run --scope) and test restart per OS |
+| The holder outlives daemon metadata | Reconnect, session.list, and surface orphaned sessions |
 | Local IPC differs across platforms | Wrap IPC transport and test UDS, AF_UNIX, and named pipes |
 | Terminal emulator fidelity is hard | Spike full-screen TUI attach in Phase 0, fuzz parser input, and keep emulator snapshots as the primary resume path |
 | Event storage stalls or disk fills | Apply backpressure, emit health events, and mark output gaps explicitly |
@@ -948,8 +947,8 @@ Exit criteria:
 Keep:
 
 - durable backend-managed sessions,
-- per-session sidecar-owned PTY model,
-- sidecar orphan detection,
+- single-holder (`asmux`) PTY model,
+- session orphan detection,
 - server-side terminal emulator snapshots,
 - structural session summary records,
 - session backend contract,
