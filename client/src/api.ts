@@ -271,6 +271,10 @@ export const api = {
     req<FsListing>(
       `/api/fs/list?path=${encodeURIComponent(path)}&show_hidden=${showHidden}`,
     ),
+  enrollmentToken: () =>
+    req<{ enrollment_token: string }>("/api/auth/enrollment-token").then(
+      (r) => r.enrollment_token,
+    ),
 };
 
 export function streamUrl(id: string): string {

@@ -32,6 +32,8 @@ Implemented:
 - Workspace registration + allowlist, guided `git init` for plain folders,
   and per-session Git worktree isolation so concurrent agents on one repo get
   separate working trees; instance cleanup is guarded against dirty/live state.
+- Remote connectivity: device enrollment + bearer-token auth with loopback
+  trust; the client connects to local, direct-LAN, or SSH-tunnelled daemons.
 
 Next iterations (see `docs/mvp-execution-plan.md`): out-of-process sidecars,
 Git worktree isolation + change tracking, the Electron shell, and rich output.
@@ -59,6 +61,11 @@ Environment overrides: `ASM_BIND`, `ASM_DATA_DIR`, `ASM_CONFIG_DIR`,
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/health` | version, hostname, platform, uptime, backend, active sessions |
+| GET | `/api/auth/status` | server id + auth policy (public) |
+| POST | `/api/auth/enroll` | exchange enrollment token for a device token (public) |
+| GET | `/api/auth/enrollment-token` | reveal enrollment token (loopback only) |
+| GET | `/api/auth/devices` | list enrolled devices |
+| POST | `/api/auth/devices/:id/revoke` | revoke a device |
 | GET | `/api/fs/list?path=&show_hidden=` | browse host directories (for the picker) |
 | GET | `/api/plugins` | list agent plugins + binary detection |
 | GET | `/api/workspaces` | list registered workspaces |
@@ -99,6 +106,53 @@ Create-session body:
   "approve_custom": false
 }
 ```
+
+## Connectivity & auth
+
+The daemon authenticates by connection origin:
+
+- **Loopback is trusted** — local clients (and SSH-forwarded localhost ports)
+  need no token.
+- **Off-loopback requires a device token** — a direct LAN/remote client must
+  enroll first.
+
+`/health` and the auth bootstrap endpoints are always public; everything else
+under `/api` is gated.
+
+### Local
+
+Run the daemon and open the client — same-origin, no setup. The connection
+button in the header shows `local`.
+
+### Remote via SSH local port-forward (recommended for private hosts)
+
+Keep the remote daemon bound to loopback (the default) and tunnel to it:
+
+```bash
+ssh -L 4600:127.0.0.1:4600 user@remote-host
+```
+
+Then in the client's **Connect** dialog, use `http://localhost:4600` with **no
+enrollment token** — the daemon sees the forwarded connection as loopback and
+trusts it, and SSH provides the encryption.
+
+### Remote via direct LAN
+
+Bind the daemon off-loopback and enroll a device:
+
+```bash
+ASM_BIND=0.0.0.0:4600 asm-daemon      # logs the enrollment token on startup
+```
+
+The enrollment token is also visible in the client's **Connect** dialog when
+you're connected locally (loopback-only endpoint). In the dialog on the remote
+device, enter `http://<host>:4600` plus the enrollment token; the client
+receives a device token stored locally for future connections. Revoke devices
+via `POST /api/auth/devices/:id/revoke`.
+
+> Direct off-loopback traffic is not TLS-encrypted in the MVP — prefer the SSH
+> tunnel for untrusted networks. Relay/gateway modes for NAT'd hosts are on the
+> roadmap.
 
 ## Running the client
 

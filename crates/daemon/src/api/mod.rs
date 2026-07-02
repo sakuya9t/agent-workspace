@@ -40,6 +40,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/api/auth/status", get(auth::status))
         .route("/api/auth/enroll", post(auth::enroll))
+        .route("/api/auth/enrollment-token", get(auth::enrollment_token))
         .route("/api/auth/devices", get(auth::list_devices))
         .route("/api/auth/devices/:id/revoke", post(auth::revoke_device))
         .route("/api/fs/list", get(fs::list))

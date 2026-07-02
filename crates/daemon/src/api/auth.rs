@@ -1,4 +1,6 @@
-use axum::extract::{Path, State};
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
@@ -61,6 +63,22 @@ pub async fn enroll(
         "device_token": device.token,
         "device_name": device.name,
     })))
+}
+
+/// Loopback-only: reveal the enrollment token so the owner (at the host, or
+/// over an SSH tunnel) can enroll another device. Never exposed to remote peers.
+pub async fn enrollment_token(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if !peer.ip().is_loopback() {
+        return Err(AppError(
+            StatusCode::FORBIDDEN,
+            "enrollment token is only visible from the daemon host (loopback)".into(),
+        ));
+    }
+    let (_, token) = state.manager.db.identity()?;
+    Ok(Json(json!({ "enrollment_token": token })))
 }
 
 /// Authenticated: list enrolled devices (no tokens).

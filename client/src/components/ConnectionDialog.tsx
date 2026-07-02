@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
-import { enrollDevice, probeHealth } from "../api";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { api, enrollDevice, probeHealth } from "../api";
 import { useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
 
@@ -26,6 +26,14 @@ export function ConnectionDialog() {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [ok, setOk] = useState<string | null>(null);
+
+  // When connected locally, reveal the enrollment token to set up other devices.
+  const { data: localEnrollToken } = useQuery({
+    queryKey: ["enrollment-token"],
+    queryFn: api.enrollmentToken,
+    enabled: show && !profile.baseUrl,
+    retry: false,
+  });
 
   if (!show) return null;
 
@@ -87,6 +95,12 @@ export function ConnectionDialog() {
         <button className="btn" onClick={useLocal}>
           Use local daemon (this machine)
         </button>
+        {localEnrollToken && (
+          <div className="dim small enroll-token">
+            Enrollment token for other devices:{" "}
+            <span className="mono selectable">{localEnrollToken}</span>
+          </div>
+        )}
 
         <div className="conn-divider">— or connect to a remote host —</div>
 
