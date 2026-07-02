@@ -17,6 +17,7 @@ use crate::session_manager::{CreateSessionRequest, SessionManager};
 use crate::source_control::SourceControl;
 use crate::util::now_millis;
 
+mod fs;
 mod scm;
 mod ws;
 
@@ -36,6 +37,7 @@ pub fn router(state: AppState) -> Router {
 
     let mut app = Router::new()
         .route("/health", get(health))
+        .route("/api/fs/list", get(fs::list))
         .route("/api/plugins", get(list_plugins))
         .route("/api/workspaces", get(list_workspaces).post(add_workspace))
         .route("/api/workspaces/:id/init-git", post(init_workspace_git))
@@ -70,12 +72,27 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({
         "status": "ok",
         "version": VERSION,
+        "hostname": hostname(),
         "platform": current_platform(),
         "uptime_ms": now_millis() - state.started_at,
         "database": "ok",
         "backend": state.manager.backend_id(),
         "active_sessions": state.manager.live_count(),
     }))
+}
+
+/// Best-effort host name for the pool/host node in the client.
+fn hostname() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "local".to_string())
 }
 
 async fn list_plugins(State(state): State<AppState>) -> Json<serde_json::Value> {

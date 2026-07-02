@@ -85,11 +85,25 @@ export interface Commit {
 export interface Health {
   status: string;
   version: string;
+  hostname: string;
   platform: string;
   uptime_ms: number;
   database: string;
   backend: string;
   active_sessions: number;
+}
+
+export interface FsEntry {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  is_git: boolean;
+}
+
+export interface FsListing {
+  path: string;
+  parent: string | null;
+  entries: FsEntry[];
 }
 
 export interface Workspace {
@@ -206,6 +220,10 @@ export const api = {
     req<{ opened: boolean; path: string }>(`/api/sessions/${id}/open-vscode`, {
       method: "POST",
     }),
+  fsList: (path: string, showHidden: boolean) =>
+    req<FsListing>(
+      `/api/fs/list?path=${encodeURIComponent(path)}&show_hidden=${showHidden}`,
+    ),
 };
 
 export function streamUrl(id: string): string {

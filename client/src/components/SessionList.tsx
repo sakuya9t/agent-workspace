@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, Session, SessionStatus, AttentionState } from "../api";
+import { api, Session, SessionStatus, AttentionState, Workspace } from "../api";
 import { useUiStore } from "../store";
 
 const STATUS_COLOR: Record<SessionStatus, string> = {
@@ -43,14 +43,29 @@ export function SessionList() {
   const qc = useQueryClient();
   const activeId = useUiStore((s) => s.activeSessionId);
   const setActive = useUiStore((s) => s.setActive);
-  const setShowNew = useUiStore((s) => s.setShowNewSession);
+  const openNewSession = useUiStore((s) => s.openNewSession);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+
+  const toggle = (id: string) =>
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  const isOpen = (id: string) => !collapsed.has(id);
 
   const { data: sessions, error } = useQuery({
     queryKey: ["sessions"],
     queryFn: api.listSessions,
     refetchInterval: 1500,
   });
+  const { data: workspaces } = useQuery({
+    queryKey: ["workspaces"],
+    queryFn: api.listWorkspaces,
+    refetchInterval: 5000,
+  });
+  const { data: health } = useQuery({ queryKey: ["health"], queryFn: api.health });
 
   const stop = useMutation({
     mutationFn: (id: string) => api.stopSession(id),
@@ -70,9 +85,23 @@ export function SessionList() {
     if (s.attention_state !== "none") ack.mutate(s.id);
   };
 
-  // The backend returns sessions newest-first; keep that order in both groups.
-  const active = sessions?.filter((s) => isLive(s.status)) ?? [];
-  const history = sessions?.filter((s) => !isLive(s.status)) ?? [];
+  const all = sessions ?? [];
+  const active = all.filter((s) => isLive(s.status));
+  const history = all.filter((s) => !isLive(s.status));
+
+  // Group active sessions by workspace; unknown/none go to "ad-hoc".
+  const wsIds = new Set((workspaces ?? []).map((w) => w.id));
+  const byWs = new Map<string, Session[]>();
+  const adhoc: Session[] = [];
+  for (const s of active) {
+    if (s.workspace_id && wsIds.has(s.workspace_id)) {
+      const list = byWs.get(s.workspace_id) ?? [];
+      list.push(s);
+      byWs.set(s.workspace_id, list);
+    } else {
+      adhoc.push(s);
+    }
+  }
 
   const row = (s: Session) => (
     <div
@@ -134,25 +163,96 @@ export function SessionList() {
     </div>
   );
 
+  const workspaceNode = (w: Workspace) => {
+    const list = byWs.get(w.id) ?? [];
+    const open = isOpen(w.id);
+    return (
+      <div key={w.id} className="tree-branch">
+        <div className="tree-node lvl1" onClick={() => toggle(w.id)}>
+          <span className="chevron">{open ? "▾" : "▸"}</span>
+          <span className="tree-icon">{w.is_git ? "◆" : "▪"}</span>
+          <span className="tree-label" title={w.root_path}>
+            {w.name}
+          </span>
+          <span className="tree-sub">{w.is_git ? "git" : "plain"}</span>
+          {list.length > 0 && <span className="tree-badge">{list.length}</span>}
+          <button
+            className="tree-add"
+            title="New session in this workspace"
+            onClick={(e) => {
+              e.stopPropagation();
+              openNewSession(w.id);
+            }}
+          >
+            +
+          </button>
+        </div>
+        {open && (
+          <div className="tree-leaves">
+            {list.length ? (
+              list.map(row)
+            ) : (
+              <div className="tree-empty">no active sessions</div>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const hostOpen = isOpen("host");
+
   return (
     <div className="panel sessions">
       <div className="panel-header">
         <span>Sessions</span>
-        <button className="btn primary" onClick={() => setShowNew(true)}>
+        <button className="btn primary" onClick={() => openNewSession(null)}>
           + New
         </button>
       </div>
 
       <div className="panel-body">
         {error && <div className="error">Cannot reach daemon: {String(error)}</div>}
-        {!error && active.length === 0 && (
-          <div className="empty">
-            {history.length === 0
-              ? "No sessions yet. Create one to begin."
-              : "No active sessions."}
+
+        {!error && (
+          <div className="tree">
+            <div className="tree-node lvl0" onClick={() => toggle("host")}>
+              <span className="chevron">{hostOpen ? "▾" : "▸"}</span>
+              <span className="tree-icon">⬢</span>
+              <span className="tree-label">{health?.hostname ?? "host"}</span>
+              <span className="tree-sub">
+                {health ? `${health.platform} · v${health.version}` : "connecting…"}
+              </span>
+              <span className="tree-badge">{active.length}</span>
+            </div>
+
+            {hostOpen && (
+              <div className="tree-children">
+                {(workspaces ?? []).map(workspaceNode)}
+
+                {adhoc.length > 0 && (
+                  <div className="tree-branch">
+                    <div className="tree-node lvl1" onClick={() => toggle("adhoc")}>
+                      <span className="chevron">{isOpen("adhoc") ? "▾" : "▸"}</span>
+                      <span className="tree-icon">▫</span>
+                      <span className="tree-label">Ad-hoc directories</span>
+                      <span className="tree-badge">{adhoc.length}</span>
+                    </div>
+                    {isOpen("adhoc") && (
+                      <div className="tree-leaves">{adhoc.map(row)}</div>
+                    )}
+                  </div>
+                )}
+
+                {(workspaces ?? []).length === 0 && adhoc.length === 0 && (
+                  <div className="tree-empty">
+                    No active sessions. Click <b>+ New</b> to start one.
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         )}
-        {active.map(row)}
       </div>
 
       {history.length > 0 && (

@@ -58,7 +58,8 @@ Environment overrides: `ASM_BIND`, `ASM_DATA_DIR`, `ASM_CONFIG_DIR`,
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| GET | `/health` | version, platform, uptime, backend, active sessions |
+| GET | `/health` | version, hostname, platform, uptime, backend, active sessions |
+| GET | `/api/fs/list?path=&show_hidden=` | browse host directories (for the picker) |
 | GET | `/api/plugins` | list agent plugins + binary detection |
 | GET | `/api/workspaces` | list registered workspaces |
 | POST | `/api/workspaces` | register a workspace (`{name, root_path}`) |

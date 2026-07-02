@@ -10,7 +10,13 @@
       "Bash(echo \"=== exit: $? ===\")",
       "Bash(node --experimental-strip-types -e \"1\")",
       "Bash(npx tsc *)",
-      "Bash(echo \"exit: $?\")"
+      "Bash(echo \"exit: $?\")",
+      "Bash(pkill -9 -f vite)",
+      "Bash(node /tmp/claude-1000/-home-sakuya-dev-agent-workspace/dac34c4f-92a2-42fb-9457-2b0e8c64b38f/scratchpad/t.mjs)",
+      "Bash(node vite.proxy-log.test.mjs)",
+      "Bash(echo \"tsc exit: $?\")",
+      "Bash(npx vite *)",
+      "Bash(node -e \"console.log\\(JSON.stringify\\(require\\('./package.json'\\).scripts,null,2\\)\\)\")"
     ]
   }
 }

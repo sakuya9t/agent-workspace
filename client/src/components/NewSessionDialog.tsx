@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api";
 import { useUiStore } from "../store";
+import { DirectoryPicker } from "./DirectoryPicker";
 
 type Target = { kind: "workspace"; id: string } | { kind: "path" };
 
@@ -10,6 +11,7 @@ export function NewSessionDialog() {
   const show = useUiStore((s) => s.showNewSession);
   const setShow = useUiStore((s) => s.setShowNewSession);
   const setActive = useUiStore((s) => s.setActive);
+  const presetWorkspaceId = useUiStore((s) => s.newSessionWorkspaceId);
 
   const { data: plugins } = useQuery({
     queryKey: ["plugins"],
@@ -32,6 +34,16 @@ export function NewSessionDialog() {
   // Inline workspace registration.
   const [wsName, setWsName] = useState("");
   const [wsPath, setWsPath] = useState("");
+
+  // Which field the directory picker is currently editing (if any).
+  const [picking, setPicking] = useState<null | "cwd" | "wsPath">(null);
+
+  // When opened from a workspace node, preselect that workspace.
+  useEffect(() => {
+    if (show && presetWorkspaceId) {
+      setTarget({ kind: "workspace", id: presetWorkspaceId });
+    }
+  }, [show, presetWorkspaceId]);
 
   const registerWs = useMutation({
     mutationFn: () => api.addWorkspace(wsName, wsPath),
@@ -120,13 +132,18 @@ export function NewSessionDialog() {
 
         {target.kind === "path" && (
           <>
-            <label className="form-label">Working directory (absolute path on server)</label>
-            <input
-              className="input mono"
-              placeholder="/home/you/project"
-              value={cwd}
-              onChange={(e) => setCwd(e.target.value)}
-            />
+            <label className="form-label">Working directory (on the daemon host)</label>
+            <div className="path-row">
+              <input
+                className="input mono"
+                placeholder="/home/you/project"
+                value={cwd}
+                onChange={(e) => setCwd(e.target.value)}
+              />
+              <button className="btn" onClick={() => setPicking("cwd")}>
+                Browse…
+              </button>
+            </div>
           </>
         )}
 
@@ -181,12 +198,17 @@ export function NewSessionDialog() {
                 value={wsName}
                 onChange={(e) => setWsName(e.target.value)}
               />
-              <input
-                className="input mono"
-                placeholder="/absolute/path/on/server"
-                value={wsPath}
-                onChange={(e) => setWsPath(e.target.value)}
-              />
+              <div className="path-row">
+                <input
+                  className="input mono"
+                  placeholder="/absolute/path/on/server"
+                  value={wsPath}
+                  onChange={(e) => setWsPath(e.target.value)}
+                />
+                <button className="btn" onClick={() => setPicking("wsPath")}>
+                  Browse…
+                </button>
+              </div>
               {registerWs.error && <div className="error">{String(registerWs.error)}</div>}
               <button
                 className="btn"
@@ -226,6 +248,19 @@ export function NewSessionDialog() {
           </button>
         </div>
       </div>
+
+      {picking && (
+        <DirectoryPicker
+          title={picking === "cwd" ? "Select working directory" : "Select workspace root"}
+          initialPath={picking === "cwd" ? cwd : wsPath}
+          onPick={(p) => {
+            if (picking === "cwd") setCwd(p);
+            else setWsPath(p);
+            setPicking(null);
+          }}
+          onClose={() => setPicking(null)}
+        />
+      )}
     </div>
   );
 }
