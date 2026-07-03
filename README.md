@@ -86,6 +86,7 @@ scripts/start.sh            # build + start the holder and the daemon (sidecar)
 scripts/status.sh           # what's running + /health
 scripts/restart-daemon.sh   # restart only the daemon — sessions survive (adopt)
 scripts/stop.sh             # stop both (stop.sh daemon|asmux for just one)
+scripts/token.sh            # print this host's device-enrollment token
 ```
 
 Override with env, e.g. `ASM_BIND=0.0.0.0:4600 RELEASE=1 scripts/start.sh`. The
@@ -270,14 +271,22 @@ trusts it, and SSH provides the encryption.
 Bind the daemon off-loopback and enroll a device:
 
 ```bash
-ASM_BIND=0.0.0.0:4600 asm-daemon      # logs the enrollment token on startup
+ASM_BIND=0.0.0.0:4600 scripts/start.sh   # logs the enrollment token on startup
 ```
 
 Retrieve the enrollment token in any of these ways:
 
 ```bash
-asm-daemon token          # print it on the host (or over SSH)
+scripts/token.sh                          # reads the service scripts' data dir
+./target/debug/asm-daemon token           # or the built binary directly
+cargo run -q -p asm-daemon -- token       # or via cargo (no binary on PATH)
 ```
+
+> `asm-daemon` is **not on `PATH`** — it lives at `target/debug/asm-daemon` after
+> a build. `token` reads the enrollment token from the SQLite DB under
+> `ASM_DATA_DIR`, so run it with the **same** `ASM_DATA_DIR` as the daemon (the
+> service scripts do this for you). To get `asm-daemon` on your `PATH`, install
+> it with `cargo install --path crates/daemon`.
 
 It's also logged on startup and shown in the client's **Connect** dialog when
 you're connected locally (a loopback-only endpoint). On the remote device,
