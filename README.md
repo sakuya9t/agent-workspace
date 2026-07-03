@@ -196,7 +196,7 @@ socket path), `ASMUX_MEMORY_LIMIT` (holder ring-memory cap, bytes).
 | POST | `/api/sessions/:id/cleanup?force=` | remove the session's worktree |
 | POST | `/api/sessions/:id/resize` | resize (`{rows, cols}`) |
 | POST | `/api/sessions/:id/ack` | acknowledge/clear attention |
-| POST | `/api/sessions/:id/open-vscode` | open the session's instance in VS Code |
+| GET | `/api/sessions/:id/vscode-target` | path/user/host for the client's `vscode://` deep link |
 | GET (WS) | `/api/sessions/:id/stream` | terminal stream |
 | GET | `/api/sessions/:id/scm/status` | repo status, branch, changed files |
 | GET | `/api/sessions/:id/scm/diff?path=&untracked=` | unified diff for a file |

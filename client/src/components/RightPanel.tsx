@@ -1,13 +1,21 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, ChangedFile, Commit, Session } from "../api";
 import { Target } from "../connectionStore";
+import { buildVscodeLaunch, launchVscode, VscodeLaunch } from "../vscode";
 import { DiffModal } from "./DiffModal";
 
 interface Props {
   target: Target | undefined;
   session: Session | undefined;
 }
+
+type VscodeState =
+  | { phase: "idle" }
+  | { phase: "launching" }
+  | { phase: "opened"; launch: VscodeLaunch }
+  | { phase: "not-installed"; launch: VscodeLaunch }
+  | { phase: "error"; message: string };
 
 const STATUS_COLOR: Record<string, string> = {
   A: "#9ece6a",
@@ -44,9 +52,45 @@ export function RightPanel({ target, session }: Props) {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["instance", base, session?.id] }),
   });
 
-  const openVscode = useMutation({
-    mutationFn: () => api.openVscode(target!, session!.id),
-  });
+  // "Continue in VS Code" launches the editor on the *client's* machine via a
+  // vscode:// deep link (Remote-SSH for remote daemons). If nothing handles
+  // the link, fall back to offering the VS Code download — the Zoom-link UX.
+  const [vscode, setVscode] = useState<VscodeState>({ phase: "idle" });
+  const [copied, setCopied] = useState(false);
+  // Reset on daemon switch too: the same session reached through another
+  // profile launches differently (local vs Remote-SSH).
+  useEffect(() => setVscode({ phase: "idle" }), [session?.id, base]);
+  useEffect(() => setCopied(false), [vscode.phase, session?.id]);
+
+  const copyCli = async (text: string) => {
+    try {
+      // clipboard API needs a secure context; plain-http LAN profiles don't
+      // have one, so fall back to the selection-based path.
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+    }
+    setCopied(true);
+  };
+
+  const continueInVscode = async () => {
+    setVscode({ phase: "launching" });
+    try {
+      const info = await api.vscodeTarget(target!, session!.id);
+      const launch = buildVscodeLaunch(target!, info);
+      const opened = await launchVscode(launch.uri);
+      setVscode({ phase: opened ? "opened" : "not-installed", launch });
+    } catch (e) {
+      setVscode({ phase: "error", message: String(e) });
+    }
+  };
 
   const { data: summary } = useQuery({
     queryKey: ["summary", base, session?.id],
@@ -88,16 +132,53 @@ export function RightPanel({ target, session }: Props) {
       <div className="panel-body details">
         <button
           className="btn vscode-btn"
-          disabled={openVscode.isPending}
-          onClick={() => openVscode.mutate()}
-          title="Open this session's workspace in VS Code"
+          disabled={vscode.phase === "launching"}
+          onClick={continueInVscode}
+          title="Open this session's workspace in VS Code on this machine"
         >
-          {openVscode.isPending ? "Opening…" : "Continue in VS Code"}
+          {vscode.phase === "launching" ? "Opening…" : "Continue in VS Code"}
         </button>
-        {openVscode.data && (
-          <div className="dim small">Opened {openVscode.data.path}</div>
+        {vscode.phase === "opened" && (
+          <div className="dim small">
+            {vscode.launch.kind === "remote-ssh"
+              ? `Opening in VS Code via Remote-SSH (${vscode.launch.sshDest})…`
+              : "Opening in VS Code…"}
+          </div>
         )}
-        {openVscode.error && <div className="error">{String(openVscode.error)}</div>}
+        {vscode.phase === "not-installed" && (
+          <div className="vscode-fallback">
+            <div>VS Code didn't open — it may not be installed on this machine.</div>
+            <a
+              className="btn tiny"
+              href="https://code.visualstudio.com/download"
+              target="_blank"
+              rel="noreferrer"
+            >
+              Download VS Code
+            </a>
+            {vscode.launch.kind === "remote-ssh" && (
+              <div className="dim small">
+                Already installed? Remote windows also need the “Remote - SSH”
+                extension and SSH access to {vscode.launch.sshDest}.
+              </div>
+            )}
+            {vscode.launch.cliCommand && (
+              <>
+                <div className="dim small">Or open it from a terminal on this machine:</div>
+                <div className="cli-row">
+                  <code>{vscode.launch.cliCommand}</code>
+                  <button
+                    className="btn tiny"
+                    onClick={() => copyCli(vscode.launch.cliCommand!)}
+                  >
+                    {copied ? "Copied" : "Copy"}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+        {vscode.phase === "error" && <div className="error">{vscode.message}</div>}
 
         {session.risky && (
           <div className="risk-banner" title="This session was started with agent guardrails disabled">
