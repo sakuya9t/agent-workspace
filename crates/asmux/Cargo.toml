@@ -1,0 +1,27 @@
+[package]
+name = "asmux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Out-of-process PTY-holding session sidecar for the Agent Session Manager"
+
+[[bin]]
+name = "asmux"
+path = "src/main.rs"
+
+[lib]
+name = "asmux"
+path = "src/lib.rs"
+
+[dependencies]
+asmux-wire = { path = "../asmux-wire" }
+tokio.workspace = true
+planus.workspace = true
+portable-pty.workspace = true
+nix.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+anyhow.workspace = true

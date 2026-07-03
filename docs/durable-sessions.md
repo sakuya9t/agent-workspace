@@ -1,7 +1,9 @@
 # Durable Sessions via an Out-of-Process Session Holder ("asmux")
 
-Status: **design, refining before code.** No implementation yet. Adapts the
-"acmux" design (from the agent-conductor project) to this codebase.
+Status: **M1 landed; M2–M5 pending.** The standalone holder (`crates/asmux` +
+the `crates/asmux-wire` FlatBuffers types) is implemented and tested against the
+frozen contract; wiring it into the daemon (M2 `SidecarBackend`) is next. Adapts
+the "acmux" design (from the agent-conductor project) to this codebase.
 
 Locked decisions: sidecar crate/binary named **`asmux`**; wire encoding is
 **FlatBuffers** (schema frozen once shipped); **one holder for all sessions**
@@ -251,11 +253,24 @@ sessions instead of dropping them — see [`deployment.md`](deployment.md).
 
 ## Incremental milestones
 
-- **M1 — asmux core (standalone).** New crate `crates/asmux`. UDS server;
-  `Session` = portable_pty master + cursor ring buffer + child pid; reader
-  thread + reaper; total-memory cap; RPCs `hello/create/list/attach/input/
-  output/resize/kill/exited/heartbeat`; bounded input queue; per-session
-  backpressure. Verifiable with a tiny throwaway client; no daemon changes.
+- **M1 — asmux core (standalone). _Done._** New crates `crates/asmux` (holder)
+  and `crates/asmux-wire` (planus-generated FlatBuffers types, split out so the
+  holder keeps `#![forbid(unsafe_code)]`). UDS server at `<runtime_dir>/asmux.sock`
+  (`0600`, dir `0700`); `Session` = portable_pty master + cursor ring buffer +
+  child pid; a reader thread feeding the ring and a **separate writer thread** so
+  a stalled child can't block the connection; reaper; total-memory cap with
+  tombstone-LRU eviction; the full frozen RPC/event/data surface
+  (`hello/create/list/attach/detach/input/output/resize/kill/purge/
+  updateMetadata/readBuffer/heartbeat` + `SessionExited`/`SessionDetached`/
+  `Error`); single-attacher-with-takeover; bounded input queue (`INPUT_OVERFLOW`);
+  per-session backpressure eviction; dedicated-thread heartbeats. The never-crash
+  lints are enforced (clippy clean). Verified end-to-end by an in-process
+  integration test driving a real `cat` PTY through the whole lifecycle
+  (`crates/asmux/tests/e2e.rs`); no daemon changes.
+  _Deferred to later milestones:_ the 10 s idle watchdog and `binary_sha256`
+  population land in M4; round-robin writer fairness across sessions (M1 gives
+  per-session eviction + a shared bounded data channel) is a hardening follow-up;
+  the best-effort crash-salvage ring flush is optional and not yet built.
 - **M2 — SidecarBackend in asm-daemon.** Implement `SessionBackend` over the
   asmux client; `vt100` rebuilt from ring-buffer replay. Behind
   `ASM_BACKEND=sidecar` (default stays `native`). Auto-spawn asmux if the socket

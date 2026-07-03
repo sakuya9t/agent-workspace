@@ -1,0 +1,11 @@
+[package]
+name = "asmux-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "FlatBuffers wire types for the asmux protocol (shared by holder + daemon client)"
+
+[dependencies]
+planus.workspace = true
+serde.workspace = true

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/daemon"]
+members = ["crates/daemon", "crates/asmux", "crates/asmux-wire"]
 
 [workspace.package]
 version = "0.1.0"
@@ -27,3 +27,5 @@ futures = "0.3"
 directories = "5"
 parking_lot = "0.12"
 async-trait = "0.1"
+planus = "1.3"
+nix = { version = "0.31", features = ["signal", "process"] }

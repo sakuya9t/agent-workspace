@@ -1,0 +1,161 @@
+// asmux wire protocol — FROZEN once shipped.
+//
+// Append-only discipline: never remove/renumber a field id, never reuse an
+// ordinal, never change a field's type, never repurpose an enum/error value.
+// New capability is added only as new trailing ids or new ordinals/enum values.
+//
+// The canonical prose contract is docs/asmux-protocol.md. This schema is the
+// machine-checked mirror of it. The message ordinal (see that doc's ordinal
+// catalog) is carried in the 3-byte frame header, NOT in the FlatBuffers body,
+// so there is no union here — the ordinal fixes each frame's root_type.
+namespace asmux.wire;
+
+// FromEarliest replays tail..head then goes live — a one-round-trip
+// "give me whatever you still have" that never returns BUFFER_GAP.
+enum AttachMode : byte { FromCursor = 0, LiveOnly = 1, FromEarliest = 2 }
+
+// Why asmux ended a connection's attachment without a DetachRequest.
+enum DetachReason : byte {
+  Superseded = 0,     // another attach took over this session (takeover)
+  Killed = 1,         // the session was killed
+  Backpressure = 2,   // this session's stream fell behind; resync via attach FromCursor
+  ServerShutdown = 3,
+  Purged = 4,         // the tombstone was purged during an in-flight replay
+}
+
+table KV { key: string (id: 0); value: string (id: 1); }
+
+table SessionRecord {
+  id: string (id: 0);                 // uuid v4
+  alive: bool (id: 1);
+  pid: int32 (id: 2);
+  exit_code: int32 (id: 3);           // meaningful only when alive==false AND exit_signal==0
+  exit_signal: int32 (id: 4);         // 0 if exited normally; when != 0, exit_code is -1 (signalled)
+  cols: uint16 (id: 5);
+  rows: uint16 (id: 6);
+  head_cursor: uint64 (id: 7);        // total bytes ever produced
+  tail_cursor: uint64 (id: 8);        // earliest replayable cursor
+  ring_capacity: uint64 (id: 9);
+  created_at_unix_ms: int64 (id: 10);
+  command: string (id: 11);
+  metadata: [KV] (id: 12);
+}
+
+table Error {                         // 200
+  rpc_id: uint64 (id: 0);             // 0 => unsolicited (event-like error), else echoes a request
+  code: uint32 (id: 1);               // see Error codes
+  message: string (id: 2);            // human text, non-authoritative
+  session_id: string (id: 3);         // when applicable
+  earliest_cursor: uint64 (id: 4);    // set for BUFFER_GAP
+}
+
+table HelloRequest {                  // 0
+  rpc_id: uint64 (id: 0);
+  client_pid: int32 (id: 1);
+  client_name: string (id: 2);
+  protocol_min: uint16 (id: 3);
+  protocol_max: uint16 (id: 4);
+}
+table HelloResponse {                 // 1
+  rpc_id: uint64 (id: 0);
+  server_pid: int32 (id: 1);          // the asmux process pid (the daemon is the *client*)
+  binary_sha256: string (id: 2);      // BINARY DRIFT ONLY (soft-reboot); NOT instance identity
+  protocol: uint16 (id: 3);           // negotiated version
+  session_count: uint32 (id: 4);
+  started_at_unix_ms: int64 (id: 5);
+  instance_id: string (id: 6);        // random uuid minted at asmux startup; proves same instance
+}
+
+table CreateRequest {                 // 2
+  rpc_id: uint64 (id: 0);
+  command: string (id: 1);
+  args: [string] (id: 2);
+  cwd: string (id: 3);
+  env: [KV] (id: 4);
+  cols: uint16 (id: 5);
+  rows: uint16 (id: 6);
+  metadata: [KV] (id: 7);
+  ring_capacity: uint64 (id: 8);      // 0 => server default (2 MiB)
+  session_id: string (id: 9);         // optional caller-supplied uuid; else server mints
+}
+table CreateResponse { rpc_id: uint64 (id: 0); session: SessionRecord (id: 1); }
+
+table KillRequest {                   // 4
+  rpc_id: uint64 (id: 0);
+  session_id: string (id: 1);
+  signal: int32 (id: 2);              // 0 => platform default terminate
+}
+table KillResponse { rpc_id: uint64 (id: 0); }
+
+table PurgeRequest { rpc_id: uint64 (id: 0); session_id: string (id: 1); }
+table PurgeResponse { rpc_id: uint64 (id: 0); }
+
+table ListRequest { rpc_id: uint64 (id: 0); }
+table ListResponse { rpc_id: uint64 (id: 0); sessions: [SessionRecord] (id: 1); }
+
+table UpdateMetadataRequest {         // 10
+  rpc_id: uint64 (id: 0);
+  session_id: string (id: 1);
+  patch: [KV] (id: 2);                // value present (incl. "") => set; value null/absent => delete
+}
+table UpdateMetadataResponse { rpc_id: uint64 (id: 0); session: SessionRecord (id: 1); }
+
+table ResizeRequest {                 // 12
+  rpc_id: uint64 (id: 0);
+  session_id: string (id: 1);
+  cols: uint16 (id: 2);
+  rows: uint16 (id: 3);
+}
+table ResizeResponse { rpc_id: uint64 (id: 0); }
+
+table ReadBufferRequest {             // 14
+  rpc_id: uint64 (id: 0);
+  session_id: string (id: 1);
+  from_cursor: uint64 (id: 2);
+  max_bytes: uint64 (id: 3);          // 0 => server chooses; server always caps below the frame limit
+}
+table ReadBufferResponse {            // 15
+  rpc_id: uint64 (id: 0);
+  from_cursor: uint64 (id: 1);        // cursor of the first byte in `data`
+  head_cursor: uint64 (id: 2);        // current head; keep reading until your cursor reaches this
+  data: [ubyte] (id: 3);              // covers from_cursor .. from_cursor+len(data); MAY be a partial read
+}
+
+table AttachRequest {                 // 16
+  rpc_id: uint64 (id: 0);
+  session_id: string (id: 1);
+  mode: AttachMode (id: 2);
+  from_cursor: uint64 (id: 3);        // used when mode == FromCursor
+}
+table AttachResponse {                // 17
+  rpc_id: uint64 (id: 0);
+  head_cursor: uint64 (id: 1);        // live stream continues from here
+}
+
+table DetachRequest { rpc_id: uint64 (id: 0); session_id: string (id: 1); }
+table DetachResponse { rpc_id: uint64 (id: 0); }
+
+table SessionExited {                 // 100 (event)
+  session_id: string (id: 0);
+  exit_code: int32 (id: 1);           // valid when exit_signal == 0
+  exit_signal: int32 (id: 2);         // 0 if normal; else the child was signalled
+  head_cursor: uint64 (id: 3);        // final cursor
+}
+
+table SessionDetached {               // 101 (event, server -> evicted client)
+  session_id: string (id: 0);
+  reason: DetachReason (id: 1);
+  last_cursor: uint64 (id: 2);        // resume point for a later attach FromCursor
+}
+
+table SessionInput {                  // 300 (data, client -> asmux)
+  session_id: string (id: 0);
+  data: [ubyte] (id: 1);
+}
+table SessionOutput {                 // 301 (data, asmux -> client)
+  session_id: string (id: 0);
+  head_cursor: uint64 (id: 1);        // cursor AFTER this chunk
+  data: [ubyte] (id: 2);
+}
+
+table Heartbeat { unix_ms: int64 (id: 0); }  // 400
