@@ -78,6 +78,20 @@ cargo run -p asm-daemon
 
 ### Durable sessions (daemon + asmux)
 
+**Easiest — convenience scripts** (they build, run both processes in the
+background under `$ASM_DATA_DIR/logs`, and manage the lifecycle):
+
+```bash
+scripts/start.sh            # build + start the holder and the daemon (sidecar)
+scripts/status.sh           # what's running + /health
+scripts/restart-daemon.sh   # restart only the daemon — sessions survive (adopt)
+scripts/stop.sh             # stop both (stop.sh daemon|asmux for just one)
+```
+
+Override with env, e.g. `ASM_BIND=0.0.0.0:4600 RELEASE=1 scripts/start.sh`. The
+rest of this section is the manual equivalent, for when you want the processes in
+the foreground or wired into your own supervisor.
+
 Build both binaries first — `cargo run -p asm-daemon` only builds the asmux
 *library*, not the `asmux` holder binary:
 
