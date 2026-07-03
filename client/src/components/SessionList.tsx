@@ -105,18 +105,37 @@ export function SessionList() {
     if (s.attention_state !== "none") ack.mutate({ target, id: s.id });
   };
 
-  // History aggregates ended sessions across all daemons.
-  const history: { daemon: DaemonState["daemon"]; target: Target; s: Session }[] = [];
+  // History aggregates ended sessions across all daemons. Workspace names are
+  // resolved per daemon; a session whose workspace was since removed (or an
+  // ad-hoc session) falls back to its working directory in the row.
+  const history: {
+    daemon: DaemonState["daemon"];
+    target: Target;
+    s: Session;
+    workspaceName?: string;
+  }[] = [];
   for (const st of states) {
     if (!st.data) continue;
     const target = targetOf(st.daemon);
+    const wsNames = new Map(st.data.workspaces.map((w) => [w.id, w.name]));
     for (const s of st.data.sessions) {
-      if (!isLive(s.status)) history.push({ daemon: st.daemon, target, s });
+      if (!isLive(s.status))
+        history.push({
+          daemon: st.daemon,
+          target,
+          s,
+          workspaceName: s.workspace_id ? wsNames.get(s.workspace_id) : undefined,
+        });
     }
   }
   history.sort((a, b) => b.s.last_activity_at - a.s.last_activity_at);
 
-  const row = (daemonId: string, target: Target, s: Session, daemonLabel?: string) => {
+  const row = (
+    daemonId: string,
+    target: Target,
+    s: Session,
+    ctx?: { daemonLabel?: string; workspaceName?: string },
+  ) => {
     const selected = active?.daemonId === daemonId && active?.sessionId === s.id;
     return (
       <div
@@ -139,7 +158,7 @@ export function SessionList() {
               ⚠ unsafe
             </span>
           )}
-          {daemonLabel && <span className="daemon-tag">{daemonLabel}</span>}
+          {ctx?.daemonLabel && <span className="daemon-tag">{ctx.daemonLabel}</span>}
           {s.attached && !selected && isLive(s.status) && (
             <span
               className="attn-badge"
@@ -159,7 +178,9 @@ export function SessionList() {
           )}
         </div>
         <div className="session-sub">
-          <span className="mono">{basename(s.working_directory)}</span>
+          <span className="mono" title={s.working_directory}>
+            {ctx?.workspaceName ?? basename(s.working_directory)}
+          </span>
           <span className="dim">{relTime(s.last_activity_at)}</span>
         </div>
         <div className="session-actions">
@@ -410,8 +431,8 @@ export function SessionList() {
           </div>
           {historyOpen && (
             <div className="history-list">
-              {history.map(({ daemon, target, s }) =>
-                row(daemon.id, target, s, states.length > 1 ? daemon.label : undefined),
+              {history.map(({ daemon, target, s, workspaceName }) =>
+                row(daemon.id, target, s, { daemonLabel: daemon.label, workspaceName }),
               )}
             </div>
           )}
