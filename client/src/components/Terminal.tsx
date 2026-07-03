@@ -63,6 +63,12 @@ export function TerminalView({ target, sessionId, live }: Props) {
       ws = socket;
 
       socket.onopen = () => {
+        // The attach snapshot replays scrollback history. Drop what this
+        // terminal already holds so a reconnect doesn't append a second copy.
+        // The alternate buffer has no scrollback (and its snapshot carries
+        // none), so leave the normal buffer's history alone while a TUI owns
+        // the screen.
+        if (term.buffer.active.type === "normal") term.clear();
         safeFit(fit);
         sendResize();
       };

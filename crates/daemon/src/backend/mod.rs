@@ -59,6 +59,63 @@ pub struct Snapshot {
     pub last_seq: u64,
 }
 
+/// Render the emulator's scrollback (oldest first) as plain lines followed by
+/// a full repaint of the visible screen. Fed to a fresh client terminal this
+/// reproduces the screen AND fills the client's own scrollback, so the user
+/// can scroll up to output from before they attached. Used for the attach
+/// snapshot only — the mid-stream lag resend must stay screen-only, or every
+/// resend would append the whole history to the client's scrollback again.
+///
+/// While the application holds the alternate screen, vt100 exposes a
+/// zero-length scrollback and this degrades to the plain screen repaint
+/// (matching real terminals, where the alternate screen has no scrollback).
+///
+/// The parser's view offset is restored to 0 before returning.
+pub(crate) fn repaint_with_history(parser: &mut vt100::Parser) -> Vec<u8> {
+    let (rows, cols) = parser.screen().size();
+
+    // View offsets are clamped to the available scrollback, so this measures it.
+    parser.set_scrollback(usize::MAX);
+    let available = parser.screen().scrollback();
+
+    let mut out = Vec::new();
+    if available > 0 {
+        // Home + erase: the history lines below carry no positioning of their
+        // own, and a reconnecting client may have its cursor anywhere.
+        out.extend_from_slice(b"\x1b[H\x1b[J");
+    }
+    // At view offset `k`, the window's first visible row is the
+    // (available-k)'th-oldest scrollback line — walking the offset down to 1
+    // emits every scrollback line exactly once, oldest first.
+    //
+    // INVARIANT: only the FIRST visible row may be read at offsets deeper than
+    // the screen height. vt100 0.15's `visible_rows` miscomputes (and, with
+    // overflow checks, panics on) the screen-row tail of the window for
+    // `offset > rows`; the leading scrollback rows are correct at any depth.
+    // Overflow checks are disabled for vt100 in Cargo.toml for this reason.
+    for offset in (1..=available).rev() {
+        parser.set_scrollback(offset);
+        if let Some(line) = parser.screen().rows_formatted(0, cols).next() {
+            out.extend_from_slice(&line);
+        }
+        out.extend_from_slice(b"\x1b[m\r\n");
+    }
+    parser.set_scrollback(0);
+    if available > 0 {
+        // Scroll the emitted lines fully into the client's scrollback: the
+        // repaint below starts by erasing the viewport (\x1b[H\x1b[J), and any
+        // history line still visible would be erased rather than scrolled back.
+        // After the history print the cursor row is min(available, rows-1), so
+        // rows-1 newlines push out exactly the visible history lines without
+        // ever pushing the blank cursor row (a spurious empty history line).
+        for _ in 0..rows.saturating_sub(1) {
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+    out.extend_from_slice(&parser.screen().contents_formatted());
+    out
+}
+
 /// Factory for live sessions. The native backend is registered under the
 /// plugin registry; a mock backend implements the same trait in tests.
 pub trait SessionBackend: Send + Sync {
@@ -103,4 +160,65 @@ pub trait BackendSession: Send + Sync {
     fn stop(&self) -> Result<()>;
     fn watch_status(&self) -> watch::Receiver<BackendStatus>;
     fn last_seq(&self) -> u64;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::repaint_with_history;
+
+    /// Feed the attach repaint to a fresh client-side emulator (standing in
+    /// for xterm.js) and check both the visible screen and the scrollback.
+    #[test]
+    fn attach_repaint_reproduces_screen_and_history() {
+        let mut server = vt100::Parser::new(5, 20, 100);
+        for i in 1..=12 {
+            server.process(format!("line {i}\r\n").as_bytes());
+        }
+        server.process(b"\x1b[31mprompt>\x1b[m ");
+
+        let repaint = repaint_with_history(&mut server);
+        assert_eq!(server.screen().scrollback(), 0, "view offset restored");
+        // History lines carry no positioning, so the stream must home+erase
+        // first — a reconnecting client's cursor can be anywhere.
+        assert!(repaint.starts_with(b"\x1b[H\x1b[J"));
+
+        let mut client = vt100::Parser::new(5, 20, 1000);
+        client.process(&repaint);
+
+        // The visible screen and cursor match the server's exactly.
+        assert_eq!(client.screen().contents(), server.screen().contents());
+        assert_eq!(
+            client.screen().cursor_position(),
+            server.screen().cursor_position()
+        );
+
+        // 13 lines painted on a 5-row screen leave exactly 8 in scrollback —
+        // no gap and no spurious blank line between history and screen.
+        client.set_scrollback(usize::MAX);
+        assert_eq!(client.screen().scrollback(), 8);
+        let oldest = client.screen().contents();
+        assert!(oldest.starts_with("line 1\n"), "oldest window: {oldest:?}");
+    }
+
+    #[test]
+    fn attach_repaint_without_scrollback_is_screen_only() {
+        let mut server = vt100::Parser::new(5, 20, 100);
+        server.process(b"hello");
+        let expected = server.screen().contents_formatted();
+        assert_eq!(repaint_with_history(&mut server), expected);
+    }
+
+    /// TUI apps own the alternate screen; there the snapshot must stay a plain
+    /// screen repaint (real terminals have no alt-screen scrollback either).
+    #[test]
+    fn attach_repaint_in_alternate_screen_is_screen_only() {
+        let mut server = vt100::Parser::new(5, 20, 100);
+        for i in 1..=12 {
+            server.process(format!("line {i}\r\n").as_bytes());
+        }
+        server.process(b"\x1b[?1049h\x1b[Hfullscreen app");
+        let expected = server.screen().contents_formatted();
+        assert_eq!(repaint_with_history(&mut server), expected);
+        assert!(server.screen().alternate_screen());
+    }
 }

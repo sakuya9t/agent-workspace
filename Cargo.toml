@@ -8,6 +8,16 @@ edition = "2021"
 license = "MIT"
 authors = ["Agent Session Manager"]
 
+# vt100 0.15 has a debug-only arithmetic overflow in `Grid::visible_rows` when
+# the scrollback view offset exceeds the screen height (`rows_len - offset` in
+# a `take()` that release builds wrap harmlessly). We view deep scrollback to
+# build attach repaints (backend::repaint_with_history), so align dev/test
+# behavior with release for this one unmaintained crate. The wrapped `take` is
+# only ever observed through the first visible row, which is computed correctly
+# at every offset — see the invariant note in repaint_with_history.
+[profile.dev.package.vt100]
+overflow-checks = false
+
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["ws"] }
