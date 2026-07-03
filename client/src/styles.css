@@ -611,6 +611,26 @@ body {
 .vscode-fallback .btn {
   align-self: flex-start;
 }
+.vscode-fallback .cli-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.vscode-fallback .cli-row code {
+  flex: 1;
+  padding: 4px 6px;
+  font-size: 11px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  white-space: nowrap;
+  overflow-x: auto;
+}
+.vscode-fallback .cli-row .btn {
+  align-self: center;
+  flex-shrink: 0;
+}
 
 /* segmented control + workspace register box */
 .seg {

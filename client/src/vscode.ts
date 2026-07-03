@@ -11,6 +11,8 @@ export interface VscodeLaunch {
   kind: "local" | "remote-ssh";
   /** `user@host` VS Code will SSH to (remote-ssh only). */
   sshDest?: string;
+  /** Terminal equivalent of the deep link (remote-ssh only). */
+  cliCommand?: string;
 }
 
 const LOOPBACK = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
@@ -39,10 +41,14 @@ export function buildVscodeLaunch(t: Target, info: VscodeTarget): VscodeLaunch {
   const urlHost = new URL(t.baseUrl).hostname;
   const host = LOOPBACK.has(urlHost) ? info.hostname : urlHost;
   const sshDest = info.ssh_user ? `${info.ssh_user}@${host}` : host;
+  const quotedPath = /[^\w@%+=:,./-]/.test(info.path)
+    ? `'${info.path.replace(/'/g, `'\\''`)}'`
+    : info.path;
   return {
     uri: `vscode://vscode-remote/ssh-remote+${sshDest}${path}`,
     kind: "remote-ssh",
     sshDest,
+    cliCommand: `code --remote ssh-remote+${sshDest} ${quotedPath}`,
   };
 }
 

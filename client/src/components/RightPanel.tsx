@@ -56,7 +56,29 @@ export function RightPanel({ target, session }: Props) {
   // vscode:// deep link (Remote-SSH for remote daemons). If nothing handles
   // the link, fall back to offering the VS Code download — the Zoom-link UX.
   const [vscode, setVscode] = useState<VscodeState>({ phase: "idle" });
-  useEffect(() => setVscode({ phase: "idle" }), [session?.id]);
+  const [copied, setCopied] = useState(false);
+  // Reset on daemon switch too: the same session reached through another
+  // profile launches differently (local vs Remote-SSH).
+  useEffect(() => setVscode({ phase: "idle" }), [session?.id, base]);
+  useEffect(() => setCopied(false), [vscode.phase, session?.id]);
+
+  const copyCli = async (text: string) => {
+    try {
+      // clipboard API needs a secure context; plain-http LAN profiles don't
+      // have one, so fall back to the selection-based path.
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+    }
+    setCopied(true);
+  };
 
   const continueInVscode = async () => {
     setVscode({ phase: "launching" });
@@ -139,6 +161,20 @@ export function RightPanel({ target, session }: Props) {
                 Already installed? Remote windows also need the “Remote - SSH”
                 extension and SSH access to {vscode.launch.sshDest}.
               </div>
+            )}
+            {vscode.launch.cliCommand && (
+              <>
+                <div className="dim small">Or open it from a terminal on this machine:</div>
+                <div className="cli-row">
+                  <code>{vscode.launch.cliCommand}</code>
+                  <button
+                    className="btn tiny"
+                    onClick={() => copyCli(vscode.launch.cliCommand!)}
+                  >
+                    {copied ? "Copied" : "Copy"}
+                  </button>
+                </div>
+              </>
             )}
           </div>
         )}
