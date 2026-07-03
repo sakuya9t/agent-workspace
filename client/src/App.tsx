@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useUiStore } from "./store";
 import { targetOf } from "./connectionStore";
 import { useDaemonStates } from "./useDaemons";
@@ -7,15 +8,20 @@ import { TerminalView } from "./components/Terminal";
 import { RightPanel } from "./components/RightPanel";
 import { NewSessionDialog } from "./components/NewSessionDialog";
 import { ConnectionDialog } from "./components/ConnectionDialog";
+import { UsageModal } from "./components/UsageModal";
 
 function isLive(s: Session): boolean {
   return s.status === "running" || s.status === "starting";
 }
 
+/** Agents that persist usage transcripts the daemon can read (view-usage). */
+const USAGE_AGENTS = new Set(["claude", "codex"]);
+
 export function App() {
   const active = useUiStore((s) => s.activeSession);
   const setShowConnection = useUiStore((s) => s.setShowConnection);
   const states = useDaemonStates();
+  const [showUsage, setShowUsage] = useState(false);
 
   const reachable = states.filter((s) => s.daemon.connected && s.data).length;
   const totalLive = states.reduce(
@@ -54,10 +60,21 @@ export function App() {
         <div className="panel center">
           <div className="panel-header">
             {activeSession ? (
-              <span className="mono">
-                {activeState?.daemon.label} · {activeSession.agent_plugin_id} ·{" "}
-                {activeSession.status}
-              </span>
+              <>
+                <span className="mono">
+                  {activeState?.daemon.label} · {activeSession.agent_plugin_id} ·{" "}
+                  {activeSession.status}
+                </span>
+                {USAGE_AGENTS.has(activeSession.agent_plugin_id) && (
+                  <button
+                    className="btn tiny usage-link"
+                    onClick={() => setShowUsage(true)}
+                    title="Token & context usage for this session"
+                  >
+                    view usage
+                  </button>
+                )}
+              </>
             ) : (
               <span>Terminal</span>
             )}
@@ -80,6 +97,15 @@ export function App() {
 
         <RightPanel target={target} session={activeSession} />
       </div>
+
+      {showUsage && activeSession && target && (
+        <UsageModal
+          target={target}
+          sessionId={activeSession.id}
+          agent={activeSession.agent_plugin_id}
+          onClose={() => setShowUsage(false)}
+        />
+      )}
 
       <NewSessionDialog />
       <ConnectionDialog />

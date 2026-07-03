@@ -58,6 +58,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:id", get(get_session))
         .route("/api/sessions/:id/summary", get(get_summary))
+        .route("/api/sessions/:id/usage", get(get_session_usage))
         .route("/api/sessions/:id/workspace", get(get_session_workspace))
         .route("/api/sessions/:id/stop", post(stop_session))
         .route("/api/sessions/:id/archive", post(archive_session))
@@ -307,6 +308,34 @@ async fn get_summary(
         Some(s) => Ok(Json(json!({ "summary": s }))),
         None => Err(AppError(StatusCode::NOT_FOUND, "no summary yet".into())),
     }
+}
+
+/// Best-effort token/context usage for a session, read from the agent's own
+/// on-disk transcript (Claude Code / Codex). Returns `available: false` for
+/// agents that don't record usage.
+async fn get_session_usage(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let s = state
+        .manager
+        .get_session(&id)?
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "no such session".into()))?;
+    let usage = state
+        .manager
+        .registry
+        .get(&s.agent_plugin_id)
+        .and_then(|p| {
+            p.usage(&crate::plugins::usage::UsageContext {
+                cwd: std::path::PathBuf::from(&s.working_directory),
+                started_at_ms: s.created_at,
+            })
+        })
+        .unwrap_or_else(|| crate::plugins::usage::AgentUsage {
+            note: Some("No usage data available for this agent/session.".into()),
+            ..Default::default()
+        });
+    Ok(Json(json!({ "usage": usage })))
 }
 
 async fn stop_session(

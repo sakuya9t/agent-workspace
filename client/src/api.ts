@@ -70,6 +70,31 @@ export interface SessionSummary {
   terminal_event_end: number;
 }
 
+export interface RateLimitWindow {
+  label: string;
+  used_percent: number;
+  window_minutes: number | null;
+  /** Unix seconds at which the window resets. */
+  resets_at: number | null;
+}
+
+/** Best-effort per-session usage, read from the agent's on-disk transcript. */
+export interface SessionUsage {
+  available: boolean;
+  source: string | null;
+  model: string | null;
+  context_tokens: number | null;
+  context_window: number | null;
+  input_tokens: number | null;
+  cached_input_tokens: number | null;
+  output_tokens: number | null;
+  reasoning_tokens: number | null;
+  total_tokens: number | null;
+  rate_limits: RateLimitWindow[];
+  updated_at: string | null;
+  note: string | null;
+}
+
 export interface ChangedFile {
   path: string;
   status: string;
@@ -245,6 +270,8 @@ export const api = {
     req<{ sessions: Session[] }>(t, "/api/sessions").then((r) => r.sessions),
   getSummary: (t: Target, id: string) =>
     req<{ summary: SessionSummary }>(t, `/api/sessions/${id}/summary`).then((r) => r.summary),
+  sessionUsage: (t: Target, id: string) =>
+    req<{ usage: SessionUsage }>(t, `/api/sessions/${id}/usage`).then((r) => r.usage),
   createSession: (t: Target, body: CreateSessionBody) =>
     req<{ session: Session }>(t, "/api/sessions", {
       method: "POST",

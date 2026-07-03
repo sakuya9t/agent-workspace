@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 
+use super::usage::{self, AgentUsage, UsageContext};
 use super::{find_in_path, AgentContext, AgentOption, AgentPlugin, LaunchSpec};
 
 const ALL_PLATFORMS: &[&str] = &["linux", "macos", "windows"];
@@ -70,6 +71,9 @@ impl AgentPlugin for CodexPlugin {
     fn bell_means_attention(&self) -> bool {
         true
     }
+    fn usage(&self, cx: &UsageContext) -> Option<AgentUsage> {
+        usage::codex_usage(cx)
+    }
     fn options(&self) -> Vec<AgentOption> {
         vec![AgentOption {
             key: "bypass_approvals".into(),
@@ -117,6 +121,9 @@ impl AgentPlugin for ClaudePlugin {
     }
     fn bell_means_attention(&self) -> bool {
         true
+    }
+    fn usage(&self, cx: &UsageContext) -> Option<AgentUsage> {
+        usage::claude_usage(cx)
     }
     fn options(&self) -> Vec<AgentOption> {
         vec![AgentOption {

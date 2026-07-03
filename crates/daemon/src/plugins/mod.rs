@@ -5,6 +5,9 @@ use anyhow::Result;
 use serde::Serialize;
 
 pub mod builtin;
+pub mod usage;
+
+use usage::{AgentUsage, UsageContext};
 
 /// User-supplied launch inputs for an agent. The working directory is resolved
 /// separately by the session manager and passed to the backend spawn spec.
@@ -68,6 +71,13 @@ pub trait AgentPlugin: Send + Sync {
     /// and only opted into by agents whose bells are meaningful.
     fn bell_means_attention(&self) -> bool {
         false
+    }
+
+    /// Best-effort token/context usage for a running session, read from the
+    /// agent's own on-disk transcript (mirrors its `/status` / `/usage`). Agents
+    /// that don't persist usage return `None`.
+    fn usage(&self, _cx: &UsageContext) -> Option<AgentUsage> {
+        None
     }
 }
 
