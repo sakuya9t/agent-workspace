@@ -18,8 +18,10 @@ Implemented:
 
 - Rust daemon (`asm-daemon`) with tokio + axum HTTP/WebSocket API.
 - SQLite storage (WAL) with a batched terminal-event writer.
-- `SessionBackend` trait + built-in native PTY backend (portable-pty) driving a
-  headless `vt100` terminal emulator per session.
+- `SessionBackend` trait with two backends: the built-in **native** PTY backend
+  (portable-pty, in-process) and an out-of-process **asmux** holder
+  (`ASM_BACKEND=sidecar`) that keeps PTYs alive across daemon restarts. Both
+  drive a headless `vt100` terminal emulator per session in the daemon.
 - Server-side terminal snapshots exported as ANSI repaint streams for
   fresh-client / reconnect resume (no raw-offset replay as the primary path).
 - Session lifecycle: create, list, attach, resize, stop, archive, with a
@@ -27,11 +29,14 @@ Implemented:
 - Attention signals (activity / likely-blocked / approval-needed / failed).
 - Static agent plugin registry: `shell`, `codex`, `claude`, `custom_command`
   (custom commands require explicit approval).
-- No silent relaunch: a daemon restart reconciles lingering sessions to
-  `failed` rather than pretending they continued.
-- Clean shutdown: on `SIGINT`/`SIGTERM` the daemon kills every live session's
-  child before exiting, so no PTY process is leaked (the same hook will tear
-  down out-of-process/tmux sidecars once that backend lands).
+- Durable sessions survive a daemon restart in sidecar mode: the daemon detaches
+  on shutdown and re-adopts the holder's live sessions on start. Native mode has
+  no live backend to recover, so a restart reconciles lingering sessions to
+  `failed`; if the holder itself died they become `indeterminate`. No silent
+  relaunch either way. Proven by `scripts/durable-restart-test.mjs`.
+- Clean shutdown: on `SIGINT`/`SIGTERM` the native daemon kills every live child
+  so no PTY leaks; the sidecar daemon instead **detaches** and leaves the
+  holder's children running for adopt on the next start.
 - Workspace registration + allowlist, guided `git init` for plain folders,
   and per-session Git worktree isolation so concurrent agents on one repo get
   separate working trees; instance cleanup is guarded against dirty/live state.
@@ -42,8 +47,9 @@ Implemented:
 - Multi-daemon: the client connects to several daemons at once and aggregates
   all their sessions in one left-panel tree (host → workspace → agent).
 
-Next iterations (see `docs/mvp-execution-plan.md`): out-of-process sidecars,
-Git worktree isolation + change tracking, the Electron shell, and rich output.
+Next iterations (see `docs/mvp-execution-plan.md`): asmux hardening (auto-reconnect
+watchdog, exact cold-stitch adopt, Windows ConPTY), the Electron shell, and rich
+output (CodeMirror / Marked / Shiki / Mermaid).
 
 ## Layout
 
@@ -55,13 +61,99 @@ docs/            requirements, architecture, MVP execution plan
 
 ## Running the daemon
 
+The daemon runs one of two session backends (see
+[`docs/durable-sessions.md`](docs/durable-sessions.md)):
+
+- **`native`** (default) — PTYs run in-process. Simplest to run, but a daemon
+  restart loses live sessions (they reconcile to `failed`).
+- **`sidecar`** — PTYs are held by a separate **asmux** holder process, so
+  sessions **survive a daemon restart**: the daemon re-adopts them on start.
+
+### Native (quick start)
+
 ```bash
 # build + run (listens on 127.0.0.1:4600 by default)
 cargo run -p asm-daemon
 ```
 
+### Durable sessions (daemon + asmux)
+
+Build both binaries first — `cargo run -p asm-daemon` only builds the asmux
+*library*, not the `asmux` holder binary:
+
+```bash
+cargo build                       # builds asm-daemon AND asmux
+```
+
+Then start the daemon in sidecar mode. It **auto-spawns** the asmux holder (in
+its own process group, so the holder outlives the daemon) when the socket is dead:
+
+```bash
+ASM_BACKEND=sidecar cargo run -p asm-daemon
+```
+
+Or run the holder yourself and point the daemon at it (disable auto-spawn) — this
+gives you independent control of each process:
+
+```bash
+# terminal 1 — the holder: owns every PTY; keep it running across daemon restarts
+./target/debug/asmux
+
+# terminal 2 — the daemon
+ASM_BACKEND=sidecar ASM_ASMUX_AUTOSPAWN=0 cargo run -p asm-daemon
+```
+
+Both sides find the socket at `<runtime_dir>/asmux.sock` (override with
+`ASMUX_SOCK`). Confirm the backend is active:
+
+```bash
+curl -s localhost:4600/health      # -> "backend":"asmux-sidecar"
+```
+
+#### Restart the daemon — sessions survive
+
+Stop the daemon (`Ctrl-C` / `SIGTERM`) and start it again. On shutdown the
+sidecar daemon **detaches** and leaves the children running in asmux; on restart
+it reconnects, lists the holder's sessions, and **adopts** the live ones — they
+stay `running` with their terminal screen reconstructed. asmux keeps running the
+whole time, so the restarted daemon connects to the existing holder rather than
+spawning a new one.
+
+```bash
+# with the daemon under cargo:  Ctrl-C, then re-run the same command
+ASM_BACKEND=sidecar cargo run -p asm-daemon
+```
+
+#### Restart asmux — live sessions are lost (by design)
+
+asmux holds the live PTYs, so restarting it kills every child. This is the
+holder's failure domain: **a holder restart loses liveness, not history.** There
+is no auto-reconnect yet (that lands in M4), so restart the daemon afterward; on
+start it finds the old sessions gone from the holder and marks them
+**`indeterminate`** — outcome unknown, preserved output still viewable — never a
+silent `failed`.
+
+```bash
+pkill -TERM asmux                 # terminates all child PTYs; unlinks its socket
+./target/debug/asmux &            # fresh, empty holder
+# then restart the daemon so it reconnects and reconciles
+```
+
+#### Stop everything
+
+The auto-spawned holder is detached and outlives the daemon by design, so stop
+both:
+
+```bash
+pkill -TERM asm-daemon            # daemon detaches (leaves sessions running)
+pkill -TERM asmux                 # then stop the holder
+```
+
 Environment overrides: `ASM_BIND`, `ASM_DATA_DIR`, `ASM_CONFIG_DIR`,
-`ASM_RUNTIME_DIR`, `ASM_STATIC_DIR`, `ASM_LOG`.
+`ASM_RUNTIME_DIR`, `ASM_STATIC_DIR`, `ASM_LOG`, and for the holder:
+`ASM_BACKEND` (`native`|`sidecar`), `ASM_ASMUX_AUTOSPAWN` (`0` disables
+auto-spawn), `ASM_ASMUX_BIN` (explicit holder binary path), `ASMUX_SOCK` (holder
+socket path), `ASMUX_MEMORY_LIMIT` (holder ring-memory cap, bytes).
 
 ### HTTP API
 
@@ -209,4 +301,15 @@ disconnect → reconnect snapshot resume → scm status → stop → summary):
 
 ```bash
 node scripts/smoke.mjs 127.0.0.1:4600 /path/to/a/git/repo
+```
+
+### Durable-restart test (asmux)
+
+Proves sessions survive a daemon restart. Self-contained — it starts asmux and
+two daemon generations itself (no running daemon needed), creates a session,
+`SIGTERM`s the daemon, restarts it, and asserts the session was adopted
+(`running`, screen reconstructed, still accepts input):
+
+```bash
+cargo build && node scripts/durable-restart-test.mjs
 ```
