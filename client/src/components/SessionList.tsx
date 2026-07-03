@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, Session, SessionStatus, AttentionState, Workspace } from "../api";
-import { Target, targetOf } from "../connectionStore";
+import { Target, targetOf, useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
 import { DaemonState, useDaemonStates } from "../useDaemons";
 
@@ -54,6 +54,7 @@ export function SessionList() {
   const setActive = useUiStore((s) => s.setActive);
   const openNewSession = useUiStore((s) => s.openNewSession);
   const setShowConnection = useUiStore((s) => s.setShowConnection);
+  const updateDaemon = useConnStore((s) => s.updateDaemon);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
 
@@ -270,41 +271,66 @@ export function SessionList() {
 
   const daemonNode = (st: DaemonState) => {
     const { daemon } = st;
+    const connected = daemon.connected;
     const target = targetOf(daemon);
     const open = isOpen(daemon.id);
-    const bundle = st.data;
+    // Ignore any stale cache while disconnected — a disconnected host shows no
+    // sessions, just a "connect" affordance.
+    const bundle = connected ? st.data : undefined;
     // Only treat a daemon as unreachable when we have NO cached data. A single
     // dropped poll keeps the last data, so the tree stays stable (no flicker).
-    const unreachable = Boolean(st.error) && !bundle;
+    const unreachable = connected && Boolean(st.error) && !bundle;
     const active = bundle?.sessions.filter((s) => isLive(s.status)) ?? [];
     const wsIds = new Set((bundle?.workspaces ?? []).map((w) => w.id));
     const adhoc = active.filter((s) => !s.workspace_id || !wsIds.has(s.workspace_id));
 
     return (
-      <div key={daemon.id} className="tree-branch">
+      <div key={daemon.id} className={"tree-branch" + (connected ? "" : " disconnected")}>
         <div className="tree-node lvl0" onClick={() => toggle(daemon.id)}>
           <span className="chevron">{open ? "▾" : "▸"}</span>
           <span className="tree-icon">⬢</span>
           <span className="tree-label">{daemon.label}</span>
           <span className="tree-sub">
-            {bundle
-              ? `${bundle.health.hostname} · ${bundle.health.platform}`
-              : unreachable
-                ? "unreachable"
-                : "connecting…"}
+            {!connected
+              ? "disconnected"
+              : bundle
+                ? `${bundle.health.hostname} · ${bundle.health.platform}`
+                : unreachable
+                  ? "unreachable"
+                  : "connecting…"}
           </span>
-          {bundle && <span className="tree-badge">{active.length}</span>}
+          {connected && bundle && <span className="tree-badge">{active.length}</span>}
+          {connected && (
+            <button
+              className="tree-add"
+              title="New session on this daemon"
+              onClick={(e) => {
+                e.stopPropagation();
+                openNewSession(daemon.id, null);
+              }}
+            >
+              +
+            </button>
+          )}
           <button
-            className="tree-add"
-            title="New session on this daemon"
+            className="btn tiny conn-toggle"
+            title={
+              connected
+                ? "Disconnect — keep the host listed but stop polling it"
+                : "Connect — resume polling with the same token"
+            }
             onClick={(e) => {
               e.stopPropagation();
-              openNewSession(daemon.id, null);
+              updateDaemon(daemon.id, { connected: !connected });
             }}
           >
-            +
+            {connected ? "disconnect" : "connect"}
           </button>
         </div>
+
+        {open && !connected && (
+          <div className="tree-empty">disconnected — not polling</div>
+        )}
 
         {open && unreachable && (
           <div className="tree-empty error-line">
@@ -313,7 +339,7 @@ export function SessionList() {
           </div>
         )}
 
-        {open && bundle && (
+        {open && connected && bundle && (
           <div className="tree-children">
             {bundle.workspaces.map((w) =>
               workspaceNode(

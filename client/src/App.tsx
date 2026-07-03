@@ -17,9 +17,9 @@ export function App() {
   const setShowConnection = useUiStore((s) => s.setShowConnection);
   const states = useDaemonStates();
 
-  const reachable = states.filter((s) => s.data).length;
+  const reachable = states.filter((s) => s.daemon.connected && s.data).length;
   const totalLive = states.reduce(
-    (n, s) => n + (s.data?.sessions.filter(isLive).length ?? 0),
+    (n, s) => n + (s.daemon.connected ? (s.data?.sessions.filter(isLive).length ?? 0) : 0),
     0,
   );
 

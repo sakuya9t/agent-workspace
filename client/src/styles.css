@@ -338,6 +338,19 @@ body {
   border-color: var(--accent);
   color: var(--text);
 }
+.conn-toggle {
+  margin-left: 6px;
+  flex: none;
+}
+/* When disconnected there is no badge/“+”, so right-align the connect button. */
+.tree-branch.disconnected .conn-toggle {
+  margin-left: auto;
+}
+.tree-branch.disconnected .tree-label,
+.tree-branch.disconnected .tree-sub,
+.tree-branch.disconnected .tree-icon {
+  opacity: 0.5;
+}
 .tree-leaves {
   padding-left: 18px;
 }

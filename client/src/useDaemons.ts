@@ -34,7 +34,9 @@ export function useDaemonStates(): DaemonState[] {
         ]);
         return { health, sessions, workspaces };
       },
-      refetchInterval: 1500,
+      // A disconnected host stays in the list but is not polled.
+      enabled: d.connected,
+      refetchInterval: d.connected ? 1500 : (false as const),
       // Keep the last good data during a refetch (and across token/URL changes)
       // so the panel never blanks between polls.
       placeholderData: keepPreviousData,
