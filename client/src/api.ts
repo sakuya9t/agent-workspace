@@ -35,6 +35,8 @@ export interface Session {
   updated_at: number;
   last_activity_at: number;
   risky: boolean;
+  /** Whether a live client is currently attached (for takeover prompts). */
+  attached?: boolean;
 }
 
 export interface AgentOption {

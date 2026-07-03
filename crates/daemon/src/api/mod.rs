@@ -20,7 +20,7 @@ use crate::util::now_millis;
 mod auth;
 mod fs;
 mod scm;
-mod ws;
+pub mod ws;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -31,6 +31,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub scm: Arc<dyn SourceControl>,
     pub started_at: i64,
+    /// Tracks the single live WS attacher per session (takeover).
+    pub attachments: Arc<ws::Attachments>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -198,8 +200,24 @@ async fn cleanup_instance(
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
-    let sessions = state.manager.list_sessions()?;
+    // Augment each session with `attached` (is a live client currently on it?)
+    // so the UI can prompt for takeover instead of silently stealing it.
+    let sessions: Vec<serde_json::Value> = state
+        .manager
+        .list_sessions()?
+        .iter()
+        .map(|s| with_attached(s, &state))
+        .collect();
     Ok(Json(json!({ "sessions": sessions })))
+}
+
+/// Serialize a session and add the runtime `attached` flag.
+fn with_attached(s: &crate::domain::Session, state: &AppState) -> serde_json::Value {
+    let mut v = serde_json::to_value(s).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("attached".into(), json!(state.attachments.is_attached(&s.id)));
+    }
+    v
 }
 
 #[derive(Debug, Deserialize)]
@@ -263,7 +281,7 @@ async fn get_session(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     match state.manager.get_session(&id)? {
-        Some(s) => Ok(Json(json!({ "session": s }))),
+        Some(s) => Ok(Json(json!({ "session": with_attached(&s, &state) }))),
         None => Err(AppError(StatusCode::NOT_FOUND, "no such session".into())),
     }
 }

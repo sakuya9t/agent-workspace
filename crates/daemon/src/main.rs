@@ -111,6 +111,7 @@ async fn main() -> Result<()> {
         config: Arc::new(config.clone()),
         scm: Arc::new(source_control::GitSourceControl),
         started_at: now_millis(),
+        attachments: api::ws::Attachments::new(),
     };
     let app = api::router(state);
 

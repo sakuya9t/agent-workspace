@@ -1,13 +1,73 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::response::Response;
 use futures::{SinkExt, StreamExt};
+use parking_lot::Mutex;
 use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::Notify;
 
 use super::AppState;
+
+/// WebSocket close code sent to a client that was superseded by another one.
+/// The client uses it to distinguish a takeover (don't reconnect) from a
+/// transient drop (do reconnect).
+pub const CLOSE_SUPERSEDED: u16 = 4001;
+
+/// Tracks the single live attacher per session (single-attacher with takeover):
+/// a new live attach supersedes the previous one, which is signalled to close.
+/// This mirrors the product rule "one session, one active client" at the
+/// daemon↔client boundary (asmux enforces the same at its own layer).
+#[derive(Default)]
+pub struct Attachments {
+    map: Mutex<HashMap<String, Attach>>,
+    next: AtomicU64,
+}
+
+struct Attach {
+    conn_id: u64,
+    cancel: Arc<Notify>,
+}
+
+impl Attachments {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Attachments {
+            map: Mutex::new(HashMap::new()),
+            next: AtomicU64::new(1),
+        })
+    }
+
+    /// Is any client currently attached (live) to this session?
+    pub fn is_attached(&self, session_id: &str) -> bool {
+        self.map.lock().contains_key(session_id)
+    }
+
+    fn next_id(&self) -> u64 {
+        self.next.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Install `conn_id` as the sole attacher, returning the superseded one's
+    /// cancel handle (to notify) if there was one.
+    fn attach(&self, session_id: &str, conn_id: u64, cancel: Arc<Notify>) -> Option<Arc<Notify>> {
+        self.map
+            .lock()
+            .insert(session_id.to_string(), Attach { conn_id, cancel })
+            .map(|a| a.cancel)
+    }
+
+    /// Drop this connection's attachment iff it is still the current one (a
+    /// later takeover by another connection must not be cleared by this one).
+    fn release(&self, session_id: &str, conn_id: u64) {
+        let mut m = self.map.lock();
+        if m.get(session_id).map(|a| a.conn_id) == Some(conn_id) {
+            m.remove(session_id);
+        }
+    }
+}
 
 /// Control messages from the client. Terminal input arrives either as a
 /// binary frame (raw bytes) or as a JSON `{"t":"i","d":"..."}` text frame.
@@ -35,7 +95,9 @@ async fn handle(socket: WebSocket, id: String, state: AppState) {
     }
 }
 
-/// Live session: snapshot repaint, then bidirectional streaming.
+/// Live session: snapshot repaint, then bidirectional streaming. Enforces
+/// single-attacher-with-takeover — a new attach supersedes the previous client,
+/// which is closed with [`CLOSE_SUPERSEDED`].
 async fn handle_live(
     socket: WebSocket,
     id: String,
@@ -44,6 +106,13 @@ async fn handle_live(
 ) {
     // Acknowledge attention as soon as a client actually attaches.
     let _ = state.manager.acknowledge_attention(&id);
+
+    // Register as the sole attacher; supersede any previous one.
+    let conn_id = state.attachments.next_id();
+    let cancel = Arc::new(Notify::new());
+    if let Some(prev) = state.attachments.attach(&id, conn_id, cancel.clone()) {
+        prev.notify_one();
+    }
 
     let (snapshot, mut out_rx) = handle.attach();
     let (mut sender, mut receiver) = socket.split();
@@ -54,30 +123,47 @@ async fn handle_live(
         .await
         .is_err()
     {
+        state.attachments.release(&id, conn_id);
         return;
     }
 
-    // Outbound: forward live output; on lag, resend a fresh snapshot.
+    // Outbound: forward live output; on lag, resend a fresh snapshot; on
+    // takeover, close with the superseded code so the client won't reconnect.
     let handle_out = handle.clone();
+    let cancel_out = cancel.clone();
     let mut outbound = tokio::spawn(async move {
         loop {
-            match out_rx.recv().await {
-                Ok(bytes) => {
-                    if sender.send(Message::Binary(bytes.to_vec())).await.is_err() {
-                        break;
+            tokio::select! {
+                biased;
+                _ = cancel_out.notified() => {
+                    let _ = sender
+                        .send(Message::Close(Some(CloseFrame {
+                            code: CLOSE_SUPERSEDED,
+                            reason: "superseded by another client".into(),
+                        })))
+                        .await;
+                    break;
+                }
+                recv = out_rx.recv() => {
+                    match recv {
+                        Ok(bytes) => {
+                            if sender.send(Message::Binary(bytes.to_vec())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(RecvError::Lagged(_)) => {
+                            let snap = handle_out.snapshot();
+                            if sender
+                                .send(Message::Binary(snap.repaint.to_vec()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(RecvError::Closed) => break,
                     }
                 }
-                Err(RecvError::Lagged(_)) => {
-                    let snap = handle_out.snapshot();
-                    if sender
-                        .send(Message::Binary(snap.repaint.to_vec()))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(RecvError::Closed) => break,
             }
         }
     });
@@ -111,6 +197,7 @@ async fn handle_live(
     }
 
     outbound.abort();
+    state.attachments.release(&id, conn_id);
 }
 
 /// Exited session: replay persisted output as a diagnostic history frame.

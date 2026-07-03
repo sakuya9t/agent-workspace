@@ -3,6 +3,10 @@ import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { streamUrl } from "../api";
 import { Target } from "../connectionStore";
+import { useUiStore } from "../store";
+
+/** WS close code the daemon uses when another client takes over the session. */
+const CLOSE_SUPERSEDED = 4001;
 
 interface Props {
   target: Target;
@@ -66,7 +70,19 @@ export function TerminalView({ target, sessionId, live }: Props) {
         if (typeof ev.data === "string") term.write(ev.data);
         else term.write(new Uint8Array(ev.data as ArrayBuffer));
       };
-      socket.onclose = () => {
+      socket.onclose = (ev) => {
+        if (ev.code === CLOSE_SUPERSEDED) {
+          // Taken over by another client — do NOT reconnect (that would start a
+          // takeover ping-pong). Show why, then clear the selection so the
+          // session can be reclaimed from the sidebar (which prompts again).
+          term.write(
+            "\r\n\x1b[33m[This session was taken over by another client.]\x1b[0m\r\n",
+          );
+          reconnectTimer = window.setTimeout(() => {
+            if (mounted) useUiStore.getState().setActive(null);
+          }, 1800);
+          return;
+        }
         if (mounted && live) {
           // Transient loss: reconnect; the snapshot repaints current state.
           reconnectTimer = window.setTimeout(connect, 1000);

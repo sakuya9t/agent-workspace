@@ -83,6 +83,18 @@ export function SessionList() {
   });
 
   const select = (daemonId: string, target: Target, s: Session) => {
+    const isMine = active?.daemonId === daemonId && active?.sessionId === s.id;
+    // Single-attacher: opening a session another client holds takes it over,
+    // disconnecting them — so confirm first.
+    if (s.attached && !isMine && isLive(s.status)) {
+      if (
+        !confirm(
+          "This session is open on another client.\n\nTake over? The other client will be disconnected from it.",
+        )
+      ) {
+        return;
+      }
+    }
     setActive({ daemonId, sessionId: s.id });
     if (s.attention_state !== "none") ack.mutate({ target, id: s.id });
   };
@@ -122,6 +134,15 @@ export function SessionList() {
             </span>
           )}
           {daemonLabel && <span className="daemon-tag">{daemonLabel}</span>}
+          {s.attached && !selected && isLive(s.status) && (
+            <span
+              className="attn-badge"
+              style={{ background: "#565f89" }}
+              title="Open on another client — click to take over"
+            >
+              in use
+            </span>
+          )}
           {s.attention_state !== "none" && (
             <span
               className="attn-badge"
