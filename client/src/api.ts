@@ -212,16 +212,34 @@ async function req<T>(t: Target, path: string, init?: RequestInit): Promise<T> {
   };
   if (t.token) headers["Authorization"] = `Bearer ${t.token}`;
 
-  const res = await fetch(baseOf(t) + path, { ...init, headers });
+  let res: Response;
+  try {
+    res = await fetch(baseOf(t) + path, { ...init, headers });
+  } catch {
+    // fetch rejects with an opaque TypeError when the host is unreachable
+    // (connection refused, DNS, offline) — name the likely cause instead.
+    throw new Error(
+      `cannot connect — daemon unreachable${t.baseUrl ? ` at ${t.baseUrl}` : ""} (not started?)`,
+    );
+  }
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`;
+    let fromBody = false;
     try {
       const body = await res.json();
-      if (body?.error) msg = body.error;
+      if (body?.error) {
+        msg = body.error;
+        fromBody = true;
+      }
     } catch {
       /* ignore */
     }
-    if (res.status === 401) msg = `unauthorized — enroll or reconnect (${msg})`;
+    if (res.status === 401) {
+      msg = `unauthorized — enroll or reconnect (${msg})`;
+    } else if (!fromBody && (res.status === 502 || res.status === 504)) {
+      // A bare gateway error means a proxy sits in front of a dead daemon.
+      msg = `cannot connect — daemon unreachable (${msg})`;
+    }
     throw new Error(msg);
   }
   return res.json() as Promise<T>;
@@ -234,11 +252,18 @@ export async function enrollDevice(
   deviceName: string,
 ): Promise<{ server_id: string; device_id: string; device_token: string }> {
   const b = baseUrl ? baseUrl.replace(/\/$/, "") : "";
-  const res = await fetch(b + "/api/auth/enroll", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ enrollment_token: enrollmentToken, device_name: deviceName }),
-  });
+  let res: Response;
+  try {
+    res = await fetch(b + "/api/auth/enroll", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enrollment_token: enrollmentToken, device_name: deviceName }),
+    });
+  } catch {
+    throw new Error(
+      `cannot connect — daemon unreachable${baseUrl ? ` at ${baseUrl}` : ""} (not started?)`,
+    );
+  }
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`;
     try {
@@ -257,7 +282,14 @@ export async function probeHealth(baseUrl: string, token: string | null): Promis
   const b = baseUrl ? baseUrl.replace(/\/$/, "") : "";
   const headers: Record<string, string> = {};
   if (token) headers["Authorization"] = `Bearer ${token}`;
-  const res = await fetch(b + "/health", { headers });
+  let res: Response;
+  try {
+    res = await fetch(b + "/health", { headers });
+  } catch {
+    throw new Error(
+      `cannot connect — daemon unreachable${baseUrl ? ` at ${baseUrl}` : ""} (not started?)`,
+    );
+  }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json();
 }

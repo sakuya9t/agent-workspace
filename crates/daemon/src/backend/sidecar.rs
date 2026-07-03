@@ -207,8 +207,18 @@ impl SidecarSession {
 
 impl BackendSession for SidecarSession {
     fn attach(&self) -> (Snapshot, broadcast::Receiver<Arc<[u8]>>) {
-        let parser = self.parser.lock();
-        let snap = self.build_snapshot(&parser);
+        let mut parser = self.parser.lock();
+        let (rows, cols) = parser.screen().size();
+        // Attach repaints include scrollback history so the client can scroll
+        // up to output from before it attached.
+        let repaint: Arc<[u8]> =
+            Arc::from(super::repaint_with_history(&mut parser).into_boxed_slice());
+        let snap = Snapshot {
+            rows,
+            cols,
+            repaint,
+            last_seq: self.seq.load(Ordering::SeqCst),
+        };
         let rx = self.tx.subscribe();
         drop(parser);
         (snap, rx)

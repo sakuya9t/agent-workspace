@@ -7,6 +7,7 @@ import { SessionList } from "./components/SessionList";
 import { TerminalView } from "./components/Terminal";
 import { RightPanel } from "./components/RightPanel";
 import { NewSessionDialog } from "./components/NewSessionDialog";
+import { NewWorkspaceDialog } from "./components/NewWorkspaceDialog";
 import { ConnectionDialog } from "./components/ConnectionDialog";
 import { UsageModal } from "./components/UsageModal";
 
@@ -108,6 +109,7 @@ export function App() {
       )}
 
       <NewSessionDialog />
+      <NewWorkspaceDialog />
       <ConnectionDialog />
     </div>
   );

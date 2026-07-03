@@ -53,6 +53,7 @@ export function SessionList() {
   const active = useUiStore((s) => s.activeSession);
   const setActive = useUiStore((s) => s.setActive);
   const openNewSession = useUiStore((s) => s.openNewSession);
+  const openNewWorkspace = useUiStore((s) => s.openNewWorkspace);
   const setShowConnection = useUiStore((s) => s.setShowConnection);
   const updateDaemon = useConnStore((s) => s.updateDaemon);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -303,10 +304,10 @@ export function SessionList() {
           {connected && (
             <button
               className="tree-add"
-              title="New session on this daemon"
+              title="New workspace on this host"
               onClick={(e) => {
                 e.stopPropagation();
-                openNewSession(daemon.id, null);
+                openNewWorkspace(daemon.id);
               }}
             >
               +

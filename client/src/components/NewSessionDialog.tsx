@@ -18,7 +18,7 @@ export function NewSessionDialog() {
 
   const [daemonId, setDaemonId] = useState("local");
   const [pluginId, setPluginId] = useState("shell");
-  const [target, setTarget] = useState<SessionTarget>({ kind: "path" });
+  const [targetState, setTarget] = useState<SessionTarget>({ kind: "path" });
   const [cwd, setCwd] = useState("");
   const [command, setCommand] = useState("");
   const [approve, setApprove] = useState(false);
@@ -32,7 +32,15 @@ export function NewSessionDialog() {
   const [wsPath, setWsPath] = useState("");
   const [picking, setPicking] = useState<null | "cwd" | "wsPath">(null);
 
-  const daemon = daemons.find((d) => d.id === daemonId) ?? daemons[0];
+  // Opened from a workspace's "+": daemon and workspace are fixed — derive them
+  // straight from the presets (not state) so the lock can't be bypassed.
+  const lockedWs = presetWorkspaceId != null;
+  const effDaemonId = lockedWs && presetDaemonId ? presetDaemonId : daemonId;
+  const target: SessionTarget = lockedWs
+    ? { kind: "workspace", id: presetWorkspaceId }
+    : targetState;
+
+  const daemon = daemons.find((d) => d.id === effDaemonId) ?? daemons[0];
   const conn = daemon ? targetOf(daemon) : { baseUrl: "", token: null };
 
   // Apply presets when the dialog opens.
@@ -176,7 +184,7 @@ export function NewSessionDialog() {
     },
     onSuccess: (session) => {
       qc.invalidateQueries({ queryKey: ["daemon"] });
-      setActive({ daemonId, sessionId: session.id });
+      setActive({ daemonId: effDaemonId, sessionId: session.id });
       setShow(false);
       setCommand("");
     },
@@ -206,7 +214,12 @@ export function NewSessionDialog() {
         <div className="modal-title">New session</div>
 
         <label className="form-label">Daemon</label>
-        <select className="input" value={daemonId} onChange={(e) => setDaemonId(e.target.value)}>
+        <select
+          className="input"
+          value={effDaemonId}
+          disabled={lockedWs}
+          onChange={(e) => setDaemonId(e.target.value)}
+        >
           {daemons.map((d) => (
             <option key={d.id} value={d.id}>
               {d.label}
@@ -246,27 +259,31 @@ export function NewSessionDialog() {
           </label>
         ))}
 
-        <label className="form-label">Run in</label>
-        <div className="seg">
-          <button
-            className={"seg-btn" + (target.kind === "workspace" ? " on" : "")}
-            onClick={() =>
-              setTarget(
-                workspaces && workspaces[0]
-                  ? { kind: "workspace", id: workspaces[0].id }
-                  : { kind: "workspace", id: "" },
-              )
-            }
-          >
-            Workspace (isolated)
-          </button>
-          <button
-            className={"seg-btn" + (target.kind === "path" ? " on" : "")}
-            onClick={() => setTarget({ kind: "path" })}
-          >
-            Directory
-          </button>
-        </div>
+        {!lockedWs && (
+          <>
+            <label className="form-label">Run in</label>
+            <div className="seg">
+              <button
+                className={"seg-btn" + (target.kind === "workspace" ? " on" : "")}
+                onClick={() =>
+                  setTarget(
+                    workspaces && workspaces[0]
+                      ? { kind: "workspace", id: workspaces[0].id }
+                      : { kind: "workspace", id: "" },
+                  )
+                }
+              >
+                Workspace (isolated)
+              </button>
+              <button
+                className={"seg-btn" + (target.kind === "path" ? " on" : "")}
+                onClick={() => setTarget({ kind: "path" })}
+              >
+                Directory
+              </button>
+            </div>
+          </>
+        )}
 
         {target.kind === "path" && (
           <>
@@ -295,6 +312,7 @@ export function NewSessionDialog() {
             <select
               className="input"
               value={selectedWs?.id ?? ""}
+              disabled={lockedWs}
               onChange={(e) => setTarget({ kind: "workspace", id: e.target.value })}
             >
               <option value="" disabled>
@@ -316,16 +334,18 @@ export function NewSessionDialog() {
                   {selectedWs.root_path}
                   {selectedWs.root_exists === false ? "  · missing on host" : ""}
                 </div>
-                <button
-                  className="btn tiny"
-                  title="Unregister this workspace (files are left intact)"
-                  disabled={removeWs.isPending}
-                  onClick={() => {
-                    if (confirm(`Remove workspace "${selectedWs.name}"?`)) removeWs.mutate(selectedWs.id);
-                  }}
-                >
-                  Remove
-                </button>
+                {!lockedWs && (
+                  <button
+                    className="btn tiny"
+                    title="Unregister this workspace (files are left intact)"
+                    disabled={removeWs.isPending}
+                    onClick={() => {
+                      if (confirm(`Remove workspace "${selectedWs.name}"?`)) removeWs.mutate(selectedWs.id);
+                    }}
+                  >
+                    Remove
+                  </button>
+                )}
               </div>
             )}
             {removeWs.error && <div className="error">{String(removeWs.error)}</div>}
@@ -448,34 +468,36 @@ export function NewSessionDialog() {
               </div>
             )}
 
-            <div className="register-box">
-              <div className="dim small">Register a new workspace on {daemon?.label}</div>
-              <input
-                className="input"
-                placeholder="name"
-                value={wsName}
-                onChange={(e) => setWsName(e.target.value)}
-              />
-              <div className="path-row">
+            {!lockedWs && (
+              <div className="register-box">
+                <div className="dim small">Register a new workspace on {daemon?.label}</div>
                 <input
-                  className="input mono"
-                  placeholder="/absolute/path/on/that/host"
-                  value={wsPath}
-                  onChange={(e) => setWsPath(e.target.value)}
+                  className="input"
+                  placeholder="name"
+                  value={wsName}
+                  onChange={(e) => setWsName(e.target.value)}
                 />
-                <button className="btn" onClick={() => setPicking("wsPath")}>
-                  Browse…
+                <div className="path-row">
+                  <input
+                    className="input mono"
+                    placeholder="/absolute/path/on/that/host"
+                    value={wsPath}
+                    onChange={(e) => setWsPath(e.target.value)}
+                  />
+                  <button className="btn" onClick={() => setPicking("wsPath")}>
+                    Browse…
+                  </button>
+                </div>
+                {registerWs.error && <div className="error">{String(registerWs.error)}</div>}
+                <button
+                  className="btn"
+                  disabled={!wsName.trim() || !wsPath.trim() || registerWs.isPending}
+                  onClick={() => registerWs.mutate()}
+                >
+                  {registerWs.isPending ? "Registering…" : "Register"}
                 </button>
               </div>
-              {registerWs.error && <div className="error">{String(registerWs.error)}</div>}
-              <button
-                className="btn"
-                disabled={!wsName.trim() || !wsPath.trim() || registerWs.isPending}
-                onClick={() => registerWs.mutate()}
-              >
-                {registerWs.isPending ? "Registering…" : "Register"}
-              </button>
-            </div>
+            )}
           </>
         )}
 

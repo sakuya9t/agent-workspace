@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
-import { createDaemonAwareLogger, isDaemonDownProxyError } from "./vite.proxy-log.ts";
+import {
+  createDaemonAwareLogger,
+  isDaemonDownProxyError,
+  respondDaemonDown,
+} from "./vite.proxy-log.ts";
 
 // A minimal stand-in for Vite's Logger that records calls.
 function fakeLogger() {
@@ -74,6 +78,61 @@ check("real errors still pass through to base.error", () => {
   log.error(REAL_ERR);
   assert.deepEqual(base._errors, [REAL_ERR]);
   assert.equal(base._warns.length, 0);
+});
+
+// --- respondDaemonDown: the proxy `configure` hook ---
+
+// Minimal stand-ins for node-http-proxy's Server and http.ServerResponse.
+function fakeProxy() {
+  const listeners = {};
+  return {
+    on(event, cb) { listeners[event] = cb; },
+    _fire(event, ...args) { listeners[event]?.(...args); },
+  };
+}
+function fakeRes() {
+  return {
+    headersSent: false,
+    writableEnded: false,
+    _status: null,
+    _headers: null,
+    _body: null,
+    writeHead(status, headers) {
+      this.headersSent = true;
+      this._status = status;
+      this._headers = headers;
+      return this;
+    },
+    end(body) {
+      this.writableEnded = true;
+      this._body = body;
+    },
+  };
+}
+
+check("connection error answers 502 with a JSON 'cannot connect' body", () => {
+  const proxy = fakeProxy();
+  respondDaemonDown("http://127.0.0.1:4600")(proxy, {});
+  const res = fakeRes();
+  proxy._fire("error", new Error("connect ECONNREFUSED 127.0.0.1:4600"), {}, res);
+  assert.equal(res._status, 502);
+  assert.equal(res._headers["content-type"], "application/json");
+  const body = JSON.parse(res._body);
+  assert.match(body.error, /cannot connect/);
+  assert.match(body.error, /127\.0\.0\.1:4600/);
+});
+
+check("leaves already-answered responses and ws sockets alone", () => {
+  const proxy = fakeProxy();
+  respondDaemonDown("http://127.0.0.1:4600")(proxy, {});
+
+  const sent = fakeRes();
+  sent.headersSent = true;
+  proxy._fire("error", new Error("x"), {}, sent);
+  assert.equal(sent._status, null, "must not write over an in-flight response");
+
+  const socket = { destroyed: false, end() {} }; // ws upgrade: no writeHead
+  proxy._fire("error", new Error("x"), {}, socket); // must not throw
 });
 
 if (failures) {
