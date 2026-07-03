@@ -21,6 +21,14 @@ export function DirectoryPicker({ target, initialPath, title, onPick, onClose }:
   const [path, setPath] = useState(initialPath ?? "");
   const [showHidden, setShowHidden] = useState(false);
   const [manual, setManual] = useState(initialPath ?? "");
+  // Single-clicked entry in the list; takes precedence over the listed
+  // directory when confirming, so "c" clicked inside /a/b picks /a/b/c.
+  const [selected, setSelected] = useState<string | null>(null);
+
+  const navigate = (p: string) => {
+    setSelected(null);
+    setPath(p);
+  };
 
   const { data, error, isFetching } = useQuery({
     queryKey: ["fs", target.baseUrl, path, showHidden],
@@ -34,6 +42,7 @@ export function DirectoryPicker({ target, initialPath, title, onPick, onClose }:
   }, [data?.path]);
 
   const current = data?.path ?? path;
+  const chosen = selected ?? current;
 
   return (
     <div
@@ -58,13 +67,16 @@ export function DirectoryPicker({ target, initialPath, title, onPick, onClose }:
             className="input mono"
             value={manual}
             spellCheck={false}
-            onChange={(e) => setManual(e.target.value)}
+            onChange={(e) => {
+              setSelected(null);
+              setManual(e.target.value);
+            }}
             onKeyDown={(e) => {
-              if (e.key === "Enter") setPath(manual);
+              if (e.key === "Enter") navigate(manual);
             }}
             placeholder="/absolute/path"
           />
-          <button className="btn" onClick={() => setPath(manual)}>
+          <button className="btn" onClick={() => navigate(manual)}>
             Go
           </button>
         </div>
@@ -73,11 +85,11 @@ export function DirectoryPicker({ target, initialPath, title, onPick, onClose }:
           <button
             className="btn tiny"
             disabled={!data?.parent}
-            onClick={() => data?.parent && setPath(data.parent)}
+            onClick={() => data?.parent && navigate(data.parent)}
           >
             ↑ Up
           </button>
-          <button className="btn tiny" onClick={() => setPath("")}>
+          <button className="btn tiny" onClick={() => navigate("")}>
             ~ Home
           </button>
           <label className="checkbox small">
@@ -100,10 +112,13 @@ export function DirectoryPicker({ target, initialPath, title, onPick, onClose }:
           {data?.entries.map((e) => (
             <div
               key={e.path}
-              className="picker-entry"
-              onDoubleClick={() => setPath(e.path)}
-              onClick={() => setManual(e.path)}
-              title="Double-click to open"
+              className={`picker-entry${selected === e.path ? " selected" : ""}`}
+              onDoubleClick={() => navigate(e.path)}
+              onClick={() => {
+                setSelected(e.path);
+                setManual(e.path);
+              }}
+              title="Click to select, double-click to open"
             >
               <span className="picker-icon">{e.is_git ? "◆" : "▸"}</span>
               <span className="mono">{e.name}</span>
@@ -118,8 +133,8 @@ export function DirectoryPicker({ target, initialPath, title, onPick, onClose }:
           </button>
           <button
             className="btn primary"
-            disabled={!current}
-            onClick={() => onPick(current)}
+            disabled={!chosen}
+            onClick={() => onPick(chosen)}
           >
             Use this folder
           </button>

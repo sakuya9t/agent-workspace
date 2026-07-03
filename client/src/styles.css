@@ -411,6 +411,9 @@ body {
 .picker-entry:hover {
   background: var(--panel-2);
 }
+.picker-entry.selected {
+  background: var(--accent-2);
+}
 .picker-icon {
   color: var(--accent);
   flex: none;
