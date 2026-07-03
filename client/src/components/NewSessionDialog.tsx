@@ -97,6 +97,41 @@ export function NewSessionDialog() {
     },
   });
 
+  const cleanupWt = useMutation({
+    mutationFn: (v: { id: string; force: boolean }) =>
+      api.cleanupWorktrees(conn, v.id, v.force),
+    onSuccess: (report, v) => {
+      qc.invalidateQueries({ queryKey: ["workspaces", conn.baseUrl] });
+      const lines: string[] = [];
+      if (report.removed_worktrees.length)
+        lines.push(`Removed ${report.removed_worktrees.length} orphaned worktree(s).`);
+      if (report.deleted_branches.length)
+        lines.push(`Deleted ${report.deleted_branches.length} orphaned branch(es).`);
+      if (report.skipped_dirty.length)
+        lines.push(`Skipped ${report.skipped_dirty.length} worktree(s) with uncommitted changes.`);
+      if (report.skipped_unmerged.length)
+        lines.push(`Skipped ${report.skipped_unmerged.length} branch(es) with unmerged commits.`);
+      if (!lines.length) {
+        alert("Nothing orphaned to clean up.");
+        return;
+      }
+      const skipped = report.skipped_dirty.length + report.skipped_unmerged.length;
+      if (
+        !v.force &&
+        skipped > 0 &&
+        confirm(
+          lines.join("\n") +
+            "\n\nForce-remove the skipped ones too? This DISCARDS uncommitted changes and unmerged commits.",
+        )
+      ) {
+        cleanupWt.mutate({ id: v.id, force: true });
+      } else {
+        alert(lines.join("\n"));
+      }
+    },
+    onError: (e) => alert(String(e)),
+  });
+
   const create = useMutation({
     mutationFn: async () => {
       const plugin = plugins?.find((p) => p.id === pluginId);
@@ -294,6 +329,25 @@ export function NewSessionDialog() {
               </div>
             )}
             {removeWs.error && <div className="error">{String(removeWs.error)}</div>}
+            {selectedWs && selectedWs.is_git && (
+              <div className="hint">
+                <button
+                  className="btn tiny"
+                  disabled={cleanupWt.isPending}
+                  title="Remove worktrees/branches left in this repo by throwaway or other daemons (that no session here owns)"
+                  onClick={() => {
+                    if (
+                      confirm(
+                        `Scan "${selectedWs.name}" for orphaned asm-session worktrees/branches and remove ones no session on this daemon owns?`,
+                      )
+                    )
+                      cleanupWt.mutate({ id: selectedWs.id, force: false });
+                  }}
+                >
+                  {cleanupWt.isPending ? "Cleaning…" : "Clean up orphaned worktrees"}
+                </button>
+              </div>
+            )}
             {selectedWs && selectedWs.is_git && (
               <label className="checkbox">
                 <input

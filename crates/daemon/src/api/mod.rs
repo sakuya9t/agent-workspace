@@ -50,6 +50,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/workspaces", get(list_workspaces).post(add_workspace))
         .route("/api/workspaces/:id", delete(remove_workspace))
         .route("/api/workspaces/:id/init-git", post(init_workspace_git))
+        .route(
+            "/api/workspaces/:id/cleanup-worktrees",
+            post(cleanup_workspace_worktrees),
+        )
         .route("/api/workspaces/:id/branches", get(list_workspace_branches))
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:id", get(get_session))
@@ -166,6 +170,15 @@ async fn init_workspace_git(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let w = state.manager.init_workspace_git(&id)?;
     Ok(Json(json!({ "workspace": w })))
+}
+
+async fn cleanup_workspace_worktrees(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<CleanupParams>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let report = state.manager.cleanup_orphan_worktrees(&id, params.force)?;
+    Ok(Json(json!({ "report": report })))
 }
 
 async fn list_workspace_branches(

@@ -121,6 +121,61 @@ pub fn remove_worktree(root: &Path, instance_path: &Path, force: bool) -> Result
     Ok(())
 }
 
+/// One entry from `git worktree list --porcelain`.
+pub struct WorktreeEntry {
+    pub path: String,
+    /// The checked-out branch (short name), or `None` for a detached worktree.
+    pub branch: Option<String>,
+}
+
+/// List all worktrees registered on `root`. The first entry is the main worktree.
+pub fn list_worktrees(root: &Path) -> Result<Vec<WorktreeEntry>> {
+    let out = run(root, &["worktree", "list", "--porcelain"])?;
+    let mut entries = Vec::new();
+    let mut path: Option<String> = None;
+    let mut branch: Option<String> = None;
+    for line in out.lines() {
+        if line.trim().is_empty() {
+            if let Some(p) = path.take() {
+                entries.push(WorktreeEntry { path: p, branch: branch.take() });
+            }
+            continue;
+        }
+        if let Some(p) = line.strip_prefix("worktree ") {
+            path = Some(p.to_string());
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
+        }
+    }
+    if let Some(p) = path.take() {
+        entries.push(WorktreeEntry { path: p, branch: branch.take() });
+    }
+    Ok(entries)
+}
+
+/// Drop registrations for worktrees whose directories no longer exist.
+pub fn prune_worktrees(root: &Path) -> Result<()> {
+    run(root, &["worktree", "prune"])?;
+    Ok(())
+}
+
+/// Whether `branch` is fully contained in the main worktree's current HEAD
+/// (i.e. deleting it loses no unique commits).
+pub fn branch_is_merged(root: &Path, branch: &str) -> bool {
+    Command::new("git")
+        .args(["merge-base", "--is-ancestor", branch, "HEAD"])
+        .current_dir(root)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Delete a local branch. `force` uses `-D` (drops unmerged commits).
+pub fn delete_branch(root: &Path, branch: &str, force: bool) -> Result<()> {
+    run(root, &["branch", if force { "-D" } else { "-d" }, branch])?;
+    Ok(())
+}
+
 fn run(cwd: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .args(args)

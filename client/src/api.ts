@@ -130,6 +130,13 @@ export interface Workspace {
   root_exists?: boolean;
 }
 
+export interface WorktreeCleanupReport {
+  removed_worktrees: string[];
+  deleted_branches: string[];
+  skipped_dirty: string[];
+  skipped_unmerged: string[];
+}
+
 export interface WorkspaceInstance {
   id: string;
   workspace_id: string;
@@ -280,6 +287,12 @@ export const api = {
     }).then((r) => r.workspace),
   removeWorkspace: (t: Target, id: string) =>
     req<{ ok: boolean }>(t, `/api/workspaces/${id}`, { method: "DELETE" }),
+  cleanupWorktrees: (t: Target, id: string, force: boolean) =>
+    req<{ report: WorktreeCleanupReport }>(
+      t,
+      `/api/workspaces/${id}/cleanup-worktrees?force=${force}`,
+      { method: "POST" },
+    ).then((r) => r.report),
   initWorkspaceGit: (t: Target, id: string) =>
     req<{ workspace: Workspace }>(t, `/api/workspaces/${id}/init-git`, {
       method: "POST",

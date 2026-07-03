@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use parking_lot::Mutex;
+use serde::Serialize;
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
@@ -389,6 +390,83 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Find and remove worktrees/branches in a workspace's repo that this daemon
+    /// no longer owns — leftovers from throwaway/other daemons that shared the
+    /// repo (the "branch already checked out" cause). "Orphaned" = an
+    /// `asm-session/*` worktree or branch whose session is unknown to this daemon.
+    /// Guards uncommitted (dirty) worktrees and unmerged branches unless `force`.
+    pub fn cleanup_orphan_worktrees(
+        &self,
+        workspace_id: &str,
+        force: bool,
+    ) -> Result<WorktreeCleanupReport> {
+        let ws = self
+            .db
+            .get_workspace(workspace_id)?
+            .ok_or_else(|| anyhow!("no such workspace"))?;
+        if !ws.is_git {
+            bail!("workspace `{}` is not a git repository", ws.name);
+        }
+        let root = Path::new(&ws.root_path);
+
+        // Auto branches are `asm-session/<first 8 chars of the session uuid>`. A
+        // worktree/branch whose suffix matches a session this daemon knows about
+        // (live or ended) is owned, not orphaned.
+        let known: std::collections::HashSet<String> = self
+            .db
+            .list_sessions()?
+            .iter()
+            .filter_map(|s| s.id.get(..8).map(str::to_string))
+            .collect();
+
+        let mut report = WorktreeCleanupReport::default();
+
+        // 1. Drop registrations whose directories are already gone (always safe).
+        let _ = workspace::prune_worktrees(root);
+
+        // 2. Remove orphaned managed worktrees.
+        let worktrees = workspace::list_worktrees(root)?;
+        for (i, wt) in worktrees.iter().enumerate() {
+            if i == 0 {
+                continue; // the main worktree
+            }
+            let Some(branch) = wt.branch.as_deref() else {
+                continue; // detached / no branch
+            };
+            let Some(suffix) = branch.strip_prefix("asm-session/") else {
+                continue; // only our auto-managed worktrees
+            };
+            if known.contains(suffix) {
+                continue; // owned by a session we know
+            }
+            let path = Path::new(&wt.path);
+            if !force && workspace::worktree_is_dirty(path) {
+                report.skipped_dirty.push(wt.path.clone());
+                continue;
+            }
+            if workspace::remove_worktree(root, path, force).is_ok() {
+                report.removed_worktrees.push(wt.path.clone());
+                delete_orphan_branch(root, branch, force, &mut report);
+            } else {
+                report.skipped_dirty.push(wt.path.clone());
+            }
+        }
+
+        // 3. Orphaned `asm-session/*` branches that have no worktree left.
+        let (branches, _head) = workspace::list_branches(root)?;
+        for b in branches {
+            let Some(suffix) = b.strip_prefix("asm-session/") else {
+                continue;
+            };
+            if known.contains(suffix) || report.deleted_branches.contains(&b) {
+                continue;
+            }
+            delete_orphan_branch(root, &b, force, &mut report);
+        }
+
+        Ok(report)
+    }
+
     pub fn stop_session(&self, id: &str) -> Result<Session> {
         let handle = self.live_handle(id);
         match handle {
@@ -768,6 +846,36 @@ impl SessionManager {
 /// Best-effort path canonicalization for allowlist comparisons.
 fn canonical(p: &str) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p))
+}
+
+/// What an orphan-worktree cleanup removed and what it left (needing `force`).
+#[derive(Debug, Default, Serialize)]
+pub struct WorktreeCleanupReport {
+    /// Worktree directories removed (orphaned, unknown to this daemon).
+    pub removed_worktrees: Vec<String>,
+    /// Orphaned `asm-session/*` branches deleted.
+    pub deleted_branches: Vec<String>,
+    /// Worktrees left because they have uncommitted changes (retry with force).
+    pub skipped_dirty: Vec<String>,
+    /// Branches left because they have unmerged commits (retry with force).
+    pub skipped_unmerged: Vec<String>,
+}
+
+/// Delete an orphaned branch when it is safe (fully merged) or forced. Records
+/// the outcome in `report`.
+fn delete_orphan_branch(
+    root: &Path,
+    branch: &str,
+    force: bool,
+    report: &mut WorktreeCleanupReport,
+) {
+    if force || workspace::branch_is_merged(root, branch) {
+        if workspace::delete_branch(root, branch, force).is_ok() {
+            report.deleted_branches.push(branch.to_string());
+        }
+    } else if !report.skipped_unmerged.iter().any(|b| b == branch) {
+        report.skipped_unmerged.push(branch.to_string());
+    }
 }
 
 /// Heuristic classifier over the decoded output tail. A session is "blocked"
