@@ -61,6 +61,14 @@ pub trait AgentPlugin: Send + Sync {
     fn options(&self) -> Vec<AgentOption> {
         Vec::new()
     }
+
+    /// Whether a terminal bell (`0x07`) from this agent means "needs your
+    /// attention" (agents ring it for an approval prompt or a completed turn).
+    /// A plain shell rings the bell as UI noise, so this is **off by default**
+    /// and only opted into by agents whose bells are meaningful.
+    fn bell_means_attention(&self) -> bool {
+        false
+    }
 }
 
 /// Serializable plugin metadata for the client.

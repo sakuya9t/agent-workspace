@@ -67,6 +67,9 @@ impl AgentPlugin for CodexPlugin {
     fn detect_binary(&self) -> Option<String> {
         find_in_path("codex")
     }
+    fn bell_means_attention(&self) -> bool {
+        true
+    }
     fn options(&self) -> Vec<AgentOption> {
         vec![AgentOption {
             key: "bypass_approvals".into(),
@@ -111,6 +114,9 @@ impl AgentPlugin for ClaudePlugin {
     }
     fn detect_binary(&self) -> Option<String> {
         find_in_path("claude")
+    }
+    fn bell_means_attention(&self) -> bool {
+        true
     }
     fn options(&self) -> Vec<AgentOption> {
         vec![AgentOption {

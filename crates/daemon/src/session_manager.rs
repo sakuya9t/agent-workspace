@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,8 +10,8 @@ use serde::Serialize;
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
-/// How long output must be silent before a working session is considered idle
-/// (finished its turn, waiting for the next input) rather than blocked.
+/// How long output must be silent before a *working* session is considered idle
+/// (finished its turn, waiting for the next input).
 const IDLE_AFTER: Duration = Duration::from_secs(4);
 
 use crate::backend::{BackendSession, BackendSpawnSpec, BackendStatus, HolderEntry, SessionBackend};
@@ -59,6 +60,9 @@ pub struct SessionManager {
     live: Mutex<HashMap<String, Arc<dyn BackendSession>>>,
     /// Base directory under which per-session Git worktrees are created.
     worktree_root: PathBuf,
+    /// Per-session flag: set when the user views or interacts, telling the
+    /// monitor to clear a sticky "blocked" (needs-attention) state.
+    attn_reset: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl SessionManager {
@@ -74,6 +78,7 @@ impl SessionManager {
             backend,
             live: Mutex::new(HashMap::new()),
             worktree_root,
+            attn_reset: Mutex::new(HashMap::new()),
         }
     }
 
@@ -190,7 +195,8 @@ impl SessionManager {
         self.db
             .update_status(&id, SessionStatus::Running, None, now_millis())?;
 
-        self.clone().spawn_monitor(id.clone(), handle, session.created_at);
+        self.clone()
+            .spawn_monitor(id.clone(), handle, session.created_at, plugin.bell_means_attention());
 
         self.db
             .get_session(&id)?
@@ -566,6 +572,11 @@ impl SessionManager {
             let sess = self.db.get_session(&id)?;
             let (rows, cols) = sess.as_ref().map(|s| (s.rows, s.cols)).unwrap_or((24, 80));
             let created_at = sess.as_ref().map(|s| s.created_at).unwrap_or_else(now_millis);
+            let bell_attention = sess
+                .as_ref()
+                .and_then(|s| self.registry.get(&s.agent_plugin_id))
+                .map(|p| p.bell_means_attention())
+                .unwrap_or(false);
 
             match by_id.get(&id) {
                 Some(entry) if entry.alive => match self.backend.adopt(&id, rows, cols) {
@@ -573,7 +584,7 @@ impl SessionManager {
                         self.live.lock().insert(id.clone(), handle.clone());
                         self.db
                             .update_status(&id, SessionStatus::Running, None, now_millis())?;
-                        self.clone().spawn_monitor(id.clone(), handle, created_at);
+                        self.clone().spawn_monitor(id.clone(), handle, created_at, bell_attention);
                         adopted += 1;
                         tracing::info!(session = %id, "adopted live holder session");
                     }
@@ -648,12 +659,34 @@ impl SessionManager {
     pub fn acknowledge_attention(&self, id: &str) -> Result<Session> {
         self.db
             .set_attention(id, AttentionState::None, None, now_millis())?;
+        self.signal_attn_reset(id);
         self.db
             .get_session(id)?
             .ok_or_else(|| anyhow!("no such session"))
     }
 
-    fn spawn_monitor(self: Arc<Self>, id: String, handle: Arc<dyn BackendSession>, started_at: i64) {
+    /// The user interacted with a session (sent input), which resolves any
+    /// pending "blocked" state — tell the monitor to stop holding it. Cheap: sets
+    /// a flag; the badge itself clears on the next output (working) or on view.
+    pub fn note_interaction(&self, id: &str) {
+        self.signal_attn_reset(id);
+    }
+
+    fn signal_attn_reset(&self, id: &str) {
+        if let Some(flag) = self.attn_reset.lock().get(id) {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn spawn_monitor(
+        self: Arc<Self>,
+        id: String,
+        handle: Arc<dyn BackendSession>,
+        started_at: i64,
+        bell_attention: bool,
+    ) {
+        let reset = Arc::new(AtomicBool::new(false));
+        self.attn_reset.lock().insert(id.clone(), reset.clone());
         tokio::spawn(async move {
             let mut status_rx = handle.watch_status();
             let (_snap, mut out_rx) = handle.attach();
@@ -662,14 +695,10 @@ impl SessionManager {
             let mut last_attn = AttentionState::None;
 
             loop {
-                // While the agent is producing output (or rang the bell), watch
-                // closely for the silence that means "idle"; otherwise back off.
-                // A real decision-prompt (`ApprovalNeeded`) is a genuine block and
-                // stays put until the agent produces more output.
-                let idle_delay = if matches!(
-                    last_attn,
-                    AttentionState::Activity | AttentionState::LikelyBlocked
-                ) {
+                // Only a *working* session needs the close idle watch; a blocked
+                // session is sticky (stays until viewed/answered) and silence
+                // never demotes it to idle.
+                let idle_delay = if last_attn == AttentionState::Activity {
                     IDLE_AFTER
                 } else {
                     Duration::from_secs(60)
@@ -690,7 +719,12 @@ impl SessionManager {
                     recv = out_rx.recv() => {
                         match recv {
                             Ok(bytes) => {
-                                self.on_output(&id, &handle, &bytes, &mut tail, &mut last_activity_write, &mut last_attn);
+                                // If the user viewed/answered since the last chunk,
+                                // clear the sticky block before classifying anew.
+                                if reset.swap(false, Ordering::Relaxed) {
+                                    last_attn = AttentionState::None;
+                                }
+                                self.on_output(&id, &handle, &bytes, bell_attention, &mut tail, &mut last_activity_write, &mut last_attn);
                             }
                             Err(RecvError::Lagged(_)) => { /* attention is best-effort */ }
                             Err(RecvError::Closed) => {
@@ -703,17 +737,15 @@ impl SessionManager {
                     }
                 }
             }
+            self.attn_reset.lock().remove(&id);
         });
     }
 
-    /// Output has been silent for [`IDLE_AFTER`]: a working (or bell-rung)
-    /// session is now idle — waiting for the next input. A session at a real
-    /// decision-prompt (`ApprovalNeeded`) is genuinely blocked and stays put.
+    /// Output has been silent for [`IDLE_AFTER`]: a *working* session is now idle,
+    /// waiting for the next input. A blocked session (bell / prompt) is sticky and
+    /// stays blocked — silence doesn't mean it stopped needing you.
     fn on_idle(&self, id: &str, last_attn: &mut AttentionState) {
-        if matches!(
-            *last_attn,
-            AttentionState::Activity | AttentionState::LikelyBlocked
-        ) {
+        if *last_attn == AttentionState::Activity {
             *last_attn = AttentionState::Idle;
             let _ = self.db.set_attention(
                 id,
@@ -724,11 +756,13 @@ impl SessionManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn on_output(
         &self,
         id: &str,
         handle: &Arc<dyn BackendSession>,
         bytes: &[u8],
+        bell_attention: bool,
         tail: &mut String,
         last_write: &mut i64,
         last_attn: &mut AttentionState,
@@ -736,11 +770,28 @@ impl SessionManager {
         // Maintain a small decoded tail for prompt/approval detection.
         tail.push_str(&String::from_utf8_lossy(bytes));
         trim_tail(tail, 4096);
-        let (attention, reason) = classify_attention(tail);
+        // Only trust the bell as an attention signal for agents that opt in
+        // (a plain shell rings it as UI noise).
+        let bell = bell_attention && bytes.contains(&0x07);
+        let (raw, reason) = classify_attention(tail, bell);
+
+        // Sticky "blocked": agents ring the bell / show a prompt when they need
+        // you, then keep redrawing (TUIs) — plain redraw output must NOT demote
+        // that back to "working". It clears when the user views or answers (which
+        // resets `last_attn` in the monitor loop).
+        let was_blocked = matches!(
+            *last_attn,
+            AttentionState::LikelyBlocked | AttentionState::ApprovalNeeded
+        );
+        let attention = if raw == AttentionState::Activity && was_blocked {
+            *last_attn
+        } else {
+            raw
+        };
         *last_attn = attention;
 
         let now = now_millis();
-        // Debounce activity writes, but always flush on a blocking/approval signal.
+        // Debounce activity writes, but always flush a blocking/approval signal.
         if attention != AttentionState::Activity || now - *last_write >= 400 {
             *last_write = now;
             let _ = self.db.update_activity(
@@ -878,16 +929,18 @@ fn delete_orphan_branch(
     }
 }
 
-/// Heuristic classifier over the decoded output tail. A session is "blocked"
-/// (needs input to proceed) only when an input prompt sits at the **current end**
-/// of output — the place a waiting program leaves its cursor. Everything else is
-/// working "activity" (later settled to `idle` by the silence timer).
+/// Classify one output chunk. A session is **blocked** (needs input) when an
+/// input prompt sits at the current end of output, or when the agent rang the
+/// terminal **bell** — the explicit "I need you" signal agents emit for approval
+/// or turn-complete. Otherwise it is working **activity** (later settled to
+/// `idle` by the silence timer, or kept "blocked" by the sticky rule in
+/// `on_output`).
 ///
-/// Deliberately does NOT treat a bell (`0x07`) as blocked: agents emit bells
-/// routinely while working (spinners, redraws), which made the status flip
-/// active↔blocked. And matching only the last line keeps a prompt-like phrase
-/// mid-stream from flipping a working agent to blocked.
-fn classify_attention(tail: &str) -> (AttentionState, Option<String>) {
+/// Matching only the last non-blank line keeps a prompt-like phrase mid-stream
+/// (with output after it) from flipping a working agent to blocked. The bell is
+/// applied per chunk (an event), not scanned from the accumulated tail, so a
+/// stale bell doesn't linger.
+fn classify_attention(tail: &str, bell: bool) -> (AttentionState, Option<String>) {
     const APPROVAL_PATTERNS: &[&str] = &[
         "(y/n)",
         "[y/n]",
@@ -901,9 +954,6 @@ fn classify_attention(tail: &str) -> (AttentionState, Option<String>) {
         "are you sure",
         "press enter to continue",
     ];
-    // The last non-blank line is the current bottom of the screen, where a
-    // waiting prompt lives. If the agent produced output after a prompt, that
-    // line is no longer the prompt — so it reads as working, not blocked.
     let last_line = tail
         .rsplit(|c: char| c == '\n' || c == '\r')
         .find(|s| !s.trim().is_empty())
@@ -916,6 +966,12 @@ fn classify_attention(tail: &str) -> (AttentionState, Option<String>) {
                 Some(format!("prompt detected: {p}")),
             );
         }
+    }
+    if bell {
+        return (
+            AttentionState::LikelyBlocked,
+            Some("agent rang the terminal bell".to_string()),
+        );
     }
     (AttentionState::Activity, None)
 }
@@ -948,11 +1004,11 @@ mod tests {
 
     #[test]
     fn detects_approval_prompt_at_end() {
-        let (a, reason) = classify_attention("Proceed? (y/n)");
+        let (a, reason) = classify_attention("Proceed? (y/n)", false);
         assert_eq!(a, AttentionState::ApprovalNeeded);
         assert!(reason.is_some());
         // A prompt on a prior line (cursor sits after it, no trailing output).
-        let (a2, _) = classify_attention("Working...\nPassword: ");
+        let (a2, _) = classify_attention("Working...\nPassword: ", false);
         assert_eq!(a2, AttentionState::ApprovalNeeded);
     }
 
@@ -960,22 +1016,22 @@ mod tests {
     fn prompt_phrase_mid_stream_is_activity() {
         // The prompt-like phrase is NOT the last line — the agent kept working,
         // so it must read as active, not blocked (no active<->blocked flicker).
-        let (a, _) = classify_attention("Do you want to continue?\nDownloading 42%...");
+        let (a, _) = classify_attention("Do you want to continue?\nDownloading 42%...", false);
         assert_eq!(a, AttentionState::Activity);
     }
 
     #[test]
     fn plain_output_is_activity() {
-        let (a, reason) = classify_attention("building project...");
+        let (a, reason) = classify_attention("building project...", false);
         assert_eq!(a, AttentionState::Activity);
         assert!(reason.is_none());
     }
 
     #[test]
-    fn bell_does_not_block() {
-        // Output containing a bell is still just working (bells are noise).
-        let (a, _) = classify_attention("compiling\u{07} module");
-        assert_eq!(a, AttentionState::Activity);
+    fn bell_signals_blocked() {
+        // The bell is the agent explicitly asking for attention.
+        let (a, _) = classify_attention("some output", true);
+        assert_eq!(a, AttentionState::LikelyBlocked);
     }
 
     // ---- tail trimming ----

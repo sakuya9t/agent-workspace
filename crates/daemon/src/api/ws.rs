@@ -176,11 +176,13 @@ async fn handle_live(
                 match msg {
                     Some(Ok(Message::Binary(b))) => {
                         let _ = handle.send_input(&b);
+                        state.manager.note_interaction(&id);
                     }
                     Some(Ok(Message::Text(t))) => {
                         match serde_json::from_str::<ClientMsg>(&t) {
                             Ok(ClientMsg::Input { d }) => {
                                 let _ = handle.send_input(d.as_bytes());
+                                state.manager.note_interaction(&id);
                             }
                             Ok(ClientMsg::Resize { rows, cols }) => {
                                 let _ = state.manager.resize_session(&id, rows, cols);
