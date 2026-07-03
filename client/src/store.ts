@@ -13,9 +13,17 @@ interface UiState {
   setShowNewSession: (v: boolean) => void;
   /** Daemon to preselect when the new-session dialog opens. */
   newSessionDaemonId: string | null;
-  /** Workspace to preselect when the new-session dialog opens. */
+  /**
+   * Workspace to preselect when the new-session dialog opens. When set (the
+   * dialog was opened from a workspace's "+"), daemon and workspace are locked.
+   */
   newSessionWorkspaceId: string | null;
   openNewSession: (daemonId?: string | null, workspaceId?: string | null) => void;
+  showNewWorkspace: boolean;
+  setShowNewWorkspace: (v: boolean) => void;
+  /** Daemon the new-workspace dialog registers into. */
+  newWorkspaceDaemonId: string | null;
+  openNewWorkspace: (daemonId: string) => void;
   showConnection: boolean;
   setShowConnection: (v: boolean) => void;
 }
@@ -34,6 +42,11 @@ export const useUiStore = create<UiState>((set) => ({
       newSessionDaemonId: daemonId,
       newSessionWorkspaceId: workspaceId,
     }),
+  showNewWorkspace: false,
+  setShowNewWorkspace: (v) => set({ showNewWorkspace: v }),
+  newWorkspaceDaemonId: null,
+  openNewWorkspace: (daemonId) =>
+    set({ showNewWorkspace: true, newWorkspaceDaemonId: daemonId }),
   showConnection: false,
   setShowConnection: (v) => set({ showConnection: v }),
 }));

@@ -53,6 +53,7 @@ export function SessionList() {
   const active = useUiStore((s) => s.activeSession);
   const setActive = useUiStore((s) => s.setActive);
   const openNewSession = useUiStore((s) => s.openNewSession);
+  const openNewWorkspace = useUiStore((s) => s.openNewWorkspace);
   const setShowConnection = useUiStore((s) => s.setShowConnection);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
@@ -296,10 +297,10 @@ export function SessionList() {
           {bundle && <span className="tree-badge">{active.length}</span>}
           <button
             className="tree-add"
-            title="New session on this daemon"
+            title="New workspace on this host"
             onClick={(e) => {
               e.stopPropagation();
-              openNewSession(daemon.id, null);
+              openNewWorkspace(daemon.id);
             }}
           >
             +
