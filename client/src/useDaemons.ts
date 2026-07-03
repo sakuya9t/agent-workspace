@@ -1,4 +1,4 @@
-import { useQueries } from "@tanstack/react-query";
+import { keepPreviousData, useQueries } from "@tanstack/react-query";
 import { api, Health, Session, Workspace } from "./api";
 import { DaemonConn, targetOf, useConnStore } from "./connectionStore";
 
@@ -35,6 +35,12 @@ export function useDaemonStates(): DaemonState[] {
         return { health, sessions, workspaces };
       },
       refetchInterval: 1500,
+      // Keep the last good data during a refetch (and across token/URL changes)
+      // so the panel never blanks between polls.
+      placeholderData: keepPreviousData,
+      // A transient poll failure keeps the previous data (see SessionList: the
+      // tree only shows "unreachable" when there is no cached data at all), so a
+      // single dropped LAN poll doesn't flash the UI.
       retry: false,
     })),
   });

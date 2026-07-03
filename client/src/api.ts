@@ -12,6 +12,7 @@ export type SessionStatus =
 export type AttentionState =
   | "none"
   | "activity"
+  | "idle"
   | "likely_blocked"
   | "approval_needed"
   | "failed";

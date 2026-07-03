@@ -15,15 +15,19 @@ const STATUS_COLOR: Record<SessionStatus, string> = {
   indeterminate: "#ff9e64",
 };
 
+// active = producing output; idle = waiting for the next input (calm);
+// blocked = needs input to proceed (urgent).
 const ATTENTION_LABEL: Partial<Record<AttentionState, string>> = {
-  activity: "new",
+  activity: "active",
+  idle: "idle",
   likely_blocked: "blocked",
-  approval_needed: "approve",
+  approval_needed: "blocked",
   failed: "failed",
 };
 
 const ATTENTION_COLOR: Partial<Record<AttentionState, string>> = {
   activity: "#7aa2f7",
+  idle: "#565f89",
   likely_blocked: "#e0af68",
   approval_needed: "#f7768e",
   failed: "#f7768e",
@@ -170,7 +174,7 @@ export function SessionList() {
           ) : (
             <>
               <span className="ended-status" title={s.status}>
-                {s.status}
+                {endedLabel(s.status)}
                 {s.exit_code !== null ? ` · ${s.exit_code}` : ""}
               </span>
               {s.status !== "archived" && (
@@ -269,6 +273,9 @@ export function SessionList() {
     const target = targetOf(daemon);
     const open = isOpen(daemon.id);
     const bundle = st.data;
+    // Only treat a daemon as unreachable when we have NO cached data. A single
+    // dropped poll keeps the last data, so the tree stays stable (no flicker).
+    const unreachable = Boolean(st.error) && !bundle;
     const active = bundle?.sessions.filter((s) => isLive(s.status)) ?? [];
     const wsIds = new Set((bundle?.workspaces ?? []).map((w) => w.id));
     const adhoc = active.filter((s) => !s.workspace_id || !wsIds.has(s.workspace_id));
@@ -280,13 +287,13 @@ export function SessionList() {
           <span className="tree-icon">⬢</span>
           <span className="tree-label">{daemon.label}</span>
           <span className="tree-sub">
-            {st.error
-              ? "unreachable"
-              : bundle
-                ? `${bundle.health.hostname} · ${bundle.health.platform}`
+            {bundle
+              ? `${bundle.health.hostname} · ${bundle.health.platform}`
+              : unreachable
+                ? "unreachable"
                 : "connecting…"}
           </span>
-          {!st.error && <span className="tree-badge">{active.length}</span>}
+          {bundle && <span className="tree-badge">{active.length}</span>}
           <button
             className="tree-add"
             title="New session on this daemon"
@@ -299,7 +306,7 @@ export function SessionList() {
           </button>
         </div>
 
-        {open && Boolean(st.error) && (
+        {open && unreachable && (
           <div className="tree-empty error-line">
             {daemon.baseUrl || "local"} —{" "}
             {(st.error as Error)?.message ?? "unreachable"}
@@ -390,4 +397,9 @@ export function SessionList() {
 function basename(p: string): string {
   const parts = p.split(/[/\\]/).filter(Boolean);
   return parts.length ? parts[parts.length - 1] : p;
+}
+
+/// A user-stopped session ended deliberately, not by failure — show "finished".
+function endedLabel(s: SessionStatus): string {
+  return s === "stopped" ? "finished" : s;
 }

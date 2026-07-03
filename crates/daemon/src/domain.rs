@@ -65,8 +65,14 @@ impl SessionStatus {
 #[serde(rename_all = "snake_case")]
 pub enum AttentionState {
     None,
+    /// Producing output right now (the agent is working).
     Activity,
+    /// Output has stopped and nothing is pending — waiting at a ready prompt for
+    /// the next input. Not urgent; the next input starts new work.
+    Idle,
     LikelyBlocked,
+    /// A decision-prompt was detected in recent output — the agent is blocked and
+    /// needs input to *proceed* with what it is doing.
     ApprovalNeeded,
     Failed,
 }
@@ -76,6 +82,7 @@ impl AttentionState {
         match self {
             AttentionState::None => "none",
             AttentionState::Activity => "activity",
+            AttentionState::Idle => "idle",
             AttentionState::LikelyBlocked => "likely_blocked",
             AttentionState::ApprovalNeeded => "approval_needed",
             AttentionState::Failed => "failed",
@@ -85,6 +92,7 @@ impl AttentionState {
     pub fn from_str(s: &str) -> AttentionState {
         match s {
             "activity" => AttentionState::Activity,
+            "idle" => AttentionState::Idle,
             "likely_blocked" => AttentionState::LikelyBlocked,
             "approval_needed" => AttentionState::ApprovalNeeded,
             "failed" => AttentionState::Failed,
@@ -217,6 +225,7 @@ mod tests {
         for a in [
             AttentionState::None,
             AttentionState::Activity,
+            AttentionState::Idle,
             AttentionState::LikelyBlocked,
             AttentionState::ApprovalNeeded,
             AttentionState::Failed,

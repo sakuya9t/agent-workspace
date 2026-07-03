@@ -1,11 +1,16 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use parking_lot::Mutex;
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
+
+/// How long output must be silent before a working session is considered idle
+/// (finished its turn, waiting for the next input) rather than blocked.
+const IDLE_AFTER: Duration = Duration::from_secs(4);
 
 use crate::backend::{BackendSession, BackendSpawnSpec, BackendStatus, HolderEntry, SessionBackend};
 use crate::db::Db;
@@ -576,8 +581,23 @@ impl SessionManager {
             let (_snap, mut out_rx) = handle.attach();
             let mut tail = String::new();
             let mut last_activity_write = 0i64;
+            let mut last_attn = AttentionState::None;
 
             loop {
+                // While the agent is producing output (or rang the bell), watch
+                // closely for the silence that means "idle"; otherwise back off.
+                // A real decision-prompt (`ApprovalNeeded`) is a genuine block and
+                // stays put until the agent produces more output.
+                let idle_delay = if matches!(
+                    last_attn,
+                    AttentionState::Activity | AttentionState::LikelyBlocked
+                ) {
+                    IDLE_AFTER
+                } else {
+                    Duration::from_secs(60)
+                };
+                let idle_tick = tokio::time::sleep(idle_delay);
+
                 tokio::select! {
                     changed = status_rx.changed() => {
                         if changed.is_err() {
@@ -592,7 +612,7 @@ impl SessionManager {
                     recv = out_rx.recv() => {
                         match recv {
                             Ok(bytes) => {
-                                self.on_output(&id, &handle, &bytes, &mut tail, &mut last_activity_write);
+                                self.on_output(&id, &handle, &bytes, &mut tail, &mut last_activity_write, &mut last_attn);
                             }
                             Err(RecvError::Lagged(_)) => { /* attention is best-effort */ }
                             Err(RecvError::Closed) => {
@@ -600,9 +620,30 @@ impl SessionManager {
                             }
                         }
                     }
+                    _ = idle_tick => {
+                        self.on_idle(&id, &mut last_attn);
+                    }
                 }
             }
         });
+    }
+
+    /// Output has been silent for [`IDLE_AFTER`]: a working (or bell-rung)
+    /// session is now idle — waiting for the next input. A session at a real
+    /// decision-prompt (`ApprovalNeeded`) is genuinely blocked and stays put.
+    fn on_idle(&self, id: &str, last_attn: &mut AttentionState) {
+        if matches!(
+            *last_attn,
+            AttentionState::Activity | AttentionState::LikelyBlocked
+        ) {
+            *last_attn = AttentionState::Idle;
+            let _ = self.db.set_attention(
+                id,
+                AttentionState::Idle,
+                Some("idle — waiting for input"),
+                now_millis(),
+            );
+        }
     }
 
     fn on_output(
@@ -612,12 +653,14 @@ impl SessionManager {
         bytes: &[u8],
         tail: &mut String,
         last_write: &mut i64,
+        last_attn: &mut AttentionState,
     ) {
         // Maintain a small decoded tail for prompt/approval detection.
         tail.push_str(&String::from_utf8_lossy(bytes));
         trim_tail(tail, 4096);
         let bell = bytes.contains(&0x07);
         let (attention, reason) = classify_attention(tail, bell);
+        *last_attn = attention;
 
         let now = now_millis();
         // Debounce activity writes, but always flush on a blocking/approval signal.
@@ -677,6 +720,19 @@ impl SessionManager {
             Some(SessionStatus::Stopped) => SessionStatus::Stopped,
             Some(SessionStatus::Archived) => SessionStatus::Archived,
             _ => final_status,
+        };
+
+        // A user-ended session is not a failure. Stopping kills the child (a
+        // non-zero/​signalled exit), which would otherwise show as `failed` with a
+        // scary exit code — clear both and label the summary by the user action.
+        let user_ended = matches!(
+            status_to_write,
+            SessionStatus::Stopped | SessionStatus::Archived
+        );
+        let (exit_code, attention, reason, exit_label) = if user_ended {
+            (None, AttentionState::None, None, status_to_write.as_str().to_string())
+        } else {
+            (exit_code, attention, reason, exit_label)
         };
 
         let _ = self
