@@ -598,6 +598,20 @@ body {
   font-weight: 600;
 }
 
+.vscode-fallback {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+  padding: 8px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.vscode-fallback .btn {
+  align-self: flex-start;
+}
+
 /* segmented control + workspace register box */
 .seg {
   display: flex;

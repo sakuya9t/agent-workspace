@@ -65,7 +65,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/:id/cleanup", post(cleanup_instance))
         .route("/api/sessions/:id/resize", post(resize_session))
         .route("/api/sessions/:id/ack", post(ack_attention))
-        .route("/api/sessions/:id/open-vscode", post(open_vscode))
+        .route("/api/sessions/:id/vscode-target", get(vscode_target))
         .route("/api/sessions/:id/stream", get(ws::stream))
         .route("/api/sessions/:id/scm/status", get(scm::status))
         .route("/api/sessions/:id/scm/diff", get(scm::diff))
@@ -377,10 +377,12 @@ async fn ack_attention(
     Ok(Json(json!({ "session": s })))
 }
 
-/// Open the session's isolated workspace instance in VS Code. Opening the
-/// editor does not touch the running agent session; the working directory is
+/// Describe where the *client's* VS Code should connect to reach this
+/// session's workspace. The daemon never launches an editor itself — the web
+/// client turns this into a `vscode://` deep link (local folder when the
+/// daemon is on the browser's machine, Remote-SSH otherwise). The path is
 /// already the isolated instance (worktree) for isolated sessions.
-async fn open_vscode(
+async fn vscode_target(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -388,28 +390,22 @@ async fn open_vscode(
         .manager
         .get_session(&id)?
         .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "no such session".into()))?;
-    let target = session.working_directory;
 
-    let code = crate::plugins::find_in_path("code").ok_or_else(|| {
-        AppError(
-            StatusCode::BAD_REQUEST,
-            "VS Code CLI `code` not found in PATH on the daemon host. For a remote daemon, \
-             use VS Code Remote-SSH to open this path."
-                .into(),
-        )
-    })?;
+    Ok(Json(json!({
+        "path": session.working_directory,
+        "ssh_user": daemon_user(),
+        "hostname": hostname(),
+    })))
+}
 
-    std::process::Command::new(code)
-        .arg(&target)
-        .spawn()
-        .map_err(|e| {
-            AppError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to launch VS Code: {e}"),
-            )
-        })?;
-
-    Ok(Json(json!({ "opened": true, "path": target })))
+/// User the daemon runs as — the account VS Code Remote-SSH should log in
+/// with, since it owns the session worktrees.
+fn daemon_user() -> Option<String> {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 // ---------- error type ----------

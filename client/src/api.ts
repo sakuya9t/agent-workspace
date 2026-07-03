@@ -199,6 +199,13 @@ export interface BranchList {
   head: string | null;
 }
 
+/** Where a client-side VS Code should connect to reach a session's workspace. */
+export interface VscodeTarget {
+  path: string;
+  ssh_user: string | null;
+  hostname: string;
+}
+
 import { Target } from "./connectionStore";
 
 function baseOf(t: Target): string {
@@ -366,10 +373,8 @@ export const api = {
     req<{ ok: boolean }>(t, `/api/sessions/${id}/cleanup?force=${force}`, {
       method: "POST",
     }),
-  openVscode: (t: Target, id: string) =>
-    req<{ opened: boolean; path: string }>(t, `/api/sessions/${id}/open-vscode`, {
-      method: "POST",
-    }),
+  vscodeTarget: (t: Target, id: string) =>
+    req<VscodeTarget>(t, `/api/sessions/${id}/vscode-target`),
   fsList: (t: Target, path: string, showHidden: boolean) =>
     req<FsListing>(
       t,
