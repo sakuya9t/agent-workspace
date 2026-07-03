@@ -8,6 +8,15 @@ use directories::ProjectDirs;
 ///
 /// This is the seed of the Platform abstraction from the architecture doc:
 /// data dir, config dir, and a per-user runtime dir (future sidecar sockets).
+/// Which session backend the daemon drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    /// In-process native PTYs (default). PTYs die with the daemon.
+    Native,
+    /// Out-of-process `asmux` holder. Sessions survive daemon restart (adopt).
+    Sidecar,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: SocketAddr,
@@ -16,10 +25,19 @@ pub struct Config {
     /// `runtime_dir` for per-user sidecar sockets. Created at resolve time.
     #[allow(dead_code)]
     pub config_dir: PathBuf,
-    #[allow(dead_code)]
     pub runtime_dir: PathBuf,
     /// Optional path to a built web client (client/dist) for packaged serving.
     pub static_dir: Option<PathBuf>,
+    /// Selected session backend (`ASM_BACKEND=native|sidecar`, default native).
+    pub backend: BackendKind,
+    /// asmux UDS path (`ASMUX_SOCK` override, else `runtime_dir/asmux.sock`).
+    pub asmux_socket: PathBuf,
+    /// Auto-spawn asmux if its socket is dead (`ASM_ASMUX_AUTOSPAWN=0` disables,
+    /// e.g. when asmux is a peer container the daemon only connects to).
+    pub asmux_autospawn: bool,
+    /// Explicit asmux binary path (`ASM_ASMUX_BIN`); else a sibling of the
+    /// daemon binary, else `asmux` on `PATH`.
+    pub asmux_bin: Option<PathBuf>,
 }
 
 impl Config {
@@ -59,12 +77,24 @@ impl Config {
         std::fs::create_dir_all(&runtime_dir)
             .with_context(|| format!("creating runtime dir {}", runtime_dir.display()))?;
 
+        let backend = match std::env::var("ASM_BACKEND").as_deref() {
+            Ok("sidecar") => BackendKind::Sidecar,
+            _ => BackendKind::Native,
+        };
+        let asmux_socket = env_path("ASMUX_SOCK").unwrap_or_else(|| runtime_dir.join("asmux.sock"));
+        let asmux_autospawn = !matches!(std::env::var("ASM_ASMUX_AUTOSPAWN").as_deref(), Ok("0"));
+        let asmux_bin = env_path("ASM_ASMUX_BIN");
+
         Ok(Self {
             bind,
             data_dir,
             config_dir,
             runtime_dir,
             static_dir,
+            backend,
+            asmux_socket,
+            asmux_autospawn,
+            asmux_bin,
         })
     }
 

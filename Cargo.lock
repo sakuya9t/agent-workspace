@@ -52,11 +52,13 @@ name = "asm-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "asmux",
  "async-trait",
  "axum",
  "directories",
  "futures",
  "parking_lot",
+ "planus",
  "portable-pty",
  "rusqlite",
  "serde",

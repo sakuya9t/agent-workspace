@@ -4,6 +4,19 @@ use anyhow::Result;
 use tokio::sync::{broadcast, watch};
 
 pub mod native;
+pub mod sidecar;
+pub mod asmux_client;
+
+/// One session the holder still knows about, from `holder_list()`. Used at
+/// startup to decide adopt (alive) vs reconcile-from-exit (dead) vs
+/// reconcile-indeterminate (absent — the holder itself was gone).
+#[derive(Debug, Clone)]
+pub struct HolderEntry {
+    pub id: String,
+    pub alive: bool,
+    pub exit_code: i32,
+    pub exit_signal: i32,
+}
 
 /// Everything a backend needs to spawn one live session.
 #[derive(Debug, Clone)]
@@ -51,6 +64,28 @@ pub struct Snapshot {
 pub trait SessionBackend: Send + Sync {
     fn id(&self) -> &'static str;
     fn create(&self, spec: BackendSpawnSpec) -> Result<Arc<dyn BackendSession>>;
+
+    /// Whether live sessions survive a daemon shutdown. `true` for an
+    /// out-of-process holder (asmux): on shutdown the daemon detaches and leaves
+    /// the children running to be re-adopted, rather than killing them. `false`
+    /// for the in-process native backend, whose PTYs must be reaped.
+    fn keep_sessions_on_shutdown(&self) -> bool {
+        false
+    }
+
+    /// Sessions the out-of-process holder still knows about (empty for backends
+    /// that don't outlive the daemon).
+    fn holder_list(&self) -> Result<Vec<HolderEntry>> {
+        Ok(Vec::new())
+    }
+
+    /// Re-adopt a session that is still alive in the holder after a daemon
+    /// restart: seed a fresh daemon-side emulator from cold history and re-attach
+    /// the holder ring. Returns `None` if this backend cannot adopt (native) or
+    /// the session is not recoverable.
+    fn adopt(&self, _session_id: &str, _rows: u16, _cols: u16) -> Result<Option<Arc<dyn BackendSession>>> {
+        Ok(None)
+    }
 }
 
 /// A single live session owned by a backend.

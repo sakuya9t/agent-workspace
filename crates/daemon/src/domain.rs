@@ -11,6 +11,12 @@ pub enum SessionStatus {
     Failed,
     Stopped,
     Archived,
+    /// The session holder (asmux) exited while this session was running, so no
+    /// completion record was ever persisted — the outcome is unknown (it may have
+    /// finished, been killed, or still be running as an orphan). Distinct from
+    /// `failed`, which asserts a real failure. See docs/durable-sessions.md →
+    /// Reconciliation states.
+    Indeterminate,
 }
 
 impl SessionStatus {
@@ -22,6 +28,7 @@ impl SessionStatus {
             SessionStatus::Failed => "failed",
             SessionStatus::Stopped => "stopped",
             SessionStatus::Archived => "archived",
+            SessionStatus::Indeterminate => "indeterminate",
         }
     }
 
@@ -33,11 +40,14 @@ impl SessionStatus {
             "failed" => SessionStatus::Failed,
             "stopped" => SessionStatus::Stopped,
             "archived" => SessionStatus::Archived,
+            "indeterminate" => SessionStatus::Indeterminate,
             _ => SessionStatus::Failed,
         }
     }
 
-    /// A session that is no longer producing live output.
+    /// A session that is no longer producing live output. `indeterminate` counts:
+    /// there is no live backend to attach to, so it behaves terminally (history
+    /// only) even though its true outcome is unknown.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -45,6 +55,7 @@ impl SessionStatus {
                 | SessionStatus::Failed
                 | SessionStatus::Stopped
                 | SessionStatus::Archived
+                | SessionStatus::Indeterminate
         )
     }
 }
@@ -195,6 +206,7 @@ mod tests {
             SessionStatus::Failed,
             SessionStatus::Stopped,
             SessionStatus::Archived,
+            SessionStatus::Indeterminate,
         ] {
             assert_eq!(SessionStatus::from_str(s.as_str()), s);
         }

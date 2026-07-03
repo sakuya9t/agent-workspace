@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
-use crate::backend::{BackendSession, BackendSpawnSpec, BackendStatus, SessionBackend};
+use crate::backend::{BackendSession, BackendSpawnSpec, BackendStatus, HolderEntry, SessionBackend};
 use crate::db::Db;
 use crate::domain::{
     AttentionState, Session, SessionStatus, SessionSummary, Workspace, WorkspaceInstance,
@@ -386,14 +386,28 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("session vanished"))
     }
 
-    /// Tear down every live backend session. Called on daemon shutdown so no
-    /// child process is leaked — the native backend kills its PTY child, and a
-    /// future out-of-process/tmux backend would kill its sidecar the same way
-    /// through `BackendSession::stop`. Returns how many sessions were stopped.
+    /// Tear down live backend sessions on daemon shutdown. For an in-process
+    /// backend this kills each PTY child so nothing leaks. For an out-of-process
+    /// holder (asmux) it does the **opposite**: the children must survive the
+    /// daemon, so we detach and leave them running (recorded `running`) to be
+    /// re-adopted next start — killing them would defeat durability. Returns how
+    /// many sessions were actively stopped (0 for a surviving holder).
     pub fn shutdown_all_live(&self) -> usize {
         // Drain under the lock so nothing else can grab a handle mid-shutdown.
         let handles: Vec<(String, Arc<dyn BackendSession>)> =
             self.live.lock().drain().collect();
+
+        if self.backend.keep_sessions_on_shutdown() {
+            // Leave the holder's children running; the socket closing on process
+            // exit lets asmux reclaim the attachment. Do NOT stop() or mark them
+            // stopped — they stay `running` for adopt-on-restart.
+            tracing::info!(
+                "holder backend: leaving {} live session(s) running for adopt",
+                handles.len()
+            );
+            return 0;
+        }
+
         let n = handles.len();
         for (id, h) in &handles {
             // Record intent first (like stop_session) so a racing monitor keeps
@@ -406,6 +420,96 @@ impl SessionManager {
             }
         }
         n
+    }
+
+    /// Reconcile sessions left live in the DB after a restart.
+    ///
+    /// - In-process backend: the PTYs are gone, so those rows become `failed`.
+    /// - Out-of-process holder: adopt-or-reconcile against `holder_list()` —
+    ///   alive in the holder → **adopt** (re-attach, mark `running`); a real exit
+    ///   record → `exited`/`failed`; absent from the holder → **`indeterminate`**
+    ///   (the holder itself died, so no completion record exists).
+    pub async fn startup_reconcile(self: &Arc<Self>) -> Result<()> {
+        if !self.backend.keep_sessions_on_shutdown() {
+            let n = self.db.reconcile_orphans_on_startup(now_millis())?;
+            if n > 0 {
+                tracing::warn!(
+                    "reconciled {n} session(s) to `failed` after restart (in-process backend not recoverable)"
+                );
+            }
+            return Ok(());
+        }
+
+        let holder = match self.backend.holder_list() {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!("holder list failed ({e:#}); reconciling live sessions to indeterminate");
+                for id in self.db.live_session_ids()? {
+                    self.reconcile_indeterminate(&id)?;
+                }
+                return Ok(());
+            }
+        };
+        let by_id: HashMap<String, HolderEntry> =
+            holder.into_iter().map(|h| (h.id.clone(), h)).collect();
+
+        let mut adopted = 0usize;
+        let mut reconciled = 0usize;
+        for id in self.db.live_session_ids()? {
+            let sess = self.db.get_session(&id)?;
+            let (rows, cols) = sess.as_ref().map(|s| (s.rows, s.cols)).unwrap_or((24, 80));
+            let created_at = sess.as_ref().map(|s| s.created_at).unwrap_or_else(now_millis);
+
+            match by_id.get(&id) {
+                Some(entry) if entry.alive => match self.backend.adopt(&id, rows, cols) {
+                    Ok(Some(handle)) => {
+                        self.live.lock().insert(id.clone(), handle.clone());
+                        self.db
+                            .update_status(&id, SessionStatus::Running, None, now_millis())?;
+                        self.clone().spawn_monitor(id.clone(), handle, created_at);
+                        adopted += 1;
+                        tracing::info!(session = %id, "adopted live holder session");
+                    }
+                    Ok(None) | Err(_) => {
+                        self.reconcile_indeterminate(&id)?;
+                        reconciled += 1;
+                    }
+                },
+                Some(entry) => {
+                    // The holder has a real completion record.
+                    let (status, code) = if entry.exit_signal != 0 {
+                        (SessionStatus::Failed, None)
+                    } else if entry.exit_code == 0 {
+                        (SessionStatus::Exited, Some(0))
+                    } else {
+                        (SessionStatus::Exited, Some(entry.exit_code))
+                    };
+                    self.db.update_status(&id, status, code, now_millis())?;
+                    reconciled += 1;
+                }
+                None => {
+                    // Absent from the holder: the holder died → outcome unknown.
+                    self.reconcile_indeterminate(&id)?;
+                    reconciled += 1;
+                }
+            }
+        }
+        tracing::info!("startup reconcile: adopted {adopted}, reconciled {reconciled} session(s)");
+        Ok(())
+    }
+
+    /// Mark a session `indeterminate` with the acmux-style advisory.
+    fn reconcile_indeterminate(&self, id: &str) -> Result<()> {
+        let now = now_millis();
+        self.db
+            .update_status(id, SessionStatus::Indeterminate, None, now)?;
+        self.db.set_attention(
+            id,
+            AttentionState::LikelyBlocked,
+            Some("no completion record — the session holder exited while this was running; check the preserved output before assuming it finished"),
+            now,
+        )?;
+        Ok(())
     }
 
     pub fn archive_session(&self, id: &str) -> Result<Session> {

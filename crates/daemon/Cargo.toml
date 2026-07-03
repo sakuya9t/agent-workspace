@@ -11,6 +11,8 @@ name = "asm-daemon"
 path = "src/main.rs"
 
 [dependencies]
+asmux = { path = "../asmux" }
+planus.workspace = true
 tokio.workspace = true
 axum.workspace = true
 tower.workspace = true

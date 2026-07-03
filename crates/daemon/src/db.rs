@@ -435,6 +435,40 @@ impl Db {
         Ok(())
     }
 
+    /// Persist the asmux ring cursor the daemon has drained up to, for adopt.
+    pub fn set_backend_cursor(&self, id: &str, cursor: u64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE sessions SET backend_cursor = ?2 WHERE id = ?1",
+            rusqlite::params![id, cursor as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The persisted `consumed` cursor. Reserved for the M3-exact adopt path
+    /// (cold-stitch + `attach FromCursor(consumed)`); the current adopt replays
+    /// the holder ring `FromEarliest`.
+    #[allow(dead_code)]
+    pub fn get_backend_cursor(&self, id: &str) -> Result<u64> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT backend_cursor FROM sessions WHERE id = ?1")?;
+        let mut rows = stmt.query_map([id], |r| r.get::<_, i64>(0))?;
+        match rows.next() {
+            Some(r) => Ok(r?.max(0) as u64),
+            None => Ok(0),
+        }
+    }
+
+    /// Ids of sessions currently recorded live (`starting`/`running`) — the
+    /// adopt-or-reconcile candidates at startup.
+    pub fn live_session_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT id FROM sessions WHERE status IN ('starting','running') ORDER BY created_at ASC")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
     /// On startup, any session left in a live state is reconciled: since the
     /// MVP native backend is in-process, a daemon restart means its PTYs are
     /// gone, so those sessions become `failed` (never silently relaunched).
@@ -541,6 +575,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.pragma_update(None, "user_version", 4)?;
         tracing::info!("applied schema migration v4");
     }
+    if version < 5 {
+        conn.execute_batch(SCHEMA_V5)?;
+        conn.pragma_update(None, "user_version", 5)?;
+        tracing::info!("applied schema migration v5");
+    }
     Ok(())
 }
 
@@ -631,6 +670,14 @@ CREATE TABLE devices (
 
 const SCHEMA_V4: &str = r#"
 ALTER TABLE sessions ADD COLUMN risky INTEGER NOT NULL DEFAULT 0;
+"#;
+
+// The asmux ring byte-cursor the daemon has drained + persisted up to
+// (`consumed`). On adopt-on-restart the daemon seeds vt100 from its cold history
+// and re-attaches the holder ring `FromCursor(backend_cursor)`. 0 = nothing
+// drained yet (also the value for native/in-process sessions, which never adopt).
+const SCHEMA_V5: &str = r#"
+ALTER TABLE sessions ADD COLUMN backend_cursor INTEGER NOT NULL DEFAULT 0;
 "#;
 
 /// Batches terminal events into transactions to keep write amplification low.

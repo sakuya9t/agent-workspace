@@ -1,9 +1,11 @@
 # Durable Sessions via an Out-of-Process Session Holder ("asmux")
 
-Status: **M1 landed; M2–M5 pending.** The standalone holder (`crates/asmux` +
-the `crates/asmux-wire` FlatBuffers types) is implemented and tested against the
-frozen contract; wiring it into the daemon (M2 `SidecarBackend`) is next. Adapts
-the "acmux" design (from the agent-conductor project) to this codebase.
+Status: **M1–M3 landed; M4–M5 pending.** The standalone holder (`crates/asmux` +
+`crates/asmux-wire`), the daemon-side `SidecarBackend` over an async client, and
+adopt-on-restart are all implemented and tested — sessions survive a daemon
+restart end-to-end (`scripts/durable-restart-test.mjs`). Remaining: M4 hardening
+(watchdog/reconnect, soft-reboot, exact cold-stitch adopt) and M5 Windows.
+Adapts the "acmux" design (from the agent-conductor project) to this codebase.
 
 Locked decisions: sidecar crate/binary named **`asmux`**; wire encoding is
 **FlatBuffers** (schema frozen once shipped); **one holder for all sessions**
@@ -271,28 +273,40 @@ sessions instead of dropping them — see [`deployment.md`](deployment.md).
   population land in M4; round-robin writer fairness across sessions (M1 gives
   per-session eviction + a shared bounded data channel) is a hardening follow-up;
   the best-effort crash-salvage ring flush is optional and not yet built.
-- **M2 — SidecarBackend in asm-daemon.** Implement `SessionBackend` over the
-  asmux client; `vt100` rebuilt from ring-buffer replay. Behind
+- **M2 — SidecarBackend in asm-daemon. _Done._** `SidecarBackend`/`SidecarSession`
+  (`crates/daemon/src/backend/sidecar.rs`) implement the existing
+  `SessionBackend`/`BackendSession` traits over an async `AsmuxClient`
+  (`backend/asmux_client.rs`): one UDS multiplexes all sessions, with a
+  reader/writer task pair (the reader is isolated because `read_frame` isn't
+  cancellation-safe) demuxing RPC replies vs per-session output/exit. The `vt100`
+  emulator stays in the daemon, fed by a per-session **drain task**; sync trait
+  methods bridge to the async client via `block_in_place`. Behind
   `ASM_BACKEND=sidecar` (default stays `native`). Auto-spawn asmux if the socket
-  is dead — **and spawn it outside the daemon's kill zone.** Under systemd,
-  `KillMode=control-group` (the default) tears down the daemon's whole cgroup on
-  stop/restart, which would take asmux with it. Spawn via `systemd-run --user
-  --scope` (or a separate user unit); plain `setsid` is the non-systemd fallback
-  and **does not** escape a cgroup, so it is not sufficient on systemd. In the
-  two-container deployment asmux is a *peer* container, not a child — the daemon
-  connects and retries, and `ASM_ASMUX_AUTOSPAWN=0` disables the spawn path.
-- **M3 — adopt-on-restart.** Add `SessionBackend::adopt`; schema **v5**
-  `sessions.backend_handle` (the DB already reaches `user_version 4` via the
-  `risky` column); persist `(vt100 snapshot, cursor)` pairs; replace
-  `reconcile_orphans_on_startup` with adopt-or-reconcile. **Acceptance (no-gap
-  path):** start a full-screen-TUI agent → emit output → `SIGTERM` daemon →
-  restart → session still `running`, **screen reconstructed exactly** from
-  snapshot + cold-stitch + ring replay, zero-flicker reconnect. **Acceptance (gap
-  path):** keep the daemon down until the ring wraps past `consumed` → restart →
-  session `running` with an explicit **gap marker** and an approximate screen that
-  becomes exact on the next repaint (no crash, no silent wrong state). Also:
-  duplicate `create` retry returns the existing record; an asmux kill
-  mid-session reconciles to **`indeterminate`**, not `failed`.
+  is dead — **and outside the daemon's kill zone** (a new process group;
+  `ASM_ASMUX_AUTOSPAWN=0` disables it for the peer-container case). Under systemd,
+  `KillMode=control-group` (the default) would still take asmux down with the
+  daemon's cgroup, so production must spawn via `systemd-run --user --scope` (or a
+  separate user unit) — plain group-detach/`setsid` does **not** escape a cgroup.
+  The shutdown path is the critical inversion: for a holder backend the daemon
+  **detaches and leaves the children running** instead of killing them.
+- **M3 — adopt-on-restart. _Done (ring-replay adopt; exact cold-stitch is a
+  follow-up)._** `SessionBackend::adopt` + `SessionManager::startup_reconcile`
+  replace the blanket `reconcile_orphans_on_startup`; schema **v5** adds
+  `sessions.backend_cursor` (the persisted `consumed` cursor). On restart the
+  daemon reconnects the holder, `list`s it, and for each live DB row: **adopts**
+  if the holder still has it alive (re-`attach FromEarliest`, replay the ring into
+  a fresh daemon `vt100`, mark `running`); reconciles `exited`/`failed` from a real
+  exit record; or marks **`indeterminate`** if the holder no longer knows it (no
+  completion record). Duplicate `create` is idempotent (holder-side launch
+  fingerprint). **Verified end-to-end** by `scripts/durable-restart-test.mjs`:
+  create → `SIGTERM` daemon → restart → session still `running`, screen
+  reconstructed (marker present), still accepts input. _Follow-up:_ the current
+  adopt reconstructs from the holder **ring** (exact while the session's output
+  fits the ring; approximate + repaint beyond it). The M3-exact path — seed from
+  cold history and `attach FromCursor(backend_cursor)` with a real **gap marker**
+  when the ring wrapped past `consumed` — is scaffolded (`backend_cursor` is
+  persisted; `get_backend_cursor` + `HolderEntry.head_cursor` are ready) but not
+  yet the default.
 - **M4 — hardening.** Soft-reboot (hash drift + confirm), orphan surfacing/adopt,
   `purge`, metadata RPCs, `readLog`, heartbeat/watchdog reconnect with backoff,
   slow-attacher drop + resync, `list`-after-reconnect reconciliation.

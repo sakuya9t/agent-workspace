@@ -10,13 +10,18 @@ mod source_control;
 mod util;
 mod workspace;
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use api::AppState;
+use backend::asmux_client::AsmuxClient;
 use backend::native::NativePtyBackend;
-use config::Config;
+use backend::sidecar::SidecarBackend;
+use backend::SessionBackend;
+use config::{BackendKind, Config};
 use db::Db;
 use plugins::PluginRegistry;
 use session_manager::SessionManager;
@@ -68,19 +73,38 @@ async fn main() -> Result<()> {
         );
     }
 
-    // A daemon restart means the in-process native PTYs are gone. Never
-    // silently relaunch: reconcile any lingering live rows to `failed`.
-    let orphaned = db.reconcile_orphans_on_startup(now_millis())?;
-    if orphaned > 0 {
-        tracing::warn!(
-            "reconciled {orphaned} session(s) to `failed` after restart (native backend not recoverable in-process)"
-        );
-    }
-
     let registry = Arc::new(PluginRegistry::with_builtins());
-    let backend = Arc::new(NativePtyBackend::new(db.events()));
     let worktree_root = config.data_dir.join("worktrees");
+
+    // Select the session backend. The out-of-process holder (asmux) is what makes
+    // sessions survive a daemon restart; the native in-process backend does not.
+    let backend: Arc<dyn SessionBackend> = match config.backend {
+        BackendKind::Native => {
+            tracing::info!("session backend: native (in-process PTYs; do not survive restart)");
+            Arc::new(NativePtyBackend::new(db.events()))
+        }
+        BackendKind::Sidecar => {
+            ensure_asmux(&config).await?;
+            let client = AsmuxClient::connect(&config.asmux_socket)
+                .await
+                .context("connecting to asmux holder")?;
+            tracing::info!(
+                socket = %config.asmux_socket.display(),
+                instance_id = %client.instance_id,
+                holder_pid = client.server_pid,
+                "session backend: asmux holder (sessions survive daemon restart)"
+            );
+            Arc::new(SidecarBackend::new(client, db.events(), db.clone()))
+        }
+    };
+
     let manager = Arc::new(SessionManager::new(db, registry, backend, worktree_root));
+
+    // Reconcile sessions left live by a previous run: adopt survivors from the
+    // holder, or mark them failed/indeterminate. (Native marks them `failed`.)
+    if let Err(e) = manager.startup_reconcile().await {
+        tracing::error!("startup reconcile failed: {e:#}");
+    }
 
     let state = AppState {
         manager: manager.clone(),
@@ -114,6 +138,69 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Ensure the asmux holder is reachable, auto-spawning it (detached) if the
+/// socket is dead and autospawn is enabled.
+async fn ensure_asmux(config: &Config) -> Result<()> {
+    use tokio::net::UnixStream;
+
+    if UnixStream::connect(&config.asmux_socket).await.is_ok() {
+        return Ok(());
+    }
+    if !config.asmux_autospawn {
+        bail!(
+            "asmux socket {} is unavailable and ASM_ASMUX_AUTOSPAWN=0",
+            config.asmux_socket.display()
+        );
+    }
+
+    let bin = resolve_asmux_bin(config);
+    tracing::info!(bin = %bin.display(), "auto-spawning asmux holder");
+
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.env("ASM_RUNTIME_DIR", &config.runtime_dir)
+        .env("ASMUX_SOCK", &config.asmux_socket)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // Detach into its own process group so a signal aimed at the daemon's group
+    // (or the daemon dying) does not take the holder with it. Escaping a systemd
+    // cgroup needs `systemd-run --user --scope` — see docs/deployment.md (M4).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.spawn()
+        .with_context(|| format!("spawning asmux binary at {}", bin.display()))?;
+
+    // Wait for the socket to come up.
+    for _ in 0..50 {
+        if UnixStream::connect(&config.asmux_socket).await.is_ok() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bail!(
+        "asmux did not start listening at {}",
+        config.asmux_socket.display()
+    )
+}
+
+/// `ASM_ASMUX_BIN`, else a sibling of the daemon binary, else `asmux` on `PATH`.
+fn resolve_asmux_bin(config: &Config) -> PathBuf {
+    if let Some(p) = &config.asmux_bin {
+        return p.clone();
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(sib) = exe.parent().map(|d| d.join("asmux")) {
+            if sib.exists() {
+                return sib;
+            }
+        }
+    }
+    PathBuf::from("asmux")
 }
 
 /// Resolve when the process is asked to terminate (Ctrl-C / SIGINT, or SIGTERM
