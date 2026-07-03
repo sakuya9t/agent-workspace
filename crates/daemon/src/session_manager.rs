@@ -658,8 +658,7 @@ impl SessionManager {
         // Maintain a small decoded tail for prompt/approval detection.
         tail.push_str(&String::from_utf8_lossy(bytes));
         trim_tail(tail, 4096);
-        let bell = bytes.contains(&0x07);
-        let (attention, reason) = classify_attention(tail, bell);
+        let (attention, reason) = classify_attention(tail);
         *last_attn = attention;
 
         let now = now_millis();
@@ -771,11 +770,16 @@ fn canonical(p: &str) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p))
 }
 
-/// Very small heuristic prompt/approval classifier over the decoded tail.
-/// MVP attention detection works on recent output text only — it never needs
-/// direct access to sidecar terminal screen state.
-fn classify_attention(tail: &str, bell: bool) -> (AttentionState, Option<String>) {
-    let lower = tail.to_lowercase();
+/// Heuristic classifier over the decoded output tail. A session is "blocked"
+/// (needs input to proceed) only when an input prompt sits at the **current end**
+/// of output — the place a waiting program leaves its cursor. Everything else is
+/// working "activity" (later settled to `idle` by the silence timer).
+///
+/// Deliberately does NOT treat a bell (`0x07`) as blocked: agents emit bells
+/// routinely while working (spinners, redraws), which made the status flip
+/// active↔blocked. And matching only the last line keeps a prompt-like phrase
+/// mid-stream from flipping a working agent to blocked.
+fn classify_attention(tail: &str) -> (AttentionState, Option<String>) {
     const APPROVAL_PATTERNS: &[&str] = &[
         "(y/n)",
         "[y/n]",
@@ -789,6 +793,14 @@ fn classify_attention(tail: &str, bell: bool) -> (AttentionState, Option<String>
         "are you sure",
         "press enter to continue",
     ];
+    // The last non-blank line is the current bottom of the screen, where a
+    // waiting prompt lives. If the agent produced output after a prompt, that
+    // line is no longer the prompt — so it reads as working, not blocked.
+    let last_line = tail
+        .rsplit(|c: char| c == '\n' || c == '\r')
+        .find(|s| !s.trim().is_empty())
+        .unwrap_or(tail);
+    let lower = last_line.to_lowercase();
     for p in APPROVAL_PATTERNS {
         if lower.contains(p) {
             return (
@@ -796,12 +808,6 @@ fn classify_attention(tail: &str, bell: bool) -> (AttentionState, Option<String>
                 Some(format!("prompt detected: {p}")),
             );
         }
-    }
-    if bell {
-        return (
-            AttentionState::LikelyBlocked,
-            Some("terminal bell".to_string()),
-        );
     }
     (AttentionState::Activity, None)
 }
@@ -833,23 +839,35 @@ mod tests {
     // ---- attention classifier ----
 
     #[test]
-    fn detects_approval_prompt() {
-        let (a, reason) = classify_attention("Proceed? (y/n)", false);
+    fn detects_approval_prompt_at_end() {
+        let (a, reason) = classify_attention("Proceed? (y/n)");
         assert_eq!(a, AttentionState::ApprovalNeeded);
         assert!(reason.is_some());
+        // A prompt on a prior line (cursor sits after it, no trailing output).
+        let (a2, _) = classify_attention("Working...\nPassword: ");
+        assert_eq!(a2, AttentionState::ApprovalNeeded);
     }
 
     #[test]
-    fn bell_is_likely_blocked() {
-        let (a, _) = classify_attention("just some output", true);
-        assert_eq!(a, AttentionState::LikelyBlocked);
+    fn prompt_phrase_mid_stream_is_activity() {
+        // The prompt-like phrase is NOT the last line — the agent kept working,
+        // so it must read as active, not blocked (no active<->blocked flicker).
+        let (a, _) = classify_attention("Do you want to continue?\nDownloading 42%...");
+        assert_eq!(a, AttentionState::Activity);
     }
 
     #[test]
     fn plain_output_is_activity() {
-        let (a, reason) = classify_attention("building project...", false);
+        let (a, reason) = classify_attention("building project...");
         assert_eq!(a, AttentionState::Activity);
         assert!(reason.is_none());
+    }
+
+    #[test]
+    fn bell_does_not_block() {
+        // Output containing a bell is still just working (bells are noise).
+        let (a, _) = classify_attention("compiling\u{07} module");
+        assert_eq!(a, AttentionState::Activity);
     }
 
     // ---- tail trimming ----

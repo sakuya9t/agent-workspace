@@ -15,10 +15,10 @@ const STATUS_COLOR: Record<SessionStatus, string> = {
   indeterminate: "#ff9e64",
 };
 
-// active = producing output; idle = waiting for the next input (calm);
+// working = producing output; idle = waiting for the next input (calm);
 // blocked = needs input to proceed (urgent).
 const ATTENTION_LABEL: Partial<Record<AttentionState, string>> = {
-  activity: "active",
+  activity: "working",
   idle: "idle",
   likely_blocked: "blocked",
   approval_needed: "blocked",
