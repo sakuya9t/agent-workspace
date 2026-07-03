@@ -103,10 +103,14 @@ pub struct Session {
     /// Woken on every ring append and on child exit, so a streamer can flush.
     data_signal: Arc<Notify>,
 
-    master: Mutex<Box<dyn MasterPty + Send>>,
-    killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    // Live-child handles. All three are released (set to `None`) by the reader
+    // thread once the child is reaped, so a *tombstone* no longer pins a PTY
+    // master fd, a child handle, or an idle writer thread. Guarded everywhere by
+    // an `is_alive()` check, so `None` is only ever observed on a dead session.
+    master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    killer: Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>,
 
-    input_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    input_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
     input_queued: Arc<AtomicUsize>,
 
     /// The one connection currently streaming this session, if any.
@@ -178,9 +182,9 @@ impl Session {
             status: Mutex::new(Status::Running),
             metadata: Mutex::new(spec.metadata),
             data_signal: data_signal.clone(),
-            master: Mutex::new(pair.master),
-            killer: Mutex::new(killer),
-            input_tx,
+            master: Mutex::new(Some(pair.master)),
+            killer: Mutex::new(Some(killer)),
+            input_tx: Mutex::new(Some(input_tx)),
             input_queued: input_queued.clone(),
             attacher: Mutex::new(None),
         });
@@ -273,8 +277,14 @@ impl Session {
             return InputOutcome::Overflow;
         }
         self.input_queued.fetch_add(len, Ordering::AcqRel);
-        if self.input_tx.send(data.to_vec()).is_err() {
-            // Writer thread gone (child dead): undo the reservation.
+        let sent = self
+            .input_tx
+            .lock()
+            .as_ref()
+            .map(|tx| tx.send(data.to_vec()).is_ok())
+            .unwrap_or(false);
+        if !sent {
+            // Writer thread gone (child dead / reaped): undo the reservation.
             self.input_queued.fetch_sub(len, Ordering::AcqRel);
             return InputOutcome::NotAlive;
         }
@@ -288,15 +298,19 @@ impl Session {
         }
         {
             let master = self.master.lock();
-            if master
-                .resize(PtySize {
-                    rows,
-                    cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
+            let resized = master
+                .as_ref()
+                .map(|m| {
+                    m.resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .is_ok()
                 })
-                .is_err()
-            {
+                .unwrap_or(false);
+            if !resized {
                 return InputOutcome::NotAlive;
             }
         }
@@ -311,7 +325,9 @@ impl Session {
             return;
         }
         if signal == 0 {
-            let _ = self.killer.lock().kill();
+            if let Some(k) = self.killer.lock().as_mut() {
+                let _ = k.kill();
+            }
             return;
         }
         #[cfg(unix)]
@@ -322,11 +338,32 @@ impl Session {
             }
         }
         // Unknown signal or non-unix: fall back to the default terminate.
-        let _ = self.killer.lock().kill();
+        if let Some(k) = self.killer.lock().as_mut() {
+            let _ = k.kill();
+        }
+    }
+
+    /// Release everything only a *live* child needs: the PTY master (frees the
+    /// ptmx fd), the child-killer handle, and the input sender. Dropping the
+    /// sender closes the input channel, so the writer thread's blocking receive
+    /// returns and the thread exits (closing its PTY writer fd). Called once
+    /// from the reader thread after the child is reaped. The ring and status are
+    /// deliberately left intact for the tombstone.
+    fn release_child_handles(&self) {
+        *self.master.lock() = None;
+        *self.killer.lock() = None;
+        *self.input_tx.lock() = None;
     }
 
     pub fn metadata(&self) -> Vec<(String, String)> {
         self.metadata.lock().clone()
+    }
+
+    /// Test-only: whether the live-child handles (PTY master, input channel) are
+    /// still held. Both must be `false` once a session has become a tombstone.
+    #[cfg(test)]
+    fn holds_child_handles(&self) -> bool {
+        self.master.lock().is_some() || self.input_tx.lock().is_some()
     }
 
     /// Apply a metadata patch: `Some(v)` sets (including `""`), `None` deletes.
@@ -418,6 +455,10 @@ fn reader_loop(mut reader: Box<dyn Read + Send>, session: Arc<Session>, mut chil
         },
     };
     *session.status.lock() = status;
+    // The child is gone. Release the live-only handles so this tombstone stops
+    // pinning a PTY master fd and an idle writer thread; the ring (recorded
+    // output) and status are retained for late replay / adoption.
+    session.release_child_handles();
     // Wake the streamer so it can flush the tail and emit SessionExited.
     session.data_signal.notify_one();
 }
@@ -438,4 +479,70 @@ fn writer_loop(
 
 fn short(id: &str) -> String {
     id.chars().take(8).collect()
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn spec(command: &str, args: &[&str]) -> SpawnSpec {
+        SpawnSpec {
+            session_id: "t".into(),
+            command: command.into(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            cwd: String::new(),
+            env: vec![],
+            cols: 80,
+            rows: 24,
+            ring_capacity: 64 * 1024,
+            metadata: vec![],
+            fingerprint: 0,
+            created_at_unix_ms: 0,
+        }
+    }
+
+    fn wait_until<F: Fn() -> bool>(secs: u64, cond: F) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cond()
+    }
+
+    #[test]
+    fn tombstone_releases_pty_master_and_writer_thread() {
+        let session = Session::spawn(spec("/bin/sh", &["-c", "exit 0"])).unwrap();
+        // Reader thread observes EOF, reaps the child, flips status, then releases.
+        assert!(wait_until(5, || !session.is_alive()), "child should exit");
+        assert!(
+            wait_until(2, || !session.holds_child_handles()),
+            "tombstone must release the PTY master and input channel"
+        );
+        // The tombstone stays usable and correctly rejects further input.
+        assert_eq!(session.send_input(b"x"), InputOutcome::NotAlive);
+        assert!(!session.record().alive);
+    }
+
+    #[test]
+    fn live_session_holds_handles_and_echoes() {
+        // `cat` stays alive echoing stdin; handles must remain held while alive.
+        let session = Session::spawn(spec("/bin/cat", &[])).unwrap();
+        assert!(session.is_alive());
+        assert!(session.holds_child_handles());
+        assert_eq!(session.send_input(b"hi\n"), InputOutcome::Queued);
+        session.kill(0);
+        assert!(wait_until(5, || !session.is_alive()), "cat should exit on kill");
+        assert!(wait_until(2, || !session.holds_child_handles()));
+    }
 }
