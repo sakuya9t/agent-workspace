@@ -294,6 +294,15 @@ impl Db {
         rows.next().transpose().map_err(Into::into)
     }
 
+    pub fn delete_workspace(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "DELETE FROM workspaces WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn set_workspace_git(&self, id: &str, is_git: bool) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(

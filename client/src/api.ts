@@ -6,7 +6,8 @@ export type SessionStatus =
   | "exited"
   | "failed"
   | "stopped"
-  | "archived";
+  | "archived"
+  | "indeterminate";
 
 export type AttentionState =
   | "none"
@@ -122,6 +123,8 @@ export interface Workspace {
   root_path: string;
   is_git: boolean;
   created_at: number;
+  /** Whether root_path currently exists on the host (from the list endpoint). */
+  root_exists?: boolean;
 }
 
 export interface WorkspaceInstance {
@@ -272,6 +275,8 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ name, root_path }),
     }).then((r) => r.workspace),
+  removeWorkspace: (t: Target, id: string) =>
+    req<{ ok: boolean }>(t, `/api/workspaces/${id}`, { method: "DELETE" }),
   initWorkspaceGit: (t: Target, id: string) =>
     req<{ workspace: Workspace }>(t, `/api/workspaces/${id}/init-git`, {
       method: "POST",

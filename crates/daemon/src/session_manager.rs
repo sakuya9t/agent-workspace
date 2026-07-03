@@ -304,6 +304,30 @@ impl SessionManager {
         self.db.list_workspaces()
     }
 
+    /// Unregister a workspace (removes it from the allowlist). Refuses while it
+    /// still has live sessions. Does not stop sessions or delete worktrees on
+    /// disk — it only drops the registration; existing session records keep
+    /// their (now dangling) `workspace_id`.
+    pub fn remove_workspace(&self, id: &str) -> Result<()> {
+        let ws = self
+            .db
+            .get_workspace(id)?
+            .ok_or_else(|| anyhow!("no such workspace"))?;
+        let has_live = self
+            .db
+            .list_sessions()?
+            .iter()
+            .any(|s| s.workspace_id.as_deref() == Some(id) && !s.status.is_terminal());
+        if has_live {
+            bail!(
+                "workspace `{}` still has live sessions; stop them first",
+                ws.name
+            );
+        }
+        self.db.delete_workspace(id)?;
+        Ok(())
+    }
+
     /// Local branches and current HEAD for a workspace, for the new-session
     /// branch picker. Empty for non-Git workspaces.
     pub fn list_workspace_branches(&self, id: &str) -> Result<(Vec<String>, Option<String>)> {

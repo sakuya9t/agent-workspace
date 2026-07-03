@@ -12,6 +12,7 @@ const STATUS_COLOR: Record<SessionStatus, string> = {
   failed: "#f7768e",
   stopped: "#565f89",
   archived: "#414868",
+  indeterminate: "#ff9e64",
 };
 
 const ATTENTION_LABEL: Partial<Record<AttentionState, string>> = {
@@ -74,6 +75,11 @@ export function SessionList() {
   const ack = useMutation({
     mutationFn: ({ target, id }: MutArgs) => api.ackAttention(target, id),
     onSuccess: refresh,
+  });
+  const removeWs = useMutation({
+    mutationFn: ({ target, id }: MutArgs) => api.removeWorkspace(target, id),
+    onSuccess: refresh,
+    onError: (e) => alert(String(e)),
   });
 
   const select = (daemonId: string, target: Target, s: Session) => {
@@ -172,15 +178,30 @@ export function SessionList() {
   ) => {
     const key = daemonId + ":ws:" + w.id;
     const open = isOpen(key);
+    const missing = w.root_exists === false;
     return (
       <div key={key} className="tree-branch">
         <div className="tree-node lvl2" onClick={() => toggle(key)}>
           <span className="chevron">{open ? "▾" : "▸"}</span>
           <span className="tree-icon">{w.is_git ? "◆" : "▪"}</span>
-          <span className="tree-label" title={w.root_path}>
+          <span
+            className="tree-label"
+            title={missing ? `${w.root_path} — no longer exists on the host` : w.root_path}
+            style={missing ? { color: "#f7768e" } : undefined}
+          >
             {w.name}
           </span>
-          <span className="tree-sub">{w.is_git ? "git" : "plain"}</span>
+          {missing ? (
+            <span
+              className="tree-sub"
+              style={{ color: "#f7768e" }}
+              title={`${w.root_path} — no longer exists on the host`}
+            >
+              missing
+            </span>
+          ) : (
+            <span className="tree-sub">{w.is_git ? "git" : "plain"}</span>
+          )}
           {sessions.length > 0 && <span className="tree-badge">{sessions.length}</span>}
           <button
             className="tree-add"
@@ -191,6 +212,22 @@ export function SessionList() {
             }}
           >
             +
+          </button>
+          <button
+            className="tree-add"
+            title="Remove (unregister) this workspace"
+            onClick={(e) => {
+              e.stopPropagation();
+              if (
+                confirm(
+                  `Remove workspace "${w.name}"?\n\nThis only unregisters it from this daemon — sessions and files on disk are left intact.`,
+                )
+              ) {
+                removeWs.mutate({ target, id: w.id });
+              }
+            }}
+          >
+            ×
           </button>
         </div>
         {open && (

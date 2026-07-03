@@ -4,7 +4,7 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
@@ -46,6 +46,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/fs/list", get(fs::list))
         .route("/api/plugins", get(list_plugins))
         .route("/api/workspaces", get(list_workspaces).post(add_workspace))
+        .route("/api/workspaces/:id", delete(remove_workspace))
         .route("/api/workspaces/:id/init-git", post(init_workspace_git))
         .route("/api/workspaces/:id/branches", get(list_workspace_branches))
         .route("/api/sessions", get(list_sessions).post(create_session))
@@ -115,7 +116,24 @@ async fn list_plugins(State(state): State<AppState>) -> Json<serde_json::Value> 
 async fn list_workspaces(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    Ok(Json(json!({ "workspaces": state.manager.list_workspaces()? })))
+    // Augment each workspace with a live `root_exists` check so the client can
+    // flag a workspace whose directory was deleted on the host.
+    let workspaces: Vec<serde_json::Value> = state
+        .manager
+        .list_workspaces()?
+        .iter()
+        .map(|w| {
+            let mut v = serde_json::to_value(w).unwrap_or_else(|_| json!({}));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "root_exists".into(),
+                    json!(std::path::Path::new(&w.root_path).is_dir()),
+                );
+            }
+            v
+        })
+        .collect();
+    Ok(Json(json!({ "workspaces": workspaces })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,6 +148,14 @@ async fn add_workspace(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let w = state.manager.register_workspace(body.name, body.root_path)?;
     Ok(Json(json!({ "workspace": w })))
+}
+
+async fn remove_workspace(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    state.manager.remove_workspace(&id)?;
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn init_workspace_git(

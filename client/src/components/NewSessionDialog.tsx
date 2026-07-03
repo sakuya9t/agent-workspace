@@ -88,13 +88,39 @@ export function NewSessionDialog() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["workspaces", conn.baseUrl] }),
   });
 
+  const removeWs = useMutation({
+    mutationFn: (id: string) => api.removeWorkspace(conn, id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["workspaces", conn.baseUrl] });
+      qc.invalidateQueries({ queryKey: ["daemon"] });
+      setTarget({ kind: "workspace", id: "" });
+    },
+  });
+
   const create = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       const plugin = plugins?.find((p) => p.id === pluginId);
       const effectiveOptions: Record<string, boolean> = {};
       for (const o of plugin?.options ?? []) {
         effectiveOptions[o.key] = agentOptions[o.key] ?? o.default;
       }
+
+      // Resolve where to run. A workspace is used directly; a raw directory is
+      // auto-registered as a workspace (reusing one with the same root) so it is
+      // allowlisted rather than rejected, then run in place (no worktree).
+      let workspaceId: string;
+      let useDirect = directCheckout;
+      if (target.kind === "workspace") {
+        workspaceId = target.id;
+      } else {
+        const path = cwd.trim();
+        const existing = workspaces?.find((w) => w.root_path === path);
+        const ws = existing ?? (await api.addWorkspace(conn, dirLabel(path), path));
+        workspaceId = ws.id;
+        useDirect = true;
+        qc.invalidateQueries({ queryKey: ["workspaces", conn.baseUrl] });
+      }
+
       const base = baseRef || defaultBranch;
       const existing = existingBranch || defaultBranch;
       const branchArgs =
@@ -105,11 +131,10 @@ export function NewSessionDialog() {
             : {};
       return api.createSession(conn, {
         agent_plugin_id: pluginId,
-        cwd: target.kind === "path" ? cwd : undefined,
-        workspace_id: target.kind === "workspace" ? target.id : undefined,
+        workspace_id: workspaceId,
         command: pluginId === "custom_command" ? command : undefined,
         approve_custom: approve,
-        direct_checkout: directCheckout,
+        direct_checkout: useDirect,
         options: effectiveOptions,
         ...branchArgs,
       });
@@ -222,6 +247,10 @@ export function NewSessionDialog() {
                 Browse…
               </button>
             </div>
+            <div className="dim small">
+              Registered as a workspace on first use so it stays on the allowlist;
+              remove it later from its workspace node in the sidebar.
+            </div>
           </>
         )}
 
@@ -239,10 +268,32 @@ export function NewSessionDialog() {
               {workspaces?.map((w) => (
                 <option key={w.id} value={w.id}>
                   {w.name} {w.is_git ? "· git" : "· plain"}
+                  {w.root_exists === false ? " · missing" : ""}
                 </option>
               ))}
             </select>
-            {selectedWs && <div className="dim small mono">{selectedWs.root_path}</div>}
+            {selectedWs && (
+              <div className="path-row">
+                <div
+                  className="dim small mono"
+                  style={selectedWs.root_exists === false ? { color: "#f7768e" } : undefined}
+                >
+                  {selectedWs.root_path}
+                  {selectedWs.root_exists === false ? "  · missing on host" : ""}
+                </div>
+                <button
+                  className="btn tiny"
+                  title="Unregister this workspace (files are left intact)"
+                  disabled={removeWs.isPending}
+                  onClick={() => {
+                    if (confirm(`Remove workspace "${selectedWs.name}"?`)) removeWs.mutate(selectedWs.id);
+                  }}
+                >
+                  Remove
+                </button>
+              </div>
+            )}
+            {removeWs.error && <div className="error">{String(removeWs.error)}</div>}
             {selectedWs && selectedWs.is_git && (
               <label className="checkbox">
                 <input
@@ -417,4 +468,10 @@ export function NewSessionDialog() {
       )}
     </div>
   );
+}
+
+/** Last path segment, used as the auto-registered workspace name. */
+function dirLabel(p: string): string {
+  const parts = p.split(/[/\\]/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : p || "dir";
 }
