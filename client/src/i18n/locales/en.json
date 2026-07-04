@@ -243,7 +243,7 @@
   "connection": {
     "title": "Daemons",
     "sameOrigin": "same-origin (local)",
-    "tokenTag": "token",
+    "tokenTag": "🔒 token",
     "remove": "remove",
     "enrollTokenLabel": "Enrollment token for other devices:",
     "addDivider": "— add a remote daemon —",

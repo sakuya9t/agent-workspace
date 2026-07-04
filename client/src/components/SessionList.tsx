@@ -283,6 +283,7 @@ export function SessionList() {
     const active = bundle?.sessions.filter((s) => isLive(s.status)) ?? [];
     const wsIds = new Set((bundle?.workspaces ?? []).map((w) => w.id));
     const adhoc = active.filter((s) => !s.workspace_id || !wsIds.has(s.workspace_id));
+    const adhocKey = daemon.id + ":adhoc";
 
     return (
       <div key={daemon.id} className={"tree-branch" + (connected ? "" : " disconnected")}>
@@ -351,18 +352,13 @@ export function SessionList() {
             )}
             {adhoc.length > 0 && (
               <div className="tree-branch">
-                <div
-                  className="tree-node lvl2"
-                  onClick={() => toggle(daemon.id + ":adhoc")}
-                >
-                  <span className="chevron">
-                    {isOpen(daemon.id + ":adhoc") ? "▾" : "▸"}
-                  </span>
+                <div className="tree-node lvl2" onClick={() => toggle(adhocKey)}>
+                  <span className="chevron">{isOpen(adhocKey) ? "▾" : "▸"}</span>
                   <span className="tree-icon">▫</span>
                   <span className="tree-label">{t("sessionList.adhoc")}</span>
                   <span className="tree-badge">{adhoc.length}</span>
                 </div>
-                {isOpen(daemon.id + ":adhoc") && (
+                {isOpen(adhocKey) && (
                   <div className="tree-leaves">
                     {adhoc.map((s) => row(daemon.id, target, s))}
                   </div>

@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && eslint src && vite build",
+    "lint": "eslint src",
     "preview": "vite preview",
     "test": "node vite.proxy-log.test.mjs"
   },
@@ -24,7 +25,10 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.4",
+    "eslint": "^10.6.0",
+    "eslint-plugin-i18next": "^6.1.5",
     "typescript": "^5.7.2",
+    "typescript-eslint": "^8.62.1",
     "vite": "^6.0.5"
   }
 }

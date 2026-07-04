@@ -79,7 +79,7 @@ export function ConnectionDialog() {
                 <div className="daemon-name">{daemonLabel(d)}</div>
                 <div className="dim small mono">
                   {d.baseUrl || t("connection.sameOrigin")}
-                  {d.token ? ` · 🔒 ${t("connection.tokenTag")}` : ""}
+                  {d.token && <>{" · "}{t("connection.tokenTag")}</>}
                 </div>
               </div>
               {d.id !== "local" && (
