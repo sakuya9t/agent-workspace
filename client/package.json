@@ -5,8 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && eslint src && vite build",
-    "lint": "eslint src",
+    "build": "tsc --noEmit && eslint src && node check-locales.mjs && vite build",
+    "lint": "eslint src && node check-locales.mjs",
     "preview": "vite preview",
     "test": "node vite.proxy-log.test.mjs"
   },
