@@ -250,7 +250,9 @@ async function req<T>(t: Target, path: string, init?: RequestInit): Promise<T> {
       // A bare gateway error means a proxy sits in front of a dead daemon.
       msg = i18n.t("api.gatewayUnreachable", { message: msg });
     }
-    throw new Error(msg);
+    // Expose the HTTP status so callers can branch on it (e.g. 409 → confirm
+    // and retry a guarded, destructive action with force).
+    throw Object.assign(new Error(msg), { status: res.status });
   }
   return res.json() as Promise<T>;
 }
@@ -323,10 +325,12 @@ export const api = {
     req<{ session: Session }>(t, `/api/sessions/${id}/stop`, { method: "POST" }).then(
       (r) => r.session,
     ),
-  archiveSession: (t: Target, id: string) =>
-    req<{ session: Session }>(t, `/api/sessions/${id}/archive`, { method: "POST" }).then(
-      (r) => r.session,
-    ),
+  archiveSession: (t: Target, id: string, force = false) =>
+    req<{ session: Session }>(
+      t,
+      `/api/sessions/${id}/archive${force ? "?force=true" : ""}`,
+      { method: "POST" },
+    ).then((r) => r.session),
   ackAttention: (t: Target, id: string) =>
     req<{ session: Session }>(t, `/api/sessions/${id}/ack`, { method: "POST" }).then(
       (r) => r.session,
