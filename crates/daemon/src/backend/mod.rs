@@ -70,6 +70,14 @@ pub struct Snapshot {
 /// zero-length scrollback and this degrades to the plain screen repaint
 /// (matching real terminals, where the alternate screen has no scrollback).
 ///
+/// Besides the contents, the repaint carries the terminal MODE state: which
+/// buffer is active (DECSET 1049) and the input modes (mouse protocol,
+/// bracketed paste, application cursor/keypad). TUIs like claude enable SGR
+/// mouse reporting and scroll their transcript on wheel reports; a freshly
+/// attached client that never saw those DECSETs treats the wheel as "scroll
+/// local scrollback" — which is empty — and the wheel is dead until the app
+/// happens to re-assert its modes on the next keystroke.
+///
 /// The parser's view offset is restored to 0 before returning.
 pub(crate) fn repaint_with_history(parser: &mut vt100::Parser) -> Vec<u8> {
     let (rows, cols) = parser.screen().size();
@@ -79,6 +87,14 @@ pub(crate) fn repaint_with_history(parser: &mut vt100::Parser) -> Vec<u8> {
     let available = parser.screen().scrollback();
 
     let mut out = Vec::new();
+    // Sync the client's active buffer before anything else: the history below
+    // must land in the normal buffer (the alternate one has no scrollback),
+    // and an alt-screen app's repaint must land in the alternate buffer.
+    out.extend_from_slice(if parser.screen().alternate_screen() {
+        b"\x1b[?1049h"
+    } else {
+        b"\x1b[?1049l"
+    });
     if available > 0 {
         // Home + erase: the history lines below carry no positioning of their
         // own, and a reconnecting client may have its cursor anywhere.
@@ -113,6 +129,7 @@ pub(crate) fn repaint_with_history(parser: &mut vt100::Parser) -> Vec<u8> {
         }
     }
     out.extend_from_slice(&parser.screen().contents_formatted());
+    out.extend_from_slice(&parser.screen().input_mode_formatted());
     out
 }
 
@@ -178,9 +195,10 @@ mod tests {
 
         let repaint = repaint_with_history(&mut server);
         assert_eq!(server.screen().scrollback(), 0, "view offset restored");
-        // History lines carry no positioning, so the stream must home+erase
-        // first — a reconnecting client's cursor can be anywhere.
-        assert!(repaint.starts_with(b"\x1b[H\x1b[J"));
+        // Buffer sync first (a reconnecting client may sit in the alternate
+        // buffer, where history lines would not reach the scrollback), then
+        // home+erase — the client's cursor can be anywhere.
+        assert!(repaint.starts_with(b"\x1b[?1049l\x1b[H\x1b[J"));
 
         let mut client = vt100::Parser::new(5, 20, 1000);
         client.process(&repaint);
@@ -204,12 +222,15 @@ mod tests {
     fn attach_repaint_without_scrollback_is_screen_only() {
         let mut server = vt100::Parser::new(5, 20, 100);
         server.process(b"hello");
-        let expected = server.screen().contents_formatted();
+        let mut expected = b"\x1b[?1049l".to_vec();
+        expected.extend_from_slice(&server.screen().contents_formatted());
+        expected.extend_from_slice(&server.screen().input_mode_formatted());
         assert_eq!(repaint_with_history(&mut server), expected);
     }
 
     /// TUI apps own the alternate screen; there the snapshot must stay a plain
-    /// screen repaint (real terminals have no alt-screen scrollback either).
+    /// screen repaint (real terminals have no alt-screen scrollback either) —
+    /// no history replay, no home+erase preamble.
     #[test]
     fn attach_repaint_in_alternate_screen_is_screen_only() {
         let mut server = vt100::Parser::new(5, 20, 100);
@@ -217,8 +238,36 @@ mod tests {
             server.process(format!("line {i}\r\n").as_bytes());
         }
         server.process(b"\x1b[?1049h\x1b[Hfullscreen app");
-        let expected = server.screen().contents_formatted();
+        let mut expected = b"\x1b[?1049h".to_vec();
+        expected.extend_from_slice(&server.screen().contents_formatted());
+        expected.extend_from_slice(&server.screen().input_mode_formatted());
         assert_eq!(repaint_with_history(&mut server), expected);
         assert!(server.screen().alternate_screen());
+    }
+
+    /// Attach while a TUI owns the alternate screen with mouse reporting on
+    /// (claude, codex): the repaint must arm the client's alternate buffer,
+    /// mouse protocol, and bracketed paste, or wheel events over the client
+    /// terminal try to scroll its (empty) local scrollback and do nothing
+    /// until the app happens to re-assert its modes.
+    #[test]
+    fn attach_repaint_replays_alt_screen_and_input_modes() {
+        let mut server = vt100::Parser::new(5, 20, 100);
+        server.process(b"\x1b[?1049h\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[Hfullscreen app");
+
+        let mut client = vt100::Parser::new(5, 20, 1000);
+        client.process(&repaint_with_history(&mut server));
+
+        assert!(client.screen().alternate_screen());
+        assert_eq!(
+            client.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::ButtonMotion
+        );
+        assert_eq!(
+            client.screen().mouse_protocol_encoding(),
+            vt100::MouseProtocolEncoding::Sgr
+        );
+        assert!(client.screen().bracketed_paste());
+        assert_eq!(client.screen().contents(), server.screen().contents());
     }
 }
