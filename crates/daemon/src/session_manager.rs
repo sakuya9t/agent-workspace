@@ -23,6 +23,20 @@ use crate::plugins::{AgentContext, PluginRegistry};
 use crate::util::now_millis;
 use crate::workspace;
 
+/// A destructive operation was refused because it would discard uncommitted or
+/// unmerged work. Carried as a typed error so the API can answer `409 Conflict`
+/// and the client can confirm and retry with `force`.
+#[derive(Debug)]
+pub struct NeedsForce(pub String);
+
+impl std::fmt::Display for NeedsForce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for NeedsForce {}
+
 /// Request to start a new session.
 #[derive(Debug, Clone)]
 pub struct CreateSessionRequest {
@@ -630,7 +644,12 @@ impl SessionManager {
         Ok(())
     }
 
-    pub fn archive_session(&self, id: &str) -> Result<Session> {
+    /// Archive a finished session. Unlike a plain "finished" session (which stays
+    /// in history with its branch kept), archiving is the "throw this away" step:
+    /// it removes the session's managed worktree and deletes its branch, then
+    /// marks the record `archived` (dropped from the history view). Refuses to
+    /// discard uncommitted or unmerged work unless `force` — see `discard_instance`.
+    pub fn archive_session(&self, id: &str, force: bool) -> Result<Session> {
         let s = self
             .db
             .get_session(id)?
@@ -638,11 +657,72 @@ impl SessionManager {
         if !s.status.is_terminal() {
             bail!("cannot archive a live session; stop it first");
         }
+        self.discard_instance(id, force)?;
         self.db
             .update_status(id, SessionStatus::Archived, s.exit_code, now_millis())?;
         self.db
             .get_session(id)?
             .ok_or_else(|| anyhow!("session vanished"))
+    }
+
+    /// Tear down a session's managed worktree and delete its branch, reclaiming
+    /// both. A no-op for ad-hoc sessions and direct/plain instances (which share
+    /// the source checkout and own no branch). Guards against data loss unless
+    /// `force`: a dirty worktree or an unmerged branch raises [`NeedsForce`] so
+    /// the caller can confirm before anything is removed. The unmerged check runs
+    /// before the worktree is touched, so a refusal leaves everything intact.
+    fn discard_instance(&self, session_id: &str, force: bool) -> Result<()> {
+        let Some(inst) = self.db.get_instance_for_session(session_id)? else {
+            return Ok(()); // ad-hoc session: nothing managed to remove
+        };
+        if inst.isolation != "worktree" {
+            return Ok(()); // direct/plain: no owned worktree or branch
+        }
+        let ws = self
+            .db
+            .get_workspace(&inst.workspace_id)?
+            .ok_or_else(|| anyhow!("workspace record missing"))?;
+        let root = Path::new(&ws.root_path);
+        let inst_path = Path::new(&inst.path);
+        let active = inst.status == "active";
+
+        if active && self.live_handle(session_id).is_some() {
+            bail!("stop the session before archiving it");
+        }
+
+        // Refuse to silently discard work unless forced. Both guards surface as
+        // `NeedsForce` (→ HTTP 409) so the client can confirm and retry.
+        if !force {
+            if active && workspace::worktree_is_dirty(inst_path) {
+                return Err(NeedsForce(
+                    "worktree has uncommitted changes; archiving would discard them".into(),
+                )
+                .into());
+            }
+            if let Some(branch) = inst.branch.as_deref() {
+                if workspace::branch_exists(root, branch)
+                    && !workspace::branch_is_merged(root, branch)
+                {
+                    return Err(NeedsForce(format!(
+                        "branch `{branch}` has unmerged commits; archiving would delete them"
+                    ))
+                    .into());
+                }
+            }
+        }
+
+        // Safe (or forced): drop the worktree first (a branch checked out in a
+        // worktree cannot be deleted), then the branch itself.
+        if active {
+            workspace::remove_worktree(root, inst_path, force)?;
+            self.db.set_instance_status(&inst.id, "released")?;
+        }
+        if let Some(branch) = inst.branch.as_deref() {
+            if workspace::branch_exists(root, branch) {
+                workspace::delete_branch(root, branch, force)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn resize_session(&self, id: &str, rows: u16, cols: u16) -> Result<()> {
@@ -1221,12 +1301,116 @@ mod tests {
         let (manager, dir) = test_manager();
         let s = manager.create_session(shell_req()).unwrap();
         // Live session cannot be archived.
-        assert!(manager.archive_session(&s.id).is_err());
+        assert!(manager.archive_session(&s.id, false).is_err());
         // After stop it can.
         manager.stop_session(&s.id).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        let archived = manager.archive_session(&s.id).unwrap();
+        let archived = manager.archive_session(&s.id, false).unwrap();
         assert_eq!(archived.status, SessionStatus::Archived);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Init a git repo with one commit so it can host managed worktrees.
+    fn git_init(path: &Path) {
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "init"]);
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn ws_req(workspace_id: &str) -> CreateSessionRequest {
+        let mut r = shell_req();
+        r.workspace_id = Some(workspace_id.to_string());
+        r
+    }
+
+    #[tokio::test]
+    async fn archive_removes_worktree_and_branch() {
+        let (manager, dir) = test_manager();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+
+        // Managed-worktree session on an auto branch off the clean HEAD.
+        let s = manager.create_session(ws_req(&ws.id)).unwrap();
+        let inst = manager.get_instance_for_session(&s.id).unwrap().unwrap();
+        let branch = inst.branch.clone().unwrap();
+        assert!(Path::new(&inst.path).is_dir());
+        assert!(workspace::branch_exists(&repo, &branch));
+
+        manager.stop_session(&s.id).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Branch is merged (points at HEAD) and worktree is clean → archives
+        // without force, taking the worktree and branch with it.
+        let archived = manager.archive_session(&s.id, false).unwrap();
+        assert_eq!(archived.status, SessionStatus::Archived);
+        assert!(!Path::new(&inst.path).exists());
+        assert!(!workspace::branch_exists(&repo, &branch));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn archive_guards_unmerged_branch_until_forced() {
+        let (manager, dir) = test_manager();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+
+        let s = manager.create_session(ws_req(&ws.id)).unwrap();
+        let inst = manager.get_instance_for_session(&s.id).unwrap().unwrap();
+        let branch = inst.branch.clone().unwrap();
+        let wt = Path::new(&inst.path);
+
+        // Add a commit on the session branch so it is no longer merged into HEAD.
+        git_in(wt, &["commit", "-q", "--allow-empty", "-m", "work"]);
+
+        manager.stop_session(&s.id).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Non-force archive refuses (unmerged) with a NeedsForce error, leaving
+        // the worktree, branch, and status untouched.
+        let err = manager.archive_session(&s.id, false).unwrap_err();
+        assert!(err.downcast_ref::<NeedsForce>().is_some());
+        assert!(workspace::branch_exists(&repo, &branch));
+        assert!(wt.is_dir());
+        assert_eq!(
+            manager.get_session(&s.id).unwrap().unwrap().status,
+            SessionStatus::Stopped
+        );
+
+        // Forced archive removes both.
+        let archived = manager.archive_session(&s.id, true).unwrap();
+        assert_eq!(archived.status, SessionStatus::Archived);
+        assert!(!wt.exists());
+        assert!(!workspace::branch_exists(&repo, &branch));
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }

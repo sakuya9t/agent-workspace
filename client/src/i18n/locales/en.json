@@ -153,6 +153,7 @@
     "inUseTitle": "Open on another client — click to take over",
     "stop": "stop",
     "archive": "archive",
+    "confirmArchiveForce": "{{message}}.\n\nArchive anyway and delete the branch? This cannot be undone.",
     "missingTitle": "{{path}} — no longer exists on the host",
     "newSessionTitle": "New session in this workspace",
     "removeWsTitle": "Remove (unregister) this workspace",

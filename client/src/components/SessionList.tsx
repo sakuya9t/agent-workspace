@@ -59,9 +59,25 @@ export function SessionList() {
     mutationFn: ({ target, id }: MutArgs) => api.stopSession(target, id),
     onSuccess: refresh,
   });
+  // Archiving removes the session from history and deletes its branch. When the
+  // daemon guards uncommitted/unmerged work it answers 409 — confirm, then retry
+  // with force so nothing is discarded without the user's say-so.
   const archive = useMutation({
-    mutationFn: ({ target, id }: MutArgs) => api.archiveSession(target, id),
+    mutationFn: async ({ target, id }: MutArgs) => {
+      try {
+        return await api.archiveSession(target, id);
+      } catch (e) {
+        if ((e as { status?: number }).status === 409) {
+          if (confirm(t("sessionList.confirmArchiveForce", { message: (e as Error).message }))) {
+            return api.archiveSession(target, id, true);
+          }
+          return; // declined — leave it in history
+        }
+        throw e;
+      }
+    },
     onSuccess: refresh,
+    onError: (e) => alert(String(e)),
   });
   const ack = useMutation({
     mutationFn: ({ target, id }: MutArgs) => api.ackAttention(target, id),
@@ -86,9 +102,11 @@ export function SessionList() {
     if (s.attention_state !== "none") ack.mutate({ target, id: s.id });
   };
 
-  // History aggregates ended sessions across all daemons. Workspace names are
-  // resolved per daemon; a session whose workspace was since removed (or an
-  // ad-hoc session) falls back to its working directory in the row.
+  // History aggregates finished sessions across all daemons: ended but not yet
+  // archived. Archiving is the deliberate "throw this away" step — it drops the
+  // session from history and deletes its branch, so archived sessions are hidden
+  // here. Workspace names are resolved per daemon; a session whose workspace was
+  // since removed (or an ad-hoc session) falls back to its working directory.
   const history: {
     daemon: DaemonState["daemon"];
     target: Target;
@@ -100,7 +118,7 @@ export function SessionList() {
     const target = targetOf(st.daemon);
     const wsNames = new Map(st.data.workspaces.map((w) => [w.id, w.name]));
     for (const s of st.data.sessions) {
-      if (!isLive(s.status))
+      if (!isLive(s.status) && s.status !== "archived")
         history.push({
           daemon: st.daemon,
           target,

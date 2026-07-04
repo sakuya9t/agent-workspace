@@ -159,6 +159,23 @@ pub fn prune_worktrees(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether a local branch of this name exists in `root`.
+pub fn branch_exists(root: &Path, branch: &str) -> bool {
+    // `--output()` (not `status()`): `rev-parse --verify` prints the resolved
+    // SHA on success, which must not leak to the daemon's stdout.
+    Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .current_dir(root)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Whether `branch` is fully contained in the main worktree's current HEAD
 /// (i.e. deleting it loses no unique commits).
 pub fn branch_is_merged(root: &Path, branch: &str) -> bool {

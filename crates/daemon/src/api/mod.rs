@@ -352,9 +352,17 @@ async fn stop_session(
 async fn archive_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<CleanupParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let s = state.manager.archive_session(&id)?;
-    Ok(Json(json!({ "session": s })))
+    match state.manager.archive_session(&id, params.force) {
+        Ok(s) => Ok(Json(json!({ "session": s }))),
+        // Archiving would discard uncommitted/unmerged work: 409 so the client
+        // can confirm and retry with `?force=true`.
+        Err(e) if e.downcast_ref::<crate::session_manager::NeedsForce>().is_some() => {
+            Err(AppError(StatusCode::CONFLICT, format!("{e:#}")))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[derive(Debug, Deserialize)]
