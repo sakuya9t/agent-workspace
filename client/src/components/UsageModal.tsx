@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { api, SessionUsage } from "../api";
 import { Target } from "../connectionStore";
+import { fmtReset } from "../i18n/time";
 
 interface Props {
   target: Target;
@@ -135,17 +136,4 @@ function heat(pct: number): string {
   if (pct >= 90) return "hot";
   if (pct >= 70) return "warm";
   return "cool";
-}
-
-function fmtReset(unixSecs: number): string {
-  const ms = unixSecs * 1000;
-  const diff = ms - Date.now();
-  if (diff <= 0) return "now";
-  const mins = Math.round(diff / 60000);
-  if (mins < 60) return `in ${mins}m`;
-  const hours = Math.floor(mins / 60);
-  const rem = mins % 60;
-  if (hours < 24) return rem ? `in ${hours}h ${rem}m` : `in ${hours}h`;
-  const days = Math.floor(hours / 24);
-  return `in ${days}d ${hours % 24}h`;
 }

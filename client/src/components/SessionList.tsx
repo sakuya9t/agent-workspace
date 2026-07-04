@@ -4,6 +4,7 @@ import { api, Session, SessionStatus, AttentionState, Workspace } from "../api";
 import { Target, targetOf, useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
 import { DaemonState, useDaemonStates } from "../useDaemons";
+import { relTime } from "../i18n/time";
 
 const STATUS_COLOR: Record<SessionStatus, string> = {
   starting: "#e0af68",
@@ -35,15 +36,6 @@ const ATTENTION_COLOR: Partial<Record<AttentionState, string>> = {
 
 function isLive(s: SessionStatus): boolean {
   return s === "running" || s === "starting";
-}
-
-function relTime(ms: number): string {
-  const d = Date.now() - ms;
-  if (d < 5000) return "just now";
-  if (d < 60000) return `${Math.floor(d / 1000)}s ago`;
-  if (d < 3600000) return `${Math.floor(d / 60000)}m ago`;
-  if (d < 86400000) return `${Math.floor(d / 3600000)}h ago`;
-  return `${Math.floor(d / 86400000)}d ago`;
 }
 
 type MutArgs = { target: Target; id: string };

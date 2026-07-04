@@ -10,6 +10,19 @@
     "viewUsageTitle": "Token & context usage for this session",
     "emptyTerminal": "Select or create a session to open its terminal."
   },
+  "time": {
+    "justNow": "just now",
+    "secondsAgo": "{{count}}s ago",
+    "minutesAgo": "{{count}}m ago",
+    "hoursAgo": "{{count}}h ago",
+    "daysAgo": "{{count}}d ago",
+    "monthsAgo": "{{count}}mo ago",
+    "resetNow": "now",
+    "inMinutes": "in {{m}}m",
+    "inHours": "in {{h}}h",
+    "inHoursMinutes": "in {{h}}h {{m}}m",
+    "inDaysHours": "in {{d}}d {{h}}h"
+  },
   "common": {
     "cancel": "Cancel",
     "close": "close",

@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, ChangedFile, Commit, Session } from "../api";
 import { Target } from "../connectionStore";
 import { buildVscodeLaunch, launchVscode, VscodeLaunch } from "../vscode";
+import { relTime } from "../i18n/time";
 import { DiffModal } from "./DiffModal";
 
 interface Props {
@@ -349,16 +350,6 @@ function CommitGraph({ commits, head }: { commits: Commit[]; head: string | null
       })}
     </div>
   );
-}
-
-function relTime(ms: number): string {
-  const d = Date.now() - ms;
-  if (d < 0) return "just now";
-  if (d < 60000) return `${Math.floor(d / 1000)}s ago`;
-  if (d < 3600000) return `${Math.floor(d / 60000)}m ago`;
-  if (d < 86400000) return `${Math.floor(d / 3600000)}h ago`;
-  if (d < 2592000000) return `${Math.floor(d / 86400000)}d ago`;
-  return `${Math.floor(d / 2592000000)}mo ago`;
 }
 
 function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
