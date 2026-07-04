@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useUiStore } from "./store";
-import { targetOf } from "./connectionStore";
+import { daemonLabel, targetOf } from "./connectionStore";
 import { useDaemonStates } from "./useDaemons";
 import { Session } from "./api";
 import { statusLabel } from "./i18n/labels";
@@ -65,7 +65,8 @@ export function App() {
             {activeSession ? (
               <>
                 <span className="mono">
-                  {activeState?.daemon.label} · {activeSession.agent_plugin_id} ·{" "}
+                  {activeState && daemonLabel(activeState.daemon)} ·{" "}
+                  {activeSession.agent_plugin_id} ·{" "}
                   {statusLabel(activeSession.status)}
                 </span>
                 {USAGE_AGENTS.has(activeSession.agent_plugin_id) && (

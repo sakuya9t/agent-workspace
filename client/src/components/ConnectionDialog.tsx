@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { Trans, useTranslation } from "react-i18next";
 import { api, enrollDevice, probeHealth } from "../api";
-import { localTarget, useConnStore } from "../connectionStore";
+import { daemonLabel, localTarget, useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
 
 /**
@@ -11,6 +12,7 @@ import { useUiStore } from "../store";
  * loopback). The local daemon (this page's origin) is always present.
  */
 export function ConnectionDialog() {
+  const { t } = useTranslation();
   const qc = useQueryClient();
   const show = useUiStore((s) => s.showConnection);
   const setShow = useUiStore((s) => s.setShowConnection);
@@ -36,7 +38,7 @@ export function ConnectionDialog() {
   const addRemote = async () => {
     const targetUrl = url.trim().replace(/\/$/, "");
     if (!targetUrl) {
-      setErr("Enter a daemon URL.");
+      setErr(t("connection.errNoUrl"));
       return;
     }
     setBusy(true);
@@ -67,17 +69,17 @@ export function ConnectionDialog() {
   return (
     <div className="modal-backdrop" onClick={() => setShow(false)}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <div className="modal-title">Daemons</div>
+        <div className="modal-title">{t("connection.title")}</div>
 
         <div className="daemon-list">
           {daemons.map((d) => (
             <div key={d.id} className="daemon-row">
               <span className="tree-icon">⬢</span>
               <div className="daemon-meta">
-                <div className="daemon-name">{d.label}</div>
+                <div className="daemon-name">{daemonLabel(d)}</div>
                 <div className="dim small mono">
-                  {d.baseUrl || "same-origin (local)"}
-                  {d.token ? " · 🔒 token" : ""}
+                  {d.baseUrl || t("connection.sameOrigin")}
+                  {d.token ? ` · 🔒 ${t("connection.tokenTag")}` : ""}
                 </div>
               </div>
               {d.id !== "local" && (
@@ -88,7 +90,7 @@ export function ConnectionDialog() {
                     qc.invalidateQueries({ queryKey: ["daemon"] });
                   }}
                 >
-                  remove
+                  {t("connection.remove")}
                 </button>
               )}
             </div>
@@ -97,48 +99,57 @@ export function ConnectionDialog() {
 
         {localEnrollToken && (
           <div className="dim small enroll-token">
-            Enrollment token for other devices:{" "}
+            {t("connection.enrollTokenLabel")}{" "}
             <span className="mono selectable">{localEnrollToken}</span>
           </div>
         )}
 
-        <div className="conn-divider">— add a remote daemon —</div>
+        <div className="conn-divider">{t("connection.addDivider")}</div>
 
-        <label className="form-label">Daemon URL</label>
+        <label className="form-label">{t("connection.urlLabel")}</label>
         <input
           className="input mono"
-          placeholder="http://192.168.0.5:4600  or  http://localhost:4600 (SSH tunnel)"
+          placeholder={t("connection.urlPlaceholder", {
+            lan: "http://192.168.0.5:4600",
+            tunnel: "http://localhost:4600",
+          })}
           value={url}
           onChange={(e) => setUrl(e.target.value)}
         />
 
         <label className="form-label">
-          Enrollment token <span className="dim">(blank for SSH-tunnelled / loopback)</span>
+          {t("connection.tokenLabel")}{" "}
+          <span className="dim">{t("connection.tokenHint")}</span>
         </label>
         <input
           className="input mono"
-          placeholder="from `asm-daemon token` on that host"
+          placeholder={t("connection.tokenPlaceholder", { cmd: "asm-daemon token" })}
           value={enrollToken}
           onChange={(e) => setEnrollToken(e.target.value)}
         />
 
-        <label className="form-label">Label (optional)</label>
+        <label className="form-label">{t("connection.nameLabel")}</label>
         <input className="input" value={name} onChange={(e) => setName(e.target.value)} />
 
         {err && <div className="error">{err}</div>}
 
         <div className="conn-hint dim small">
-          Tip: for a private host, run{" "}
-          <span className="mono">ssh -L 4600:127.0.0.1:4600 user@host</span> and add{" "}
-          <span className="mono">http://localhost:4600</span> with no token.
+          <Trans
+            i18nKey="connection.sshTip"
+            components={{ cmd: <span className="mono" /> }}
+            values={{
+              ssh: "ssh -L 4600:127.0.0.1:4600 user@host",
+              url: "http://localhost:4600",
+            }}
+          />
         </div>
 
         <div className="modal-actions">
           <button className="btn" onClick={() => setShow(false)}>
-            Close
+            {t("connection.close")}
           </button>
           <button className="btn primary" disabled={busy} onClick={addRemote}>
-            {busy ? "Adding…" : "Add daemon"}
+            {busy ? t("connection.adding") : t("connection.add")}
           </button>
         </div>
       </div>

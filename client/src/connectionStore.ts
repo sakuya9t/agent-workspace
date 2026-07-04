@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import i18n from "./i18n";
 
 /**
  * A daemon the client talks to. The client can hold several at once and
@@ -27,6 +28,15 @@ export const targetOf = (d: DaemonConn): Target => ({
   baseUrl: d.baseUrl,
   token: d.token,
 });
+
+/**
+ * Display label for a daemon. The local daemon's stored label is an internal
+ * sentinel — persisted data is never localized, so its visible text resolves
+ * through i18n at render time. User-entered remote labels are data, shown as-is.
+ */
+export function daemonLabel(d: DaemonConn): string {
+  return d.id === "local" ? i18n.t("common.thisMachine") : d.label;
+}
 
 interface ConnState {
   daemons: DaemonConn[];

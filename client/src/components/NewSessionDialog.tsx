@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api";
-import { targetOf, useConnStore } from "../connectionStore";
+import { daemonLabel, targetOf, useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
 import { DirectoryPicker } from "./DirectoryPicker";
 
@@ -222,7 +222,7 @@ export function NewSessionDialog() {
         >
           {daemons.map((d) => (
             <option key={d.id} value={d.id}>
-              {d.label}
+              {daemonLabel(d)}
               {d.baseUrl ? ` (${d.baseUrl})` : ""}
             </option>
           ))}
@@ -287,7 +287,9 @@ export function NewSessionDialog() {
 
         {target.kind === "path" && (
           <>
-            <label className="form-label">Working directory (on {daemon?.label})</label>
+            <label className="form-label">
+              Working directory (on {daemon && daemonLabel(daemon)})
+            </label>
             <div className="path-row">
               <input
                 className="input mono"
@@ -470,7 +472,9 @@ export function NewSessionDialog() {
 
             {!lockedWs && (
               <div className="register-box">
-                <div className="dim small">Register a new workspace on {daemon?.label}</div>
+                <div className="dim small">
+                  Register a new workspace on {daemon && daemonLabel(daemon)}
+                </div>
                 <input
                   className="input"
                   placeholder="name"

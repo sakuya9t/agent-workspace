@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, Session, SessionStatus, AttentionState, Workspace } from "../api";
-import { Target, targetOf, useConnStore } from "../connectionStore";
+import { daemonLabel, Target, targetOf, useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
 import { DaemonState, useDaemonStates } from "../useDaemons";
 import { relTime } from "../i18n/time";
@@ -294,7 +294,7 @@ export function SessionList() {
         <div className="tree-node lvl0" onClick={() => toggle(daemon.id)}>
           <span className="chevron">{open ? "▾" : "▸"}</span>
           <span className="tree-icon">⬢</span>
-          <span className="tree-label">{daemon.label}</span>
+          <span className="tree-label">{daemonLabel(daemon)}</span>
           <span className="tree-sub">
             {!connected
               ? "disconnected"
@@ -415,7 +415,7 @@ export function SessionList() {
           {historyOpen && (
             <div className="history-list">
               {history.map(({ daemon, target, s, workspaceName }) =>
-                row(daemon.id, target, s, { daemonLabel: daemon.label, workspaceName }),
+                row(daemon.id, target, s, { daemonLabel: daemonLabel(daemon), workspaceName }),
               )}
             </div>
           )}

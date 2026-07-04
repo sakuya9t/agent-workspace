@@ -57,5 +57,24 @@
     "copied": "Copied",
     "browse": "Browse…",
     "thisMachine": "This machine"
+  },
+  "connection": {
+    "title": "Daemons",
+    "sameOrigin": "same-origin (local)",
+    "tokenTag": "token",
+    "remove": "remove",
+    "enrollTokenLabel": "Enrollment token for other devices:",
+    "addDivider": "— add a remote daemon —",
+    "urlLabel": "Daemon URL",
+    "urlPlaceholder": "{{lan}}  or  {{tunnel}} (SSH tunnel)",
+    "tokenLabel": "Enrollment token",
+    "tokenHint": "(blank for SSH-tunnelled / loopback)",
+    "tokenPlaceholder": "from `{{cmd}}` on that host",
+    "nameLabel": "Label (optional)",
+    "errNoUrl": "Enter a daemon URL.",
+    "sshTip": "Tip: for a private host, run <cmd>{{ssh}}</cmd> and add <cmd>{{url}}</cmd> with no token.",
+    "close": "Close",
+    "adding": "Adding…",
+    "add": "Add daemon"
   }
 }
