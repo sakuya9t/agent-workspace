@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useUiStore } from "./store";
 import { targetOf } from "./connectionStore";
 import { useDaemonStates } from "./useDaemons";
@@ -19,6 +20,7 @@ function isLive(s: Session): boolean {
 const USAGE_AGENTS = new Set(["claude", "codex"]);
 
 export function App() {
+  const { t } = useTranslation();
   const active = useUiStore((s) => s.activeSession);
   const setShowConnection = useUiStore((s) => s.setShowConnection);
   const states = useDaemonStates();
@@ -40,17 +42,16 @@ export function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <div className="brand">Agent Session Manager</div>
+        <div className="brand">{t("app.title")}</div>
         <div className="health">
           <span className={"dot " + (reachable > 0 ? "ok" : "bad")} />
-          {states.length} daemon{states.length === 1 ? "" : "s"} · {reachable} reachable ·{" "}
-          {totalLive} live
+          {t("app.daemonSummary", { count: states.length, reachable, live: totalLive })}
           <button
             className="btn tiny conn-btn"
             onClick={() => setShowConnection(true)}
-            title="Connect / manage daemons"
+            title={t("app.manageTitle")}
           >
-            manage
+            {t("app.manage")}
           </button>
         </div>
       </header>
@@ -70,14 +71,14 @@ export function App() {
                   <button
                     className="btn tiny usage-link"
                     onClick={() => setShowUsage(true)}
-                    title="Token & context usage for this session"
+                    title={t("app.viewUsageTitle")}
                   >
-                    view usage
+                    {t("app.viewUsage")}
                   </button>
                 )}
               </>
             ) : (
-              <span>Terminal</span>
+              <span>{t("app.terminal")}</span>
             )}
           </div>
           <div className="panel-body terminal-body">
@@ -89,9 +90,7 @@ export function App() {
                 live={live}
               />
             ) : (
-              <div className="empty big">
-                Select or create a session to open its terminal.
-              </div>
+              <div className="empty big">{t("app.emptyTerminal")}</div>
             )}
           </div>
         </div>

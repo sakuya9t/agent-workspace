@@ -1,3 +1,5 @@
+// i18n must initialize before any module whose code can call t().
+import "./i18n";
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";

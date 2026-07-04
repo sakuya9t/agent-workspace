@@ -1,0 +1,21 @@
+{
+  "app": {
+    "title": "Agent Session Manager",
+    "daemonSummary_one": "{{count}} daemon · {{reachable}} reachable · {{live}} live",
+    "daemonSummary_other": "{{count}} daemons · {{reachable}} reachable · {{live}} live",
+    "manage": "manage",
+    "manageTitle": "Connect / manage daemons",
+    "terminal": "Terminal",
+    "viewUsage": "view usage",
+    "viewUsageTitle": "Token & context usage for this session",
+    "emptyTerminal": "Select or create a session to open its terminal."
+  },
+  "common": {
+    "cancel": "Cancel",
+    "close": "close",
+    "copy": "Copy",
+    "copied": "Copied",
+    "browse": "Browse…",
+    "thisMachine": "This machine"
+  }
+}
