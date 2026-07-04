@@ -75,8 +75,54 @@ body {
 .workspace {
   flex: 1;
   display: grid;
-  grid-template-columns: 280px 1fr 320px;
+  /* Columns are set inline (App.tsx) from the persisted panel widths:
+     left  |  resizer  |  center (1fr)  |  resizer  |  right */
+  grid-template-columns: 280px 6px minmax(0, 1fr) 6px 320px;
   min-height: 0;
+}
+
+/* Draggable vertical divider between panels. */
+.col-resizer {
+  position: relative;
+  cursor: col-resize;
+  background: var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Widen the hit target beyond the visible 6px column without shifting layout. */
+  outline: none;
+}
+.col-resizer::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  right: -3px;
+}
+.col-resizer:hover,
+.col-resizer:focus-visible {
+  background: var(--accent);
+}
+.col-resizer-grip {
+  width: 2px;
+  height: 28px;
+  border-radius: 1px;
+  background: var(--dim);
+  opacity: 0.5;
+  pointer-events: none;
+}
+.col-resizer:hover .col-resizer-grip,
+.col-resizer:focus-visible .col-resizer-grip {
+  opacity: 0;
+}
+/* While dragging, suppress text selection and keep the resize cursor everywhere. */
+body.col-resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+body.col-resizing iframe {
+  pointer-events: none;
 }
 
 .panel {
@@ -84,11 +130,7 @@ body {
   flex-direction: column;
   min-height: 0;
   min-width: 0;
-  border-right: 1px solid var(--border);
   background: var(--panel);
-}
-.panel.right {
-  border-right: none;
 }
 
 .panel-header {

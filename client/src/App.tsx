@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useUiStore } from "./store";
+import { fitPanels, RESIZER_W, useUiStore } from "./store";
 import { daemonLabel, targetOf } from "./connectionStore";
 import { useDaemonStates } from "./useDaemons";
 import { Session } from "./api";
@@ -8,6 +8,7 @@ import { statusLabel } from "./i18n/labels";
 import { SessionList } from "./components/SessionList";
 import { TerminalView } from "./components/Terminal";
 import { RightPanel } from "./components/RightPanel";
+import { PanelResizer } from "./components/PanelResizer";
 import { NewSessionDialog } from "./components/NewSessionDialog";
 import { NewWorkspaceDialog } from "./components/NewWorkspaceDialog";
 import { ConnectionDialog } from "./components/ConnectionDialog";
@@ -24,8 +25,23 @@ export function App() {
   const { t } = useTranslation();
   const active = useUiStore((s) => s.activeSession);
   const setShowConnection = useUiStore((s) => s.setShowConnection);
+  const leftWidth = useUiStore((s) => s.leftWidth);
+  const rightWidth = useUiStore((s) => s.rightWidth);
+  const setLeftWidth = useUiStore((s) => s.setLeftWidth);
+  const setRightWidth = useUiStore((s) => s.setRightWidth);
   const states = useDaemonStates();
   const [showUsage, setShowUsage] = useState(false);
+
+  // Fit the stored side-panel widths to the live viewport so the terminal keeps
+  // a usable minimum. Tracks window resizes; the resizers drive off these
+  // effective widths so a drag never starts from an off-screen value.
+  const [viewportW, setViewportW] = useState(() => window.innerWidth);
+  useEffect(() => {
+    const onResize = () => setViewportW(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  const { left: effLeft, right: effRight } = fitPanels(leftWidth, rightWidth, viewportW);
 
   const reachable = states.filter((s) => s.daemon.connected && s.data).length;
   const totalLive = states.reduce(
@@ -57,8 +73,20 @@ export function App() {
         </div>
       </header>
 
-      <div className="workspace">
+      <div
+        className="workspace"
+        style={{
+          gridTemplateColumns: `${effLeft}px ${RESIZER_W}px minmax(0, 1fr) ${RESIZER_W}px ${effRight}px`,
+        }}
+      >
         <SessionList />
+
+        <PanelResizer
+          side="left"
+          width={effLeft}
+          onResize={setLeftWidth}
+          label={t("app.resizeLeft")}
+        />
 
         <div className="panel center">
           <div className="panel-header">
@@ -96,6 +124,13 @@ export function App() {
             )}
           </div>
         </div>
+
+        <PanelResizer
+          side="right"
+          width={effRight}
+          onResize={setRightWidth}
+          label={t("app.resizeRight")}
+        />
 
         <RightPanel target={target} session={activeSession} />
       </div>

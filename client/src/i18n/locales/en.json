@@ -8,7 +8,9 @@
     "terminal": "Terminal",
     "viewUsage": "view usage",
     "viewUsageTitle": "Token & context usage for this session",
-    "emptyTerminal": "Select or create a session to open its terminal."
+    "emptyTerminal": "Select or create a session to open its terminal.",
+    "resizeLeft": "Resize session list",
+    "resizeRight": "Resize details panel"
   },
   "status": {
     "starting": "starting",
