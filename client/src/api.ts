@@ -207,6 +207,7 @@ export interface VscodeTarget {
 }
 
 import { Target } from "./connectionStore";
+import i18n from "./i18n";
 
 function baseOf(t: Target): string {
   return t.baseUrl ? t.baseUrl.replace(/\/$/, "") : "";
@@ -226,7 +227,9 @@ async function req<T>(t: Target, path: string, init?: RequestInit): Promise<T> {
     // fetch rejects with an opaque TypeError when the host is unreachable
     // (connection refused, DNS, offline) — name the likely cause instead.
     throw new Error(
-      `cannot connect — daemon unreachable${t.baseUrl ? ` at ${t.baseUrl}` : ""} (not started?)`,
+      t.baseUrl
+        ? i18n.t("api.unreachableAt", { baseUrl: t.baseUrl })
+        : i18n.t("api.unreachable"),
     );
   }
   if (!res.ok) {
@@ -242,10 +245,10 @@ async function req<T>(t: Target, path: string, init?: RequestInit): Promise<T> {
       /* ignore */
     }
     if (res.status === 401) {
-      msg = `unauthorized — enroll or reconnect (${msg})`;
+      msg = i18n.t("api.unauthorized", { message: msg });
     } else if (!fromBody && (res.status === 502 || res.status === 504)) {
       // A bare gateway error means a proxy sits in front of a dead daemon.
-      msg = `cannot connect — daemon unreachable (${msg})`;
+      msg = i18n.t("api.gatewayUnreachable", { message: msg });
     }
     throw new Error(msg);
   }
@@ -268,7 +271,7 @@ export async function enrollDevice(
     });
   } catch {
     throw new Error(
-      `cannot connect — daemon unreachable${baseUrl ? ` at ${baseUrl}` : ""} (not started?)`,
+      baseUrl ? i18n.t("api.unreachableAt", { baseUrl }) : i18n.t("api.unreachable"),
     );
   }
   if (!res.ok) {
@@ -294,7 +297,7 @@ export async function probeHealth(baseUrl: string, token: string | null): Promis
     res = await fetch(b + "/health", { headers });
   } catch {
     throw new Error(
-      `cannot connect — daemon unreachable${baseUrl ? ` at ${baseUrl}` : ""} (not started?)`,
+      baseUrl ? i18n.t("api.unreachableAt", { baseUrl }) : i18n.t("api.unreachable"),
     );
   }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);

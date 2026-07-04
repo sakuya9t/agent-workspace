@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
 import { api } from "../api";
 import { Target } from "../connectionStore";
 
@@ -15,6 +16,7 @@ interface Props {
  * side-by-side viewer is the next iteration (Phase 4).
  */
 export function DiffModal({ target, sessionId, path, untracked, onClose }: Props) {
+  const { t } = useTranslation();
   const { data, error, isLoading } = useQuery({
     queryKey: ["diff", target.baseUrl, sessionId, path, untracked],
     queryFn: () => api.scmDiff(target, sessionId, path, untracked),
@@ -27,14 +29,14 @@ export function DiffModal({ target, sessionId, path, untracked, onClose }: Props
         <div className="modal-title">
           <span className="mono">{path}</span>
           <button className="btn tiny" onClick={onClose}>
-            close
+            {t("common.close")}
           </button>
         </div>
         <div className="diff-view mono">
-          {isLoading && <div className="dim">Loading diff…</div>}
+          {isLoading && <div className="dim">{t("diffModal.loading")}</div>}
           {error && <div className="error">{String(error)}</div>}
           {data !== undefined && data.length === 0 && (
-            <div className="dim">No changes to display.</div>
+            <div className="dim">{t("diffModal.noChanges")}</div>
           )}
           {data &&
             data.split("\n").map((line, i) => (

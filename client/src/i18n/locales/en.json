@@ -213,6 +213,33 @@
     "noCommits": "No commits yet.",
     "loadingHistory": "Loading history…"
   },
+  "usage": {
+    "title": "Session usage",
+    "reading": "Reading usage…",
+    "noData": "No usage data available for this session.",
+    "contextWindow": "Context window",
+    "input": "Input",
+    "cachedInput": "Cached input",
+    "output": "Output",
+    "reasoning": "Reasoning",
+    "total": "Total",
+    "rateLimits": "Rate limits",
+    "resets": "resets {{when}}",
+    "readingLine": "Reading: {{when}}"
+  },
+  "diffModal": {
+    "loading": "Loading diff…",
+    "noChanges": "No changes to display."
+  },
+  "terminal": {
+    "takenOver": "This session was taken over by another client."
+  },
+  "api": {
+    "unreachableAt": "cannot connect — daemon unreachable at {{baseUrl}} (not started?)",
+    "unreachable": "cannot connect — daemon unreachable (not started?)",
+    "unauthorized": "unauthorized — enroll or reconnect ({{message}})",
+    "gatewayUnreachable": "cannot connect — daemon unreachable ({{message}})"
+  },
   "connection": {
     "title": "Daemons",
     "sameOrigin": "same-origin (local)",

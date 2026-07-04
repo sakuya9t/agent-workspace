@@ -4,6 +4,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { streamUrl } from "../api";
 import { Target } from "../connectionStore";
 import { useUiStore } from "../store";
+import i18n from "../i18n";
 
 /** WS close code the daemon uses when another client takes over the session. */
 const CLOSE_SUPERSEDED = 4001;
@@ -81,9 +82,7 @@ export function TerminalView({ target, sessionId, live }: Props) {
           // Taken over by another client — do NOT reconnect (that would start a
           // takeover ping-pong). Show why, then clear the selection so the
           // session can be reclaimed from the sidebar (which prompts again).
-          term.write(
-            "\r\n\x1b[33m[This session was taken over by another client.]\x1b[0m\r\n",
-          );
+          term.write("\r\n\x1b[33m[" + i18n.t("terminal.takenOver") + "]\x1b[0m\r\n");
           reconnectTimer = window.setTimeout(() => {
             if (mounted) useUiStore.getState().setActive(null);
           }, 1800);
