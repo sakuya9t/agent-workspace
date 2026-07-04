@@ -97,3 +97,16 @@ items below are additional, tracked here so we don't forget.
   allowlist) and fold their use into the lifecycle audit log (item 7).
   Re-evaluate once the worktree is the only isolation boundary (a bypassed
   sandbox can still reach anything the daemon user can).
+
+## 10. Usage endpoint reads the Claude OAuth token and calls out — LOW
+
+- **What:** `GET /api/sessions/:id/usage` for Claude sessions reads the CLI's
+  own `~/.claude/.credentials.json` and makes an outbound HTTPS call to
+  `api.anthropic.com/api/oauth/usage` (the same call Claude Code's `/usage`
+  makes) to report account-wide rate-limit windows. The token never leaves the
+  daemon or appears in responses/logs; results are cached ~30s.
+- **Current mitigation:** best-effort and read-only — no token refresh, no
+  writes to the credentials file; a missing/expired token just omits the
+  rate-limit rows.
+- **Guidance:** if a "no outbound network" deployment mode is added, gate this
+  fetch behind it.

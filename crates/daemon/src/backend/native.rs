@@ -54,6 +54,9 @@ impl SessionBackend for NativePtyBackend {
             cmd.arg(a);
         }
         cmd.cwd(&spec.cwd);
+        // Don't let an enclosing Claude/Codex session leak its identity into
+        // the agent (it would run as a nested child session; see asmux).
+        asmux::session::scrub_inherited_agent_env(&mut cmd);
         let mut have_term = false;
         for (k, v) in &spec.env {
             if k == "TERM" {
