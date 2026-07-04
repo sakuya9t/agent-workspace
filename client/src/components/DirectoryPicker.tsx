@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
 import { api } from "../api";
 import { Target } from "../connectionStore";
 
@@ -17,6 +18,7 @@ interface Props {
  * so this uses the daemon's /api/fs/list rather than a native file dialog.
  */
 export function DirectoryPicker({ target, initialPath, title, onPick, onClose }: Props) {
+  const { t } = useTranslation();
   // `path` empty means "let the daemon default to home".
   const [path, setPath] = useState(initialPath ?? "");
   const [showHidden, setShowHidden] = useState(false);
@@ -56,9 +58,9 @@ export function DirectoryPicker({ target, initialPath, title, onPick, onClose }:
     >
       <div className="modal picker-modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-title">
-          <span>{title ?? "Select directory"}</span>
+          <span>{title ?? t("directoryPicker.defaultTitle")}</span>
           <button className="btn tiny" onClick={onClose}>
-            close
+            {t("common.close")}
           </button>
         </div>
 
@@ -74,10 +76,10 @@ export function DirectoryPicker({ target, initialPath, title, onPick, onClose }:
             onKeyDown={(e) => {
               if (e.key === "Enter") navigate(manual);
             }}
-            placeholder="/absolute/path"
+            placeholder={t("directoryPicker.pathPlaceholder")}
           />
           <button className="btn" onClick={() => navigate(manual)}>
-            Go
+            {t("directoryPicker.goBtn")}
           </button>
         </div>
 
@@ -87,10 +89,10 @@ export function DirectoryPicker({ target, initialPath, title, onPick, onClose }:
             disabled={!data?.parent}
             onClick={() => data?.parent && navigate(data.parent)}
           >
-            ↑ Up
+            {t("directoryPicker.upBtn")}
           </button>
           <button className="btn tiny" onClick={() => navigate("")}>
-            ~ Home
+            {t("directoryPicker.homeBtn")}
           </button>
           <label className="checkbox small">
             <input
@@ -98,16 +100,16 @@ export function DirectoryPicker({ target, initialPath, title, onPick, onClose }:
               checked={showHidden}
               onChange={(e) => setShowHidden(e.target.checked)}
             />
-            hidden
+            {t("directoryPicker.hidden")}
           </label>
-          {isFetching && <span className="dim small">loading…</span>}
+          {isFetching && <span className="dim small">{t("directoryPicker.loading")}</span>}
         </div>
 
         {error && <div className="error">{String(error)}</div>}
 
         <div className="picker-list">
           {data?.entries.length === 0 && (
-            <div className="dim small">No subdirectories.</div>
+            <div className="dim small">{t("directoryPicker.noSubdirs")}</div>
           )}
           {data?.entries.map((e) => (
             <div
@@ -118,25 +120,25 @@ export function DirectoryPicker({ target, initialPath, title, onPick, onClose }:
                 setSelected(e.path);
                 setManual(e.path);
               }}
-              title="Click to select, double-click to open"
+              title={t("directoryPicker.entryTitle")}
             >
               <span className="picker-icon">{e.is_git ? "◆" : "▸"}</span>
               <span className="mono">{e.name}</span>
-              {e.is_git && <span className="git-tag">git</span>}
+              {e.is_git && <span className="git-tag">{t("common.git")}</span>}
             </div>
           ))}
         </div>
 
         <div className="modal-actions">
           <button className="btn" onClick={onClose}>
-            Cancel
+            {t("common.cancel")}
           </button>
           <button
             className="btn primary"
             disabled={!chosen}
             onClick={() => onPick(chosen)}
           >
-            Use this folder
+            {t("directoryPicker.useFolder")}
           </button>
         </div>
       </div>

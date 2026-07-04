@@ -225,11 +225,11 @@ export function SessionList() {
               style={{ color: "#f7768e" }}
               title={t("sessionList.missingTitle", { path: w.root_path })}
             >
-              {t("sessionList.missing")}
+              {t("common.missing")}
             </span>
           ) : (
             <span className="tree-sub">
-              {w.is_git ? t("sessionList.git") : t("sessionList.plain")}
+              {w.is_git ? t("common.git") : t("common.plain")}
             </span>
           )}
           {sessions.length > 0 && <span className="tree-badge">{sessions.length}</span>}

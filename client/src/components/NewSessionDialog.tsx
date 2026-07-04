@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Trans, useTranslation } from "react-i18next";
 import { api } from "../api";
 import { daemonLabel, targetOf, useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
@@ -8,6 +9,7 @@ import { DirectoryPicker } from "./DirectoryPicker";
 type SessionTarget = { kind: "workspace"; id: string } | { kind: "path" };
 
 export function NewSessionDialog() {
+  const { t } = useTranslation();
   const qc = useQueryClient();
   const show = useUiStore((s) => s.showNewSession);
   const setShow = useUiStore((s) => s.setShowNewSession);
@@ -112,25 +114,22 @@ export function NewSessionDialog() {
       qc.invalidateQueries({ queryKey: ["workspaces", conn.baseUrl] });
       const lines: string[] = [];
       if (report.removed_worktrees.length)
-        lines.push(`Removed ${report.removed_worktrees.length} orphaned worktree(s).`);
+        lines.push(t("newSession.removedWorktrees", { count: report.removed_worktrees.length }));
       if (report.deleted_branches.length)
-        lines.push(`Deleted ${report.deleted_branches.length} orphaned branch(es).`);
+        lines.push(t("newSession.deletedBranches", { count: report.deleted_branches.length }));
       if (report.skipped_dirty.length)
-        lines.push(`Skipped ${report.skipped_dirty.length} worktree(s) with uncommitted changes.`);
+        lines.push(t("newSession.skippedDirty", { count: report.skipped_dirty.length }));
       if (report.skipped_unmerged.length)
-        lines.push(`Skipped ${report.skipped_unmerged.length} branch(es) with unmerged commits.`);
+        lines.push(t("newSession.skippedUnmerged", { count: report.skipped_unmerged.length }));
       if (!lines.length) {
-        alert("Nothing orphaned to clean up.");
+        alert(t("newSession.nothingOrphaned"));
         return;
       }
       const skipped = report.skipped_dirty.length + report.skipped_unmerged.length;
       if (
         !v.force &&
         skipped > 0 &&
-        confirm(
-          lines.join("\n") +
-            "\n\nForce-remove the skipped ones too? This DISCARDS uncommitted changes and unmerged commits.",
-        )
+        confirm(lines.join("\n") + "\n\n" + t("newSession.forcePrompt"))
       ) {
         cleanupWt.mutate({ id: v.id, force: true });
       } else {
@@ -211,9 +210,9 @@ export function NewSessionDialog() {
   return (
     <div className="modal-backdrop" onClick={() => setShow(false)}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <div className="modal-title">New session</div>
+        <div className="modal-title">{t("newSession.title")}</div>
 
-        <label className="form-label">Daemon</label>
+        <label className="form-label">{t("newSession.daemonLabel")}</label>
         <select
           className="input"
           value={effDaemonId}
@@ -228,12 +227,14 @@ export function NewSessionDialog() {
           ))}
         </select>
 
-        <label className="form-label">Agent</label>
+        <label className="form-label">{t("newSession.agentLabel")}</label>
         <select className="input" value={pluginId} onChange={(e) => setPluginId(e.target.value)}>
           {plugins?.map((p) => (
             <option key={p.id} value={p.id} disabled={!p.supported_on_this_platform}>
               {p.display_name}
-              {p.id !== "custom_command" && !p.available ? " (not installed)" : ""}
+              {p.id !== "custom_command" && !p.available
+                ? ` ${t("newSession.notInstalled")}`
+                : ""}
             </option>
           ))}
         </select>
@@ -255,13 +256,13 @@ export function NewSessionDialog() {
               }
             />
             <span>{o.label}</span>
-            {o.danger && <span className="danger-tag">dangerous</span>}
+            {o.danger && <span className="danger-tag">{t("newSession.dangerous")}</span>}
           </label>
         ))}
 
         {!lockedWs && (
           <>
-            <label className="form-label">Run in</label>
+            <label className="form-label">{t("newSession.runInLabel")}</label>
             <div className="seg">
               <button
                 className={"seg-btn" + (target.kind === "workspace" ? " on" : "")}
@@ -273,13 +274,13 @@ export function NewSessionDialog() {
                   )
                 }
               >
-                Workspace (isolated)
+                {t("newSession.segWorkspace")}
               </button>
               <button
                 className={"seg-btn" + (target.kind === "path" ? " on" : "")}
                 onClick={() => setTarget({ kind: "path" })}
               >
-                Directory
+                {t("newSession.segDirectory")}
               </button>
             </div>
           </>
@@ -288,29 +289,26 @@ export function NewSessionDialog() {
         {target.kind === "path" && (
           <>
             <label className="form-label">
-              Working directory (on {daemon && daemonLabel(daemon)})
+              {t("newSession.workingDirOn", { daemon: daemon && daemonLabel(daemon) })}
             </label>
             <div className="path-row">
               <input
                 className="input mono"
-                placeholder="/home/you/project"
+                placeholder={t("newSession.cwdPlaceholder")}
                 value={cwd}
                 onChange={(e) => setCwd(e.target.value)}
               />
               <button className="btn" onClick={() => setPicking("cwd")}>
-                Browse…
+                {t("common.browse")}
               </button>
             </div>
-            <div className="dim small">
-              Registered as a workspace on first use so it stays on the allowlist;
-              remove it later from its workspace node in the sidebar.
-            </div>
+            <div className="dim small">{t("newSession.registeredHint")}</div>
           </>
         )}
 
         {target.kind === "workspace" && (
           <>
-            <label className="form-label">Workspace</label>
+            <label className="form-label">{t("newSession.workspaceLabel")}</label>
             <select
               className="input"
               value={selectedWs?.id ?? ""}
@@ -318,12 +316,14 @@ export function NewSessionDialog() {
               onChange={(e) => setTarget({ kind: "workspace", id: e.target.value })}
             >
               <option value="" disabled>
-                {workspaces?.length ? "Select…" : "No workspaces yet"}
+                {workspaces?.length
+                  ? t("newSession.selectPlaceholder")
+                  : t("newSession.noWorkspaces")}
               </option>
               {workspaces?.map((w) => (
                 <option key={w.id} value={w.id}>
-                  {w.name} {w.is_git ? "· git" : "· plain"}
-                  {w.root_exists === false ? " · missing" : ""}
+                  {w.name} · {w.is_git ? t("common.git") : t("common.plain")}
+                  {w.root_exists === false ? ` · ${t("common.missing")}` : ""}
                 </option>
               ))}
             </select>
@@ -334,18 +334,21 @@ export function NewSessionDialog() {
                   style={selectedWs.root_exists === false ? { color: "#f7768e" } : undefined}
                 >
                   {selectedWs.root_path}
-                  {selectedWs.root_exists === false ? "  · missing on host" : ""}
+                  {selectedWs.root_exists === false
+                    ? `  · ${t("newSession.missingOnHost")}`
+                    : ""}
                 </div>
                 {!lockedWs && (
                   <button
                     className="btn tiny"
-                    title="Unregister this workspace (files are left intact)"
+                    title={t("newSession.removeWsTitle")}
                     disabled={removeWs.isPending}
                     onClick={() => {
-                      if (confirm(`Remove workspace "${selectedWs.name}"?`)) removeWs.mutate(selectedWs.id);
+                      if (confirm(t("newSession.confirmRemoveWs", { name: selectedWs.name })))
+                        removeWs.mutate(selectedWs.id);
                     }}
                   >
-                    Remove
+                    {t("newSession.remove")}
                   </button>
                 )}
               </div>
@@ -356,17 +359,15 @@ export function NewSessionDialog() {
                 <button
                   className="btn tiny"
                   disabled={cleanupWt.isPending}
-                  title="Remove worktrees/branches left in this repo by throwaway or other daemons (that no session here owns)"
+                  title={t("newSession.cleanupTitle")}
                   onClick={() => {
-                    if (
-                      confirm(
-                        `Scan "${selectedWs.name}" for orphaned asm-session worktrees/branches and remove ones no session on this daemon owns?`,
-                      )
-                    )
+                    if (confirm(t("newSession.confirmCleanup", { name: selectedWs.name })))
                       cleanupWt.mutate({ id: selectedWs.id, force: false });
                   }}
                 >
-                  {cleanupWt.isPending ? "Cleaning…" : "Clean up orphaned worktrees"}
+                  {cleanupWt.isPending
+                    ? t("newSession.cleaning")
+                    : t("newSession.cleanupBtn")}
                 </button>
               </div>
             )}
@@ -377,39 +378,42 @@ export function NewSessionDialog() {
                   checked={directCheckout}
                   onChange={(e) => setDirectCheckout(e.target.checked)}
                 />
-                Run in source checkout instead of an isolated worktree (override)
+                {t("newSession.directCheckout")}
               </label>
             )}
 
             {isolatedGit && (
               <>
-                <label className="form-label">Branch</label>
+                <label className="form-label">{t("newSession.branchLabel")}</label>
                 <div className="seg">
                   <button
                     className={"seg-btn" + (branchMode === "auto" ? " on" : "")}
                     onClick={() => setBranchMode("auto")}
                   >
-                    Auto
+                    {t("newSession.segAuto")}
                   </button>
                   <button
                     className={"seg-btn" + (branchMode === "new" ? " on" : "")}
                     onClick={() => setBranchMode("new")}
                   >
-                    New branch
+                    {t("newSession.segNewBranch")}
                   </button>
                   <button
                     className={"seg-btn" + (branchMode === "existing" ? " on" : "")}
                     onClick={() => setBranchMode("existing")}
                     disabled={branches.length === 0}
                   >
-                    Existing
+                    {t("newSession.segExisting")}
                   </button>
                 </div>
 
                 {branchMode === "auto" && (
                   <div className="dim small">
-                    A fresh <span className="mono">asm-session/…</span> branch is created off{" "}
-                    <span className="mono">{defaultBranch || "HEAD"}</span>.
+                    <Trans
+                      i18nKey="newSession.autoHint"
+                      components={{ mono: <span className="mono" /> }}
+                      values={{ prefix: "asm-session/…", base: defaultBranch || "HEAD" }}
+                    />
                   </div>
                 )}
 
@@ -417,11 +421,11 @@ export function NewSessionDialog() {
                   <>
                     <input
                       className="input mono"
-                      placeholder="feature/my-branch"
+                      placeholder={t("newSession.branchPlaceholder")}
                       value={branchName}
                       onChange={(e) => setBranchName(e.target.value)}
                     />
-                    <label className="form-label">Based on</label>
+                    <label className="form-label">{t("newSession.basedOnLabel")}</label>
                     <select
                       className="input"
                       value={baseRef || defaultBranch}
@@ -449,23 +453,20 @@ export function NewSessionDialog() {
                         </option>
                       ))}
                     </select>
-                    <div className="dim small">
-                      Checked out in a new worktree. A branch already checked out
-                      elsewhere can't be reused.
-                    </div>
+                    <div className="dim small">{t("newSession.existingHint")}</div>
                   </>
                 )}
               </>
             )}
             {selectedWs && !selectedWs.is_git && (
               <div className="hint">
-                Plain folder — no isolated worktree.{" "}
+                {t("newSession.plainFolder")}{" "}
                 <button
                   className="btn tiny"
                   disabled={initGit.isPending}
                   onClick={() => initGit.mutate(selectedWs.id)}
                 >
-                  git init for change tracking
+                  {t("newSession.gitInitBtn")}
                 </button>
               </div>
             )}
@@ -473,23 +474,23 @@ export function NewSessionDialog() {
             {!lockedWs && (
               <div className="register-box">
                 <div className="dim small">
-                  Register a new workspace on {daemon && daemonLabel(daemon)}
+                  {t("newSession.registerNewWs", { daemon: daemon && daemonLabel(daemon) })}
                 </div>
                 <input
                   className="input"
-                  placeholder="name"
+                  placeholder={t("newSession.namePlaceholder")}
                   value={wsName}
                   onChange={(e) => setWsName(e.target.value)}
                 />
                 <div className="path-row">
                   <input
                     className="input mono"
-                    placeholder="/absolute/path/on/that/host"
+                    placeholder={t("newSession.wsPathPlaceholder")}
                     value={wsPath}
                     onChange={(e) => setWsPath(e.target.value)}
                   />
                   <button className="btn" onClick={() => setPicking("wsPath")}>
-                    Browse…
+                    {t("common.browse")}
                   </button>
                 </div>
                 {registerWs.error && <div className="error">{String(registerWs.error)}</div>}
@@ -498,7 +499,9 @@ export function NewSessionDialog() {
                   disabled={!wsName.trim() || !wsPath.trim() || registerWs.isPending}
                   onClick={() => registerWs.mutate()}
                 >
-                  {registerWs.isPending ? "Registering…" : "Register"}
+                  {registerWs.isPending
+                    ? t("newSession.registering")
+                    : t("newSession.register")}
                 </button>
               </div>
             )}
@@ -507,16 +510,16 @@ export function NewSessionDialog() {
 
         {isCustom && (
           <>
-            <label className="form-label">Command</label>
+            <label className="form-label">{t("newSession.commandLabel")}</label>
             <input
               className="input mono"
-              placeholder="my-tool --flag"
+              placeholder={t("newSession.commandPlaceholder")}
               value={command}
               onChange={(e) => setCommand(e.target.value)}
             />
             <label className="checkbox">
               <input type="checkbox" checked={approve} onChange={(e) => setApprove(e.target.checked)} />
-              I approve running this arbitrary command
+              {t("newSession.approveLabel")}
             </label>
           </>
         )}
@@ -525,10 +528,10 @@ export function NewSessionDialog() {
 
         <div className="modal-actions">
           <button className="btn" onClick={() => setShow(false)}>
-            Cancel
+            {t("common.cancel")}
           </button>
           <button className="btn primary" disabled={!canSubmit} onClick={() => create.mutate()}>
-            {create.isPending ? "Starting…" : "Start"}
+            {create.isPending ? t("newSession.starting") : t("newSession.start")}
           </button>
         </div>
       </div>
@@ -536,7 +539,11 @@ export function NewSessionDialog() {
       {picking && (
         <DirectoryPicker
           target={conn}
-          title={picking === "cwd" ? "Select working directory" : "Select workspace root"}
+          title={
+            picking === "cwd"
+              ? t("directoryPicker.selectWorkingDirectory")
+              : t("directoryPicker.selectWorkspaceRoot")
+          }
           initialPath={picking === "cwd" ? cwd : wsPath}
           onPick={(p) => {
             if (picking === "cwd") setCwd(p);
