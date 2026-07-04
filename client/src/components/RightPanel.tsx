@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
 import { api, ChangedFile, Commit, Session } from "../api";
 import { Target } from "../connectionStore";
 import { buildVscodeLaunch, launchVscode, VscodeLaunch } from "../vscode";
@@ -34,6 +35,7 @@ const STATUS_COLOR: Record<string, string> = {
  * session ends, and the Git changed-files list with click-to-diff.
  */
 export function RightPanel({ target, session }: Props) {
+  const { t } = useTranslation();
   const qc = useQueryClient();
   const [diffTarget, setDiffTarget] = useState<ChangedFile | null>(null);
 
@@ -120,9 +122,9 @@ export function RightPanel({ target, session }: Props) {
   if (!session || !target) {
     return (
       <div className="panel right">
-        <div className="panel-header">Details</div>
+        <div className="panel-header">{t("rightPanel.header")}</div>
         <div className="panel-body">
-          <div className="empty">Select a session.</div>
+          <div className="empty">{t("rightPanel.empty")}</div>
         </div>
       </div>
     );
@@ -130,50 +132,51 @@ export function RightPanel({ target, session }: Props) {
 
   return (
     <div className="panel right">
-      <div className="panel-header">Details</div>
+      <div className="panel-header">{t("rightPanel.header")}</div>
       <div className="panel-body details">
         <button
           className="btn vscode-btn"
           disabled={vscode.phase === "launching"}
           onClick={continueInVscode}
-          title="Open this session's workspace in VS Code on this machine"
+          title={t("rightPanel.vscode.title")}
         >
-          {vscode.phase === "launching" ? "Opening…" : "Continue in VS Code"}
+          {vscode.phase === "launching"
+            ? t("rightPanel.vscode.opening")
+            : t("rightPanel.vscode.button")}
         </button>
         {vscode.phase === "opened" && (
           <div className="dim small">
             {vscode.launch.kind === "remote-ssh"
-              ? `Opening in VS Code via Remote-SSH (${vscode.launch.sshDest})…`
-              : "Opening in VS Code…"}
+              ? t("rightPanel.vscode.openingRemote", { dest: vscode.launch.sshDest })
+              : t("rightPanel.vscode.openingLocal")}
           </div>
         )}
         {vscode.phase === "not-installed" && (
           <div className="vscode-fallback">
-            <div>VS Code didn't open — it may not be installed on this machine.</div>
+            <div>{t("rightPanel.vscode.didntOpen")}</div>
             <a
               className="btn tiny"
               href="https://code.visualstudio.com/download"
               target="_blank"
               rel="noreferrer"
             >
-              Download VS Code
+              {t("rightPanel.vscode.download")}
             </a>
             {vscode.launch.kind === "remote-ssh" && (
               <div className="dim small">
-                Already installed? Remote windows also need the “Remote - SSH”
-                extension and SSH access to {vscode.launch.sshDest}.
+                {t("rightPanel.vscode.remoteSshHint", { dest: vscode.launch.sshDest })}
               </div>
             )}
             {vscode.launch.cliCommand && (
               <>
-                <div className="dim small">Or open it from a terminal on this machine:</div>
+                <div className="dim small">{t("rightPanel.vscode.cliHint")}</div>
                 <div className="cli-row">
                   <code>{vscode.launch.cliCommand}</code>
                   <button
                     className="btn tiny"
                     onClick={() => copyCli(vscode.launch.cliCommand!)}
                   >
-                    {copied ? "Copied" : "Copy"}
+                    {copied ? t("common.copied") : t("common.copy")}
                   </button>
                 </div>
               </>
@@ -183,19 +186,23 @@ export function RightPanel({ target, session }: Props) {
         {vscode.phase === "error" && <div className="error">{vscode.message}</div>}
 
         {session.risky && (
-          <div className="risk-banner" title="This session was started with agent guardrails disabled">
-            ⚠ Unsafe session — agent guardrails disabled (skip-permissions / bypass-sandbox)
+          <div className="risk-banner" title={t("rightPanel.riskBannerTitle")}>
+            {t("rightPanel.riskBanner")}
           </div>
         )}
 
-        <Field label="Agent" value={session.agent_plugin_id} />
-        <Field label="Status" value={statusLabel(session.status)} />
-        <Field label="Command" value={[session.command, ...session.args].join(" ")} mono />
-        <Field label="Directory" value={session.working_directory} mono />
+        <Field label={t("rightPanel.fieldAgent")} value={session.agent_plugin_id} />
+        <Field label={t("rightPanel.fieldStatus")} value={statusLabel(session.status)} />
+        <Field
+          label={t("rightPanel.fieldCommand")}
+          value={[session.command, ...session.args].join(" ")}
+          mono
+        />
+        <Field label={t("rightPanel.fieldDirectory")} value={session.working_directory} mono />
         {instance && (
           <>
             <Field
-              label="Workspace instance"
+              label={t("rightPanel.fieldWorkspaceInstance")}
               value={`${isolationLabel(instance.isolation)}${
                 instance.branch ? ` · ${instance.branch}` : ""
               }${instance.status === "released" ? ` · ${instanceStatusLabel(instance.status)}` : ""}`}
@@ -207,27 +214,27 @@ export function RightPanel({ target, session }: Props) {
                   disabled={cleanup.isPending}
                   onClick={() => cleanup.mutate(false)}
                 >
-                  clean up worktree
+                  {t("rightPanel.cleanupWorktree")}
                 </button>
                 <button
                   className="btn tiny"
                   disabled={cleanup.isPending}
                   onClick={() => cleanup.mutate(true)}
                 >
-                  force
+                  {t("rightPanel.force")}
                 </button>
               </div>
             )}
             {cleanup.error && <div className="error">{String(cleanup.error)}</div>}
           </>
         )}
-        <Field label="Size" value={`${session.cols}×${session.rows}`} />
+        <Field label={t("rightPanel.fieldSize")} value={`${session.cols}×${session.rows}`} />
         {session.exit_code !== null && (
-          <Field label="Exit code" value={String(session.exit_code)} />
+          <Field label={t("rightPanel.fieldExitCode")} value={String(session.exit_code)} />
         )}
         {session.attention_state !== "none" && (
           <Field
-            label="Attention"
+            label={t("rightPanel.fieldAttention")}
             value={`${attentionLabel(session.attention_state)}${
               session.attention_reason ? ` — ${session.attention_reason}` : ""
             }`}
@@ -236,35 +243,37 @@ export function RightPanel({ target, session }: Props) {
 
         {summary && (
           <>
-            <div className="section-title">Session summary</div>
-            <Field label="Exit" value={summary.exit_status} />
-            <Field label="Duration" value={`${Math.round(summary.duration_ms / 100) / 10}s`} />
+            <div className="section-title">{t("rightPanel.summaryHeader")}</div>
+            <Field label={t("rightPanel.fieldExit")} value={summary.exit_status} />
             <Field
-              label="Event range"
+              label={t("rightPanel.fieldDuration")}
+              value={t("rightPanel.seconds", {
+                count: Math.round(summary.duration_ms / 100) / 10,
+              })}
+            />
+            <Field
+              label={t("rightPanel.fieldEventRange")}
               value={`${summary.terminal_event_start}–${summary.terminal_event_end}`}
             />
           </>
         )}
 
         <div className="section-title">
-          Source control
+          {t("rightPanel.scmHeader")}
           {scm?.is_repo && (
             <span className="branch-pill mono">
-              {scm.detached ? "detached" : scm.branch}
+              {scm.detached ? t("rightPanel.detached") : scm.branch}
               {scm.head ? ` · ${scm.head}` : ""}
             </span>
           )}
         </div>
 
         {!scm?.is_repo && (
-          <div className="dim small">
-            Not a Git repository. `git init` support arrives with workspace
-            isolation.
-          </div>
+          <div className="dim small">{t("rightPanel.notRepo", { cmd: "git init" })}</div>
         )}
 
         {scm?.is_repo && scm.changed_files.length === 0 && (
-          <div className="dim small">Working tree clean.</div>
+          <div className="dim small">{t("rightPanel.treeClean")}</div>
         )}
 
         {scm?.is_repo &&
@@ -273,7 +282,7 @@ export function RightPanel({ target, session }: Props) {
               key={f.path}
               className="changed-file"
               onClick={() => setDiffTarget(f)}
-              title="View diff"
+              title={t("rightPanel.viewDiff")}
             >
               <span
                 className="change-badge"
@@ -282,18 +291,18 @@ export function RightPanel({ target, session }: Props) {
                 {f.status}
               </span>
               <span className="mono change-path">{shortPath(f.path)}</span>
-              {f.staged && <span className="staged-dot" title="staged" />}
+              {f.staged && <span className="staged-dot" title={t("rightPanel.staged")} />}
             </div>
           ))}
 
         {scm?.is_repo && (
           <>
-            <div className="section-title">History</div>
+            <div className="section-title">{t("rightPanel.historyHeader")}</div>
             {commits && commits.length > 0 ? (
               <CommitGraph commits={commits} head={scm.head} />
             ) : (
               <div className="dim small">
-                {commits ? "No commits yet." : "Loading history…"}
+                {commits ? t("rightPanel.noCommits") : t("rightPanel.loadingHistory")}
               </div>
             )}
           </>
@@ -320,6 +329,7 @@ export function RightPanel({ target, session }: Props) {
  * highlighted.
  */
 function CommitGraph({ commits, head }: { commits: Commit[]; head: string | null }) {
+  const { t } = useTranslation();
   return (
     <div className="commit-graph">
       {commits.map((c, i) => {
@@ -338,7 +348,7 @@ function CommitGraph({ commits, head }: { commits: Commit[]; head: string | null
             </div>
             <div className="commit-body">
               <div className="commit-subject">
-                {c.subject || "(no message)"}
+                {c.subject || t("rightPanel.noMessage")}
                 {isHead && <span className="head-pill">HEAD</span>}
               </div>
               <div className="commit-meta">
