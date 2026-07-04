@@ -12,6 +12,8 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -72,8 +74,40 @@ pub struct RateLimitWindow {
 
 // ---------- Claude Code ----------
 
-/// Read usage for a Claude Code session from `~/.claude/projects/<cwd>/*.jsonl`.
+/// Usage for a Claude Code session: per-session tokens from the on-disk
+/// transcript, plus account-wide 5-hour/weekly rate-limit windows from the
+/// OAuth usage endpoint (the same data `/usage` shows). Rate limits are still
+/// returned when the transcript is missing, so a session whose agent hasn't
+/// written one yet isn't a blank modal.
 pub fn claude_usage(cx: &UsageContext) -> Option<AgentUsage> {
+    let limits = claude_rate_limits();
+    match claude_transcript_usage(cx) {
+        Some(mut u) => {
+            if !limits.is_empty() {
+                u.note = Some(format!(
+                    "{} Rate limits are account-wide.",
+                    u.note.unwrap_or_default()
+                ));
+            }
+            u.rate_limits = limits;
+            Some(u)
+        }
+        None if !limits.is_empty() => Some(AgentUsage {
+            available: true,
+            rate_limits: limits,
+            note: Some(
+                "No transcript found for this session yet; showing account-wide Claude rate \
+                 limits only."
+                    .into(),
+            ),
+            ..Default::default()
+        }),
+        None => None,
+    }
+}
+
+/// Read per-session token usage from `~/.claude/projects/<cwd>/*.jsonl`.
+fn claude_transcript_usage(cx: &UsageContext) -> Option<AgentUsage> {
     let dir = home_dir()?
         .join(".claude")
         .join("projects")
@@ -165,6 +199,173 @@ fn claude_context_window(model: &str) -> u64 {
     } else {
         200_000
     }
+}
+
+// ---------- Claude rate limits (account-wide) ----------
+
+/// The OAuth usage endpoint behind Claude Code's `/usage` command. The
+/// transcript never records rate-limit windows, so this is the only source.
+const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+/// The endpoint is account-wide, so one short-lived reading serves every
+/// session and 5s UI poll tick without hammering the API.
+const CLAUDE_RL_CACHE_TTL: Duration = Duration::from_secs(30);
+
+static CLAUDE_RL_CACHE: Mutex<Option<(Instant, Vec<RateLimitWindow>)>> = Mutex::new(None);
+
+/// Account-wide 5-hour/weekly windows for the Claude subscription, fetched
+/// with the CLI's own on-disk OAuth token. Best-effort: empty when there are
+/// no credentials (API-key auth, macOS keychain), the token is expired, or the
+/// endpoint is unreachable — misses are cached too.
+fn claude_rate_limits() -> Vec<RateLimitWindow> {
+    if let Ok(guard) = CLAUDE_RL_CACHE.lock() {
+        if let Some((at, cached)) = guard.as_ref() {
+            if at.elapsed() < CLAUDE_RL_CACHE_TTL {
+                return cached.clone();
+            }
+        }
+    }
+    let fetched = fetch_claude_rate_limits().unwrap_or_default();
+    if let Ok(mut guard) = CLAUDE_RL_CACHE.lock() {
+        *guard = Some((Instant::now(), fetched.clone()));
+    }
+    fetched
+}
+
+fn fetch_claude_rate_limits() -> Option<Vec<RateLimitWindow>> {
+    let creds_path = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(|d| PathBuf::from(d).join(".credentials.json"))
+        .or_else(|| home_dir().map(|h| h.join(".claude").join(".credentials.json")))?;
+    let creds: Value = serde_json::from_str(&fs::read_to_string(creds_path).ok()?).ok()?;
+    let oauth = &creds["claudeAiOauth"];
+    let token = oauth["accessToken"].as_str()?;
+    if token.is_empty() {
+        return None;
+    }
+    // An expired access token would only earn us a 401; the CLI refreshes it
+    // on its own, so just wait for the next cache miss.
+    if let Some(exp_ms) = oauth["expiresAt"].as_i64() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis() as i64;
+        if exp_ms <= now_ms {
+            return None;
+        }
+    }
+    let body: Value = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(4))
+        .build()
+        .get(CLAUDE_USAGE_URL)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("anthropic-beta", "oauth-2025-04-20")
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+    Some(parse_claude_rate_limits(&body))
+}
+
+/// Map the OAuth usage payload to normalized rows. Newer payloads carry a
+/// `limits` array that includes model-scoped weekly windows (what `/usage`
+/// renders); prefer it, falling back to the older `five_hour`/`seven_day`
+/// top-level objects. Windows the account doesn't have come back null.
+fn parse_claude_rate_limits(v: &Value) -> Vec<RateLimitWindow> {
+    fn reset_secs(w: &Value) -> Option<i64> {
+        w["resets_at"]
+            .as_i64()
+            .or_else(|| w["resets_at"].as_str().and_then(iso8601_to_unix_secs))
+    }
+
+    let mut out = Vec::new();
+    for l in v["limits"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        let Some(pct) = l["percent"].as_f64() else {
+            continue;
+        };
+        let (label, minutes) = match l["kind"].as_str() {
+            Some("session") => ("5-hour".to_string(), 300),
+            Some("weekly_all") => ("weekly".to_string(), 10_080),
+            Some("weekly_scoped") => {
+                let model = l["scope"]["model"]["display_name"]
+                    .as_str()
+                    .unwrap_or("scoped");
+                (format!("weekly ({model})"), 10_080)
+            }
+            _ => continue,
+        };
+        out.push(RateLimitWindow {
+            label,
+            used_percent: pct,
+            window_minutes: Some(minutes),
+            resets_at: reset_secs(l),
+        });
+    }
+    if !out.is_empty() {
+        return out;
+    }
+
+    const WINDOWS: &[(&str, &str, u64)] = &[
+        ("five_hour", "5-hour", 300),
+        ("seven_day", "weekly", 10_080),
+        ("seven_day_opus", "weekly (Opus)", 10_080),
+        ("seven_day_sonnet", "weekly (Sonnet)", 10_080),
+    ];
+    for (key, label, minutes) in WINDOWS {
+        let w = &v[*key];
+        let Some(pct) = w["utilization"].as_f64() else {
+            continue;
+        };
+        out.push(RateLimitWindow {
+            label: (*label).to_string(),
+            used_percent: pct,
+            window_minutes: Some(*minutes),
+            resets_at: reset_secs(w),
+        });
+    }
+    out
+}
+
+/// Parse an RFC 3339 timestamp (`2026-07-03T04:00:00Z`, optional fractional
+/// seconds, `Z` or numeric offset) into unix seconds, without a date crate.
+fn iso8601_to_unix_secs(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let num = |r: std::ops::Range<usize>| -> Option<i64> { s.get(r)?.parse::<i64>().ok() };
+    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    // Skip fractional seconds, then read the offset.
+    let mut rest = s.get(19..)?;
+    if let Some(frac) = rest.strip_prefix('.') {
+        let end = frac
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(frac.len());
+        rest = frac.get(end..)?;
+    }
+    let off_secs = match rest.as_bytes().first() {
+        None | Some(b'Z') | Some(b'z') => 0,
+        Some(sign @ (b'+' | b'-')) => {
+            let oh: i64 = rest.get(1..3)?.parse().ok()?;
+            let om: i64 = match rest.as_bytes().get(3) {
+                Some(b':') => rest.get(4..6)?.parse().ok()?,
+                Some(_) => rest.get(3..5)?.parse().ok()?,
+                None => 0,
+            };
+            let mag = oh * 3600 + om * 60;
+            if *sign == b'-' {
+                -mag
+            } else {
+                mag
+            }
+        }
+        _ => return None,
+    };
+    // Days since the epoch for a civil date (Howard Hinnant's algorithm).
+    let yy = if mo <= 2 { y - 1 } else { y };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + h * 3600 + mi * 60 + sec - off_secs)
 }
 
 // ---------- Codex ----------
@@ -413,6 +614,72 @@ mod tests {
         assert_eq!(window_label(10080), "weekly");
         assert_eq!(window_label(1440), "1-day");
         assert_eq!(window_label(45), "45-min");
+    }
+
+    #[test]
+    fn parses_oauth_rate_limits_from_limits_array() {
+        let v: Value = serde_json::from_str(
+            r#"{
+                "five_hour": {"utilization": 68.0, "resets_at": "2026-07-04T03:59:59.737001+00:00"},
+                "seven_day": {"utilization": 30.0, "resets_at": "2026-07-07T02:59:59.737029+00:00"},
+                "limits": [
+                    {"kind": "session", "group": "session", "percent": 68,
+                     "resets_at": "2026-07-04T03:59:59.737001+00:00", "scope": null},
+                    {"kind": "weekly_all", "group": "weekly", "percent": 30,
+                     "resets_at": "2026-07-07T02:59:59.737029+00:00", "scope": null},
+                    {"kind": "weekly_scoped", "group": "weekly", "percent": 31,
+                     "resets_at": "2026-07-07T02:59:59.737362+00:00",
+                     "scope": {"model": {"id": null, "display_name": "Fable"}}},
+                    {"kind": "unknown_future_kind", "percent": 5}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let rl = parse_claude_rate_limits(&v);
+        assert_eq!(rl.len(), 3);
+        assert_eq!(rl[0].label, "5-hour");
+        assert_eq!(rl[0].used_percent, 68.0);
+        assert_eq!(rl[0].window_minutes, Some(300));
+        assert_eq!(rl[1].label, "weekly");
+        assert_eq!(rl[2].label, "weekly (Fable)");
+        assert_eq!(rl[2].used_percent, 31.0);
+    }
+
+    #[test]
+    fn parses_oauth_rate_limits_legacy_shape() {
+        let v: Value = serde_json::from_str(
+            r#"{
+                "five_hour": {"utilization": 12.5, "resets_at": "2026-07-03T04:00:00Z"},
+                "seven_day": {"utilization": 61.0, "resets_at": "2026-01-20T00:00:00+00:00"},
+                "seven_day_opus": {"utilization": null, "resets_at": null},
+                "extra_usage": {"is_enabled": false}
+            }"#,
+        )
+        .unwrap();
+        let rl = parse_claude_rate_limits(&v);
+        assert_eq!(rl.len(), 2);
+        assert_eq!(rl[0].label, "5-hour");
+        assert_eq!(rl[0].used_percent, 12.5);
+        assert_eq!(rl[0].window_minutes, Some(300));
+        assert_eq!(rl[0].resets_at, Some(1_783_051_200));
+        assert_eq!(rl[1].label, "weekly");
+        assert_eq!(rl[1].resets_at, Some(1_768_867_200));
+    }
+
+    #[test]
+    fn iso8601_parsing() {
+        assert_eq!(
+            iso8601_to_unix_secs("2026-07-03T04:00:00Z"),
+            Some(1_783_051_200)
+        );
+        // Fractional seconds and a positive offset.
+        assert_eq!(
+            iso8601_to_unix_secs("2026-07-03T04:30:15.123+02:00"),
+            Some(1_783_045_815)
+        );
+        // Pre-epoch dates stay correct (div_euclid, not integer division).
+        assert_eq!(iso8601_to_unix_secs("1969-12-31T23:59:59Z"), Some(-1));
+        assert_eq!(iso8601_to_unix_secs("garbage"), None);
     }
 
     #[test]

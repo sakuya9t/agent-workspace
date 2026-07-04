@@ -31,3 +31,4 @@ futures.workspace = true
 directories.workspace = true
 parking_lot.workspace = true
 async-trait.workspace = true
+ureq.workspace = true

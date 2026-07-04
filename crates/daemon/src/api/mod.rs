@@ -321,20 +321,23 @@ async fn get_session_usage(
         .manager
         .get_session(&id)?
         .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "no such session".into()))?;
-    let usage = state
-        .manager
-        .registry
-        .get(&s.agent_plugin_id)
-        .and_then(|p| {
+    // File reads plus a possible (cached) rate-limit HTTP fetch — keep them off
+    // the async runtime.
+    let manager = state.manager.clone();
+    let usage = tokio::task::spawn_blocking(move || {
+        manager.registry.get(&s.agent_plugin_id).and_then(|p| {
             p.usage(&crate::plugins::usage::UsageContext {
                 cwd: std::path::PathBuf::from(&s.working_directory),
                 started_at_ms: s.created_at,
             })
         })
-        .unwrap_or_else(|| crate::plugins::usage::AgentUsage {
-            note: Some("No usage data available for this agent/session.".into()),
-            ..Default::default()
-        });
+    })
+    .await
+    .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("usage task: {e}")))?
+    .unwrap_or_else(|| crate::plugins::usage::AgentUsage {
+        note: Some("No usage data available for this agent/session.".into()),
+        ..Default::default()
+    });
     Ok(Json(json!({ "usage": usage })))
 }
 
