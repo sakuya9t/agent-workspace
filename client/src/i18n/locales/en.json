@@ -10,6 +10,33 @@
     "viewUsageTitle": "Token & context usage for this session",
     "emptyTerminal": "Select or create a session to open its terminal."
   },
+  "status": {
+    "starting": "starting",
+    "running": "running",
+    "exited": "exited",
+    "failed": "failed",
+    "stopped": "stopped",
+    "archived": "archived",
+    "indeterminate": "indeterminate",
+    "finished": "finished"
+  },
+  "attention": {
+    "none": "none",
+    "activity": "working",
+    "idle": "idle",
+    "likely_blocked": "blocked",
+    "approval_needed": "blocked",
+    "failed": "failed"
+  },
+  "isolation": {
+    "worktree": "worktree",
+    "direct": "direct",
+    "plain": "plain"
+  },
+  "instanceStatus": {
+    "active": "active",
+    "released": "released"
+  },
   "time": {
     "justNow": "just now",
     "secondsAgo": "{{count}}s ago",

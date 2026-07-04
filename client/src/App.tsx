@@ -4,6 +4,7 @@ import { useUiStore } from "./store";
 import { targetOf } from "./connectionStore";
 import { useDaemonStates } from "./useDaemons";
 import { Session } from "./api";
+import { statusLabel } from "./i18n/labels";
 import { SessionList } from "./components/SessionList";
 import { TerminalView } from "./components/Terminal";
 import { RightPanel } from "./components/RightPanel";
@@ -65,7 +66,7 @@ export function App() {
               <>
                 <span className="mono">
                   {activeState?.daemon.label} · {activeSession.agent_plugin_id} ·{" "}
-                  {activeSession.status}
+                  {statusLabel(activeSession.status)}
                 </span>
                 {USAGE_AGENTS.has(activeSession.agent_plugin_id) && (
                   <button

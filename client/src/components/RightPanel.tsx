@@ -4,6 +4,7 @@ import { api, ChangedFile, Commit, Session } from "../api";
 import { Target } from "../connectionStore";
 import { buildVscodeLaunch, launchVscode, VscodeLaunch } from "../vscode";
 import { relTime } from "../i18n/time";
+import { attentionLabel, instanceStatusLabel, isolationLabel, statusLabel } from "../i18n/labels";
 import { DiffModal } from "./DiffModal";
 
 interface Props {
@@ -188,16 +189,16 @@ export function RightPanel({ target, session }: Props) {
         )}
 
         <Field label="Agent" value={session.agent_plugin_id} />
-        <Field label="Status" value={session.status} />
+        <Field label="Status" value={statusLabel(session.status)} />
         <Field label="Command" value={[session.command, ...session.args].join(" ")} mono />
         <Field label="Directory" value={session.working_directory} mono />
         {instance && (
           <>
             <Field
               label="Workspace instance"
-              value={`${instance.isolation}${instance.branch ? ` · ${instance.branch}` : ""}${
-                instance.status === "released" ? " · released" : ""
-              }`}
+              value={`${isolationLabel(instance.isolation)}${
+                instance.branch ? ` · ${instance.branch}` : ""
+              }${instance.status === "released" ? ` · ${instanceStatusLabel(instance.status)}` : ""}`}
             />
             {instance.isolation === "worktree" && instance.status !== "released" && terminal && (
               <div className="instance-actions">
@@ -227,7 +228,7 @@ export function RightPanel({ target, session }: Props) {
         {session.attention_state !== "none" && (
           <Field
             label="Attention"
-            value={`${session.attention_state}${
+            value={`${attentionLabel(session.attention_state)}${
               session.attention_reason ? ` — ${session.attention_reason}` : ""
             }`}
           />

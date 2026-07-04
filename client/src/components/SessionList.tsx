@@ -5,6 +5,7 @@ import { Target, targetOf, useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
 import { DaemonState, useDaemonStates } from "../useDaemons";
 import { relTime } from "../i18n/time";
+import { attentionLabel, endedLabel, statusLabel } from "../i18n/labels";
 
 const STATUS_COLOR: Record<SessionStatus, string> = {
   starting: "#e0af68",
@@ -14,16 +15,6 @@ const STATUS_COLOR: Record<SessionStatus, string> = {
   stopped: "#565f89",
   archived: "#414868",
   indeterminate: "#ff9e64",
-};
-
-// working = producing output; idle = waiting for the next input (calm);
-// blocked = needs input to proceed (urgent).
-const ATTENTION_LABEL: Partial<Record<AttentionState, string>> = {
-  activity: "working",
-  idle: "idle",
-  likely_blocked: "blocked",
-  approval_needed: "blocked",
-  failed: "failed",
 };
 
 const ATTENTION_COLOR: Partial<Record<AttentionState, string>> = {
@@ -139,7 +130,7 @@ export function SessionList() {
           <span
             className="status-dot"
             style={{ background: STATUS_COLOR[s.status] }}
-            title={s.status}
+            title={statusLabel(s.status)}
           />
           <span className="session-agent">{s.agent_plugin_id}</span>
           {s.risky && (
@@ -165,7 +156,7 @@ export function SessionList() {
               className="attn-badge"
               style={{ background: ATTENTION_COLOR[s.attention_state] }}
             >
-              {ATTENTION_LABEL[s.attention_state]}
+              {attentionLabel(s.attention_state)}
             </span>
           )}
         </div>
@@ -188,7 +179,7 @@ export function SessionList() {
             </button>
           ) : (
             <>
-              <span className="ended-status" title={s.status}>
+              <span className="ended-status" title={statusLabel(s.status)}>
                 {endedLabel(s.status)}
                 {s.exit_code !== null ? ` · ${s.exit_code}` : ""}
               </span>
@@ -437,9 +428,4 @@ export function SessionList() {
 function basename(p: string): string {
   const parts = p.split(/[/\\]/).filter(Boolean);
   return parts.length ? parts[parts.length - 1] : p;
-}
-
-/// A user-stopped session ended deliberately, not by failure — show "finished".
-function endedLabel(s: SessionStatus): string {
-  return s === "stopped" ? "finished" : s;
 }
