@@ -41,6 +41,7 @@ export function RightPanel({ target, session }: Props) {
   const [diffTarget, setDiffTarget] = useState<ChangedFile | null>(null);
   const [commitTarget, setCommitTarget] = useState<string | null>(null);
   const [rebaseOpen, setRebaseOpen] = useState(false);
+  const [rebaseOnto, setRebaseOnto] = useState("");
 
   const terminal =
     session &&
@@ -146,6 +147,7 @@ export function RightPanel({ target, session }: Props) {
     mutationFn: (onto: string) => api.scmRebase(target!, session!.id, onto),
     onSuccess: () => {
       setRebaseOpen(false);
+      setRebaseOnto("");
       refreshScm();
     },
   });
@@ -165,6 +167,7 @@ export function RightPanel({ target, session }: Props) {
   // the next session (this panel is reused, not remounted, across selections).
   useEffect(() => {
     setRebaseOpen(false);
+    setRebaseOnto("");
     pull.reset();
     rebase.reset();
   }, [session?.id, base]);
@@ -378,28 +381,48 @@ export function RightPanel({ target, session }: Props) {
                 <div className="rebase-picker-label">
                   {t("rightPanel.rebaseOnto", { branch: scm.branch })}
                 </div>
-                {branchesError ? (
-                  <div className="error">{String(branchesError)}</div>
-                ) : branchList ? (
-                  branchList.branches.filter((b) => b !== branchList.head).length > 0 ? (
-                    branchList.branches
-                      .filter((b) => b !== branchList.head)
-                      .map((b) => (
-                        <button
-                          key={b}
-                          className="rebase-branch mono"
-                          disabled={rebase.isPending}
-                          onClick={() => startRebase(b)}
-                        >
-                          {b}
-                        </button>
-                      ))
-                  ) : (
-                    <div className="dim small">{t("rightPanel.noOtherBranches")}</div>
-                  )
-                ) : (
-                  <div className="dim small">{t("rightPanel.loadingBranches")}</div>
-                )}
+                {(() => {
+                  const candidates = branchList
+                    ? branchList.branches.filter((b) => b !== branchList.head)
+                    : [];
+                  if (branchesError) {
+                    return <div className="error">{String(branchesError)}</div>;
+                  }
+                  if (!branchList) {
+                    return <div className="dim small">{t("rightPanel.loadingBranches")}</div>;
+                  }
+                  if (candidates.length === 0) {
+                    return <div className="dim small">{t("rightPanel.noOtherBranches")}</div>;
+                  }
+                  return (
+                    <div className="rebase-picker-row">
+                      <select
+                        className="rebase-select mono"
+                        value={rebaseOnto}
+                        disabled={rebase.isPending}
+                        onChange={(e) => setRebaseOnto(e.target.value)}
+                      >
+                        <option value="" disabled>
+                          {t("rightPanel.rebaseSelectPlaceholder")}
+                        </option>
+                        {candidates.map((b) => (
+                          <option key={b} value={b}>
+                            {b}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        className="btn tiny"
+                        disabled={!rebaseOnto || rebase.isPending}
+                        onClick={() => startRebase(rebaseOnto)}
+                      >
+                        {rebase.isPending
+                          ? t("rightPanel.scmRunning")
+                          : t("rightPanel.rebaseConfirm")}
+                      </button>
+                    </div>
+                  );
+                })()}
               </div>
             )}
 

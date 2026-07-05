@@ -774,21 +774,32 @@ body.col-resizing iframe {
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
-.rebase-branch {
+.rebase-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+}
+.rebase-select {
+  flex: 1;
+  min-width: 0;
   background: var(--bg);
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 4px;
-  padding: 3px 8px;
-  cursor: pointer;
+  padding: 4px 6px;
   font-size: 12px;
+  cursor: pointer;
 }
-.rebase-branch:hover:not(:disabled) {
+.rebase-select:hover:not(:disabled) {
   border-color: var(--accent);
 }
-.rebase-branch:disabled {
+.rebase-select:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+.rebase-picker-row .btn {
+  flex: none;
 }
 .scm-op-result {
   white-space: pre-wrap;
