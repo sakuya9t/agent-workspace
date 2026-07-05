@@ -124,7 +124,7 @@ export function RightPanel({ target, session }: Props) {
 
   // Branch list backing the rebase-target picker; only fetched while the picker
   // is open so it doesn't poll needlessly.
-  const { data: branchList } = useQuery({
+  const { data: branchList, error: branchesError } = useQuery({
     queryKey: ["scmbranches", base, session?.id],
     queryFn: () => api.scmBranches(target!, session!.id),
     enabled: !!session && !!target && !!scm?.is_repo && rebaseOpen,
@@ -378,7 +378,9 @@ export function RightPanel({ target, session }: Props) {
                 <div className="rebase-picker-label">
                   {t("rightPanel.rebaseOnto", { branch: scm.branch })}
                 </div>
-                {branchList ? (
+                {branchesError ? (
+                  <div className="error">{String(branchesError)}</div>
+                ) : branchList ? (
                   branchList.branches.filter((b) => b !== branchList.head).length > 0 ? (
                     branchList.branches
                       .filter((b) => b !== branchList.head)
