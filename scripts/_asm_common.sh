@@ -30,18 +30,18 @@ _need() { # _need FLAG VALUE — fail if the flag was given no value
 asm_parse_args() {
   ASM_POSITIONAL=()
   ASM_SHOW_HELP=0
-  local key="" want_relay=0
+  local key="" want_relay=0 reconfig=0
   while [ $# -gt 0 ]; do
     case "$1" in
-      --bind)         _need "$1" "${2:-}" || return 2; export ASM_BIND="$2"; shift 2 ;;
+      --bind)         _need "$1" "${2:-}" || return 2; export ASM_BIND="$2"; reconfig=1; shift 2 ;;
       --data-dir)     _need "$1" "${2:-}" || return 2; export ASM_DATA_DIR="$2"; shift 2 ;;
       --runtime-dir)  _need "$1" "${2:-}" || return 2; export ASM_RUNTIME_DIR="$2"; shift 2 ;;
-      --label)        _need "$1" "${2:-}" || return 2; export ASM_NODE_LABEL="$2"; shift 2 ;;
+      --label)        _need "$1" "${2:-}" || return 2; export ASM_NODE_LABEL="$2"; reconfig=1; shift 2 ;;
       --release)      PROFILE=release; shift ;;
       --relay)        want_relay=1; shift ;;
       --relay-bind)   _need "$1" "${2:-}" || return 2; export ASM_RELAY_BIND="$2"; want_relay=1; shift 2 ;;
       --relay-key)    _need "$1" "${2:-}" || return 2; key="$2"; shift 2 ;;
-      --register)     _need "$1" "${2:-}" || return 2; export ASM_RELAY_URL="$2"; shift 2 ;;
+      --register)     _need "$1" "${2:-}" || return 2; export ASM_RELAY_URL="$2"; reconfig=1; shift 2 ;;
       -h|--help)      ASM_SHOW_HELP=1; shift ;;
       --)             shift; while [ $# -gt 0 ]; do ASM_POSITIONAL+=("$1"); shift; done ;;
       --*)            err "unknown option: $1"; return 2 ;;
@@ -52,13 +52,18 @@ asm_parse_args() {
   # (ASM_RELAY_KEYS); a registering node presents it (ASM_RELAY_KEY).
   if [ -n "$key" ]; then
     [ "$want_relay" = 1 ] && export ASM_RELAY_KEYS="$key"
-    [ -n "${ASM_RELAY_URL:-}" ] && export ASM_RELAY_KEY="$key"
+    if [ -n "${ASM_RELAY_URL:-}" ]; then export ASM_RELAY_KEY="$key"; reconfig=1; fi
   fi
   # --relay with no key (and none in the env) would reject every node.
   if [ "$want_relay" = 1 ] && [ -z "${ASM_RELAY_KEYS:-}" ]; then
     err "--relay needs --relay-key KEY (the access key nodes present)"
     return 2
   fi
+  # Record whether a daemon-affecting override (bind/label/relay registration) was
+  # passed THIS invocation, so start_daemon can re-apply it to an already-running
+  # daemon instead of silently dropping it. Always set fresh — it describes this
+  # command line, not persisted config, so it is never an env fallback.
+  export ASM_DAEMON_RECONFIG="$reconfig"
   return 0
 }
 
@@ -81,6 +86,9 @@ asm_configure() {
   ASMUX_SOCK="$ASM_RUNTIME_DIR/asmux.sock"
   ASMUX_PIDFILE="$ASM_RUNTIME_DIR/asmux.pid"
   DAEMON_PIDFILE="$ASM_RUNTIME_DIR/asm-daemon.pid"
+  # The config signature the running daemon was launched with, so start.sh can
+  # tell when a re-run's flags actually change it (see start_daemon).
+  DAEMON_STATE_FILE="$ASM_RUNTIME_DIR/asm-daemon.reg"
   RELAY_PIDFILE="$ASM_RUNTIME_DIR/asm-relay.pid"
 
   mkdir -p "$ASM_DATA_DIR" "$ASM_RUNTIME_DIR" "$LOG_DIR"
@@ -178,20 +186,45 @@ start_asmux() {
   fi
 }
 
+# The daemon reads bind/label/relay-registration config only at startup, so a
+# running daemon can't adopt new flags in place. This signature captures those
+# daemon-affecting settings; start_daemon records it on launch and compares it on
+# a re-run to decide whether the config actually changed.
+daemon_reg_signature() {
+  printf '%s|%s|%s|%s' \
+    "${ASM_BIND:-}" "${ASM_NODE_LABEL:-}" "${ASM_RELAY_URL:-}" "${ASM_RELAY_KEY:-}"
+}
+
 # Start the daemon in sidecar mode (idempotent). Autospawn is off — the scripts
 # manage the holder so restarting the daemon never spawns a second one. Any
 # ASM_RELAY_URL/ASM_RELAY_KEY (from --register) is inherited, so the daemon
 # registers outbound when configured to.
+#
+# If the daemon is already running but this invocation passed daemon-affecting
+# flags (ASM_DAEMON_RECONFIG=1) whose signature differs from what the running
+# daemon booted with, restart it to apply them — the asmux holder stays up, so
+# live sessions survive. Without this, start.sh silently drops the new flags
+# (e.g. a changed --register never taking effect).
 start_daemon() {
   if pid_alive "$DAEMON_PIDFILE"; then
-    log "daemon already running (pid $(cat "$DAEMON_PIDFILE"))"
-    return 0
+    local want recorded
+    want="$(daemon_reg_signature)"
+    recorded="$(cat "$DAEMON_STATE_FILE" 2>/dev/null || true)"
+    if [ "${ASM_DAEMON_RECONFIG:-0}" = 1 ] && [ "$want" != "$recorded" ]; then
+      log "daemon already running (pid $(cat "$DAEMON_PIDFILE")) — config changed, restarting to apply it (live sessions survive)"
+      stop_one asm-daemon "$DAEMON_PIDFILE"
+      # fall through to launch a fresh daemon with the new config
+    else
+      log "daemon already running (pid $(cat "$DAEMON_PIDFILE"))"
+      return 0
+    fi
   fi
   [ -x "$DAEMON_BIN" ] || { err "missing $DAEMON_BIN — build first (cargo build -p asm-daemon)"; return 1; }
   log "starting asm-daemon (sidecar) on $ASM_BIND..."
   ASM_BACKEND=sidecar ASM_ASMUX_AUTOSPAWN=0 \
     nohup "$DAEMON_BIN" >>"$LOG_DIR/asm-daemon.log" 2>&1 </dev/null &
   echo $! > "$DAEMON_PIDFILE"
+  daemon_reg_signature > "$DAEMON_STATE_FILE"
   if wait_health; then
     log "daemon up (pid $(cat "$DAEMON_PIDFILE"))  http://$ASM_BIND"
   else

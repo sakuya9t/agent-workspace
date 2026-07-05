@@ -19,12 +19,12 @@ asm_configure
 
 what="${ASM_POSITIONAL[0]:-all}"
 case "$what" in
-  daemon) stop_one asm-daemon "$DAEMON_PIDFILE" ;;
+  daemon) stop_one asm-daemon "$DAEMON_PIDFILE"; rm -f "$DAEMON_STATE_FILE" ;;
   asmux)  stop_one asmux "$ASMUX_PIDFILE" ;;
   relay)  stop_one asm-relay "$RELAY_PIDFILE" ;;
   all)
     # Daemon first (it detaches from the holder), then the holder, then the relay.
-    stop_one asm-daemon "$DAEMON_PIDFILE"
+    stop_one asm-daemon "$DAEMON_PIDFILE"; rm -f "$DAEMON_STATE_FILE"
     stop_one asmux "$ASMUX_PIDFILE"
     stop_one asm-relay "$RELAY_PIDFILE"
     ;;

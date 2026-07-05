@@ -280,6 +280,7 @@
   },
   "relay": {
     "sectionTitle": "— relays —",
+    "empty": "No relays yet. Relays don't appear on their own — add one below with its URL and access key. Hosts that dial out to it then show up here, ready to connect.",
     "addDivider": "— add a relay —",
     "urlLabel": "Relay URL",
     "urlPlaceholder": "http://relay-host:4700",
