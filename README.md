@@ -95,7 +95,17 @@ cargo run -p asm-daemon
 
 ### Durable sessions (daemon + asmux)
 
-**Easiest — convenience scripts** (they build, run both processes in the
+**Easiest — guided wizard.** Don't want to remember flags? Run:
+
+```bash
+scripts/wizard.sh   # start / restart / stop, and how clients reach this host
+```
+
+It asks a few plain questions, then shows the exact `start.sh` /
+`restart-daemon.sh` / `stop.sh` command and runs it once you confirm — so you can
+learn the flags as you go.
+
+**Or drive the scripts directly** (they build, run both processes in the
 background under `$ASM_DATA_DIR/logs`, and manage the lifecycle):
 
 ```bash
@@ -311,10 +321,63 @@ enter `http://<host>:4600` plus the enrollment token in the Connect dialog; the
 client receives a device token stored locally for future connections. Revoke
 devices via `POST /api/auth/devices/:id/revoke`.
 
-> Direct off-loopback traffic is not TLS-encrypted in the MVP — prefer the SSH
-> tunnel for untrusted networks. Relay/gateway modes for NAT'd hosts are on the
-> roadmap. Known security gaps and the plan to close them are tracked in
-> [`docs/security-followups.md`](docs/security-followups.md).
+### Remote via relay (NAT'd hosts, no tunnels)
+
+When a host can't accept inbound connections (behind NAT/CGNAT, no port-forward,
+no SSH), it **dials out** to a relay — a rendezvous box both sides can reach. The
+relay multiplexes the client's plain HTTP(S)/WSS to the node over that outbound
+connection, so the client needs **no tunnel** and this works from any device,
+including mobile. All three parties — relay host, node, and client — share one
+**relay access key**.
+
+**1. On the relay host** (a box with a reachable address), bundle a relay
+alongside its own daemon:
+
+```bash
+scripts/start.sh --bind 0.0.0.0:4600 --relay --relay-key meow
+# [asm] relay  — http://0.0.0.0:4700 (nodes register here)
+```
+
+The relay listens on `0.0.0.0:4700` by default (`--relay-bind ADDR` to change it).
+
+**2. On the NAT'd node**, register outbound to that relay:
+
+```bash
+scripts/start.sh --register ws://<relay-host>:4700 --relay-key meow
+```
+
+> If a daemon is already running, `start.sh` compares this registration against
+> what it booted with and, when it differs, restarts the daemon to apply the
+> change — the asmux holder stays up, so live sessions survive (you'll see
+> `config changed, restarting to apply it`). An unchanged re-run stays a no-op.
+> `scripts/restart-daemon.sh --register … --relay-key …` forces the same restart
+> explicitly.
+>
+> Confirm it registered: the node's daemon log
+> (`~/.local/share/asm/logs/asm-daemon.log`) shows `registered control stream
+> with relay`, or on the relay host
+> `curl 'http://127.0.0.1:4700/nodes?relay_key=meow'` lists the node.
+
+**3. In the client**, open the header's **manage** dialog → **Relays** → add the
+relay:
+
+- **URL** `http://<relay-host>:4700` — HTTP, not `ws://` (the client speaks
+  HTTP/WSS to the relay; the URL is stored with scheme + host, no path)
+- **Key** `meow`
+
+The client polls the relay's `/nodes` and lists each registered node; enter that
+node's enrollment token and **Connect** to enroll a device through the relay. The
+node then appears in the tree like any other daemon (reached via `/n/<node_id>`).
+A wrong key shows the relay as **unreachable** rather than as an empty list.
+
+The one key must match across all three — the relay host's `--relay-key`, the
+node's `--relay-key`, and the client's relay entry. A mismatched node is rejected
+at registration; a mismatched client entry reads as unreachable.
+
+> Neither direct off-loopback traffic nor the relay hop is TLS-encrypted in the
+> MVP — prefer the SSH tunnel on untrusted networks, and keep the relay on a
+> trusted network for now. Known security gaps and the plan to close them are
+> tracked in [`docs/security-followups.md`](docs/security-followups.md).
 
 ## Running the client
 

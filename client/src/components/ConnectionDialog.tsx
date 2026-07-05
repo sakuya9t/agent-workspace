@@ -132,9 +132,13 @@ export function ConnectionDialog() {
 
         {/* Relays: reach private hosts that dial out to the relay, no tunnels. */}
         <div className="conn-divider">{t("relay.sectionTitle")}</div>
-        {relays.map((r) => (
-          <RelayRow key={r.id} relay={r} onRemove={() => removeRelay(r.id)} />
-        ))}
+        {relays.length === 0 ? (
+          <div className="conn-hint dim small">{t("relay.empty")}</div>
+        ) : (
+          relays.map((r) => (
+            <RelayRow key={r.id} relay={r} onRemove={() => removeRelay(r.id)} />
+          ))
+        )}
 
         <div className="conn-divider">{t("relay.addDivider")}</div>
         <label className="form-label">{t("relay.urlLabel")}</label>
