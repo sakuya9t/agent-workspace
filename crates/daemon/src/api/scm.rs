@@ -42,6 +42,10 @@ pub struct DiffParams {
     path: String,
     #[serde(default)]
     untracked: bool,
+    /// When set, show the path's diff as introduced by this commit rather than
+    /// the working-tree diff.
+    #[serde(default)]
+    commit: Option<String>,
 }
 
 pub async fn diff(
@@ -53,8 +57,27 @@ pub async fn diff(
     let scm = state.scm.clone();
     let path = params.path.clone();
     let untracked = params.untracked;
-    let diff = run_blocking(move || scm.diff(&cwd, &path, untracked)).await?;
+    let commit = params.commit.clone();
+    let diff =
+        run_blocking(move || scm.diff(&cwd, &path, untracked, commit.as_deref())).await?;
     Ok(Json(json!({ "path": params.path, "diff": diff })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CommitParams {
+    hash: String,
+}
+
+pub async fn commit(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<CommitParams>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let cwd = session_cwd(&state, &id).await?;
+    let scm = state.scm.clone();
+    let hash = params.hash.clone();
+    let commit = run_blocking(move || scm.show(&cwd, &hash)).await?;
+    Ok(Json(json!({ "commit": commit })))
 }
 
 #[derive(Debug, Deserialize)]

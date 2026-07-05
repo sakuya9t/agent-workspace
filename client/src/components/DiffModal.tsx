@@ -8,6 +8,8 @@ interface Props {
   sessionId: string;
   path: string;
   untracked: boolean;
+  /** When set, show the file's diff as introduced by this commit. */
+  commit?: string;
   onClose: () => void;
 }
 
@@ -15,11 +17,11 @@ interface Props {
  * Read-only unified-diff viewer. Line-colored for MVP; a CodeMirror-based
  * side-by-side viewer is the next iteration (Phase 4).
  */
-export function DiffModal({ target, sessionId, path, untracked, onClose }: Props) {
+export function DiffModal({ target, sessionId, path, untracked, commit, onClose }: Props) {
   const { t } = useTranslation();
   const { data, error, isLoading } = useQuery({
-    queryKey: ["diff", target.baseUrl, sessionId, path, untracked],
-    queryFn: () => api.scmDiff(target, sessionId, path, untracked),
+    queryKey: ["diff", target.baseUrl, sessionId, path, untracked, commit ?? null],
+    queryFn: () => api.scmDiff(target, sessionId, path, untracked, commit),
     retry: false,
   });
 

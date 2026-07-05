@@ -209,6 +209,7 @@
     "notRepo": "Not a Git repository. `{{cmd}}` support arrives with workspace isolation.",
     "treeClean": "Working tree clean.",
     "viewDiff": "View diff",
+    "viewCommit": "View commit details",
     "staged": "staged",
     "historyHeader": "History",
     "noMessage": "(no message)",
@@ -232,6 +233,14 @@
   "diffModal": {
     "loading": "Loading diff…",
     "noChanges": "No changes to display."
+  },
+  "commitModal": {
+    "loading": "Loading commit…",
+    "parents": "Parents",
+    "filesChanged": "{{count}} file(s) changed",
+    "noFiles": "No file changes in this commit.",
+    "binary": "bin",
+    "renamed": "{{from}} → {{to}}"
   },
   "terminal": {
     "takenOver": "This session was taken over by another client."

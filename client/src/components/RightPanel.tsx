@@ -7,6 +7,7 @@ import { buildVscodeLaunch, launchVscode, VscodeLaunch } from "../vscode";
 import { relTime } from "../i18n/time";
 import { attentionLabel, instanceStatusLabel, isolationLabel, statusLabel } from "../i18n/labels";
 import { DiffModal } from "./DiffModal";
+import { CommitModal } from "./CommitModal";
 
 interface Props {
   target: Target | undefined;
@@ -38,6 +39,7 @@ export function RightPanel({ target, session }: Props) {
   const { t } = useTranslation();
   const qc = useQueryClient();
   const [diffTarget, setDiffTarget] = useState<ChangedFile | null>(null);
+  const [commitTarget, setCommitTarget] = useState<string | null>(null);
 
   const terminal =
     session &&
@@ -299,7 +301,7 @@ export function RightPanel({ target, session }: Props) {
           <>
             <div className="section-title">{t("rightPanel.historyHeader")}</div>
             {commits && commits.length > 0 ? (
-              <CommitGraph commits={commits} head={scm.head} />
+              <CommitGraph commits={commits} head={scm.head} onSelect={setCommitTarget} />
             ) : (
               <div className="dim small">
                 {commits ? t("rightPanel.noCommits") : t("rightPanel.loadingHistory")}
@@ -318,6 +320,15 @@ export function RightPanel({ target, session }: Props) {
           onClose={() => setDiffTarget(null)}
         />
       )}
+
+      {commitTarget && (
+        <CommitModal
+          target={target}
+          sessionId={session.id}
+          hash={commitTarget}
+          onClose={() => setCommitTarget(null)}
+        />
+      )}
     </div>
   );
 }
@@ -328,7 +339,15 @@ export function RightPanel({ target, session }: Props) {
  * the top. Merge commits (>1 parent) get a hollow dot; the HEAD commit is
  * highlighted.
  */
-function CommitGraph({ commits, head }: { commits: Commit[]; head: string | null }) {
+function CommitGraph({
+  commits,
+  head,
+  onSelect,
+}: {
+  commits: Commit[];
+  head: string | null;
+  onSelect: (hash: string) => void;
+}) {
   const { t } = useTranslation();
   return (
     <div className="commit-graph">
@@ -336,7 +355,12 @@ function CommitGraph({ commits, head }: { commits: Commit[]; head: string | null
         const merge = c.parents.length > 1;
         const isHead = !!head && c.short === head;
         return (
-          <div className="commit-row" key={c.hash} title={c.hash}>
+          <div
+            className="commit-row"
+            key={c.hash}
+            title={t("rightPanel.viewCommit")}
+            onClick={() => onSelect(c.hash)}
+          >
             <div
               className={
                 "commit-rail" +
