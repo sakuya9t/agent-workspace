@@ -671,7 +671,7 @@ The product does not support:
 - Structural session summary records.
 - Workspace registration and allowlist.
 - Agent plugin registry.
-- Built-in Codex, Claude Code, and custom command plugins.
+- Built-in Codex, Claude Code, opencode, and custom command plugins.
 - Source-control plugin interface.
 - Built-in Git plugin with status, diffs, and commit graph.
 - Git-worktree isolation for concurrent sessions on the same repo.

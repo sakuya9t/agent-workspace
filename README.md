@@ -27,8 +27,9 @@ Implemented:
 - Session lifecycle: create, list, attach, resize, stop, archive, with a
   state machine and structural session summary records on exit.
 - Attention signals (activity / likely-blocked / approval-needed / failed).
-- Static agent plugin registry: `shell`, `codex`, `claude`, `custom_command`
-  (custom commands require explicit approval).
+- Static agent plugin registry: `shell`, `codex`, `claude`, `opencode`,
+  `custom_command` (custom commands require explicit approval). The new-session
+  dialog only offers the agents whose CLI is actually installed on that host.
 - Durable sessions survive a daemon restart in sidecar mode: the daemon detaches
   on shutdown and re-adopts the holder's live sessions on start. Native mode has
   no live backend to recover, so a restart reconciles lingering sessions to

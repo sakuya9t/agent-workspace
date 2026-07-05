@@ -13,6 +13,7 @@ pub fn all() -> Vec<Arc<dyn AgentPlugin>> {
         Arc::new(ShellPlugin),
         Arc::new(CodexPlugin),
         Arc::new(ClaudePlugin),
+        Arc::new(OpencodePlugin),
         Arc::new(CustomCommandPlugin),
     ]
 }
@@ -143,6 +144,54 @@ impl AgentPlugin for ClaudePlugin {
         let mut args = Vec::new();
         if ctx.opt("skip_permissions") {
             args.push("--dangerously-skip-permissions".to_string());
+        }
+        args.extend(ctx.extra_args.clone());
+        Ok(LaunchSpec {
+            command,
+            args,
+            env: ctx.extra_env.clone(),
+            requires_approval: false,
+        })
+    }
+}
+
+/// opencode CLI agent (the default `opencode` TUI in the session's cwd).
+pub struct OpencodePlugin;
+
+impl AgentPlugin for OpencodePlugin {
+    fn id(&self) -> &'static str {
+        "opencode"
+    }
+    fn display_name(&self) -> &'static str {
+        "opencode"
+    }
+    fn supported_platforms(&self) -> &'static [&'static str] {
+        ALL_PLATFORMS
+    }
+    fn detect_binary(&self) -> Option<String> {
+        find_in_path("opencode")
+    }
+    fn bell_means_attention(&self) -> bool {
+        true
+    }
+    fn options(&self) -> Vec<AgentOption> {
+        vec![AgentOption {
+            key: "auto_approve".into(),
+            label: "Auto-approve permissions".into(),
+            description:
+                "Launch with --auto: opencode auto-approves any permission that isn't explicitly denied."
+                    .into(),
+            danger: true,
+            default: false,
+        }]
+    }
+    fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
+        let command = self
+            .detect_binary()
+            .ok_or_else(|| anyhow!("`opencode` binary not found in PATH"))?;
+        let mut args = Vec::new();
+        if ctx.opt("auto_approve") {
+            args.push("--auto".to_string());
         }
         args.extend(ctx.extra_args.clone());
         Ok(LaunchSpec {
