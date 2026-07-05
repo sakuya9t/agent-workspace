@@ -103,7 +103,7 @@
     "autoHint": "A fresh <mono>{{prefix}}</mono> branch is created off <mono>{{base}}</mono>.",
     "branchPlaceholder": "feature/my-branch",
     "basedOnLabel": "Based on",
-    "existingHint": "Checked out in a new worktree. A branch already checked out elsewhere can't be reused.",
+    "existingHint": "Checked out in a worktree. If the branch is already open in another session, you'll share its worktree and see the same diffs — concurrent edits from both agents can interfere.",
     "plainFolder": "Plain folder — no isolated worktree.",
     "gitInitBtn": "git init for change tracking",
     "registerNewWs": "Register a new workspace on {{daemon}}",
