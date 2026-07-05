@@ -137,6 +137,8 @@ fn parse_claude_text(text: &str) -> Option<AgentUsage> {
     let mut u = AgentUsage::default();
     let (mut in_sum, mut cr_sum, mut out_sum) = (0u64, 0u64, 0u64);
     let (mut last_in, mut last_cr, mut last_cc) = (0u64, 0u64, 0u64);
+    // Largest single-turn prompt we see, used to sanity-check the window below.
+    let mut peak_ctx = 0u64;
     let mut found = false;
 
     for line in text.lines() {
@@ -161,11 +163,18 @@ fn parse_claude_text(text: &str) -> Option<AgentUsage> {
         last_in = ii;
         last_cr = cr;
         last_cc = cc;
+        // Switching model mid-session (via `/model`) hands the rest of the
+        // transcript a different — possibly smaller — window, and Claude compacts
+        // context to fit it. Reset the peak on a switch so the window check below
+        // only weighs prompts the *current* model actually held; otherwise an
+        // 800k Opus run would wrongly inflate a Haiku turn's window to 1M.
         if let Some(m) = v["message"]["model"].as_str() {
-            if !m.is_empty() && m != "<synthetic>" {
+            if !m.is_empty() && m != "<synthetic>" && u.model.as_deref() != Some(m) {
                 u.model = Some(m.to_string());
+                peak_ctx = 0;
             }
         }
+        peak_ctx = peak_ctx.max(ii + cr + cc);
         if let Some(ts) = v["timestamp"].as_str() {
             u.updated_at = Some(ts.to_string());
         }
@@ -177,7 +186,10 @@ fn parse_claude_text(text: &str) -> Option<AgentUsage> {
     }
     u.available = true;
     u.context_tokens = Some(last_in + last_cr + last_cc);
-    u.context_window = u.model.as_deref().map(claude_context_window);
+    u.context_window = u
+        .model
+        .as_deref()
+        .map(|m| claude_context_window(m, peak_ctx));
     u.input_tokens = Some(in_sum);
     u.cached_input_tokens = Some(cr_sum);
     u.output_tokens = Some(out_sum);
@@ -191,13 +203,31 @@ fn parse_claude_text(text: &str) -> Option<AgentUsage> {
     Some(u)
 }
 
-/// Best-effort context window for a Claude model id (the transcript does not
-/// record it). 1M-context variants are tagged; everything else assumes 200k.
-fn claude_context_window(model: &str) -> u64 {
-    if model.to_lowercase().contains("1m") {
-        1_000_000
+/// Best-effort context window for a Claude session. The transcript records
+/// neither the window nor the `[1m]` suffix Claude Code uses for the extended
+/// variant, so we estimate from the model id: current families ship a 1M window
+/// as standard, older ones (and Haiku) are 200k. `peak_ctx` is the largest
+/// prompt we actually observed — a 200k model can never exceed its window, so a
+/// peak above 200k is proof of a larger one. That floor corrects any model we
+/// estimate too low, including a 1M-toggled Sonnet whose tag was stripped.
+fn claude_context_window(model: &str, peak_ctx: u64) -> u64 {
+    let m = model.to_lowercase();
+    // Families whose standard context window is 1M (plus an explicit `1m` tag,
+    // in case a future transcript preserves it).
+    let is_1m = m.contains("1m")
+        || m.contains("opus-4-6")
+        || m.contains("opus-4-7")
+        || m.contains("opus-4-8")
+        || m.contains("sonnet-4-6")
+        || m.contains("sonnet-5")
+        || m.contains("fable")
+        || m.contains("mythos");
+    let estimate = if is_1m { 1_000_000 } else { 200_000 };
+    // Never claim a window smaller than a prompt we've already seen fit in it.
+    if peak_ctx > 200_000 {
+        estimate.max(1_000_000)
     } else {
-        200_000
+        estimate
     }
 }
 
@@ -583,10 +613,44 @@ mod tests {
         assert_eq!(u.model.as_deref(), Some("claude-opus-4-8"));
         // Last turn context = 2 + 200 + 2000.
         assert_eq!(u.context_tokens, Some(2202));
-        assert_eq!(u.context_window, Some(200_000));
+        // Opus 4.8 ships a 1M window as standard.
+        assert_eq!(u.context_window, Some(1_000_000));
         // Cumulative output = 50 + 80.
         assert_eq!(u.output_tokens, Some(130));
         assert_eq!(u.updated_at.as_deref(), Some("2026-07-02T10:00:05Z"));
+    }
+
+    #[test]
+    fn claude_model_switch_uses_current_model_window() {
+        // Session runs Opus (1M) up to an 800k prompt, then `/model`-switches to
+        // Haiku (200k); Claude compacts context down to fit. The reported window
+        // must follow the *current* model — the stale 800k Opus peak must not
+        // inflate Haiku's 200k window.
+        let text = concat!(
+            r#"{"type":"assistant","timestamp":"2026-07-02T10:00:01Z","message":{"model":"claude-opus-4-8","usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":800000,"output_tokens":50}}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-07-02T10:05:00Z","message":{"model":"claude-haiku-4-5","usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":150000,"output_tokens":80}}}"#,
+        );
+        let u = parse_claude_text(text).expect("usage");
+        assert_eq!(u.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(u.context_tokens, Some(150_000));
+        assert_eq!(u.context_window, Some(200_000));
+    }
+
+    #[test]
+    fn claude_context_window_estimates() {
+        // Current 1M families, tagged when small.
+        assert_eq!(claude_context_window("claude-opus-4-8", 0), 1_000_000);
+        assert_eq!(claude_context_window("claude-fable-5", 0), 1_000_000);
+        assert_eq!(claude_context_window("claude-sonnet-4-6", 0), 1_000_000);
+        // Haiku and older models are 200k.
+        assert_eq!(claude_context_window("claude-haiku-4-5", 0), 200_000);
+        // Empirical floor: a prompt bigger than 200k proves a >200k window even
+        // when the model id alone would estimate 200k (e.g. a 1M-toggled Sonnet
+        // whose `[1m]` tag the transcript strips).
+        assert_eq!(claude_context_window("claude-sonnet-4-5", 812_766), 1_000_000);
+        // Below the floor, the 200k estimate stands.
+        assert_eq!(claude_context_window("claude-sonnet-4-5", 150_000), 200_000);
     }
 
     #[test]
