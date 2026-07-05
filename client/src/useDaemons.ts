@@ -24,7 +24,7 @@ export function useDaemonStates(): DaemonState[] {
   const daemons = useConnStore((s) => s.daemons);
   const results = useQueries({
     queries: daemons.map((d) => ({
-      queryKey: ["daemon", d.id, d.baseUrl, d.token],
+      queryKey: ["daemon", d.id, d.baseUrl, d.token, d.relayKey ?? null],
       queryFn: async (): Promise<DaemonBundle> => {
         const t = targetOf(d);
         const [health, sessions, workspaces] = await Promise.all([

@@ -240,6 +240,7 @@ async function req<T>(t: Target, path: string, init?: RequestInit): Promise<T> {
     ...((init?.headers as Record<string, string>) ?? {}),
   };
   if (t.token) headers["Authorization"] = `Bearer ${t.token}`;
+  if (t.relayKey) headers["X-ASM-Relay-Key"] = t.relayKey;
 
   let res: Response;
   try {
@@ -278,18 +279,25 @@ async function req<T>(t: Target, path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
-/** Enroll a device against a specific daemon; returns its device token. */
+/**
+ * Enroll a device against a specific daemon; returns its device token. When the
+ * daemon is reached through a relay, pass `relayKey` so the relay authorizes the
+ * (public, at the daemon layer) enroll request.
+ */
 export async function enrollDevice(
   baseUrl: string,
   enrollmentToken: string,
   deviceName: string,
+  relayKey?: string | null,
 ): Promise<{ server_id: string; device_id: string; device_token: string }> {
   const b = baseUrl ? baseUrl.replace(/\/$/, "") : "";
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (relayKey) headers["X-ASM-Relay-Key"] = relayKey;
   let res: Response;
   try {
     res = await fetch(b + "/api/auth/enroll", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers,
       body: JSON.stringify({ enrollment_token: enrollmentToken, device_name: deviceName }),
     });
   } catch {
@@ -311,10 +319,15 @@ export async function enrollDevice(
 }
 
 /** Probe a daemon's /health (used to validate a connection). */
-export async function probeHealth(baseUrl: string, token: string | null): Promise<Health> {
+export async function probeHealth(
+  baseUrl: string,
+  token: string | null,
+  relayKey?: string | null,
+): Promise<Health> {
   const b = baseUrl ? baseUrl.replace(/\/$/, "") : "";
   const headers: Record<string, string> = {};
   if (token) headers["Authorization"] = `Bearer ${token}`;
+  if (relayKey) headers["X-ASM-Relay-Key"] = relayKey;
   let res: Response;
   try {
     res = await fetch(b + "/health", { headers });
@@ -432,17 +445,50 @@ export const api = {
 };
 
 export function streamUrl(t: Target, id: string): string {
-  let host: string;
-  let secure: boolean;
+  let base: string;
   if (t.baseUrl) {
     const u = new URL(t.baseUrl);
-    host = u.host;
-    secure = u.protocol === "https:";
+    const proto = u.protocol === "https:" ? "wss" : "ws";
+    // Preserve any path prefix (e.g. `/n/<node_id>` for a relayed daemon) —
+    // dropping it would bypass the relay route. Strip a trailing slash so we
+    // don't double it before `/api`.
+    const prefix = u.pathname.replace(/\/$/, "");
+    base = `${proto}://${u.host}${prefix}`;
   } else {
-    host = location.host;
-    secure = location.protocol === "https:";
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    base = `${proto}://${location.host}`;
   }
-  let url = `${secure ? "wss" : "ws"}://${host}/api/sessions/${id}/stream`;
-  if (t.token) url += `?access_token=${encodeURIComponent(t.token)}`;
-  return url;
+  const params: string[] = [];
+  if (t.token) params.push(`access_token=${encodeURIComponent(t.token)}`);
+  // Browsers cannot set WS headers, so the relay key rides as a query param.
+  if (t.relayKey) params.push(`relay_key=${encodeURIComponent(t.relayKey)}`);
+  const query = params.length ? `?${params.join("&")}` : "";
+  return `${base}/api/sessions/${id}/stream${query}`;
+}
+
+/** One node the relay knows about (mirrors asm-relay's NodeEntry). */
+export interface RelayNode {
+  node_id: string;
+  label: string;
+  kind: "leaf" | "gateway";
+  via: string | null;
+  online: boolean;
+  last_seen: string;
+}
+
+/** Discover the nodes registered with a relay (requires the relay access key). */
+export async function listRelayNodes(url: string, accessKey: string): Promise<RelayNode[]> {
+  const b = url.replace(/\/$/, "");
+  let res: Response;
+  try {
+    res = await fetch(b + "/nodes", { headers: { "X-ASM-Relay-Key": accessKey } });
+  } catch {
+    throw new Error(i18n.t("api.unreachableAt", { baseUrl: url }));
+  }
+  if (!res.ok) {
+    if (res.status === 401) throw new Error(i18n.t("relay.errBadKey"));
+    throw new Error(`${res.status} ${res.statusText}`);
+  }
+  const body = (await res.json()) as { nodes: RelayNode[] };
+  return body.nodes ?? [];
 }

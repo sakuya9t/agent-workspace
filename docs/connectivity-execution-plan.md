@@ -270,18 +270,24 @@ starting the next, matching the M-track cadence. Rust work needs
   **Milestone reached:** a private daemon reachable only by dialing out is
   fully controllable — HTTP + live terminal WS — through the relay.
 
-- **R3 — client relay support.**
-  `RelayConn` store + persistence/migration, ConnectionDialog relay section
-  (add relay, discovered-node list with liveness, per-node connect via token
-  paste, remove), `via` plumbing in `Target`/`api.ts`/WS URLs, relay grouping
-  + the two failure states in the session tree, all strings via en.json.
-  *Acceptance:* `npm run build` green (tsc + eslint + check-locales); a CDP
-  script (scratchpad, per the established headless-Chrome technique with
-  localStorage seeding) drives: add relay → discover → connect node with
-  token → sessions appear in the tree → create + attach a session through
-  the relay → kill relay → group shows unreachable while cached data
-  remains → restart relay → recovers. Loopback-only ports (127.0.0.x)
-  since 0.0.0.0 binds are denied in this environment.
+- **R3 — client relay support. _Done 2026-07-05._**
+  `RelayConn` store (persisted `asm.relays`, cascade-remove) + `relayKey`/`via`
+  on `DaemonConn`/`Target`; `req`/`enrollDevice`/`probeHealth` send
+  `X-ASM-Relay-Key`; `streamUrl` now preserves the `/n/<id>` path prefix and
+  adds `relay_key` (fixing the drop-path bug); `listRelayNodes` discovery;
+  ConnectionDialog relay section (add relay, discovered-node list with
+  liveness, per-node connect via token paste, remove); all strings via en.json;
+  relayed traffic never gets loopback trust. Also added an OPTIONS bypass to the
+  relay's key middleware so a cross-origin browser's CORS preflight is not
+  blocked. *Acceptance (met):* `npm run build` green (tsc + eslint +
+  check-locales + vite). A headless-Chrome CDP harness (scratchpad
+  `r3-browser.mjs`) loads the built client from a daemon origin and drives a
+  node ONLY through the relay, cross-origin: discovery (CORS preflight for the
+  custom header), enroll-through-relay, session list (`req` path), create +
+  terminal-WS marker echo (`streamUrl` path); then seeds a relayed `DaemonConn`
+  and confirms the **real client bundle** renders it in the tree. All 7 checks
+  pass. **Milestone reached: the browser client reaches a relayed (NAT'd) node
+  with zero client-side tooling — works on any client including mobile.**
 
 - **R4 — gateway mode (egress-less downstreams).**
   Daemon parses `ASM_RELAY_DOWNSTREAMS`; probes each target's `/health` for

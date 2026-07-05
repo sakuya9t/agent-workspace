@@ -268,6 +268,12 @@ async fn require_relay_key(
     req: Request<Body>,
     next: Next,
 ) -> Response {
+    // CORS preflight carries no key and is normally short-circuited by the CORS
+    // layer; pass any OPTIONS through untouched so a cross-origin browser client
+    // is never blocked before the key-bearing request.
+    if req.method() == axum::http::Method::OPTIONS {
+        return next.run(req).await;
+    }
     if reg.key_ok(req.headers(), req.uri()) {
         next.run(req).await
     } else {

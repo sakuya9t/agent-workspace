@@ -277,5 +277,31 @@
     "close": "Close",
     "adding": "Adding…",
     "add": "Add daemon"
+  },
+  "relay": {
+    "sectionTitle": "— relays —",
+    "addDivider": "— add a relay —",
+    "urlLabel": "Relay URL",
+    "urlPlaceholder": "http://relay-host:4700",
+    "keyLabel": "Access key",
+    "keyPlaceholder": "relay access key",
+    "labelLabel": "Label (optional)",
+    "add": "Add relay",
+    "adding": "Adding…",
+    "remove": "remove",
+    "errNoUrl": "Enter a relay URL.",
+    "errNoKey": "Enter the relay access key.",
+    "errBadKey": "Relay rejected the access key.",
+    "discovering": "Discovering nodes…",
+    "unreachable": "relay unreachable",
+    "noNodes": "No nodes registered with this relay.",
+    "online": "online",
+    "offline": "offline",
+    "connected": "connected",
+    "connect": "Connect",
+    "connecting": "Connecting…",
+    "viaGateway": "via {{gateway}}",
+    "nodeTokenPlaceholder": "enrollment token for this node",
+    "tip": "A relay lets this client reach a private host that dials out to it — no tunnels, so it works on any device."
   }
 }
