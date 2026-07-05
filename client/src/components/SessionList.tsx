@@ -308,7 +308,9 @@ export function SessionList() {
         <div className="tree-node lvl0" onClick={() => toggle(daemon.id)}>
           <span className="chevron">{open ? "▾" : "▸"}</span>
           <span className="tree-icon">⬢</span>
-          <span className="tree-label">{daemonLabel(daemon)}</span>
+          <span className="tree-label" title={daemonLabel(daemon)}>
+            {daemonLabel(daemon)}
+          </span>
           <span className="tree-sub">
             {!connected
               ? t("sessionList.disconnected")

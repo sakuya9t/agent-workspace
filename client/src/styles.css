@@ -342,6 +342,7 @@ body.col-resizing iframe {
   font-size: 11px;
 }
 .tree-label {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -350,6 +351,13 @@ body.col-resizing iframe {
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.4px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* Secondary text: yield to the host label so a short name never truncates
+     just because the subtitle is long. Only after the subtitle is fully
+     squeezed does the label itself start to ellipsize. */
+  flex-shrink: 100;
 }
 .tree-badge {
   margin-left: auto;
@@ -358,6 +366,7 @@ body.col-resizing iframe {
   border-radius: 10px;
   padding: 0 7px;
   font-size: 11px;
+  flex: none;
 }
 .tree-add {
   background: transparent;
