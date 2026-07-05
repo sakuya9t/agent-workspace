@@ -214,7 +214,13 @@
     "historyHeader": "History",
     "noMessage": "(no message)",
     "noCommits": "No commits yet.",
-    "loadingHistory": "Loading history…"
+    "loadingHistory": "Loading history…",
+    "pullTitle": "Pull latest into this branch (fast-forward only)",
+    "rebaseTitle": "Rebase this branch onto…",
+    "rebaseOnto": "Rebase {{branch}} onto",
+    "loadingBranches": "Loading branches…",
+    "noOtherBranches": "No other branches to rebase onto.",
+    "scmRunning": "Running…"
   },
   "usage": {
     "title": "Session usage",

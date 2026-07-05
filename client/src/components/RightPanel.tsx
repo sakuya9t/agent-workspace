@@ -40,6 +40,7 @@ export function RightPanel({ target, session }: Props) {
   const qc = useQueryClient();
   const [diffTarget, setDiffTarget] = useState<ChangedFile | null>(null);
   const [commitTarget, setCommitTarget] = useState<string | null>(null);
+  const [rebaseOpen, setRebaseOpen] = useState(false);
 
   const terminal =
     session &&
@@ -120,6 +121,53 @@ export function RightPanel({ target, session }: Props) {
     refetchInterval: 5000,
     retry: false,
   });
+
+  // Branch list backing the rebase-target picker; only fetched while the picker
+  // is open so it doesn't poll needlessly.
+  const { data: branchList } = useQuery({
+    queryKey: ["scmbranches", base, session?.id],
+    queryFn: () => api.scmBranches(target!, session!.id),
+    enabled: !!session && !!target && !!scm?.is_repo && rebaseOpen,
+    retry: false,
+  });
+
+  // Refresh status + history after a pull/rebase changes the branch.
+  const refreshScm = () => {
+    qc.invalidateQueries({ queryKey: ["scm", base, session?.id] });
+    qc.invalidateQueries({ queryKey: ["scmlog", base, session?.id] });
+  };
+
+  const pull = useMutation({
+    mutationFn: () => api.scmPull(target!, session!.id),
+    onSuccess: refreshScm,
+  });
+
+  const rebase = useMutation({
+    mutationFn: (onto: string) => api.scmRebase(target!, session!.id, onto),
+    onSuccess: () => {
+      setRebaseOpen(false);
+      refreshScm();
+    },
+  });
+
+  // A pull and a rebase share one result/error line, so starting one clears the
+  // other's stale output.
+  const startPull = () => {
+    rebase.reset();
+    pull.mutate();
+  };
+  const startRebase = (onto: string) => {
+    pull.reset();
+    rebase.mutate(onto);
+  };
+
+  // Don't carry an open picker or a previous session's pull/rebase output onto
+  // the next session (this panel is reused, not remounted, across selections).
+  useEffect(() => {
+    setRebaseOpen(false);
+    pull.reset();
+    rebase.reset();
+  }, [session?.id, base]);
 
   if (!session || !target) {
     return (
@@ -299,7 +347,68 @@ export function RightPanel({ target, session }: Props) {
 
         {scm?.is_repo && (
           <>
-            <div className="section-title">{t("rightPanel.historyHeader")}</div>
+            <div className="section-title with-actions">
+              <span>{t("rightPanel.historyHeader")}</span>
+              {!scm.detached && (
+                <span className="scm-actions">
+                  <button
+                    className="icon-btn"
+                    disabled={pull.isPending || rebase.isPending}
+                    onClick={startPull}
+                    title={t("rightPanel.pullTitle")}
+                    aria-label={t("rightPanel.pullTitle")}
+                  >
+                    ↓
+                  </button>
+                  <button
+                    className={"icon-btn" + (rebaseOpen ? " active" : "")}
+                    disabled={pull.isPending || rebase.isPending}
+                    onClick={() => setRebaseOpen((o) => !o)}
+                    title={t("rightPanel.rebaseTitle")}
+                    aria-label={t("rightPanel.rebaseTitle")}
+                  >
+                    ⎇
+                  </button>
+                </span>
+              )}
+            </div>
+
+            {rebaseOpen && !scm.detached && (
+              <div className="rebase-picker">
+                <div className="rebase-picker-label">
+                  {t("rightPanel.rebaseOnto", { branch: scm.branch })}
+                </div>
+                {branchList ? (
+                  branchList.branches.filter((b) => b !== branchList.head).length > 0 ? (
+                    branchList.branches
+                      .filter((b) => b !== branchList.head)
+                      .map((b) => (
+                        <button
+                          key={b}
+                          className="rebase-branch mono"
+                          disabled={rebase.isPending}
+                          onClick={() => startRebase(b)}
+                        >
+                          {b}
+                        </button>
+                      ))
+                  ) : (
+                    <div className="dim small">{t("rightPanel.noOtherBranches")}</div>
+                  )
+                ) : (
+                  <div className="dim small">{t("rightPanel.loadingBranches")}</div>
+                )}
+              </div>
+            )}
+
+            {(pull.isPending || rebase.isPending) && (
+              <div className="dim small">{t("rightPanel.scmRunning")}</div>
+            )}
+            {pull.error && <div className="error">{String(pull.error)}</div>}
+            {rebase.error && <div className="error">{String(rebase.error)}</div>}
+            {pull.data && <div className="scm-op-result mono small dim">{pull.data}</div>}
+            {rebase.data && <div className="scm-op-result mono small dim">{rebase.data}</div>}
+
             {commits && commits.length > 0 ? (
               <CommitGraph commits={commits} head={scm.head} onSelect={setCommitTarget} />
             ) : (

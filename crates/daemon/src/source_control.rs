@@ -80,6 +80,17 @@ pub trait SourceControl: Send + Sync {
     fn log(&self, cwd: &Path, limit: usize) -> Result<Vec<Commit>>;
     /// Full detail (metadata + per-file churn) for a single commit.
     fn show(&self, cwd: &Path, hash: &str) -> Result<CommitDetail>;
+    /// Local branch names and the current branch (`None` when detached).
+    fn branches(&self, cwd: &Path) -> Result<(Vec<String>, Option<String>)>;
+    /// Fast-forward-only pull of the current branch from its upstream. Never
+    /// creates a merge commit or leaves the worktree in a conflicted state; if
+    /// the branch has diverged it fails cleanly (the user can rebase instead).
+    /// Returns git's combined stdout+stderr for display.
+    fn pull(&self, cwd: &Path) -> Result<String>;
+    /// Rebase the current branch onto `onto` (a local branch). On any failure
+    /// (conflicts, dirty tree) the rebase is aborted so the worktree is left in
+    /// a clean, usable state rather than half-rebased.
+    fn rebase(&self, cwd: &Path, onto: &str) -> Result<String>;
 }
 
 pub struct GitSourceControl;
@@ -205,6 +216,69 @@ impl SourceControl for GitSourceControl {
             ],
         )?;
         parse_show(&out).ok_or_else(|| anyhow!("could not parse commit {hash}"))
+    }
+
+    fn branches(&self, cwd: &Path) -> Result<(Vec<String>, Option<String>)> {
+        if !self.detect(cwd) {
+            return Ok((vec![], None));
+        }
+        let out = git(cwd, &["branch", "--format=%(refname:short)"])?;
+        let branches: Vec<String> = out
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        let head_raw = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let head = if head_raw == "HEAD" || head_raw.is_empty() {
+            None
+        } else {
+            Some(head_raw)
+        };
+        Ok((branches, head))
+    }
+
+    fn pull(&self, cwd: &Path) -> Result<String> {
+        if !self.detect(cwd) {
+            bail!("not a git repository");
+        }
+        let out = git_output(cwd, &["pull", "--ff-only"])?;
+        if out.status.success() {
+            Ok(combined_output(&out))
+        } else {
+            bail!("git pull failed: {}", combined_output(&out).trim());
+        }
+    }
+
+    fn rebase(&self, cwd: &Path, onto: &str) -> Result<String> {
+        if !self.detect(cwd) {
+            bail!("not a git repository");
+        }
+        guard_branch(onto)?;
+        // Only rebase onto a branch that actually exists here. Beyond catching
+        // typos, the exact-match membership check makes argument/option
+        // injection impossible even though `onto` reaches git positionally.
+        let (branches, head) = self.branches(cwd)?;
+        if !branches.iter().any(|b| b == onto) {
+            bail!("unknown branch: {onto}");
+        }
+        if head.as_deref() == Some(onto) {
+            bail!("cannot rebase a branch onto itself");
+        }
+        let out = git_output(cwd, &["rebase", onto])?;
+        if out.status.success() {
+            return Ok(combined_output(&out));
+        }
+        // A failed rebase (conflicts, or a dirty tree it refused to touch) can
+        // leave a rebase in progress; abort so the session's worktree returns
+        // to a clean state instead of a confusing half-rebased one.
+        let _ = git_output(cwd, &["rebase", "--abort"]);
+        bail!(
+            "git rebase onto {onto} failed (rebase aborted): {}",
+            combined_output(&out).trim()
+        );
     }
 }
 
@@ -335,6 +409,32 @@ fn git(cwd: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Run git and return the raw `Output` (both streams, exit status) without
+/// treating a non-zero exit as an error. Used by pull/rebase, which want git's
+/// message on both success and failure and decide how to react themselves.
+fn git_output(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
+    Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| anyhow!("failed to run git: {e}"))
+}
+
+/// Merge git's stdout and stderr into one human-readable blob. Porcelain like
+/// "Already up to date." lands on stdout; progress ("From …", conflict notes)
+/// on stderr — the panel wants both.
+fn combined_output(out: &std::process::Output) -> String {
+    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+    let err = String::from_utf8_lossy(&out.stderr);
+    if !err.trim().is_empty() {
+        if !s.is_empty() && !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push_str(&err);
+    }
+    s.trim_end().to_string()
+}
+
 /// Like `git`, but tolerates exit code 1 (used by diff, which returns 1 when
 /// there are differences — notably `--no-index`).
 fn git_allow_diff(cwd: &Path, args: &[&str]) -> Result<String> {
@@ -373,6 +473,26 @@ fn guard_path(path: &str) -> Result<()> {
 fn guard_ref(hash: &str) -> Result<()> {
     if !(4..=64).contains(&hash.len()) || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("invalid commit hash");
+    }
+    Ok(())
+}
+
+/// Reject anything that could be mistaken for an option or shell/ref trickery
+/// before a branch name reaches git positionally. The caller additionally
+/// checks membership against the repo's real branch list, so this is defence
+/// in depth rather than the sole guard.
+fn guard_branch(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("empty branch name");
+    }
+    if name.starts_with('-') {
+        bail!("invalid branch name");
+    }
+    if name
+        .bytes()
+        .any(|b| b == 0 || b == b'\n' || b == b'\r' || b == b' ')
+    {
+        bail!("invalid branch name");
     }
     Ok(())
 }
@@ -435,6 +555,18 @@ mod tests {
         assert!(guard_ref("--format=%s").is_err());
         assert!(guard_ref("HEAD~1").is_err());
         assert!(guard_ref("main").is_err());
+    }
+
+    #[test]
+    fn guard_branch_rejects_options_and_whitespace() {
+        assert!(guard_branch("main").is_ok());
+        assert!(guard_branch("release/next").is_ok());
+        assert!(guard_branch("feature/foo-bar_1").is_ok());
+        assert!(guard_branch("").is_err());
+        assert!(guard_branch("--onto").is_err());
+        assert!(guard_branch("-x").is_err());
+        assert!(guard_branch("has space").is_err());
+        assert!(guard_branch("has\nnewline").is_err());
     }
 
     #[test]
