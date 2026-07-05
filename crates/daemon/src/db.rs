@@ -353,6 +353,20 @@ impl Db {
         Ok(())
     }
 
+    /// How many *other* active instances (excluding `exclude_id`) occupy `path`.
+    /// A managed worktree shared by several sessions must survive until the last
+    /// one leaves, so teardown only reclaims it when this returns 0.
+    pub fn count_active_instances_at_path(&self, path: &str, exclude_id: &str) -> Result<usize> {
+        let conn = self.conn.lock();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM workspace_instances
+             WHERE path = ?1 AND status = 'active' AND id != ?2",
+            rusqlite::params![path, exclude_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
     // ---- auth: server identity + devices ----
 
     /// Load the server identity, creating it (with a fresh enrollment token)

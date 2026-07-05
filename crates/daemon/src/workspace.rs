@@ -153,6 +153,19 @@ pub fn list_worktrees(root: &Path) -> Result<Vec<WorktreeEntry>> {
     Ok(entries)
 }
 
+/// Find where `branch` is currently checked out, if anywhere. Returns the
+/// worktree path and whether it is the repository's main working tree (the
+/// first entry from `git worktree list`). `None` means the branch exists only
+/// as a ref with no live checkout, so a fresh worktree can be created for it.
+pub fn worktree_for_branch(root: &Path, branch: &str) -> Result<Option<(String, bool)>> {
+    let worktrees = list_worktrees(root)?;
+    Ok(worktrees
+        .iter()
+        .enumerate()
+        .find(|(_, wt)| wt.branch.as_deref() == Some(branch))
+        .map(|(i, wt)| (wt.path.clone(), i == 0)))
+}
+
 /// Drop registrations for worktrees whose directories no longer exist.
 pub fn prune_worktrees(root: &Path) -> Result<()> {
     run(root, &["worktree", "prune"])?;

@@ -252,6 +252,40 @@ impl SessionManager {
                         .map(str::trim)
                         .filter(|b| !b.is_empty())
                         .unwrap_or("HEAD");
+
+                    // Picking an existing branch that is already checked out
+                    // somewhere: share that working tree rather than fail. Git
+                    // forbids a second checkout of one branch, and sharing is
+                    // exactly what lets two sessions (e.g. plan-with-CC then
+                    // review-with-codex) see the same diffs.
+                    if let Some(name) = requested {
+                        if !req.create_branch {
+                            if let Some((existing_path, is_main)) =
+                                workspace::worktree_for_branch(&root, name)?
+                            {
+                                // The repo's own checkout can't become a second
+                                // worktree; sharing it is a direct checkout,
+                                // which owns no worktree or branch to reclaim.
+                                let (path, branch, isolation) = if is_main {
+                                    (ws.root_path.clone(), None, "direct")
+                                } else {
+                                    (existing_path, Some(name.to_string()), "shared")
+                                };
+                                let inst = WorkspaceInstance {
+                                    id: Uuid::new_v4().to_string(),
+                                    workspace_id: ws.id.clone(),
+                                    session_id: Some(session_id.to_string()),
+                                    path: path.clone(),
+                                    branch,
+                                    isolation: isolation.into(),
+                                    status: "active".into(),
+                                    created_at: now,
+                                };
+                                return Ok((path, Some(inst)));
+                            }
+                        }
+                    }
+
                     let spec = match requested {
                         Some(name) if req.create_branch => {
                             workspace::BranchSpec::New { name, base }
@@ -396,15 +430,18 @@ impl SessionManager {
         if inst.status == "released" {
             return Ok(());
         }
-        if inst.isolation == "worktree" {
+        if inst.isolation == "worktree" || inst.isolation == "shared" {
             if self.live_handle(session_id).is_some() {
                 bail!("stop the session before cleaning up its worktree");
             }
-            let ws = self
-                .db
-                .get_workspace(&inst.workspace_id)?
-                .ok_or_else(|| anyhow!("workspace record missing"))?;
-            workspace::remove_worktree(Path::new(&ws.root_path), Path::new(&inst.path), force)?;
+            // Only reclaim the worktree once the last session sharing it leaves.
+            if self.db.count_active_instances_at_path(&inst.path, &inst.id)? == 0 {
+                let ws = self
+                    .db
+                    .get_workspace(&inst.workspace_id)?
+                    .ok_or_else(|| anyhow!("workspace record missing"))?;
+                workspace::remove_worktree(Path::new(&ws.root_path), Path::new(&inst.path), force)?;
+            }
         }
         self.db.set_instance_status(&inst.id, "released")?;
         Ok(())
@@ -675,7 +712,7 @@ impl SessionManager {
         let Some(inst) = self.db.get_instance_for_session(session_id)? else {
             return Ok(()); // ad-hoc session: nothing managed to remove
         };
-        if inst.isolation != "worktree" {
+        if inst.isolation != "worktree" && inst.isolation != "shared" {
             return Ok(()); // direct/plain: no owned worktree or branch
         }
         let ws = self
@@ -688,6 +725,17 @@ impl SessionManager {
 
         if active && self.live_handle(session_id).is_some() {
             bail!("stop the session before archiving it");
+        }
+
+        // Another session is still working in this shared worktree: relinquish
+        // our own claim but leave the directory and branch for the remaining
+        // sharer(s). Whoever leaves last (this check returns 0) reclaims both.
+        // No `force` bypass — force discards *our* work, never evicts a sharer.
+        if self.db.count_active_instances_at_path(&inst.path, &inst.id)? > 0 {
+            if active {
+                self.db.set_instance_status(&inst.id, "released")?;
+            }
+            return Ok(());
         }
 
         // Refuse to silently discard work unless forced. Both guards surface as
@@ -1410,6 +1458,84 @@ mod tests {
         assert_eq!(archived.status, SessionStatus::Archived);
         assert!(!wt.exists());
         assert!(!workspace::branch_exists(&repo, &branch));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn existing_branch_shares_worktree() {
+        let (manager, dir) = test_manager();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+
+        // First session gets its own managed worktree on an auto branch.
+        let a = manager.create_session(ws_req(&ws.id)).unwrap();
+        let inst_a = manager.get_instance_for_session(&a.id).unwrap().unwrap();
+        let branch = inst_a.branch.clone().unwrap();
+        assert_eq!(inst_a.isolation, "worktree");
+
+        // Second session pointed at that branch shares the first's worktree
+        // instead of failing with git's "already checked out".
+        let mut req = ws_req(&ws.id);
+        req.branch = Some(branch.clone());
+        req.create_branch = false;
+        let b = manager.create_session(req).unwrap();
+        let inst_b = manager.get_instance_for_session(&b.id).unwrap().unwrap();
+
+        assert_eq!(inst_b.isolation, "shared");
+        assert_eq!(inst_b.path, inst_a.path, "sharer runs in the owner's worktree");
+        assert_eq!(inst_b.branch.as_deref(), Some(branch.as_str()));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn shared_worktree_survives_until_last_session_leaves() {
+        let (manager, dir) = test_manager();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+
+        let a = manager.create_session(ws_req(&ws.id)).unwrap();
+        let inst_a = manager.get_instance_for_session(&a.id).unwrap().unwrap();
+        let branch = inst_a.branch.clone().unwrap();
+        let wt = inst_a.path.clone();
+
+        let mut req = ws_req(&ws.id);
+        req.branch = Some(branch.clone());
+        let b = manager.create_session(req).unwrap();
+        assert_eq!(
+            manager.get_instance_for_session(&b.id).unwrap().unwrap().path,
+            wt
+        );
+
+        // Archive the owner first while the sharer is still active: the shared
+        // worktree and branch must survive — the sharer is still using them.
+        manager.stop_session(&a.id).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        manager.archive_session(&a.id, false).unwrap();
+        assert!(Path::new(&wt).is_dir(), "worktree kept while a sharer lives");
+        assert!(
+            workspace::branch_exists(&repo, &branch),
+            "branch kept while a sharer lives"
+        );
+
+        // The last session out reclaims both.
+        manager.stop_session(&b.id).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        manager.archive_session(&b.id, false).unwrap();
+        assert!(!Path::new(&wt).exists(), "last session removes the worktree");
+        assert!(
+            !workspace::branch_exists(&repo, &branch),
+            "last session deletes the branch"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
