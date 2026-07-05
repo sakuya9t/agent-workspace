@@ -44,13 +44,18 @@ env vars, milestones **R1–R5** with acceptance criteria, mirroring how
   generated and persisted; already returned by enrollment). No second
   identity. `/health` gains `node_id` + `label` fields (R2) so gateways can
   probe downstreams (R4).
-- Mux default: **yamux over the registration WSS** (via a WS→byte-stream
-  adapter). Rationale: credit-based per-stream flow control for free — one
-  busy terminal stream must not starve control traffic or other sessions.
-  Fallback if the adapter fights us (documented pivot, not a re-litigation):
-  frp-style *dial-out-per-stream* — control connection stays, each proxied
-  stream is a fresh outbound WSS from node to relay. Costs per-stream dial
-  latency; keeps everything else in this plan identical.
+- Stream mechanism: **dial-out-per-stream** (chosen 2026-07-04 during R1). The
+  control WSS stays open; for each inbound client connection the relay sends an
+  `Open{stream_id,target}` down the control channel and the node dials a fresh
+  outbound **data WSS** (`/data?stream_id=…`) which the relay pairs with the
+  waiting client and splices. *Why not yamux (the original default):* `yamux
+  0.13` is poll-only (no `Control` handle), so multiplexing one WSS is subtle
+  single-point-of-failure code; dial-out gives **per-stream isolation for free**
+  (each stream is its own WS/TCP, so one stalled stream cannot block another —
+  an acceptance criterion becomes true by construction) using only WebSocket
+  primitives. Cost — a WS handshake per stream — is negligible for this
+  workload (few long-lived terminal streams + occasional polls). The target
+  travels in the `Open` message, so there is **no in-stream preamble**.
 
 ## Wire contract (frozen once R2 ships end-to-end)
 
