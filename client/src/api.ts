@@ -378,6 +378,17 @@ export const api = {
       t,
       `/api/sessions/${id}/scm/commit?hash=${encodeURIComponent(hash)}`,
     ).then((r) => r.commit),
+  scmBranches: (t: Target, id: string) =>
+    req<BranchList>(t, `/api/sessions/${id}/scm/branches`),
+  scmPull: (t: Target, id: string) =>
+    req<{ output: string }>(t, `/api/sessions/${id}/scm/pull`, { method: "POST" }).then(
+      (r) => r.output,
+    ),
+  scmRebase: (t: Target, id: string, onto: string) =>
+    req<{ output: string }>(t, `/api/sessions/${id}/scm/rebase`, {
+      method: "POST",
+      body: JSON.stringify({ onto }),
+    }).then((r) => r.output),
   listWorkspaces: (t: Target) =>
     req<{ workspaces: Workspace[] }>(t, "/api/workspaces").then((r) => r.workspaces),
   addWorkspace: (t: Target, name: string, root_path: string) =>

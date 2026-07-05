@@ -97,3 +97,43 @@ pub async fn log(
     let commits = run_blocking(move || scm.log(&cwd, limit)).await?;
     Ok(Json(json!({ "commits": commits })))
 }
+
+/// Local branches (rebase-target choices for the history panel).
+pub async fn branches(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let cwd = session_cwd(&state, &id).await?;
+    let scm = state.scm.clone();
+    let (branches, head) = run_blocking(move || scm.branches(&cwd)).await?;
+    Ok(Json(json!({ "branches": branches, "head": head })))
+}
+
+/// Fast-forward-only pull of the session's current branch.
+pub async fn pull(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let cwd = session_cwd(&state, &id).await?;
+    let scm = state.scm.clone();
+    let output = run_blocking(move || scm.pull(&cwd)).await?;
+    Ok(Json(json!({ "output": output })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RebaseBody {
+    onto: String,
+}
+
+/// Rebase the session's current branch onto another local branch.
+pub async fn rebase(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RebaseBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let cwd = session_cwd(&state, &id).await?;
+    let scm = state.scm.clone();
+    let onto = body.onto;
+    let output = run_blocking(move || scm.rebase(&cwd, &onto)).await?;
+    Ok(Json(json!({ "output": output })))
+}
