@@ -38,6 +38,16 @@ pub struct Config {
     /// Explicit asmux binary path (`ASM_ASMUX_BIN`); else a sibling of the
     /// daemon binary, else `asmux` on `PATH`.
     pub asmux_bin: Option<PathBuf>,
+    /// Relay base URL to register outbound to (`ASM_RELAY_URL`, e.g.
+    /// `wss://relay.example.com`). When set (with a key), the daemon dials the
+    /// relay and serves relayed traffic on a loopback tunnel listener so it is
+    /// reachable from behind NAT. See docs/connectivity-execution-plan.md.
+    pub relay_url: Option<String>,
+    /// Relay access key (`ASM_RELAY_KEY`). Required alongside `relay_url`.
+    pub relay_key: Option<String>,
+    /// Human label advertised to the relay and shown in clients
+    /// (`ASM_NODE_LABEL`, default: hostname).
+    pub node_label: String,
 }
 
 impl Config {
@@ -85,6 +95,10 @@ impl Config {
         let asmux_autospawn = !matches!(std::env::var("ASM_ASMUX_AUTOSPAWN").as_deref(), Ok("0"));
         let asmux_bin = env_path("ASM_ASMUX_BIN");
 
+        let relay_url = env_nonempty("ASM_RELAY_URL");
+        let relay_key = env_nonempty("ASM_RELAY_KEY");
+        let node_label = env_nonempty("ASM_NODE_LABEL").unwrap_or_else(hostname_label);
+
         Ok(Self {
             bind,
             data_dir,
@@ -95,6 +109,9 @@ impl Config {
             asmux_socket,
             asmux_autospawn,
             asmux_bin,
+            relay_url,
+            relay_key,
+            node_label,
         })
     }
 
@@ -105,4 +122,16 @@ impl Config {
 
 fn env_path(key: &str) -> Option<PathBuf> {
     std::env::var_os(key).map(PathBuf::from)
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|s| !s.is_empty())
+}
+
+/// Best-effort host label for the node (advertised to the relay / shown in the
+/// client) when `ASM_NODE_LABEL` is unset.
+fn hostname_label() -> String {
+    env_nonempty("HOSTNAME")
+        .or_else(|| env_nonempty("COMPUTERNAME"))
+        .unwrap_or_else(|| "asm-node".to_string())
 }

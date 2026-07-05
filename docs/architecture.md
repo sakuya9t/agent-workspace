@@ -606,24 +606,177 @@ Memory behavior:
 
 ## Connectivity
 
-Connectivity modes:
+Connectivity answers exactly one question per node: **at what URL can this
+client reach that daemon?** Sessions, terminals, and aggregation are identical
+across all modes.
+
+This section is the contract; the implementation plan (wire details, crate
+layout, milestones R1–R5) lives in
+[`connectivity-execution-plan.md`](connectivity-execution-plan.md).
+
+### Contract
+
+Invariants that hold in every mode:
+
+- Every mode terminates in a `baseUrl` the client can reach. A connected node
+  is one more daemon connection entry; the client aggregates all of them
+  identically. Direct, tunnelled, and relayed nodes are indistinguishable
+  above the URL.
+- The client speaks plain HTTP(S) and WebSocket in every mode. Routing
+  complexity is encoded in the URL shape, never in client networking code.
+- Network roles live in the server daemon and the relay only. The session
+  backend holder (`asmux`) is local IPC and is never exposed to any network.
+- Connections are initiated from the less-reachable side toward the
+  more-reachable side: clients dial daemons; NAT'd daemons dial out and
+  register.
+
+### Modes
 
 ```text
-direct:       client -> server daemon
-ssh tunnel:   client -> ssh -L local_port:server_socket -> server daemon
-relay:        server daemon -> relay <- client
-gateway:      client -> gateway daemon -> private server daemon
-ssh fallback: client -> ssh jump host -> server daemon socket
+direct:       client -> server daemon                                  (MVP)
+ssh tunnel:   client -> ssh -L local_port:daemon_port -> daemon        (MVP)
+ssh via hop:  client -> ssh -J hop ... -> daemon                       (MVP, recipe)
+relay:        daemon --register--> relay <--connect-- client           (Phase 2)
+gateway:      gateway daemon --register--> relay <--connect-- client
+                     \--forward inward--> private daemon               (Phase 3)
 ```
 
-Direct local/LAN and SSH local port forwarding are MVP modes. Relay and gateway modes preserve the same authenticated daemon API and session model.
+Direct local/LAN and SSH port forwarding are MVP modes. Relay and gateway
+modes preserve the same authenticated daemon API and session model.
 
-Relay security goal:
+### Topology Cases
 
-- relay routes encrypted streams,
-- relay does not need plaintext terminal access,
-- server and client authenticate end to end,
-- routes are authorized per owner and server.
+The reference topologies, in deployment order:
+
+```text
+case 1:  A -> B -> C        C reachable only from B (VM behind B's NAT,
+                            host on B's private net)         -> ssh recipes
+case 2:  A -> B <- C        B public; C NAT'd, dials out     -> relay
+case 3:  A -> B <- C -> D   D has no internet egress; gateway C is its
+                            only entrypoint (e.g. company-internal
+                            server behind a bastion)          -> gateway
+```
+
+All cases reduce to two composable primitives:
+
+- **forward inward** — a reachable intermediate carries connections onward to
+  a node it can reach (`ssh -L`/`-J` today; gateway stream splice in Phase 3).
+- **register outward** — an unreachable node dials out to a reachable
+  rendezvous and parks a persistent connection there (relay registration).
+
+Any node may be both a leaf (registered upstream) and a hub (forwarding
+downstream), so the primitives compose to arbitrary depth. Depth is invisible
+to the client. A NAT'd-but-egress-capable node registers with the relay
+directly, however many NAT layers it sits behind — the registry stays flat;
+gateway forwarding is only for nodes with no egress at all.
+
+**Decision (2026-07-04):** ASM owns the relay/gateway path (`asm-relay` +
+daemon gateway mode) rather than delegating to a third-party overlay mesh
+(Tailscale/headscale, Nebula). Target deployments include entrypoints where
+overlay software cannot be installed but the ASM daemon can. SSH recipes
+remain the supported zero-infrastructure fallback.
+
+### Phase 1: SSH Recipes (works today)
+
+```text
+# case 1 — C reachable only via B
+ssh -J user@B user@C -L 4602:127.0.0.1:4600 -N   # lands on C loopback: no token
+ssh user@B -L 4602:<C_ip>:4600 -N                # no sshd on C; C sees B: token
+
+# case 3 without a relay — egress-less D behind reachable C
+ssh user@C -L 4603:<D_ip>:4600 -N                # through public C: token
+# C itself NAT'd: on C keep `autossh -R 4600:<D_ip>:4600 user@B` alive,
+# then on A: ssh user@B -L 4603:127.0.0.1:4600 -N
+```
+
+The forwarded local port is added in the client as an ordinary daemon URL.
+
+### Phase 2: Relay (`asm-relay`)
+
+- `asm-relay` is a standalone, hardened, internet-facing binary on a public
+  host. Registry and router only: no sessions, no workspaces, no asmux.
+- Registration: a daemon dials `wss://relay/register` outbound (443-friendly,
+  survives restrictive egress), authenticates with a relay access key, and
+  holds the connection open; reconnect with backoff. Registration carries the
+  node id, label, and advertised downstreams.
+- Node identity: each daemon generates a stable `node_id` on first run and
+  persists it.
+- Stream model: one physical WSS connection per registered node, carrying
+  multiplexed logical streams. Each inbound client request or WebSocket is one
+  logical stream.
+- Opaque payload: the relay routes by path prefix — `/n/<node_id>/...` (HTTP
+  and WS upgrade alike) is spliced down the target node's registration
+  connection as raw bytes. The relay never parses the daemon API, so new
+  daemon endpoints need no relay changes and the client keeps speaking the
+  daemon protocol end to end.
+- Discovery: `GET /nodes` (relay access key required) returns registered
+  nodes: `node_id`, label, kind (leaf | gateway), `via` (gateway `node_id`
+  for advertised downstreams), liveness.
+
+### Phase 3: Gateway Mode
+
+- A daemon configured with `downstreams` registers itself with the relay and
+  advertises each downstream target it can reach on its private network.
+- Logical streams addressed to a downstream are spliced by the gateway onward
+  to `host:port` on its network. Downstream daemons need no internet egress
+  and no software beyond the ASM daemon — they are reached inward only.
+- Gateways compose: a downstream may itself be a gateway. Neither the client
+  nor the relay routing model grows with depth beyond the `via` attribution.
+
+### Authentication
+
+Two independent credentials, one per layer:
+
+- **Relay access key** — gates use of the relay itself: registration,
+  discovery, and routing. Scoped per owner; a relay is not an open proxy.
+- **Node enrollment / device token** — the existing daemon enrollment flow,
+  performed through the relay URL and validated end to end by the target
+  daemon. Neither relay nor gateway can mint or bypass node access.
+- **Relayed traffic is never loopback-trusted.** Tunnel streams delivered to a
+  daemon (including a gateway's own daemon) count as remote; a device token is
+  always required on relayed paths. Blank-token loopback trust remains
+  exclusive to genuine loopback connections (local clients and real SSH
+  tunnels).
+
+### Client Connection Establishment
+
+The client gains one new entity: a **relay**, which contributes discovered
+nodes rather than sessions. Client networking is unchanged — a relayed node is
+an ordinary daemon connection whose `baseUrl` happens to route through the
+relay.
+
+```text
+1. add relay (once)      relay URL + relay access key
+                         -> client calls GET /nodes, lists discovered nodes
+                            grouped under the relay with liveness
+2. connect node (once    supply that node's enrollment token
+   per node)             -> client enrolls against https://relay/n/<node_id>
+                            (validated end to end by the node), stores the
+                            device token
+3. steady state          node is a normal daemon connection:
+                           { baseUrl: "https://relay/n/<node_id>",
+                             token: <device_token>, via: <relay_id> }
+                         polled and aggregated identically to direct nodes;
+                         terminal attach upgrades wss://relay/n/<node_id>/...
+```
+
+Failure states the client distinguishes:
+
+- relay unreachable — every node under that relay is marked unreachable as a
+  group; cached session data is retained,
+- node offline — registration dropped, or the gateway reports its downstream
+  unreachable; only that node is marked, distinct from relay-down.
+
+### Relay Security Goals
+
+- the relay routes opaque streams and does not parse the daemon API,
+- client and daemon authenticate end to end; relay and gateway cannot mint
+  access,
+- routes are authorized per owner and node,
+- splice points (relay, gateway) can observe stream plaintext until nested
+  end-to-end TLS (client-to-daemon, carried through the tunnel) lands; nested
+  TLS is the hardening item that also closes the "no TLS off loopback" gap in
+  docs/security-followups.md for relayed paths.
 
 ## Attention Signals
 
@@ -852,6 +1005,7 @@ Baseline security:
 - lifecycle audit events for session create, attach, input, stop, and delete,
 - terminal log and memory secret-handling policy,
 - per-device keys for enrollment,
+- relayed traffic never inherits loopback trust,
 - API and protocol version negotiation.
 
 MVP storage disclosure:
@@ -875,3 +1029,5 @@ MVP storage disclosure:
 - Git checkpoint and worktree naming, retention, and garbage collection.
 - Binary, large-file, generated-file, and ignored-path diff behavior.
 - Placement policy defaults across locality, latency, load, cost, and power state.
+- Relay stream-multiplexing framing: default is yamux over the registration WSS, with frp-style dial-out-per-stream as the documented fallback (see connectivity-execution-plan.md → Locked decisions).
+- Pairing-code enrollment brokered through the relay to replace manual token paste.

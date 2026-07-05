@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/daemon", "crates/asmux", "crates/asmux-wire"]
+members = ["crates/daemon", "crates/asmux", "crates/asmux-wire", "crates/asm-relay"]
 
 [workspace.package]
 version = "0.1.0"
@@ -40,3 +40,10 @@ async-trait = "0.1"
 ureq = { version = "2", features = ["json"] }
 planus = "1.3"
 nix = { version = "0.31", features = ["signal", "process"] }
+# Relay/gateway (R-track). Dial-out-per-stream uses only WebSockets + hyper;
+# all versions are already resolved in Cargo.lock via axum 0.7.
+tokio-tungstenite = "0.24"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+http-body-util = "0.1"

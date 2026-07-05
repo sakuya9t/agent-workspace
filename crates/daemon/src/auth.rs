@@ -29,24 +29,54 @@ pub fn gen_server_id() -> String {
     Uuid::new_v4().to_string()
 }
 
+/// Which listener a request arrived on. Traffic relayed in through the tunnel
+/// listener must NEVER inherit loopback trust even though it lands on loopback,
+/// so the listener stamps this and the trust decision consults it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerKind {
+    /// The daemon's own bind address (loopback here is a genuine local client
+    /// or an SSH port-forward — trusted).
+    Primary,
+    /// The relay tunnel listener: connections are spliced in from remote
+    /// clients over the relay and only *appear* local. Never loopback-trusted.
+    Tunnel,
+}
+
+/// The single loopback-trust decision, computed once by [`require_auth`] and
+/// stamped on the request so loopback-only handlers (e.g. the enrollment-token
+/// endpoint) read it instead of re-deriving trust from the raw peer address.
+#[derive(Debug, Clone, Copy)]
+pub struct LoopbackTrust(pub bool);
+
 /// Auth policy:
 /// - `/health`, static assets, and the auth bootstrap endpoints are public.
 /// - Loopback connections (localhost, and SSH local port-forwards, which
-///   terminate on loopback of the remote host) are trusted without a token.
+///   terminate on loopback of the remote host) are trusted without a token —
+///   but ONLY on the primary listener. Relayed traffic (tunnel listener) is
+///   never loopback-trusted even though it arrives on loopback.
 /// - Every other connection must present a valid device bearer token
 ///   (Authorization: Bearer <token>, or `?access_token=` for WebSocket).
-pub async fn require_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
+pub async fn require_auth(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
     // CORS preflight must pass through untouched.
     if req.method() == Method::OPTIONS {
         return next.run(req).await;
     }
 
-    let path = req.uri().path();
-    if is_public(path) {
+    // The one trust decision: loopback peer AND not the relay tunnel listener.
+    let kind = req
+        .extensions()
+        .get::<ListenerKind>()
+        .copied()
+        .unwrap_or(ListenerKind::Primary);
+    let trusted = peer_is_loopback(&req) && kind != ListenerKind::Tunnel;
+    req.extensions_mut().insert(LoopbackTrust(trusted));
+
+    let path = req.uri().path().to_string();
+    if is_public(&path) {
         return next.run(req).await;
     }
 
-    if peer_is_loopback(&req) {
+    if trusted {
         return next.run(req).await;
     }
 
