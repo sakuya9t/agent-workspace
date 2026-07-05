@@ -1,14 +1,12 @@
-use std::net::SocketAddr;
-
-use axum::extract::{ConnectInfo, Path, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::Json;
+use axum::{Extension, Json};
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
 use super::{AppError, AppState};
-use crate::auth::gen_device_token;
+use crate::auth::{gen_device_token, LoopbackTrust};
 use crate::domain::{Device, DeviceInfo};
 use crate::util::now_millis;
 
@@ -66,12 +64,16 @@ pub async fn enroll(
 }
 
 /// Loopback-only: reveal the enrollment token so the owner (at the host, or
-/// over an SSH tunnel) can enroll another device. Never exposed to remote peers.
+/// over an SSH tunnel) can enroll another device. Never exposed to remote peers
+/// — and crucially never to relayed callers: the trust decision comes from
+/// [`LoopbackTrust`] (stamped by `require_auth`), NOT the raw peer address,
+/// because a relayed request reaches the daemon over a genuinely-loopback
+/// tunnel socket and would otherwise be trusted.
 pub async fn enrollment_token(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(trust): Extension<LoopbackTrust>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    if !peer.ip().is_loopback() {
+    if !trust.0 {
         return Err(AppError(
             StatusCode::FORBIDDEN,
             "enrollment token is only visible from the daemon host (loopback)".into(),

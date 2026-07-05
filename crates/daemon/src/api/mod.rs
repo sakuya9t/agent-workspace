@@ -31,6 +31,11 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub scm: Arc<dyn SourceControl>,
     pub started_at: i64,
+    /// This daemon's stable node id (== persisted `server_id`); advertised to
+    /// the relay and surfaced on `/health` so a gateway can probe it (R4).
+    pub node_id: String,
+    /// Human label for this node (`ASM_NODE_LABEL`, default hostname).
+    pub node_label: String,
     /// Tracks the single live WS attacher per session (takeover).
     pub attachments: Arc<ws::Attachments>,
 }
@@ -98,6 +103,8 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "status": "ok",
         "version": VERSION,
         "hostname": hostname(),
+        "node_id": state.node_id,
+        "label": state.node_label,
         "platform": current_platform(),
         "uptime_ms": now_millis() - state.started_at,
         "database": "ok",

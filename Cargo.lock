@@ -58,6 +58,7 @@ name = "asm-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "asm-relay",
  "asmux",
  "async-trait",
  "axum",

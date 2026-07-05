@@ -68,17 +68,17 @@ GET wss://<relay>/register            (WebSocket upgrade)
                                       accepted; query wins if both)
 ```
 
-After upgrade the socket carries **binary yamux frames** (WS binary messages
-adapted to a byte stream). Both sides may open streams:
+The `/register` socket is the **control stream** (text JSON frames). Data
+streams are separate outbound WS connections (see below) — no in-connection
+multiplexing.
 
-- **Control stream** — the node opens the *first* stream immediately and it is
-  control for the life of the connection. JSON Lines, one object per line:
+- **Control stream** (`/register`) — JSON Lines, one object per line:
   - node → relay `{"t":"hello","proto":1,"node_id":"…","label":"…",
     "downstreams":[{"node_id":"…","label":"…","reachable":true}]}`
-    (first line; relay closes with an error line + WS close on proto or key
-    mismatch, or on `node_id` collision with a *different* live connection —
-    same `node_id` reconnecting supersedes the old registration, takeover
-    semantics like asmux's single-attacher)
+    (first frame; relay closes with an error line + WS close on proto or key
+    mismatch — same `node_id` reconnecting supersedes the old registration,
+    takeover semantics like asmux's single-attacher, guarded by a generation
+    counter so the stale loop can't clobber the new entry)
   - node → relay `{"t":"downstreams","downstreams":[…]}` (replace-set update,
     sent whenever a downstream probe result changes)
   - node → relay `{"t":"ping","seq":n}` every **15 s**; relay replies
@@ -86,21 +86,19 @@ adapted to a byte stream). Both sides may open streams:
     without any control traffic; node treats a missing pong the same way and
     reconnects. (JSON ping is authoritative liveness; WS ping frames are not
     relied on.)
-- **Proxy streams** — opened by the *relay*, one per inbound client
-  connection. **Frozen framing rule: every proxy stream — direct and gateway
-  alike — begins with exactly one relay-written JSON line**
-  `{"target":"<node_id>"}` (extensible object; nodes ignore unknown fields).
-  After that line the payload is the raw client bytes (HTTP/1.1 request or
-  upgraded WS byte stream) with the `/n/<node_id>` prefix already stripped
-  by the relay. The node reads the preamble, dials the matching target — its
-  own tunnel listener when `target` is its own `node_id`, else the advertised
-  downstream — then goes byte-blind and copies until either side closes
-  (`copy_bidirectional`). One rule, no per-kind variants: R1 tests the
-  preamble on direct streams, R4 on downstream streams.
+  - relay → node `{"t":"open","stream_id":"<uuid>","target":"<node_id>"}` —
+    asks the node to dial back a data stream for one waiting client. `target`
+    is the node itself or one of its advertised downstreams.
+- **Data streams** (`/data?relay_key=…&stream_id=<uuid>`) — the node dials one
+  fresh outbound WSS per `open`. The relay pairs it back to the waiting client
+  by `stream_id` and splices; the node resolves the target and
+  `copy_bidirectional`s the WS (as a byte duplex) to the target's TCP socket.
+  Streams are independent connections — a stalled one cannot block another.
+  There is no in-stream preamble; the target came in the `open` message.
 
 Reconnect (node side): exponential backoff 1 s → 60 s cap, ±20 % jitter,
-reset after 60 s of stable connection. This is R-track code; do not reuse or
-wait for the M4 asmux watchdog.
+reset after 60 s of stable connection. This is R-track code; it does not reuse
+or wait for the M4 asmux watchdog.
 
 ### Client-facing surface (relay)
 
@@ -115,11 +113,11 @@ GET /nodes                            list registered nodes
 ANY /n/<node_id>/<rest>               opaque proxy (HTTP + WS upgrade)
   auth: relay key as above; Authorization header passes through UNTOUCHED
         (it carries the daemon device token, end-to-end)
-  routing: direct node -> its registration connection;
-           advertised downstream -> the owning gateway's connection.
-           Either way the proxy stream starts with the uniform one-line
-           {"target":"<node_id>"} preamble (see Registration) telling the
-           node which target to dial.
+  routing: mint a stream_id, send {"open",stream_id,target} to the owning
+           node's control stream (direct node = itself; advertised downstream
+           = its gateway), await the matching /data dial-back (10s timeout ->
+           502), then forward over it. relay_key is stripped from the query
+           before forwarding; Authorization is preserved.
 ```
 
 Error bodies (client maps these to distinct UI states):
@@ -132,13 +130,13 @@ Error bodies (client maps these to distinct UI states):
 ```
 
 Proxying details (relay side): strip `/n/<node_id>` prefix; forward via
-`hyper` http1 client handshake **over the yamux stream**; stream request and
-response bodies (no buffering — terminal WS and SSE-like flows must not
-stall). For `Upgrade: websocket` requests use `hyper::upgrade::on` on both
-legs and then `copy_bidirectional`. Host header is left as the relay's host —
-the daemon ignores Host. CORS: the relay answers permissive CORS (mirroring
-the daemon's stance) and must allow the `X-ASM-Relay-Key` and `Authorization`
-headers, because the client is served from a daemon origin, not the relay.
+`hyper` http1 client handshake **over the dial-back data WS** (adapted to a
+byte duplex); stream request and response bodies (no buffering — terminal WS
+and SSE-like flows must not stall). For `Upgrade: websocket` requests use
+`hyper::upgrade::on` on both legs and then `copy_bidirectional`. Host header is
+left as the relay's host — the daemon ignores Host. CORS: `CorsLayer::permissive`
+(mirroring the daemon's stance), which admits the `X-ASM-Relay-Key` and
+`Authorization` headers.
 
 TLS: the relay binary optionally terminates TLS natively
 (`ASM_RELAY_TLS_CERT` / `ASM_RELAY_TLS_KEY`, rustls); otherwise it binds
@@ -232,53 +230,45 @@ Work each milestone to completion (code + tests green + script proof) before
 starting the next, matching the M-track cadence. Rust work needs
 `source ~/.cargo/env` first.
 
-- **R1 — `asm-relay` core (standalone; no daemon changes).**
-  New crate `crates/asm-relay` (workspace member): axum server with
-  `/register` (WSS + yamux + control stream, hello/ping/downstreams,
-  same-`node_id` takeover), `/nodes`, and the `/n/<node_id>/*` proxy (HTTP
-  forward over mux stream + WS upgrade splice + the one-line `{"target"}`
-  preamble), relay-key auth on every route, permissive CORS, liveness
-  bookkeeping, error bodies exactly as specified. The **lib half** exports
-  the protocol types/consts and a reusable node-side `agent` task (register,
-  control stream, backoff/reconnect, serve proxy streams by dialing a
-  configurable local TCP target).
-  *Acceptance:* `cargo test -p asm-relay` includes an in-process e2e: start
-  relay on an ephemeral loopback port; start a fake node (the lib agent
-  pointed at a local hello-world HTTP server); assert (1) `/nodes` shows it
-  online, (2) `GET /n/<id>/…` round-trips through the tunnel — including the
-  one-line `{"target"}` preamble on this *direct* stream (the frozen
-  always-preamble rule), (3) a WS
-  echo upgrade works through `/n/<id>/…`, (4) wrong/missing relay key ⇒ 401,
-  unknown node ⇒ 404, killed agent ⇒ offline in `/nodes` and 502
-  `node_offline`, (5) a deliberately stalled proxy stream does not block a
-  concurrent stream (the mux flow-control guarantee). `cargo build` stays
-  warning-free.
+- **R1 — `asm-relay` core (standalone; no daemon changes). _Done
+  2026-07-05._** New crate `crates/asm-relay` (workspace member): axum server
+  with `/register` (control WSS: hello/ping/downstreams, same-`node_id`
+  takeover via a generation guard), `/data` (dial-back handoff by `stream_id`),
+  `/nodes`, and the `/n/<node_id>/*` proxy (hyper http1 over the data WS + WS
+  upgrade splice), relay-key auth on every route, permissive CORS, liveness
+  bookkeeping, frozen error bodies. `transport.rs` is the WS↔byte-duplex
+  adapter (serves both axum and tungstenite `Message`). The **lib half**
+  exports the protocol types/consts and the reusable node-side `agent` task
+  (register, backoff/reconnect, serve dial-back streams to a configurable local
+  TCP target). *Landed:* dial-out-per-stream replaced yamux (see Stream
+  mechanism above). *Acceptance (met):* `cargo test -p asm-relay tests/e2e.rs`
+  — relay on an ephemeral loopback port + a fake node (the lib agent → an axum
+  hello/echo server); asserts (1) `/nodes` online, (2) `GET /n/<id>/…`
+  round-trips, (3) WS echo through `/n/<id>/…`, (4) wrong/missing key ⇒ 401,
+  unknown node ⇒ 404, killed agent ⇒ offline + 502, (5) a stalled stream does
+  not block a concurrent one. Clippy clean; workspace warning-free.
 
-- **R2 — daemon register-out mode + tunnel listener.**
+- **R2 — daemon register-out mode + tunnel listener. _Done 2026-07-05._**
   Daemon consumes the R1 lib agent behind `ASM_RELAY_URL`/`ASM_RELAY_KEY`/
-  `ASM_NODE_LABEL`. Add the **tunnel listener**: a second axum serve of the
-  same router on an ephemeral loopback TCP port whose connections carry a
-  per-listener `loopback_trusted = false` attribute. **All** loopback checks
-  consult that attribute — both the auth middleware and the handler-level
-  check in `/api/auth/enrollment-token` (see the auth-interaction section
-  above; grep `is_loopback` before closing) — so relayed requests always
-  require a device token and loopback-only endpoints refuse relayed callers
-  outright, while the primary listener keeps today's behavior. `/health`
-  gains `node_id` (= `server_id`) and `label`. `node_id` sent in hello is
-  `server_id`.
-  *Acceptance:* new `scripts/relay-test.mjs` (self-contained like
-  `durable-restart-test.mjs`): starts asm-relay + a daemon with registration
-  enabled on loopback ports; asserts (1) node appears online in `/nodes`,
-  (2) enrollment **through the relay** yields a device token, (3) full API
-  loop through `/n/<id>` — create session, attach WS, see output, stop —
-  against the existing smoke-test flow, (4) a relayed request **without** a
-  token is rejected 401 even though the spliced hop is loopback (the
-  loopback-trust regression test — security-critical assert), (5) `GET
-  /api/auth/enrollment-token` through `/n/<id>` **with a valid device token**
-  is refused 403 — enrollment tokens are never retrievable through the relay
-  (this pins the handler-level check to the per-listener attribute),
-  (6) kill the relay, restart it, daemon re-registers within backoff and the
-  loop works again. `cargo test` for both crates green.
+  `ASM_NODE_LABEL` (`start_relay_if_configured` in `main.rs`). The **tunnel
+  listener** is a second axum serve of the same router on an ephemeral loopback
+  TCP port, stamped `ListenerKind::Tunnel` via an `Extension` layer. The one
+  trust decision lives in `require_auth` (`trusted = peer_is_loopback && kind
+  != Tunnel`), which stamps `LoopbackTrust(bool)`; the `/api/auth/enrollment-
+  token` handler now reads `LoopbackTrust` instead of `ConnectInfo` — closing
+  the review finding where a relayed caller with a token could read the
+  enrollment token. `/health` gained `node_id` (= `server_id`) and `label`;
+  hello sends `server_id`. *Acceptance (met):* `scripts/relay-test.mjs`
+  (self-contained): (1) node online in `/nodes`, (2) enrollment **through the
+  relay** yields a device token, (3) full loop through `/n/<id>` — create, WS
+  attach + marker echo, stop, (4) a relayed request **without** a token ⇒ 401
+  though the hop is loopback (the loopback-trust regression), (5) `GET
+  /api/auth/enrollment-token` through the relay with a valid token ⇒ 403, (6)
+  relay restart → daemon re-registers → API works again. All 11 checks pass;
+  50 daemon tests + relay suite green.
+
+  **Milestone reached:** a private daemon reachable only by dialing out is
+  fully controllable — HTTP + live terminal WS — through the relay.
 
 - **R3 — client relay support.**
   `RelayConn` store + persistence/migration, ConnectionDialog relay section
