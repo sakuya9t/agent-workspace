@@ -8,7 +8,7 @@ import { Target } from "./connectionStore";
 
 export interface VscodeLaunch {
   uri: string;
-  kind: "local" | "remote-ssh";
+  kind: "local" | "remote-ssh" | "unavailable";
   /** `user@host` VS Code will SSH to (remote-ssh only). */
   sshDest?: string;
   /** Terminal equivalent of the deep link (remote-ssh only). */
@@ -17,7 +17,26 @@ export interface VscodeLaunch {
 
 const LOOPBACK = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 
+/**
+ * Whether "Continue in VS Code" can work for a target at all.
+ *
+ * A `vscode://` deep link has to name a host the *client's* machine can reach
+ * directly (a local folder, or an SSH destination). A relayed node is — by
+ * design — only reachable through the relay; the client has no direct route to
+ * it, and no `vscode://` scheme rides the relay. Firing the remote-ssh link
+ * anyway would tell the user's VS Code to SSH into the *relay* machine (the
+ * wrong host) at a path that only exists on the node. So we gate the feature
+ * off for relayed targets. The planned fix is a browser-based editor served
+ * from the node and proxied through the relay — see
+ * docs/vscode-over-relay-plan.md.
+ */
+export function vscodeReachable(t: Target): boolean {
+  return !t.relayKey;
+}
+
 export function buildVscodeLaunch(t: Target, info: VscodeTarget): VscodeLaunch {
+  if (!vscodeReachable(t)) return { uri: "", kind: "unavailable" };
+
   // Normalize to a URI path: forward slashes, leading slash (covers Windows
   // drive paths), segments percent-encoded for spaces and friends.
   const slashed = info.path.replace(/\\/g, "/");

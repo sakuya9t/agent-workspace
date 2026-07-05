@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { api, ChangedFile, Commit, Session } from "../api";
 import { Target } from "../connectionStore";
-import { buildVscodeLaunch, launchVscode, VscodeLaunch } from "../vscode";
+import { buildVscodeLaunch, launchVscode, vscodeReachable, VscodeLaunch } from "../vscode";
 import { relTime } from "../i18n/time";
 import { attentionLabel, instanceStatusLabel, isolationLabel, statusLabel } from "../i18n/labels";
 import { DiffModal } from "./DiffModal";
@@ -88,7 +88,13 @@ export function RightPanel({ target, session }: Props) {
     setCopied(true);
   };
 
+  // Relayed nodes have no direct route from the client, so no vscode:// deep
+  // link can reach them (see vscode.ts). Disable the button rather than fire a
+  // link that would SSH into the relay machine.
+  const vscodeCanReach = !!target && vscodeReachable(target);
+
   const continueInVscode = async () => {
+    if (!vscodeCanReach) return;
     setVscode({ phase: "launching" });
     try {
       const info = await api.vscodeTarget(target!, session!.id);
@@ -189,14 +195,21 @@ export function RightPanel({ target, session }: Props) {
       <div className="panel-body details">
         <button
           className="btn vscode-btn"
-          disabled={vscode.phase === "launching"}
+          disabled={vscode.phase === "launching" || !vscodeCanReach}
           onClick={continueInVscode}
-          title={t("rightPanel.vscode.title")}
+          title={
+            vscodeCanReach
+              ? t("rightPanel.vscode.title")
+              : t("rightPanel.vscode.relayUnavailableTitle")
+          }
         >
           {vscode.phase === "launching"
             ? t("rightPanel.vscode.opening")
             : t("rightPanel.vscode.button")}
         </button>
+        {!vscodeCanReach && (
+          <div className="dim small">{t("rightPanel.vscode.relayUnavailable")}</div>
+        )}
         {vscode.phase === "opened" && (
           <div className="dim small">
             {vscode.launch.kind === "remote-ssh"
