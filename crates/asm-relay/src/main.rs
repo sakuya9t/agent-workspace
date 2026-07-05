@@ -2,18 +2,19 @@
 
 //! The standalone `asm-relay` server binary.
 //!
-//! R1 lands incrementally: this stage binds the process and serves an (empty)
-//! discovery endpoint so the crate is runnable end to end as it grows. The node
-//! registry, the `/register` WSS + yamux control stream, and the `/n/<id>`
-//! opaque proxy arrive in the following increments.
+//! Env:
+//! - `ASM_RELAY_BIND` — listen address (default `127.0.0.1:4700`).
+//! - `ASM_RELAY_KEYS` — comma-separated accepted relay access keys (required;
+//!   the relay is not an open proxy).
+//! - `ASM_RELAY_LOG` — tracing filter (default `info`).
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 
-use anyhow::{Context, Result};
-use axum::{routing::get, Json, Router};
+use anyhow::{bail, Context, Result};
 use tracing_subscriber::EnvFilter;
 
-use asm_relay::protocol::NodesResponse;
+use asm_relay::server::{run, RelayConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -29,16 +30,16 @@ async fn main() -> Result<()> {
         .parse()
         .context("parsing ASM_RELAY_BIND")?;
 
-    let app = Router::new().route("/nodes", get(nodes));
+    let keys: HashSet<String> = std::env::var("ASM_RELAY_KEYS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    if keys.is_empty() {
+        bail!("ASM_RELAY_KEYS is empty — set at least one relay access key");
+    }
 
-    let listener = tokio::net::TcpListener::bind(bind)
-        .await
-        .with_context(|| format!("binding {bind}"))?;
-    tracing::info!("asm-relay listening on http://{bind}");
-    axum::serve(listener, app).await.context("relay server error")?;
-    Ok(())
-}
-
-async fn nodes() -> Json<NodesResponse> {
-    Json(NodesResponse { nodes: Vec::new() })
+    run(RelayConfig { bind, keys }).await
 }

@@ -16,4 +16,7 @@
 //! protocol plus the reusable node-side agent, which the daemon embeds in R2)
 //! with a thin binary (the standalone relay server).
 
+pub mod agent;
 pub mod protocol;
+pub mod server;
+pub mod transport;
