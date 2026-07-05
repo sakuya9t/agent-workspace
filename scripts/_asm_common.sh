@@ -1,35 +1,90 @@
 #!/usr/bin/env bash
 # Shared config + helpers for the asm service scripts. SOURCED, not run.
 #
-# Both the daemon and the asmux holder get the SAME ASM_DATA_DIR / ASM_RUNTIME_DIR
-# here so they agree on the socket path (<runtime_dir>/asmux.sock) and the data
-# lives in one place across restarts. Override any of ASM_DATA_DIR,
-# ASM_RUNTIME_DIR, ASM_BIND, or PROFILE/RELEASE from the environment.
+# Config comes from command-line flags (parsed by asm_parse_args) with the same
+# `ASM_*` environment variables kept as fallbacks. A sourcing script does:
+#
+#     source _asm_common.sh
+#     asm_parse_args "$@" || { usage; exit 2; }
+#     asm_configure
+#
+# Both the daemon and the asmux holder get the SAME data/runtime dir so they
+# agree on the socket path (<runtime_dir>/asmux.sock) and data lives in one place
+# across restarts.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Build profile: `RELEASE=1` or `PROFILE=release` uses target/release.
-if [ "${RELEASE:-0}" = "1" ]; then PROFILE=release; fi
-PROFILE="${PROFILE:-debug}"
-BIN_DIR="$ROOT/target/$PROFILE"
-DAEMON_BIN="$BIN_DIR/asm-daemon"
-ASMUX_BIN="$BIN_DIR/asmux"
-
-# Persistent locations (shared by daemon + asmux).
-export ASM_DATA_DIR="${ASM_DATA_DIR:-$HOME/.local/share/asm}"
-export ASM_RUNTIME_DIR="${ASM_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/tmp}/asm}"
-export ASM_BIND="${ASM_BIND:-127.0.0.1:4600}"
-
-LOG_DIR="$ASM_DATA_DIR/logs"
-ASMUX_SOCK="$ASM_RUNTIME_DIR/asmux.sock"
-ASMUX_PIDFILE="$ASM_RUNTIME_DIR/asmux.pid"
-DAEMON_PIDFILE="$ASM_RUNTIME_DIR/asm-daemon.pid"
-
-mkdir -p "$ASM_DATA_DIR" "$ASM_RUNTIME_DIR" "$LOG_DIR"
-
 log() { printf '\033[1;36m[asm]\033[0m %s\n' "$*"; }
 err() { printf '\033[1;31m[asm]\033[0m %s\n' "$*" >&2; }
+
+_need() { # _need FLAG VALUE — fail if the flag was given no value
+  [ -n "${2:-}" ] && return 0
+  err "option $1 requires a value"
+  return 2
+}
+
+# Translate flags into the ASM_* env vars the binaries read (env stays the
+# fallback: a flag only overrides when given). Collects any non-flag args into
+# ASM_POSITIONAL and sets ASM_SHOW_HELP. Returns non-zero on a bad flag.
+asm_parse_args() {
+  ASM_POSITIONAL=()
+  ASM_SHOW_HELP=0
+  local key="" want_relay=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --bind)         _need "$1" "${2:-}" || return 2; export ASM_BIND="$2"; shift 2 ;;
+      --data-dir)     _need "$1" "${2:-}" || return 2; export ASM_DATA_DIR="$2"; shift 2 ;;
+      --runtime-dir)  _need "$1" "${2:-}" || return 2; export ASM_RUNTIME_DIR="$2"; shift 2 ;;
+      --label)        _need "$1" "${2:-}" || return 2; export ASM_NODE_LABEL="$2"; shift 2 ;;
+      --release)      PROFILE=release; shift ;;
+      --relay)        want_relay=1; shift ;;
+      --relay-bind)   _need "$1" "${2:-}" || return 2; export ASM_RELAY_BIND="$2"; want_relay=1; shift 2 ;;
+      --relay-key)    _need "$1" "${2:-}" || return 2; key="$2"; shift 2 ;;
+      --register)     _need "$1" "${2:-}" || return 2; export ASM_RELAY_URL="$2"; shift 2 ;;
+      -h|--help)      ASM_SHOW_HELP=1; shift ;;
+      --)             shift; while [ $# -gt 0 ]; do ASM_POSITIONAL+=("$1"); shift; done ;;
+      --*)            err "unknown option: $1"; return 2 ;;
+      *)              ASM_POSITIONAL+=("$1"); shift ;;
+    esac
+  done
+  # One shared secret feeds whichever role(s) are active: a relay host accepts it
+  # (ASM_RELAY_KEYS); a registering node presents it (ASM_RELAY_KEY).
+  if [ -n "$key" ]; then
+    [ "$want_relay" = 1 ] && export ASM_RELAY_KEYS="$key"
+    [ -n "${ASM_RELAY_URL:-}" ] && export ASM_RELAY_KEY="$key"
+  fi
+  # --relay with no key (and none in the env) would reject every node.
+  if [ "$want_relay" = 1 ] && [ -z "${ASM_RELAY_KEYS:-}" ]; then
+    err "--relay needs --relay-key KEY (the access key nodes present)"
+    return 2
+  fi
+  return 0
+}
+
+# Apply defaults and derive paths/binaries. Call after asm_parse_args.
+asm_configure() {
+  if [ "${RELEASE:-0}" = "1" ]; then PROFILE=release; fi
+  PROFILE="${PROFILE:-debug}"
+  BIN_DIR="$ROOT/target/$PROFILE"
+  DAEMON_BIN="$BIN_DIR/asm-daemon"
+  ASMUX_BIN="$BIN_DIR/asmux"
+  RELAY_BIN="$BIN_DIR/asm-relay"
+
+  export ASM_DATA_DIR="${ASM_DATA_DIR:-$HOME/.local/share/asm}"
+  export ASM_RUNTIME_DIR="${ASM_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/tmp}/asm}"
+  export ASM_BIND="${ASM_BIND:-127.0.0.1:4600}"
+  # Relay default bind is 0.0.0.0 so both LAN clients and nodes dialing out reach it.
+  export ASM_RELAY_BIND="${ASM_RELAY_BIND:-0.0.0.0:4700}"
+
+  LOG_DIR="$ASM_DATA_DIR/logs"
+  ASMUX_SOCK="$ASM_RUNTIME_DIR/asmux.sock"
+  ASMUX_PIDFILE="$ASM_RUNTIME_DIR/asmux.pid"
+  DAEMON_PIDFILE="$ASM_RUNTIME_DIR/asm-daemon.pid"
+  RELAY_PIDFILE="$ASM_RUNTIME_DIR/asm-relay.pid"
+
+  mkdir -p "$ASM_DATA_DIR" "$ASM_RUNTIME_DIR" "$LOG_DIR"
+}
 
 # Is the process named in $1 (a pidfile) alive?
 pid_alive() {
@@ -66,6 +121,43 @@ wait_health() {
   return 1
 }
 
+# The relay is enabled purely by config (a relay access key is present), never
+# by the daemon binary — it is a shared rendezvous, not a per-daemon sidecar.
+relay_enabled() { [ -n "${ASM_RELAY_KEYS:-}" ]; }
+
+wait_relay() {
+  local i host key
+  command -v curl >/dev/null 2>&1 || { sleep 0.6; return 0; }
+  host="${ASM_RELAY_BIND/0.0.0.0/127.0.0.1}"
+  key="${ASM_RELAY_KEYS%%,*}"
+  for i in $(seq 1 60); do
+    if curl -sf "http://$host/nodes?relay_key=$key" >/dev/null 2>&1; then return 0; fi
+    sleep 0.1
+  done
+  return 1
+}
+
+# Start the rendezvous relay (idempotent), if enabled. Runs detached (nohup);
+# nodes and clients reach it over the network.
+start_relay() {
+  relay_enabled || { log "relay disabled (pass --relay --relay-key KEY to bundle one)"; return 0; }
+  if pid_alive "$RELAY_PIDFILE"; then
+    log "relay already running (pid $(cat "$RELAY_PIDFILE"))"
+    return 0
+  fi
+  [ -x "$RELAY_BIN" ] || { err "missing $RELAY_BIN — build first (cargo build -p asm-relay)"; return 1; }
+  log "starting asm-relay on $ASM_RELAY_BIND..."
+  ASM_RELAY_BIND="$ASM_RELAY_BIND" ASM_RELAY_KEYS="$ASM_RELAY_KEYS" \
+    nohup "$RELAY_BIN" >>"$LOG_DIR/asm-relay.log" 2>&1 </dev/null &
+  echo $! > "$RELAY_PIDFILE"
+  if wait_relay; then
+    log "relay up (pid $(cat "$RELAY_PIDFILE"))  http://$ASM_RELAY_BIND"
+  else
+    err "relay did not come up; see $LOG_DIR/asm-relay.log"
+    return 1
+  fi
+}
+
 # Start the holder (idempotent). It runs detached (nohup) so it outlives the
 # daemon — that is what makes sessions durable across a daemon restart.
 start_asmux() {
@@ -87,7 +179,9 @@ start_asmux() {
 }
 
 # Start the daemon in sidecar mode (idempotent). Autospawn is off — the scripts
-# manage the holder so restarting the daemon never spawns a second one.
+# manage the holder so restarting the daemon never spawns a second one. Any
+# ASM_RELAY_URL/ASM_RELAY_KEY (from --register) is inherited, so the daemon
+# registers outbound when configured to.
 start_daemon() {
   if pid_alive "$DAEMON_PIDFILE"; then
     log "daemon already running (pid $(cat "$DAEMON_PIDFILE"))"

@@ -4,10 +4,15 @@
 # story in one command (rebuild + restart the control plane, keep the sessions).
 #
 #   scripts/restart-daemon.sh
+#   scripts/restart-daemon.sh --data-dir DIR   # a non-default install
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=_asm_common.sh
 source "$HERE/_asm_common.sh"
+
+asm_parse_args "$@" || { err "usage: restart-daemon.sh [--data-dir DIR] [--runtime-dir DIR] [--release]"; exit 2; }
+[ "${ASM_SHOW_HELP:-0}" = 1 ] && { err "usage: restart-daemon.sh [--data-dir DIR] [--runtime-dir DIR] [--release]"; exit 0; }
+asm_configure
 
 if ! pid_alive "$ASMUX_PIDFILE"; then
   err "asmux is not running — start the full stack first: scripts/start.sh"
