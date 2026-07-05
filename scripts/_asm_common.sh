@@ -26,6 +26,16 @@ ASMUX_SOCK="$ASM_RUNTIME_DIR/asmux.sock"
 ASMUX_PIDFILE="$ASM_RUNTIME_DIR/asmux.pid"
 DAEMON_PIDFILE="$ASM_RUNTIME_DIR/asm-daemon.pid"
 
+# The rendezvous relay is OPT-IN and belongs on a reachable host (one the client
+# and any NAT'd node can both reach). Set ASM_RELAY_KEYS (comma-separated accepted
+# access keys) to bundle a relay with this host's stack. A NAT'd node does NOT run
+# a relay — it sets ASM_RELAY_URL/ASM_RELAY_KEY instead to register OUTBOUND (the
+# daemon reads those directly). Default bind is 0.0.0.0 so both LAN clients and
+# nodes dialing out can reach it.
+RELAY_BIN="$BIN_DIR/asm-relay"
+RELAY_PIDFILE="$ASM_RUNTIME_DIR/asm-relay.pid"
+export ASM_RELAY_BIND="${ASM_RELAY_BIND:-0.0.0.0:4700}"
+
 mkdir -p "$ASM_DATA_DIR" "$ASM_RUNTIME_DIR" "$LOG_DIR"
 
 log() { printf '\033[1;36m[asm]\033[0m %s\n' "$*"; }
@@ -64,6 +74,43 @@ wait_health() {
     sleep 0.1
   done
   return 1
+}
+
+# The relay is enabled purely by config (ASM_RELAY_KEYS present), never by the
+# daemon binary — see the note where the vars are defined.
+relay_enabled() { [ -n "${ASM_RELAY_KEYS:-}" ]; }
+
+wait_relay() {
+  local i host key
+  command -v curl >/dev/null 2>&1 || { sleep 0.6; return 0; }
+  host="${ASM_RELAY_BIND/0.0.0.0/127.0.0.1}"
+  key="${ASM_RELAY_KEYS%%,*}"
+  for i in $(seq 1 60); do
+    if curl -sf "http://$host/nodes?relay_key=$key" >/dev/null 2>&1; then return 0; fi
+    sleep 0.1
+  done
+  return 1
+}
+
+# Start the rendezvous relay (idempotent), if ASM_RELAY_KEYS is set. Runs detached
+# (nohup) like the holder; nodes and clients reach it over the network.
+start_relay() {
+  relay_enabled || { log "relay disabled (set ASM_RELAY_KEYS to bundle one)"; return 0; }
+  if pid_alive "$RELAY_PIDFILE"; then
+    log "relay already running (pid $(cat "$RELAY_PIDFILE"))"
+    return 0
+  fi
+  [ -x "$RELAY_BIN" ] || { err "missing $RELAY_BIN — build first (cargo build -p asm-relay)"; return 1; }
+  log "starting asm-relay on $ASM_RELAY_BIND..."
+  ASM_RELAY_BIND="$ASM_RELAY_BIND" ASM_RELAY_KEYS="$ASM_RELAY_KEYS" \
+    nohup "$RELAY_BIN" >>"$LOG_DIR/asm-relay.log" 2>&1 </dev/null &
+  echo $! > "$RELAY_PIDFILE"
+  if wait_relay; then
+    log "relay up (pid $(cat "$RELAY_PIDFILE"))  http://$ASM_RELAY_BIND"
+  else
+    err "relay did not come up; see $LOG_DIR/asm-relay.log"
+    return 1
+  fi
 }
 
 # Start the holder (idempotent). It runs detached (nohup) so it outlives the

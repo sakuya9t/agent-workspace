@@ -7,6 +7,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=_asm_common.sh
 source "$HERE/_asm_common.sh"
 
+if pid_alive "$RELAY_PIDFILE"; then
+  log "relay   RUNNING  pid=$(cat "$RELAY_PIDFILE")  http://$ASM_RELAY_BIND"
+elif relay_enabled; then
+  log "relay   stopped"
+fi
+
 if pid_alive "$ASMUX_PIDFILE"; then
   log "asmux   RUNNING  pid=$(cat "$ASMUX_PIDFILE")  socket=$ASMUX_SOCK"
 else
