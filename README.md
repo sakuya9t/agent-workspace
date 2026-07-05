@@ -60,6 +60,22 @@ client/          React 19 + Vite + xterm.js control center (web + Electron later
 docs/            requirements, architecture, MVP execution plan
 ```
 
+## Clean-machine setup
+
+On a fresh box with nothing but a shell, bootstrap the whole toolchain (a C
+compiler + make via your package manager, Rust via rustup into `~/.cargo`, then
+a first build) with one idempotent script:
+
+```bash
+scripts/setup.sh                  # install prerequisites + debug build
+RELEASE=1 scripts/setup.sh        # release build instead
+ASM_NO_CLIENT=1 scripts/setup.sh  # skip the web client (npm) step
+```
+
+Afterwards run `source "$HOME/.cargo/env"` in your current shell (new shells get
+cargo automatically), then `scripts/start.sh`. If you already have Rust, skip
+straight to the sections below.
+
 ## Running the daemon
 
 The daemon runs one of two session backends (see
