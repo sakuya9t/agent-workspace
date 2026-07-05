@@ -244,7 +244,38 @@ impl SourceControl for GitSourceControl {
         if !self.detect(cwd) {
             bail!("not a git repository");
         }
-        let out = git_output(cwd, &["pull", "--ff-only"])?;
+        // Only a branch with somewhere to pull *from* can be pulled. Prefer the
+        // configured upstream; if none is set (common for local-only session
+        // branches) fall back to origin/<same-name> when it has been fetched
+        // before. Otherwise there is genuinely nothing to pull, so say so
+        // plainly instead of surfacing git's multi-line tracking-info error.
+        let has_upstream = git(
+            cwd,
+            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        )
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+
+        let out = if has_upstream {
+            git_output(cwd, &["pull", "--ff-only"])?
+        } else {
+            let branch = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?
+                .trim()
+                .to_string();
+            if branch.is_empty() || branch == "HEAD" {
+                bail!("cannot pull: HEAD is detached");
+            }
+            if remote_tracking_exists(cwd, "origin", &branch) {
+                git_output(cwd, &["pull", "--ff-only", "origin", &branch])?
+            } else {
+                bail!(
+                    "current branch '{branch}' is not tracking a remote branch, so there is \
+                     nothing to pull. Push it first (git push -u), or use Rebase to bring in \
+                     another branch's commits."
+                );
+            }
+        };
+
         if out.status.success() {
             Ok(combined_output(&out))
         } else {
@@ -418,6 +449,23 @@ fn git_output(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
         .current_dir(cwd)
         .output()
         .map_err(|e| anyhow!("failed to run git: {e}"))
+}
+
+/// Whether `refs/remotes/<remote>/<branch>` exists locally (i.e. the branch has
+/// been fetched before). Checked without touching the network so pull can pick
+/// a fallback source for a branch whose tracking config was never set.
+fn remote_tracking_exists(cwd: &Path, remote: &str, branch: &str) -> bool {
+    git(
+        cwd,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/{remote}/{branch}"),
+        ],
+    )
+    .map(|s| !s.trim().is_empty())
+    .unwrap_or(false)
 }
 
 /// Merge git's stdout and stderr into one human-readable blob. Porcelain like
