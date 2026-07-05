@@ -47,7 +47,7 @@ Repository collaboration remains outside the session layer:
 | Desktop client | Electron shared web UI | Native mobile, richer editor UI |
 | Terminal renderer | xterm.js | Addons and renderer tuning |
 | Session backend | Single out-of-process holder (`asmux`) owning all PTYs; VT emulator in the daemon | tmux backend, future platform backends |
-| Agent runtime | Built-in Codex, Claude Code, custom command | opencode, myclaw, Hermes, third-party plugins |
+| Agent runtime | Built-in Codex, Claude Code, opencode, custom command | myclaw, Hermes, third-party plugins |
 | Source control | Git plugin | SVN, Mercurial, Perforce, custom panels |
 | Workspace isolation | Git worktrees | Clone, reflink, full-copy, provider-specific isolation |
 | Change tracking | Git checkpoints | Provider-specific checkpoint models |

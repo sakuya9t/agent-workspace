@@ -67,7 +67,6 @@
     "title": "New session",
     "daemonLabel": "Daemon",
     "agentLabel": "Agent",
-    "notInstalled": "(not installed)",
     "dangerous": "dangerous",
     "runInLabel": "Run in",
     "segWorkspace": "Workspace (isolated)",

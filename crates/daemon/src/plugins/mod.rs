@@ -202,7 +202,7 @@ mod tests {
     #[test]
     fn registry_has_all_builtins() {
         let reg = PluginRegistry::with_builtins();
-        for id in ["shell", "codex", "claude", "custom_command"] {
+        for id in ["shell", "codex", "claude", "opencode", "custom_command"] {
             assert!(reg.get(id).is_some(), "missing builtin {id}");
         }
         assert!(reg.get("does-not-exist").is_none());

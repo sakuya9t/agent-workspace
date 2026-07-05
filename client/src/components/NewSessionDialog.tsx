@@ -62,6 +62,21 @@ export function NewSessionDialog() {
     queryFn: () => api.listPlugins(conn),
     enabled: show,
   });
+
+  // Only offer agents whose binary is installed on the selected host. The daemon
+  // detects this per-host (`available`); `custom_command` has no binary to detect
+  // but is always available since the user supplies the command.
+  const shownPlugins = (plugins ?? []).filter(
+    (p) => p.available || p.id === "custom_command",
+  );
+
+  // Keep the selection valid: if the current agent isn't offered on this host
+  // (e.g. after switching daemons), fall back to the first one that is.
+  useEffect(() => {
+    if (shownPlugins.length && !shownPlugins.some((p) => p.id === pluginId)) {
+      setPluginId(shownPlugins[0].id);
+    }
+  }, [shownPlugins, pluginId]);
   const { data: workspaces } = useQuery({
     queryKey: ["workspaces", conn.baseUrl],
     queryFn: () => api.listWorkspaces(conn),
@@ -229,12 +244,9 @@ export function NewSessionDialog() {
 
         <label className="form-label">{t("newSession.agentLabel")}</label>
         <select className="input" value={pluginId} onChange={(e) => setPluginId(e.target.value)}>
-          {plugins?.map((p) => (
-            <option key={p.id} value={p.id} disabled={!p.supported_on_this_platform}>
+          {shownPlugins.map((p) => (
+            <option key={p.id} value={p.id}>
               {p.display_name}
-              {p.id !== "custom_command" && !p.available
-                ? ` ${t("newSession.notInstalled")}`
-                : ""}
             </option>
           ))}
         </select>
