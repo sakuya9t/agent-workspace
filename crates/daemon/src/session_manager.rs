@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +13,13 @@ use uuid::Uuid;
 /// How long output must be silent before a *working* session is considered idle
 /// (finished its turn, waiting for the next input).
 const IDLE_AFTER: Duration = Duration::from_secs(4);
+
+/// After the user sends input, output arriving within this window is treated as
+/// the terminal *echoing* their keystrokes back — not the agent working — so an
+/// idle prompt stays idle while you type your next command into it. The window
+/// is bypassed once the input submits a line (CR/LF), which does hand control to
+/// the agent (see [`Interaction::submitted`]).
+const ECHO_WINDOW: Duration = Duration::from_millis(1000);
 
 use crate::backend::{BackendSession, BackendSpawnSpec, BackendStatus, HolderEntry, SessionBackend};
 use crate::db::Db;
@@ -65,6 +72,24 @@ pub struct CreateSessionRequest {
     pub options: Vec<(String, bool)>,
 }
 
+/// Per-session signal shared from the input path (the API's WebSocket handler)
+/// to the monitor task, letting the monitor tell keystroke *echo* apart from the
+/// agent actually working. Consistent with the rest of the monitor: cheap atomic
+/// stores on the hot input path, read when output arrives.
+#[derive(Default)]
+struct Interaction {
+    /// Set when the user views or answers a session — tells the monitor to clear
+    /// a sticky "blocked" (needs-attention) state.
+    reset: AtomicBool,
+    /// Wall-clock ms of the user's most recent input (`0` = none yet). Output
+    /// within [`ECHO_WINDOW`] of this is likely the terminal echoing keystrokes.
+    last_input_ms: AtomicI64,
+    /// The user's most recent input submitted a line (contained CR/LF), i.e. it
+    /// likely handed control to the agent, so its output *is* real work — not
+    /// echo. Latched on submit, cleared when the session settles back to idle.
+    submitted: AtomicBool,
+}
+
 /// Owns session lifecycle: plugin resolution, backend spawn, persistence, and
 /// the per-session monitor task that tracks exit, summaries, and attention.
 pub struct SessionManager {
@@ -74,9 +99,8 @@ pub struct SessionManager {
     live: Mutex<HashMap<String, Arc<dyn BackendSession>>>,
     /// Base directory under which per-session Git worktrees are created.
     worktree_root: PathBuf,
-    /// Per-session flag: set when the user views or interacts, telling the
-    /// monitor to clear a sticky "blocked" (needs-attention) state.
-    attn_reset: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Per-session interaction signals, keyed by session id (see [`Interaction`]).
+    interactions: Mutex<HashMap<String, Arc<Interaction>>>,
 }
 
 impl SessionManager {
@@ -92,7 +116,7 @@ impl SessionManager {
             backend,
             live: Mutex::new(HashMap::new()),
             worktree_root,
-            attn_reset: Mutex::new(HashMap::new()),
+            interactions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -745,16 +769,23 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("no such session"))
     }
 
-    /// The user interacted with a session (sent input), which resolves any
-    /// pending "blocked" state — tell the monitor to stop holding it. Cheap: sets
-    /// a flag; the badge itself clears on the next output (working) or on view.
-    pub fn note_interaction(&self, id: &str) {
-        self.signal_attn_reset(id);
+    /// The user sent input to a session. Records when (so the monitor can treat
+    /// the imminent keystroke echo as *not* the agent working) and whether it
+    /// submitted a line, and resolves any pending "blocked" state. Cheap: atomic
+    /// stores only; the badge itself updates on the next output or on view.
+    pub fn note_interaction(&self, id: &str, data: &[u8]) {
+        if let Some(sig) = self.interactions.lock().get(id) {
+            sig.last_input_ms.store(now_millis(), Ordering::Relaxed);
+            if data.iter().any(|&b| b == b'\r' || b == b'\n') {
+                sig.submitted.store(true, Ordering::Relaxed);
+            }
+            sig.reset.store(true, Ordering::Relaxed);
+        }
     }
 
     fn signal_attn_reset(&self, id: &str) {
-        if let Some(flag) = self.attn_reset.lock().get(id) {
-            flag.store(true, Ordering::Relaxed);
+        if let Some(sig) = self.interactions.lock().get(id) {
+            sig.reset.store(true, Ordering::Relaxed);
         }
     }
 
@@ -765,8 +796,8 @@ impl SessionManager {
         started_at: i64,
         bell_attention: bool,
     ) {
-        let reset = Arc::new(AtomicBool::new(false));
-        self.attn_reset.lock().insert(id.clone(), reset.clone());
+        let sig = Arc::new(Interaction::default());
+        self.interactions.lock().insert(id.clone(), sig.clone());
         tokio::spawn(async move {
             let mut status_rx = handle.watch_status();
             let (_snap, mut out_rx) = handle.attach();
@@ -800,11 +831,22 @@ impl SessionManager {
                         match recv {
                             Ok(bytes) => {
                                 // If the user viewed/answered since the last chunk,
-                                // clear the sticky block before classifying anew.
-                                if reset.swap(false, Ordering::Relaxed) {
+                                // drop a sticky *block* so fresh output reclassifies.
+                                // A plain idle prompt is left untouched here — its
+                                // keystroke echo must not read as work, which
+                                // `on_output` handles via the input timing below.
+                                if sig.reset.swap(false, Ordering::Relaxed)
+                                    && matches!(
+                                        last_attn,
+                                        AttentionState::LikelyBlocked
+                                            | AttentionState::ApprovalNeeded
+                                    )
+                                {
                                     last_attn = AttentionState::None;
                                 }
-                                self.on_output(&id, &handle, &bytes, bell_attention, &mut tail, &mut last_activity_write, &mut last_attn);
+                                let last_input_ms = sig.last_input_ms.load(Ordering::Relaxed);
+                                let submitted = sig.submitted.load(Ordering::Relaxed);
+                                self.on_output(&id, &handle, &bytes, bell_attention, &mut tail, &mut last_activity_write, &mut last_attn, last_input_ms, submitted);
                             }
                             Err(RecvError::Lagged(_)) => { /* attention is best-effort */ }
                             Err(RecvError::Closed) => {
@@ -813,20 +855,24 @@ impl SessionManager {
                         }
                     }
                     _ = idle_tick => {
-                        self.on_idle(&id, &mut last_attn);
+                        self.on_idle(&id, &mut last_attn, &sig);
                     }
                 }
             }
-            self.attn_reset.lock().remove(&id);
+            self.interactions.lock().remove(&id);
         });
     }
 
     /// Output has been silent for [`IDLE_AFTER`]: a *working* session is now idle,
     /// waiting for the next input. A blocked session (bell / prompt) is sticky and
     /// stays blocked — silence doesn't mean it stopped needing you.
-    fn on_idle(&self, id: &str, last_attn: &mut AttentionState) {
+    fn on_idle(&self, id: &str, last_attn: &mut AttentionState, sig: &Interaction) {
         if *last_attn == AttentionState::Activity {
             *last_attn = AttentionState::Idle;
+            // Fresh idle prompt: whatever the user types next is composing again,
+            // so clear the submit latch — their keystroke echo is suppressed until
+            // they submit the next line.
+            sig.submitted.store(false, Ordering::Relaxed);
             let _ = self.db.set_attention(
                 id,
                 AttentionState::Idle,
@@ -846,6 +892,8 @@ impl SessionManager {
         tail: &mut String,
         last_write: &mut i64,
         last_attn: &mut AttentionState,
+        last_input_ms: i64,
+        submitted: bool,
     ) {
         // Maintain a small decoded tail for prompt/approval detection.
         tail.push_str(&String::from_utf8_lossy(bytes));
@@ -854,6 +902,23 @@ impl SessionManager {
         // (a plain shell rings it as UI noise).
         let bell = bell_attention && bytes.contains(&0x07);
         let (raw, reason) = classify_attention(tail, bell);
+        let now = now_millis();
+
+        // Keystroke echo at an idle prompt: the user is composing their next
+        // command, the agent is not working. Output that lands within
+        // [`ECHO_WINDOW`] of their last input — and that hasn't yet submitted a
+        // line — is that echo, so the prompt stays idle. A submit (CR/LF) hands
+        // off to the agent, so its output *is* real work and falls through. This
+        // only guards the idle state; spontaneous agent output (no recent input)
+        // is outside the window and reads as activity as before.
+        if raw == AttentionState::Activity
+            && *last_attn == AttentionState::Idle
+            && !submitted
+            && last_input_ms != 0
+            && now.saturating_sub(last_input_ms) < ECHO_WINDOW.as_millis() as i64
+        {
+            return;
+        }
 
         // Sticky "blocked": agents ring the bell / show a prompt when they need
         // you, then keep redrawing (TUIs) — plain redraw output must NOT demote
@@ -870,7 +935,6 @@ impl SessionManager {
         };
         *last_attn = attention;
 
-        let now = now_millis();
         // Debounce activity writes, but always flush a blocking/approval signal.
         if attention != AttentionState::Activity || now - *last_write >= 400 {
             *last_write = now;
@@ -1411,6 +1475,88 @@ mod tests {
         assert!(!wt.exists());
         assert!(!workspace::branch_exists(&repo, &branch));
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- keystroke echo vs. real work (idle-prompt accuracy) ----
+
+    fn mock_handle() -> Arc<dyn BackendSession> {
+        let (tx, _) = broadcast::channel(16);
+        let (status_tx, status_rx) = watch::channel(BackendStatus::Running);
+        Arc::new(MockSession {
+            tx,
+            status_tx,
+            status_rx,
+            seq: AtomicU64::new(0),
+        })
+    }
+
+    #[test]
+    fn typing_at_idle_prompt_stays_idle() {
+        // The bug: at an idle prompt, the PTY echoes each keystroke as output,
+        // which used to read as the agent "working". A keystroke echo (recent
+        // input, no line submitted) must leave the prompt idle — and write
+        // nothing (`last_write` untouched).
+        let (manager, dir) = test_manager();
+        let handle = mock_handle();
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::Idle);
+        manager.on_output(
+            "sid", &handle, b"l", false, &mut tail, &mut last_write, &mut last_attn,
+            now_millis(), false,
+        );
+        assert_eq!(last_attn, AttentionState::Idle);
+        assert_eq!(last_write, 0, "echo must not record activity");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn submitting_a_line_from_idle_reads_as_working() {
+        // Pressing Enter (input contained CR/LF -> `submitted`) hands off to the
+        // agent, so its output is real work, not echo.
+        let (manager, dir) = test_manager();
+        let handle = mock_handle();
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::Idle);
+        manager.on_output(
+            "sid", &handle, b"thinking...", false, &mut tail, &mut last_write,
+            &mut last_attn, now_millis(), true,
+        );
+        assert_eq!(last_attn, AttentionState::Activity);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn spontaneous_output_after_idle_reads_as_working() {
+        // Output with no recent input (e.g. the agent resumed on its own) is
+        // outside the echo window, so it must read as working — the echo guard
+        // only covers keystrokes the user just typed.
+        let (manager, dir) = test_manager();
+        let handle = mock_handle();
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::Idle);
+        let stale_input = now_millis() - ECHO_WINDOW.as_millis() as i64 - 500;
+        manager.on_output(
+            "sid", &handle, b"progress 40%", false, &mut tail, &mut last_write,
+            &mut last_attn, stale_input, false,
+        );
+        assert_eq!(last_attn, AttentionState::Activity);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn echo_guard_does_not_mask_an_approval_prompt() {
+        // If what lands at the idle prompt is itself an approval prompt, that is
+        // a *block* — the echo timing must not swallow it.
+        let (manager, dir) = test_manager();
+        let handle = mock_handle();
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::Idle);
+        manager.on_output(
+            "sid", &handle, b"Proceed? (y/n)", false, &mut tail, &mut last_write,
+            &mut last_attn, now_millis(), false,
+        );
+        assert_eq!(last_attn, AttentionState::ApprovalNeeded);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
