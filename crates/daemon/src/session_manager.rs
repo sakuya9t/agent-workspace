@@ -852,6 +852,9 @@ impl SessionManager {
             let mut tail = String::new();
             let mut last_activity_write = 0i64;
             let mut last_attn = AttentionState::None;
+            // Carries OSC-escape state across chunks so a window-title update
+            // split over two reads isn't miscounted as a bell (see `scan_bell`).
+            let mut in_osc = false;
 
             loop {
                 // Only a *working* session needs the close idle watch; a blocked
@@ -894,7 +897,7 @@ impl SessionManager {
                                 }
                                 let last_input_ms = sig.last_input_ms.load(Ordering::Relaxed);
                                 let submitted = sig.submitted.load(Ordering::Relaxed);
-                                self.on_output(&id, &handle, &bytes, bell_attention, &mut tail, &mut last_activity_write, &mut last_attn, last_input_ms, submitted);
+                                self.on_output(&id, &handle, &bytes, bell_attention, &mut tail, &mut last_activity_write, &mut last_attn, &mut in_osc, last_input_ms, submitted);
                             }
                             Err(RecvError::Lagged(_)) => { /* attention is best-effort */ }
                             Err(RecvError::Closed) => {
@@ -940,6 +943,7 @@ impl SessionManager {
         tail: &mut String,
         last_write: &mut i64,
         last_attn: &mut AttentionState,
+        in_osc: &mut bool,
         last_input_ms: i64,
         submitted: bool,
     ) {
@@ -947,8 +951,10 @@ impl SessionManager {
         tail.push_str(&String::from_utf8_lossy(bytes));
         trim_tail(tail, 4096);
         // Only trust the bell as an attention signal for agents that opt in
-        // (a plain shell rings it as UI noise).
-        let bell = bell_attention && bytes.contains(&0x07);
+        // (a plain shell rings it as UI noise), and only a *real* bell — not the
+        // BEL that terminates an OSC window-title update, which agents like
+        // Claude Code emit constantly while working (`ESC ] 0 ; <title> BEL`).
+        let bell = bell_attention && scan_bell(bytes, in_osc);
         let (raw, reason) = classify_attention(tail, bell);
         let now = now_millis();
 
@@ -1121,6 +1127,39 @@ fn delete_orphan_branch(
     }
 }
 
+/// Scan an output chunk for a *genuine* terminal bell (a standalone `0x07`),
+/// ignoring the BEL that terminates an OSC control string (`ESC ] … BEL`).
+/// Agents like Claude Code set the window title to their current task on every
+/// redraw — `ESC ] 0 ; <title> BEL` — so a naive `contains(0x07)` reads those
+/// title updates as attention bells and pins a working session to "blocked".
+///
+/// OSC strings end at either BEL or ST (`ESC \`). `in_osc` carries the parser
+/// state across chunk boundaries so a title split over two reads (its `ESC ]`
+/// in one chunk, its BEL in the next) still isn't miscounted. Only a BEL seen
+/// outside an OSC string counts as a real bell.
+fn scan_bell(bytes: &[u8], in_osc: &mut bool) -> bool {
+    let mut bell = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if *in_osc {
+            if b == 0x07 {
+                *in_osc = false; // OSC terminator — not an attention bell.
+            } else if b == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                *in_osc = false; // ST terminator (ESC \).
+                i += 1;
+            }
+        } else if b == 0x1b && bytes.get(i + 1) == Some(&b']') {
+            *in_osc = true; // OSC introducer (ESC ]).
+            i += 1;
+        } else if b == 0x07 {
+            bell = true; // a real, standalone bell.
+        }
+        i += 1;
+    }
+    bell
+}
+
 /// Classify one output chunk. A session is **blocked** (needs input) when an
 /// input prompt sits at the current end of output, or when the agent rang the
 /// terminal **bell** — the explicit "I need you" signal agents emit for approval
@@ -1224,6 +1263,48 @@ mod tests {
         // The bell is the agent explicitly asking for attention.
         let (a, _) = classify_attention("some output", true);
         assert_eq!(a, AttentionState::LikelyBlocked);
+    }
+
+    // ---- bell scanning (OSC title vs. real bell) ----
+
+    #[test]
+    fn osc_title_bel_is_not_a_bell() {
+        // The real bug: Claude Code sets the window title to its current task on
+        // every redraw via `ESC ] 0 ; <title> BEL`. That BEL must NOT read as an
+        // attention bell, or an actively-working session shows as "blocked".
+        let mut in_osc = false;
+        let title = b"\x1b]0;Design multi-hop private network architecture\x07";
+        assert!(!scan_bell(title, &mut in_osc));
+        assert!(!in_osc, "a complete OSC leaves us outside OSC state");
+    }
+
+    #[test]
+    fn standalone_bel_is_a_bell() {
+        let mut in_osc = false;
+        assert!(scan_bell(b"work\x07more", &mut in_osc));
+        // A real bell after a title update still registers.
+        assert!(scan_bell(b"\x1b]0;title\x07 done\x07", &mut false));
+    }
+
+    #[test]
+    fn st_terminated_osc_is_not_a_bell() {
+        // OSC may also end with ST (`ESC \`) rather than BEL; a following real
+        // bell must still count.
+        let mut in_osc = false;
+        assert!(!scan_bell(b"\x1b]0;title\x1b\\", &mut in_osc));
+        assert!(!in_osc);
+        assert!(scan_bell(b"\x1b]0;t\x1b\\\x07", &mut false));
+    }
+
+    #[test]
+    fn osc_title_split_across_chunks_is_not_a_bell() {
+        // A title update whose BEL lands in the next read: the carried `in_osc`
+        // state keeps the terminator from being miscounted.
+        let mut in_osc = false;
+        assert!(!scan_bell(b"\x1b]0;Design multi-hop", &mut in_osc));
+        assert!(in_osc, "unterminated OSC carries into the next chunk");
+        assert!(!scan_bell(b" network architecture\x07", &mut in_osc));
+        assert!(!in_osc);
     }
 
     // ---- tail trimming ----
@@ -1551,7 +1632,7 @@ mod tests {
             (String::new(), 0i64, AttentionState::Idle);
         manager.on_output(
             "sid", &handle, b"l", false, &mut tail, &mut last_write, &mut last_attn,
-            now_millis(), false,
+            &mut false, now_millis(), false,
         );
         assert_eq!(last_attn, AttentionState::Idle);
         assert_eq!(last_write, 0, "echo must not record activity");
@@ -1568,7 +1649,7 @@ mod tests {
             (String::new(), 0i64, AttentionState::Idle);
         manager.on_output(
             "sid", &handle, b"thinking...", false, &mut tail, &mut last_write,
-            &mut last_attn, now_millis(), true,
+            &mut last_attn, &mut false, now_millis(), true,
         );
         assert_eq!(last_attn, AttentionState::Activity);
         let _ = std::fs::remove_dir_all(dir);
@@ -1586,7 +1667,7 @@ mod tests {
         let stale_input = now_millis() - ECHO_WINDOW.as_millis() as i64 - 500;
         manager.on_output(
             "sid", &handle, b"progress 40%", false, &mut tail, &mut last_write,
-            &mut last_attn, stale_input, false,
+            &mut last_attn, &mut false, stale_input, false,
         );
         assert_eq!(last_attn, AttentionState::Activity);
         let _ = std::fs::remove_dir_all(dir);
@@ -1602,7 +1683,7 @@ mod tests {
             (String::new(), 0i64, AttentionState::Idle);
         manager.on_output(
             "sid", &handle, b"Proceed? (y/n)", false, &mut tail, &mut last_write,
-            &mut last_attn, now_millis(), false,
+            &mut last_attn, &mut false, now_millis(), false,
         );
         assert_eq!(last_attn, AttentionState::ApprovalNeeded);
         let _ = std::fs::remove_dir_all(dir);
