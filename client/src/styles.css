@@ -950,15 +950,26 @@ body.col-resizing iframe {
 /* diff viewer */
 .diff-modal {
   width: 900px;
+  min-width: 360px;
   max-width: calc(100vw - 40px);
+  /* Let the reviewer drag the dialog larger to check whether code lines
+     overflow, instead of scrolling inside a fixed-size box. The flex column
+     lets .diff-view fill whatever height the dialog is dragged to. */
+  resize: both;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 40px);
 }
 .diff-modal .modal-title {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex: none;
 }
 .diff-view {
-  max-height: 70vh;
+  flex: 1;
+  min-height: 0;
   overflow: auto;
   background: #0b0e14;
   border: 1px solid var(--border);
