@@ -38,14 +38,48 @@ pub struct Commit {
     pub parents: Vec<String>,
 }
 
+/// Per-file line churn for one commit (the `git show --numstat` view).
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitFileStat {
+    pub path: String,
+    /// For renames, the previous path; else `None`.
+    pub orig_path: Option<String>,
+    /// Added/removed line counts; `None` for binary files (`-` in numstat).
+    pub additions: Option<u64>,
+    pub deletions: Option<u64>,
+}
+
+/// Full detail for a single commit: metadata, body, and per-file churn.
+/// This is what the history panel shows when a commit is clicked.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitDetail {
+    pub hash: String,
+    pub short: String,
+    pub subject: String,
+    pub body: String,
+    pub author: String,
+    pub email: String,
+    pub timestamp: i64,
+    pub parents: Vec<String>,
+    pub files: Vec<CommitFileStat>,
+    /// Totals across all non-binary files.
+    pub additions: u64,
+    pub deletions: u64,
+}
+
 /// Source-control plugin boundary. The Git provider is the MVP built-in;
 /// other VCS providers implement the same trait behind the same panel.
 pub trait SourceControl: Send + Sync {
     fn detect(&self, cwd: &Path) -> bool;
     fn status(&self, cwd: &Path) -> Result<ScmStatus>;
-    /// Unified diff for one path. `untracked` files diff against /dev/null.
-    fn diff(&self, cwd: &Path, path: &str, untracked: bool) -> Result<String>;
+    /// Unified diff for one path. When `commit` is set, show that path's diff
+    /// as introduced by the commit; otherwise diff the working tree (with
+    /// `untracked` files diffed against /dev/null).
+    fn diff(&self, cwd: &Path, path: &str, untracked: bool, commit: Option<&str>)
+        -> Result<String>;
     fn log(&self, cwd: &Path, limit: usize) -> Result<Vec<Commit>>;
+    /// Full detail (metadata + per-file churn) for a single commit.
+    fn show(&self, cwd: &Path, hash: &str) -> Result<CommitDetail>;
 }
 
 pub struct GitSourceControl;
@@ -94,8 +128,23 @@ impl SourceControl for GitSourceControl {
         })
     }
 
-    fn diff(&self, cwd: &Path, path: &str, untracked: bool) -> Result<String> {
+    fn diff(
+        &self,
+        cwd: &Path,
+        path: &str,
+        untracked: bool,
+        commit: Option<&str>,
+    ) -> Result<String> {
         guard_path(path)?;
+        if let Some(hash) = commit {
+            // One file's change as introduced by a specific commit. `--format=`
+            // drops the commit message so only the diff body is returned.
+            guard_ref(hash)?;
+            return git_allow_diff(
+                cwd,
+                &["show", "--no-color", "--format=", hash, "--", path],
+            );
+        }
         if untracked {
             // /dev/null diff shows the whole file as added; git exits 1 here.
             let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
@@ -138,6 +187,96 @@ impl SourceControl for GitSourceControl {
         }
         Ok(commits)
     }
+
+    fn show(&self, cwd: &Path, hash: &str) -> Result<CommitDetail> {
+        guard_ref(hash)?;
+        // Metadata fields are unit-separated and terminated by a record
+        // separator (\x1e); the `--numstat` block follows on the next lines.
+        // `%b` (body) may contain newlines, so the \x1e is what marks its end.
+        let fmt = "%H%x1f%h%x1f%s%x1f%an%x1f%ae%x1f%ct%x1f%P%x1f%b%x1e";
+        let out = git(
+            cwd,
+            &[
+                "show",
+                "--no-color",
+                "--numstat",
+                &format!("--format=format:{fmt}"),
+                hash,
+            ],
+        )?;
+        parse_show(&out).ok_or_else(|| anyhow!("could not parse commit {hash}"))
+    }
+}
+
+/// Parse the `git show --numstat --format=…\x1e` output into a `CommitDetail`.
+fn parse_show(out: &str) -> Option<CommitDetail> {
+    let (header, rest) = out.split_once('\u{1e}')?;
+    let f: Vec<&str> = header.split('\u{1f}').collect();
+    if f.len() < 8 {
+        return None;
+    }
+
+    let mut files = Vec::new();
+    let (mut additions, mut deletions) = (0u64, 0u64);
+    // Skip the blank line(s) git may insert before the numstat block; only
+    // lines shaped `<add>\t<del>\t<path>` are file entries.
+    for line in rest.lines() {
+        let mut cols = line.splitn(3, '\t');
+        let (Some(a), Some(d), Some(p)) = (cols.next(), cols.next(), cols.next()) else {
+            continue;
+        };
+        if p.is_empty() {
+            continue;
+        }
+        let add = a.parse::<u64>().ok();
+        let del = d.parse::<u64>().ok();
+        additions += add.unwrap_or(0);
+        deletions += del.unwrap_or(0);
+        let (path, orig_path) = split_rename(p);
+        files.push(CommitFileStat {
+            path,
+            orig_path,
+            additions: add,
+            deletions: del,
+        });
+    }
+
+    Some(CommitDetail {
+        hash: f[0].to_string(),
+        short: f[1].to_string(),
+        subject: f[2].to_string(),
+        author: f[3].to_string(),
+        email: f[4].to_string(),
+        timestamp: f[5].parse().unwrap_or(0),
+        parents: f[6].split_whitespace().map(|s| s.to_string()).collect(),
+        body: f[7].trim_end().to_string(),
+        files,
+        additions,
+        deletions,
+    })
+}
+
+/// Reconstruct the (new, old) paths from a numstat rename entry. Handles both
+/// `old => new` and the braced `pre/{old => new}/post` forms; returns
+/// `(path, None)` for a plain (non-rename) entry.
+fn split_rename(p: &str) -> (String, Option<String>) {
+    let Some(arrow) = p.find(" => ") else {
+        return (p.to_string(), None);
+    };
+    if let (Some(lb), Some(rb)) = (p.find('{'), p.find('}')) {
+        if lb < arrow && arrow < rb {
+            let prefix = &p[..lb];
+            let suffix = &p[rb + 1..];
+            let old = &p[lb + 1..arrow];
+            let new = &p[arrow + 4..rb];
+            return (
+                format!("{prefix}{new}{suffix}"),
+                Some(format!("{prefix}{old}{suffix}")),
+            );
+        }
+    }
+    let (old, new) = p.split_at(arrow);
+    (new[4..].to_string(), Some(old.to_string()))
 }
 
 /// Parse `git status --porcelain` (v1) into changed-file entries.
@@ -228,6 +367,16 @@ fn guard_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject anything that isn't a bare commit hash. The value reaches git as a
+/// positional argument, so restricting it to hex digits blocks both option
+/// injection (a leading `-`) and revision expressions.
+fn guard_ref(hash: &str) -> Result<()> {
+    if !(4..=64).contains(&hash.len()) || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("invalid commit hash");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,5 +424,58 @@ mod tests {
         assert!(guard_path("../secret").is_err());
         assert!(guard_path("a/../../b").is_err());
         assert!(guard_path("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn guard_ref_only_accepts_hashes() {
+        assert!(guard_ref("1176c78").is_ok());
+        assert!(guard_ref("1176c7817edc4f99eea0d10da6200322b4acad66").is_ok());
+        assert!(guard_ref("").is_err());
+        assert!(guard_ref("abc").is_err()); // too short
+        assert!(guard_ref("--format=%s").is_err());
+        assert!(guard_ref("HEAD~1").is_err());
+        assert!(guard_ref("main").is_err());
+    }
+
+    #[test]
+    fn split_rename_handles_all_forms() {
+        assert_eq!(split_rename("src/a.rs"), ("src/a.rs".into(), None));
+        assert_eq!(
+            split_rename("old.rs => new.rs"),
+            ("new.rs".into(), Some("old.rs".into()))
+        );
+        assert_eq!(
+            split_rename("src/{old.rs => new.rs}"),
+            ("src/new.rs".into(), Some("src/old.rs".into()))
+        );
+        assert_eq!(
+            split_rename("a/{b => c}/d.rs"),
+            ("a/c/d.rs".into(), Some("a/b/d.rs".into()))
+        );
+    }
+
+    #[test]
+    fn parse_show_reads_metadata_and_numstat() {
+        // \x1f = unit sep, \x1e = record sep — the format `show` emits.
+        let out = "H1\u{1f}h1\u{1f}Subject line\u{1f}Ann\u{1f}ann@x.io\u{1f}1700000000\u{1f}P1 P2\u{1f}Body line one\nBody line two\u{1e}\n\
+            10\t2\tsrc/a.rs\n\
+            -\t-\tassets/logo.png\n\
+            1\t1\tsrc/{old.rs => new.rs}\n";
+        let d = parse_show(out).expect("parses");
+        assert_eq!(d.hash, "H1");
+        assert_eq!(d.short, "h1");
+        assert_eq!(d.subject, "Subject line");
+        assert_eq!(d.email, "ann@x.io");
+        assert_eq!(d.timestamp, 1_700_000_000);
+        assert_eq!(d.parents, vec!["P1", "P2"]);
+        assert_eq!(d.body, "Body line one\nBody line two");
+        assert_eq!(d.files.len(), 3);
+        assert_eq!(d.files[0].additions, Some(10));
+        assert_eq!(d.files[1].additions, None); // binary
+        assert_eq!(d.files[2].path, "src/new.rs");
+        assert_eq!(d.files[2].orig_path.as_deref(), Some("src/old.rs"));
+        // Totals ignore the binary file.
+        assert_eq!(d.additions, 11);
+        assert_eq!(d.deletions, 3);
     }
 }

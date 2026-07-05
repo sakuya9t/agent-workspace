@@ -121,6 +121,27 @@ export interface Commit {
   parents: string[];
 }
 
+export interface CommitFileStat {
+  path: string;
+  orig_path: string | null;
+  additions: number | null;
+  deletions: number | null;
+}
+
+export interface CommitDetail {
+  hash: string;
+  short: string;
+  subject: string;
+  body: string;
+  author: string;
+  email: string;
+  timestamp: number;
+  parents: string[];
+  files: CommitFileStat[];
+  additions: number;
+  deletions: number;
+}
+
 export interface Health {
   status: string;
   version: string;
@@ -342,15 +363,21 @@ export const api = {
     }),
   scmStatus: (t: Target, id: string) =>
     req<{ status: ScmStatus }>(t, `/api/sessions/${id}/scm/status`).then((r) => r.status),
-  scmDiff: (t: Target, id: string, path: string, untracked: boolean) =>
+  scmDiff: (t: Target, id: string, path: string, untracked: boolean, commit?: string) =>
     req<{ path: string; diff: string }>(
       t,
-      `/api/sessions/${id}/scm/diff?path=${encodeURIComponent(path)}&untracked=${untracked}`,
+      `/api/sessions/${id}/scm/diff?path=${encodeURIComponent(path)}&untracked=${untracked}` +
+        (commit ? `&commit=${encodeURIComponent(commit)}` : ""),
     ).then((r) => r.diff),
   scmLog: (t: Target, id: string, limit = 30) =>
     req<{ commits: Commit[] }>(t, `/api/sessions/${id}/scm/log?limit=${limit}`).then(
       (r) => r.commits,
     ),
+  scmCommit: (t: Target, id: string, hash: string) =>
+    req<{ commit: CommitDetail }>(
+      t,
+      `/api/sessions/${id}/scm/commit?hash=${encodeURIComponent(hash)}`,
+    ).then((r) => r.commit),
   listWorkspaces: (t: Target) =>
     req<{ workspaces: Workspace[] }>(t, "/api/workspaces").then((r) => r.workspaces),
   addWorkspace: (t: Target, name: string, root_path: string) =>

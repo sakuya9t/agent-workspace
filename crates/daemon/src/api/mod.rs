@@ -69,7 +69,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/:id/stream", get(ws::stream))
         .route("/api/sessions/:id/scm/status", get(scm::status))
         .route("/api/sessions/:id/scm/diff", get(scm::diff))
-        .route("/api/sessions/:id/scm/log", get(scm::log));
+        .route("/api/sessions/:id/scm/log", get(scm::log))
+        .route("/api/sessions/:id/scm/commit", get(scm::commit));
 
     // Optionally serve a packaged web client.
     if let Some(dir) = static_dir {
