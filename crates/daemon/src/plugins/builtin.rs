@@ -3,7 +3,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 
 use super::usage::{self, AgentUsage, UsageContext};
-use super::{find_in_path, AgentContext, AgentOption, AgentPlugin, LaunchSpec};
+use super::{attention, find_in_path, AgentContext, AgentOption, AgentPlugin, LaunchSpec};
+use crate::domain::AttentionState;
 
 const ALL_PLATFORMS: &[&str] = &["linux", "macos", "windows"];
 
@@ -122,6 +123,12 @@ impl AgentPlugin for ClaudePlugin {
     }
     fn bell_means_attention(&self) -> bool {
         true
+    }
+    fn attention_uses_screen(&self) -> bool {
+        true
+    }
+    fn attention(&self, screen: &str, bell: bool) -> (AttentionState, Option<String>) {
+        attention::claude_attention(screen, bell)
     }
     fn usage(&self, cx: &UsageContext) -> Option<AgentUsage> {
         usage::claude_usage(cx)

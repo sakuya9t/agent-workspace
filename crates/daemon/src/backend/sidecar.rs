@@ -229,6 +229,10 @@ impl BackendSession for SidecarSession {
         self.build_snapshot(&parser)
     }
 
+    fn screen_text(&self) -> String {
+        self.parser.lock().screen().contents()
+    }
+
     fn send_input(&self, data: &[u8]) -> Result<()> {
         self.client.send_input(&self.session_id, data);
         Ok(())
