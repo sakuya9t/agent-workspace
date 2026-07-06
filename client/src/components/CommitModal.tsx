@@ -30,8 +30,16 @@ export function CommitModal({ target, sessionId, hash, onClose }: Props) {
 
   return (
     <>
-      <div className="modal-backdrop" onClick={onClose}>
-        <div className="modal commit-modal" onClick={(e) => e.stopPropagation()}>
+      <div
+        className="modal-backdrop"
+        onMouseDown={(e) => {
+          // Close only when the press *starts* on the backdrop itself, so a drag
+          // that merely ends on it (e.g. selecting text in the message body and
+          // releasing outside the dialog) can't dismiss it. Same guard as DiffModal.
+          if (e.target === e.currentTarget) onClose();
+        }}
+      >
+        <div className="modal commit-modal">
           <div className="modal-title">
             <span className="commit-modal-subject">
               {data?.subject ||
