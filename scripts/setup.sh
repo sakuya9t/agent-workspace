@@ -213,8 +213,9 @@ Next steps:
   1. This shell doesn't have cargo on PATH yet — run:
          source "\$HOME/.cargo/env"
      (new terminals pick it up automatically.)
-  2. Start the durable stack (holder + daemon):
-         scripts/start.sh
+  2. Guided setup (start / stop / restart + how clients reach this host):
+         scripts/wizard.sh
+     …or drive it yourself: scripts/start.sh  (see --help for flags).
   3. Check it and grab this host's enrollment token:
          scripts/status.sh
          scripts/token.sh
