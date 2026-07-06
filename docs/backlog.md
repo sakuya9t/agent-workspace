@@ -1,9 +1,10 @@
 # Backlog
 
-Last reconciled: **2026-07-05** (against `release/next` through `7d071b0`,
-which added `mobile-ui.md`). Since then, **image/screenshot paste + the 📎
-button** landed on session branch `asm-session/3160afbb` (see "Already done"
-below and [`image-paste.md`](image-paste.md)) — not yet merged to `release/next`.
+Last reconciled: **2026-07-06** (against `release/next` through `655f613`;
+image/screenshot paste + the 📎 button are now merged). This reconcile also
+added the **RF-\*** rows — code-structure refactors from the codebase
+analysis in [`refactoring-plan.md`](refactoring-plan.md), slotted directly
+before the milestones they make cheaper.
 
 This is the single cross-track index of work that is **designed but not yet
 implemented**. The detailed designs stay in their own documents
@@ -12,7 +13,8 @@ implemented**. The detailed designs stay in their own documents
 [`vscode-over-relay-plan.md`](vscode-over-relay-plan.md),
 [`mobile-ui.md`](mobile-ui.md),
 [`security-followups.md`](security-followups.md),
-[`mvp-execution-plan.md`](mvp-execution-plan.md)); this file only records
+[`mvp-execution-plan.md`](mvp-execution-plan.md),
+[`refactoring-plan.md`](refactoring-plan.md)); this file only records
 **what is pending, why it matters, what it depends on, and in what order to
 pick it up**.
 
@@ -48,18 +50,26 @@ pick it up**.
   `[pasted image <path>]` over the existing WS input frame → the agent loads it
   on submit. Design + as-built: [`image-paste.md`](image-paste.md); proofs
   `scripts/paste-test.mjs` + a headless-Chrome click-through of the 📎 button.
+- Code-quality cleanup pass (2026-07-06, zero functional change): shared
+  backend snapshot/attach helpers, one git runner + `current_branch`, one CLI
+  `build_launch` helper, db.rs idiom alignment, client `api.ts` error/URL
+  helpers + shared `shortPath`; clippy silent, all suites green. Analysis and
+  the follow-up RF-\* refactors: [`refactoring-plan.md`](refactoring-plan.md).
 
 ## Backlog summary
 
 | ID | Item | Priority | Depends on | Source (design) |
 | --- | --- | --- | --- | --- |
 | R4 | Gateway mode (egress-less downstreams) | **P1** | R1–R3 (done) | connectivity-execution-plan.md → R4 |
-| M4 | Holder hardening + exact cold-stitch adopt | **P1** | M1–M3 (done) | durable-sessions.md → M4 |
-| MOB | Mobile UI phases 1–3 + verify (adaptive shell, sheet CSS, terminal key bar) | **P1** | — (client-only) | mobile-ui.md → Execution plan |
+| RF-M4 | Pre-M4 daemon refactor bundle (SessionManager split, asmux reconnect-supervisor seam, adopt-path test coverage) | **P1** | — (land immediately before M4) | refactoring-plan.md → RF-M4 |
+| M4 | Holder hardening + exact cold-stitch adopt | **P1** | M1–M3 (done); RF-M4 | durable-sessions.md → M4 |
+| RF-MOB | Client shell prep (`useActiveSession` hook, `showUsage`→store, unify `isLive`) | **P1** | — (do with/before MOB phase 1) | refactoring-plan.md → RF-MOB |
+| MOB | Mobile UI phases 1–3 + verify (adaptive shell, sheet CSS, terminal key bar) | **P1** | RF-MOB (client-only) | mobile-ui.md → Execution plan |
 | MOB-PWA | Mobile UI phase 4: PWA manifest + iOS metas | **P2** | MOB | mobile-ui.md → Packaging path |
 | MOB-PUSH | Web Push for attention states | **P3** | MOB; daemon push plumbing (relay as carrier) | mobile-ui.md → Follow-ups |
 | IMG-2 | Image paste follow-ups: `.asm/pastes/` cleanup policy, per-agent capability hint | **P3** | image paste + 📎 button (done) | image-paste.md → Follow-ups |
-| SEC-2 | Constrain `/api/fs/list` + workspace roots | **P1** | — | security-followups.md → 2 (HIGH) |
+| RF-ERR | Typed daemon error → HTTP status mapping (RelayError-style) | **P2** | — (pair with SEC-2 or RF-M4) | refactoring-plan.md → RF-ERR |
+| SEC-2 | Constrain `/api/fs/list` + workspace roots | **P1** | RF-ERR recommended (403 mapping) | security-followups.md → 2 (HIGH) |
 | SEC-1 | Transport encryption off-loopback (direct mode TLS; relay TLS ops) | **P1/P2** | partially ties to R5 | security-followups.md → 1 (HIGH) |
 | V0 | Web-editor de-risking spike (scratchpad only) | **P2** | R1–R3 (done) | vscode-over-relay-plan.md → V0 |
 | V1 | Relay cookie auth + daemon editor proxy | **P2** | V0 go decision | vscode-over-relay-plan.md → V1 |
@@ -70,7 +80,8 @@ pick it up**.
 | SEC-4 | Hash device tokens at rest | **P2** | — | security-followups.md → 4 (MEDIUM) |
 | SEC-5 | Restrict CORS origins | **P2** | check against V1 cookie design first | security-followups.md → 5 (MEDIUM) |
 | SEC-6 | Optional "always require token" (no loopback trust) mode | **P2** | — | security-followups.md → 6 (MEDIUM) |
-| MVP-RICH | Rich output pipeline (viewer/diff/markdown/transcripts) | **P2** | client-stack decision DEC-1 | mvp-execution-plan.md → Workstream 4 |
+| RF-QUERY | Client data-layer consolidation (query-key factory, `useDaemonMutation`, api.ts split) | **P2** | DEC-1; before MVP-RICH | refactoring-plan.md → RF-QUERY |
+| MVP-RICH | Rich output pipeline (viewer/diff/markdown/transcripts) | **P2** | client-stack decision DEC-1; RF-QUERY | mvp-execution-plan.md → Workstream 4 |
 | MVP-HOOKS | Workspace setup hooks (copy/symlink/bootstrap) | **P3** | — | mvp-execution-plan.md → Workstream 6 |
 | MVP-CKPT | Checkpoints + "New segment" | **P3** | — | mvp-execution-plan.md → Workstream 7 |
 | M5 | Windows support (ConPTY, transport, ACLs) | **P3** | M4 (sequenced) | durable-sessions.md → M5 |
@@ -78,6 +89,7 @@ pick it up**.
 | SEC-7 | Auth rate limiting + lifecycle audit log | **P3** | overlaps R5 | security-followups.md → 7 (LOW) |
 | SEC-8 | Terminal-escape policy at capture/replay + fuzzing | **P3** | — | security-followups.md → 8 (LOW) |
 | DEC-1 | Decide: adopt planned client stack (shadcn/Tailwind/Dockview/Electron) or amend the plan | **P2** (decision, cheap) | — | mvp-execution-plan.md → Baseline Technology |
+| RF-VT100 | Terminal emulator dependency review (`vt100` 0.15 unmaintained) | **P3** | — (trigger: M4 cold-stitch work or upstream CVE) | refactoring-plan.md → RF-VT100 |
 | DOC-1 | Doc sync: architecture.md still calls yamux the relay default | **P3** (one-liner) | — | architecture.md → Open Decisions |
 | I18N-2 | Additional locales beyond `en` | **P4** (deferred by user) | — | i18n.md → Adding a locale |
 
@@ -95,6 +107,18 @@ sides (`downstreams` in the protocol, `via` in `/nodes`). Acceptance: the
 gateway-test script described in the plan (relay + gateway C + downstream D on
 distinct loopback addresses; 5 checks).
 
+### RF-M4 — pre-M4 daemon refactor bundle (P1)
+
+Land immediately before M4: M4's reconnect and mid-flight reconciliation
+otherwise land in the two worst structural spots. Scope (structure only, zero
+behavior change): split `SessionManager` into workspace service / session
+monitor / lifecycle core; create the daemon↔asmux **reconnect-supervisor
+home** (today connection loss is handled in three disconnected layers with no
+owner) with `AsmuxClient` behind a testable seam; make `db`/`registry`
+private; extend `MockBackend` with `holder_list`/`adopt` so the startup adopt
+path — exactly where cold-stitch lands — gets tests **before** the flip.
+Full scope + acceptance: refactoring-plan.md → RF-M4.
+
 ### M4 — Holder hardening (P1)
 
 Orthogonal to the R-track (explicitly: R code must not assume M4 exists).
@@ -107,6 +131,16 @@ stitch from SQLite cold history, `attach FromCursor(backend_cursor)`, real gap
 marker on `BUFFER_GAP`; everything is scaffolded, ring-replay is currently the
 default). This closes the headline "terminal intact after restart" promise for
 long-lived sessions whose output outgrew the ring.
+
+### RF-MOB — client shell prep (P1, client-only, hours)
+
+MOB phase 1's only structural obstacle: `App.tsx` entangles shared data
+wiring with desktop-only layout, so a naive `MobileShell` would duplicate the
+wiring. Extract `useActiveSession()` (daemon poll + active-session derivation
++ health counts), move `showUsage` into `useUiStore` (the only dialog flag
+not in the store), and unify the three divergent `isLive` definitions —
+note `RightPanel`'s ended-list omits `indeterminate`, a possible bug to
+decide while unifying. Detail: refactoring-plan.md → RF-MOB.
 
 ### MOB — mobile adaptive shell (P1, client-only)
 
@@ -128,6 +162,15 @@ control, tap-and-hold tooltips) ride along or slot in later; **MOB-PUSH**
 (Web Push for `approval_needed`/`likely_blocked`) is its own row because it
 needs daemon-side push plumbing with the relay as carrier — design that
 before building.
+
+### RF-ERR — typed daemon error mapping (P2, pairs with SEC-2)
+
+A `DaemonError` enum with one `IntoResponse` (modeled on the relay's
+`RelayError`), replacing the blanket `anyhow → 400`, per-handler 404
+hand-builds, and the one-off `NeedsForce → 409` downcast. Gives SEC-2 its
+403 and M4 `purge` its conflict codes for free. One deliberate behavior
+decision inside (aligning the two cleanup endpoints' `NeedsForce` to 409) —
+see refactoring-plan.md → RF-ERR.
 
 ### SEC-1 / SEC-2 — the two HIGH security items (P1)
 
@@ -165,6 +208,14 @@ needed sooner — they don't conflict.
 - Ops: deployment.md relay section (systemd, TLS, 443), metrics/log surface,
   `--version`/health endpoint.
 - Client polish: relay health row, per-node latency hint, reconnect toasts.
+
+### RF-QUERY — client data-layer consolidation (P2, before MVP-RICH)
+
+`RightPanel`'s 5-query/3-mutation shape is the template every MVP-RICH panel
+will clone — fix the template first: a `queryKeys` factory (keys are ad-hoc
+string arrays across ~8 files today), a `useDaemonMutation` centralizing the
+invalidation calls hand-rolled at 6+ sites, and an `api.ts` split into types
++ domain-grouped modules. Detail: refactoring-plan.md → RF-QUERY.
 
 ### MVP-RICH — rich output pipeline (P2)
 
@@ -220,6 +271,14 @@ stack incrementally (starting with MVP-RICH's CodeMirror), or amend
 `mvp-execution-plan.md` to match reality. Blocks MVP-RICH and MVP-PKG from
 starting with confidence.
 
+### RF-VT100 — terminal emulator dependency review (P3, trigger-based)
+
+`vt100` 0.15 is unmaintained; the workspace disables its overflow-checks
+(root `Cargo.toml` comment) and `repaint_with_history` carries a
+deep-scrollback invariant. Evaluate `termwiz`/`alacritty_terminal` behind the
+existing snapshot interface. Trigger: M4 cold-stitch work stressing the
+snapshot path, or an upstream CVE. Detail: refactoring-plan.md → RF-VT100.
+
 ### DOC-1 — stale relay-framing line (P3, one-liner)
 
 `architecture.md` → Open Decisions still says the relay stream-multiplexing
@@ -233,15 +292,18 @@ parity gate, typed keys); adding a locale is the 3-step recipe in `i18n.md`.
 
 ## Suggested order (cross-track)
 
-1. **MOB** phases 1–3 — freshest design, client-only, immediately usable
-   value on top of the just-shipped relay path; runs in parallel with any
-   daemon work.
-2. **R4** — finishes the connectivity story the product is built around.
-3. **M4** — durability hardening; the only remaining gap in the headline
-   restart promise. Can interleave with R4 (different subsystems).
-4. **SEC-2**, then **SEC-1(direct)** — before any exposure beyond trusted
-   networks.
-5. **DEC-1** (an hour of thought) → **MVP-RICH**.
+1. **RF-MOB** (hours) → **MOB** phases 1–3 — freshest design, client-only,
+   immediately usable value on top of the just-shipped relay path; runs in
+   parallel with any daemon work.
+2. **R4** — finishes the connectivity story the product is built around; no
+   refactor needed (relay/agent scaffolding is complete; daemon side is a
+   `Config` field + probe loop).
+3. **RF-M4** → **M4** — durability hardening; the only remaining gap in the
+   headline restart promise. Can interleave with R4 (different subsystems);
+   the cold-stitch flip waits for RF-M4's adopt-path tests.
+4. **SEC-2 + RF-ERR** (together), then **SEC-1(direct)** — before any
+   exposure beyond trusted networks.
+5. **DEC-1** (an hour of thought) → **RF-QUERY** → **MVP-RICH**.
 6. **V0** spike → V1–V3 as a block.
 7. **MOB-PWA**, then **MOB-PUSH** (design the push plumbing first).
 8. **R5** items as deployment needs them (TLS/ops first, ACLs next,
