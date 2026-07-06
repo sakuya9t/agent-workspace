@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { api, CommitFileStat } from "../api";
 import { Target } from "../connectionStore";
 import { relTime } from "../i18n/time";
+import { shortPath } from "../paths";
 import { DiffModal } from "./DiffModal";
 
 interface Props {
@@ -142,10 +143,4 @@ function absTime(unixSecs: number): string {
   } catch {
     return "";
   }
-}
-
-function shortPath(p: string): string {
-  const parts = p.split("/");
-  if (parts.length <= 3) return p;
-  return ".../" + parts.slice(-2).join("/");
 }

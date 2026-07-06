@@ -113,11 +113,7 @@ impl Db {
              FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
@@ -129,10 +125,7 @@ impl Db {
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map([id], row_to_session)?;
-        match rows.next() {
-            Some(r) => Ok(Some(r?)),
-            None => Ok(None),
-        }
+        rows.next().transpose().map_err(Into::into)
     }
 
     pub fn update_status(
@@ -258,10 +251,7 @@ impl Db {
                 terminal_event_end: row.get::<_, i64>(8)? as u64,
             })
         })?;
-        match rows.next() {
-            Some(r) => Ok(Some(r?)),
-            None => Ok(None),
-        }
+        rows.next().transpose().map_err(Into::into)
     }
 
     // ---- workspaces ----
@@ -383,23 +373,12 @@ impl Db {
              VALUES (1, ?1, ?2, ?3)",
             rusqlite::params![server_id, enrollment_token, now],
         )?;
-        let mut stmt =
-            conn.prepare("SELECT server_id, enrollment_token FROM server_identity WHERE id = 1")?;
-        let row = stmt.query_row([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
-        Ok(row)
+        read_identity(&conn)
     }
 
     /// (server_id, enrollment_token). Identity is created at startup.
     pub fn identity(&self) -> Result<(String, String)> {
-        let conn = self.conn.lock();
-        let mut stmt =
-            conn.prepare("SELECT server_id, enrollment_token FROM server_identity WHERE id = 1")?;
-        let row = stmt.query_row([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
-        Ok(row)
+        read_identity(&self.conn.lock())
     }
 
     pub fn insert_device(&self, d: &Device) -> Result<()> {
@@ -505,6 +484,15 @@ impl Db {
         )?;
         Ok(n)
     }
+}
+
+fn read_identity(conn: &Connection) -> Result<(String, String)> {
+    let mut stmt =
+        conn.prepare("SELECT server_id, enrollment_token FROM server_identity WHERE id = 1")?;
+    let row = stmt.query_row([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    Ok(row)
 }
 
 fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
@@ -705,12 +693,9 @@ ALTER TABLE sessions ADD COLUMN backend_cursor INTEGER NOT NULL DEFAULT 0;
 
 /// Batches terminal events into transactions to keep write amplification low.
 fn event_writer_loop(mut conn: Connection, mut rx: UnboundedReceiver<EventMsg>) {
-    loop {
-        // Block for the first event, then drain whatever else is queued.
-        let first = match rx.blocking_recv() {
-            Some(m) => m,
-            None => break, // all senders dropped
-        };
+    // Block for the first event, then drain whatever else is queued.
+    // The loop ends when all senders have been dropped.
+    while let Some(first) = rx.blocking_recv() {
         let mut batch = vec![first];
         while let Ok(m) = rx.try_recv() {
             batch.push(m);

@@ -76,7 +76,7 @@ pub async fn list(
             is_git,
         });
     }
-    entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    entries.sort_by_key(|e| e.name.to_lowercase());
 
     let parent = canonical
         .parent()

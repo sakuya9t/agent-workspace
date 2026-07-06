@@ -115,12 +115,8 @@ impl SourceControl for GitSourceControl {
             });
         }
 
-        let branch_raw = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let detached = branch_raw == "HEAD" || branch_raw.is_empty();
-        let branch = if detached { None } else { Some(branch_raw) };
+        let branch = current_branch(cwd);
+        let detached = branch.is_none();
         let head = git(cwd, &["rev-parse", "--short", "HEAD"])
             .ok()
             .map(|s| s.trim().to_string())
@@ -228,16 +224,7 @@ impl SourceControl for GitSourceControl {
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty())
             .collect();
-        let head_raw = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let head = if head_raw == "HEAD" || head_raw.is_empty() {
-            None
-        } else {
-            Some(head_raw)
-        };
-        Ok((branches, head))
+        Ok((branches, current_branch(cwd)))
     }
 
     fn pull(&self, cwd: &Path) -> Result<String> {
@@ -424,7 +411,21 @@ fn parse_porcelain(text: &str) -> Vec<ChangedFile> {
     out
 }
 
-fn git(cwd: &Path, args: &[&str]) -> Result<String> {
+/// The checked-out branch name, or `None` when detached (or unreadable —
+/// `git` failing degrades to the detached presentation, not an error).
+pub(crate) fn current_branch(cwd: &Path) -> Option<String> {
+    let raw = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if raw == "HEAD" || raw.is_empty() {
+        None
+    } else {
+        Some(raw)
+    }
+}
+
+pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(cwd)

@@ -6,6 +6,7 @@ import { Target } from "../connectionStore";
 import { buildVscodeLaunch, launchVscode, vscodeReachable, VscodeLaunch } from "../vscode";
 import { relTime } from "../i18n/time";
 import { attentionLabel, instanceStatusLabel, isolationLabel, statusLabel } from "../i18n/labels";
+import { shortPath } from "../paths";
 import { DiffModal } from "./DiffModal";
 import { CommitModal } from "./CommitModal";
 
@@ -541,10 +542,4 @@ function Field({ label, value, mono }: { label: string; value: string; mono?: bo
       <div className={"field-value" + (mono ? " mono" : "")}>{value}</div>
     </div>
   );
-}
-
-function shortPath(p: string): string {
-  const parts = p.split("/");
-  if (parts.length <= 3) return p;
-  return ".../" + parts.slice(-2).join("/");
 }

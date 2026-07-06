@@ -105,12 +105,11 @@ async fn run_once(cfg: &AgentConfig) -> Result<()> {
     let (ws, _resp) = tokio_tungstenite::connect_async(&url)
         .await
         .with_context(|| format!("dialing relay control stream at {url}"))?;
-    let (sink, mut stream) = ws.split();
+    let (mut sink, mut stream) = ws.split();
     tracing::info!(node = %cfg.node_id, "registered control stream with relay");
 
     // A single writer task owns the sink so pings, pongs, and hello never race.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
-    let mut sink = sink;
     let writer = tokio::spawn(async move {
         while let Some(m) = out_rx.recv().await {
             if sink.send(m).await.is_err() {

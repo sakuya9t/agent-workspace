@@ -192,41 +192,15 @@ impl SidecarSession {
         session
     }
 
-    fn build_snapshot(&self, parser: &vt100::Parser) -> Snapshot {
-        let screen = parser.screen();
-        let (rows, cols) = screen.size();
-        let repaint: Arc<[u8]> = Arc::from(screen.contents_formatted().into_boxed_slice());
-        Snapshot {
-            rows,
-            cols,
-            repaint,
-            last_seq: self.seq.load(Ordering::SeqCst),
-        }
-    }
 }
 
 impl BackendSession for SidecarSession {
     fn attach(&self) -> (Snapshot, broadcast::Receiver<Arc<[u8]>>) {
-        let mut parser = self.parser.lock();
-        let (rows, cols) = parser.screen().size();
-        // Attach repaints include scrollback history so the client can scroll
-        // up to output from before it attached.
-        let repaint: Arc<[u8]> =
-            Arc::from(super::repaint_with_history(&mut parser).into_boxed_slice());
-        let snap = Snapshot {
-            rows,
-            cols,
-            repaint,
-            last_seq: self.seq.load(Ordering::SeqCst),
-        };
-        let rx = self.tx.subscribe();
-        drop(parser);
-        (snap, rx)
+        super::attach_with_history(&self.parser, &self.tx, &self.seq)
     }
 
     fn snapshot(&self) -> Snapshot {
-        let parser = self.parser.lock();
-        self.build_snapshot(&parser)
+        super::snapshot_screen(&self.parser.lock(), &self.seq)
     }
 
     fn screen_text(&self) -> String {
@@ -313,8 +287,6 @@ async fn drain_loop(
             StreamEvent::Exited { code, signal } => {
                 let status = if signal != 0 {
                     BackendStatus::Failed(format!("signalled ({signal})"))
-                } else if code == 0 {
-                    BackendStatus::Exited(0)
                 } else {
                     BackendStatus::Exited(code)
                 };

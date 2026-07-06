@@ -277,7 +277,7 @@ async fn handle_create(conn: &Arc<Conn>, body: &[u8]) {
     }
     let args = read_string_vec(r.args().ok().flatten());
     let cwd = r.cwd().ok().flatten().unwrap_or("").to_string();
-    let env = read_kv_vec(r.env().ok().flatten());
+    let env = read_kv_pairs(r.env().ok().flatten());
     let cols = r.cols().unwrap_or(80);
     let rows = r.rows().unwrap_or(24);
     if cols == 0 || rows == 0 {
@@ -778,10 +778,6 @@ fn read_string_vec(v: Option<planus::Vector<'_, planus::Result<&str>>>) -> Vec<S
         }
     }
     out
-}
-
-fn read_kv_vec(v: Option<planus::Vector<'_, planus::Result<wire::KvRef<'_>>>>) -> Vec<(String, String)> {
-    read_kv_pairs(v)
 }
 
 fn read_kv_pairs(v: Option<planus::Vector<'_, planus::Result<wire::KvRef<'_>>>>) -> Vec<(String, String)> {

@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { api } from "../api";
-import { daemonLabel, targetOf, useConnStore } from "../connectionStore";
+import { daemonLabel, localTarget, targetOf, useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
 import { DirectoryPicker } from "./DirectoryPicker";
 
@@ -26,7 +26,7 @@ export function NewWorkspaceDialog() {
   }, [show, daemonId]);
 
   const daemon = daemons.find((d) => d.id === daemonId) ?? daemons[0];
-  const conn = daemon ? targetOf(daemon) : { baseUrl: "", token: null };
+  const conn = daemon ? targetOf(daemon) : localTarget();
 
   const register = useMutation({
     mutationFn: () =>

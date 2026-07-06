@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Trans, useTranslation } from "react-i18next";
 import { api } from "../api";
-import { daemonLabel, targetOf, useConnStore } from "../connectionStore";
+import { daemonLabel, localTarget, targetOf, useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
 import { DirectoryPicker } from "./DirectoryPicker";
 
@@ -43,7 +43,7 @@ export function NewSessionDialog() {
     : targetState;
 
   const daemon = daemons.find((d) => d.id === effDaemonId) ?? daemons[0];
-  const conn = daemon ? targetOf(daemon) : { baseUrl: "", token: null };
+  const conn = daemon ? targetOf(daemon) : localTarget();
 
   // Apply presets when the dialog opens.
   useEffect(() => {
@@ -208,7 +208,6 @@ export function NewSessionDialog() {
 
   const selectedPlugin = plugins?.find((p) => p.id === pluginId);
   const isCustom = pluginId === "custom_command";
-  const selectedWs = activeWs;
 
   const branchOk =
     !isolatedGit ||
@@ -217,7 +216,7 @@ export function NewSessionDialog() {
     (branchMode === "existing" && (existingBranch || defaultBranch).length > 0);
 
   const canSubmit =
-    (target.kind === "workspace" ? !!selectedWs : cwd.trim().length > 0) &&
+    (target.kind === "workspace" ? !!activeWs : cwd.trim().length > 0) &&
     (!isCustom || (command.trim().length > 0 && approve)) &&
     branchOk &&
     !create.isPending;
@@ -323,7 +322,7 @@ export function NewSessionDialog() {
             <label className="form-label">{t("newSession.workspaceLabel")}</label>
             <select
               className="input"
-              value={selectedWs?.id ?? ""}
+              value={activeWs?.id ?? ""}
               disabled={lockedWs}
               onChange={(e) => setTarget({ kind: "workspace", id: e.target.value })}
             >
@@ -339,14 +338,14 @@ export function NewSessionDialog() {
                 </option>
               ))}
             </select>
-            {selectedWs && (
+            {activeWs && (
               <div className="path-row">
                 <div
                   className="dim small mono"
-                  style={selectedWs.root_exists === false ? { color: "#f7768e" } : undefined}
+                  style={activeWs.root_exists === false ? { color: "#f7768e" } : undefined}
                 >
-                  {selectedWs.root_path}
-                  {selectedWs.root_exists === false
+                  {activeWs.root_path}
+                  {activeWs.root_exists === false
                     ? `  · ${t("newSession.missingOnHost")}`
                     : ""}
                 </div>
@@ -356,8 +355,8 @@ export function NewSessionDialog() {
                     title={t("newSession.removeWsTitle")}
                     disabled={removeWs.isPending}
                     onClick={() => {
-                      if (confirm(t("newSession.confirmRemoveWs", { name: selectedWs.name })))
-                        removeWs.mutate(selectedWs.id);
+                      if (confirm(t("newSession.confirmRemoveWs", { name: activeWs.name })))
+                        removeWs.mutate(activeWs.id);
                     }}
                   >
                     {t("newSession.remove")}
@@ -366,15 +365,15 @@ export function NewSessionDialog() {
               </div>
             )}
             {removeWs.error && <div className="error">{String(removeWs.error)}</div>}
-            {selectedWs && selectedWs.is_git && (
+            {activeWs && activeWs.is_git && (
               <div className="hint">
                 <button
                   className="btn tiny"
                   disabled={cleanupWt.isPending}
                   title={t("newSession.cleanupTitle")}
                   onClick={() => {
-                    if (confirm(t("newSession.confirmCleanup", { name: selectedWs.name })))
-                      cleanupWt.mutate({ id: selectedWs.id, force: false });
+                    if (confirm(t("newSession.confirmCleanup", { name: activeWs.name })))
+                      cleanupWt.mutate({ id: activeWs.id, force: false });
                   }}
                 >
                   {cleanupWt.isPending
@@ -383,7 +382,7 @@ export function NewSessionDialog() {
                 </button>
               </div>
             )}
-            {selectedWs && selectedWs.is_git && (
+            {activeWs && activeWs.is_git && (
               <label className="checkbox">
                 <input
                   type="checkbox"
@@ -470,13 +469,13 @@ export function NewSessionDialog() {
                 )}
               </>
             )}
-            {selectedWs && !selectedWs.is_git && (
+            {activeWs && !activeWs.is_git && (
               <div className="hint">
                 {t("newSession.plainFolder")}{" "}
                 <button
                   className="btn tiny"
                   disabled={initGit.isPending}
-                  onClick={() => initGit.mutate(selectedWs.id)}
+                  onClick={() => initGit.mutate(activeWs.id)}
                 >
                   {t("newSession.gitInitBtn")}
                 </button>

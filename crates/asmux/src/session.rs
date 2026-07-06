@@ -346,20 +346,14 @@ impl Session {
         if !self.is_alive() {
             return;
         }
-        if signal == 0 {
-            if let Some(k) = self.killer.lock().as_mut() {
-                let _ = k.kill();
-            }
-            return;
-        }
         #[cfg(unix)]
-        {
+        if signal != 0 {
             if let Ok(sig) = nix::sys::signal::Signal::try_from(signal) {
                 let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(self.pid), sig);
                 return;
             }
         }
-        // Unknown signal or non-unix: fall back to the default terminate.
+        // signal == 0, unknown signal, or non-unix: the default terminate.
         if let Some(k) = self.killer.lock().as_mut() {
             let _ = k.kill();
         }

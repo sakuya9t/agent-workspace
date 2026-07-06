@@ -1,6 +1,8 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
+use parking_lot::Mutex;
 use tokio::sync::{broadcast, watch};
 
 pub mod native;
@@ -131,6 +133,47 @@ pub(crate) fn repaint_with_history(parser: &mut vt100::Parser) -> Vec<u8> {
     out.extend_from_slice(&parser.screen().contents_formatted());
     out.extend_from_slice(&parser.screen().input_mode_formatted());
     out
+}
+
+/// Shared `BackendSession::attach` body for the emulator-holding backends.
+/// Captures the history-inclusive repaint and subscribes to the output stream
+/// while holding the emulator lock; a writer that processes+broadcasts under
+/// this same lock therefore hands the receiver a stream that starts exactly
+/// where the snapshot ends.
+pub(crate) fn attach_with_history(
+    parser: &Mutex<vt100::Parser>,
+    tx: &broadcast::Sender<Arc<[u8]>>,
+    seq: &AtomicU64,
+) -> (Snapshot, broadcast::Receiver<Arc<[u8]>>) {
+    let mut parser = parser.lock();
+    let (rows, cols) = parser.screen().size();
+    // Attach repaints include scrollback history so the client can scroll
+    // up to output from before it attached.
+    let repaint: Arc<[u8]> =
+        Arc::from(repaint_with_history(&mut parser).into_boxed_slice());
+    let snap = Snapshot {
+        rows,
+        cols,
+        repaint,
+        last_seq: seq.load(Ordering::SeqCst),
+    };
+    let rx = tx.subscribe();
+    drop(parser);
+    (snap, rx)
+}
+
+/// Shared `BackendSession::snapshot` body: a screen-only repaint (no history
+/// replay) of the current emulator state.
+pub(crate) fn snapshot_screen(parser: &vt100::Parser, seq: &AtomicU64) -> Snapshot {
+    let screen = parser.screen();
+    let (rows, cols) = screen.size();
+    let repaint: Arc<[u8]> = Arc::from(screen.contents_formatted().into_boxed_slice());
+    Snapshot {
+        rows,
+        cols,
+        repaint,
+        last_seq: seq.load(Ordering::SeqCst),
+    }
 }
 
 /// Factory for live sessions. The native backend is registered under the

@@ -399,6 +399,12 @@ async fn proxy(
     let Some(ctrl_tx) = reg.ctrl_if_online(&route.via) else {
         return err_response(RelayError::NodeOffline);
     };
+    // The error to surface when the routed node fails to produce a stream.
+    let unreachable = if route.is_downstream {
+        RelayError::DownstreamUnreachable
+    } else {
+        RelayError::NodeOffline
+    };
 
     // Ask the node to dial a data stream back, and wait for it.
     let stream_id = uuid::Uuid::new_v4().to_string();
@@ -408,7 +414,7 @@ async fn proxy(
     if ctrl_tx
         .send(RelayMsg::Open {
             stream_id: stream_id.clone(),
-            target: route.target.clone(),
+            target: route.target,
         })
         .is_err()
     {
@@ -420,31 +426,22 @@ async fn proxy(
         Ok(Ok(conn)) => conn,
         _ => {
             reg.pending.lock().remove(&stream_id);
-            let e = if route.is_downstream {
-                RelayError::DownstreamUnreachable
-            } else {
-                RelayError::NodeOffline
-            };
-            return err_response(e);
+            return err_response(unreachable);
         }
     };
 
-    match forward(req, data, route.is_downstream).await {
+    match forward(req, data).await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::warn!(node = %node_id, "proxy forward failed: {e:#}");
-            err_response(if route.is_downstream {
-                RelayError::DownstreamUnreachable
-            } else {
-                RelayError::NodeOffline
-            })
+            err_response(unreachable)
         }
     }
 }
 
 /// Forward one client request over the data stream via an HTTP/1.1 client,
 /// splicing the connection through on a WebSocket upgrade.
-async fn forward(req: Request<Body>, data: DataConn, _is_downstream: bool) -> Result<Response> {
+async fn forward(mut req: Request<Body>, data: DataConn) -> Result<Response> {
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(data))
         .await
         .context("http1 handshake over data stream")?;
@@ -454,7 +451,6 @@ async fn forward(req: Request<Body>, data: DataConn, _is_downstream: bool) -> Re
     });
 
     let is_upgrade = is_websocket_upgrade(req.headers());
-    let mut req = req;
     let client_upgrade = if is_upgrade {
         Some(hyper::upgrade::on(&mut req))
     } else {

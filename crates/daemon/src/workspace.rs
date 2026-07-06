@@ -1,24 +1,26 @@
+//! Git worktree helpers for per-session workspace isolation.
+//!
+//! Independent sessions on the same repository each get their own managed
+//! worktree (separate working directory + index) on an app-managed branch, so
+//! they never share one writable working tree.
+
 use std::path::Path;
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Result};
 
-/// Git worktree helpers for per-session workspace isolation.
-///
-/// Independent sessions on the same repository each get their own managed
-/// worktree (separate working directory + index) on an app-managed branch, so
-/// they never share one writable working tree.
+use crate::source_control::{current_branch, git};
 
 pub fn is_git_repo(root: &Path) -> bool {
     matches!(
-        run(root, &["rev-parse", "--is-inside-work-tree"]),
+        git(root, &["rev-parse", "--is-inside-work-tree"]),
         Ok(out) if out.trim() == "true"
     )
 }
 
 /// `git init` a plain folder so it gains full change tracking.
 pub fn init_repo(root: &Path) -> Result<()> {
-    run(root, &["init"])?;
+    git(root, &["init"])?;
     Ok(())
 }
 
@@ -49,23 +51,23 @@ pub fn create_worktree(
 
     match spec {
         BranchSpec::Auto { name } => {
-            if run(root, &["worktree", "add", "-b", name, path_str, "HEAD"]).is_ok() {
+            if git(root, &["worktree", "add", "-b", name, path_str, "HEAD"]).is_ok() {
                 return Ok(Some(name.to_string()));
             }
             // Branch name may collide; fall back to a detached worktree.
-            run(root, &["worktree", "add", "--detach", path_str, "HEAD"])
+            git(root, &["worktree", "add", "--detach", path_str, "HEAD"])
                 .map_err(|e| anyhow!("worktree add failed: {e}"))?;
             Ok(None)
         }
         BranchSpec::New { name, base } => {
-            run(root, &["worktree", "add", "-b", name, path_str, base])
+            git(root, &["worktree", "add", "-b", name, path_str, base])
                 .map_err(|e| anyhow!("could not create branch `{name}`: {e}"))?;
             Ok(Some(name.to_string()))
         }
         BranchSpec::Existing { name } => {
             // No -b: check out the existing branch. Git refuses if it is already
             // checked out in another worktree, which surfaces as a clear error.
-            run(root, &["worktree", "add", path_str, name])
+            git(root, &["worktree", "add", path_str, name])
                 .map_err(|e| anyhow!("could not check out branch `{name}`: {e}"))?;
             Ok(Some(name.to_string()))
         }
@@ -77,27 +79,18 @@ pub fn list_branches(root: &Path) -> Result<(Vec<String>, Option<String>)> {
     if !is_git_repo(root) {
         return Ok((vec![], None));
     }
-    let out = run(root, &["branch", "--format=%(refname:short)"])?;
+    let out = git(root, &["branch", "--format=%(refname:short)"])?;
     let branches: Vec<String> = out
         .lines()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect();
-    let head_raw = run(root, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let head = if head_raw == "HEAD" || head_raw.is_empty() {
-        None
-    } else {
-        Some(head_raw)
-    };
-    Ok((branches, head))
+    Ok((branches, current_branch(root)))
 }
 
 /// True if the worktree has uncommitted changes (tracked or untracked).
 pub fn worktree_is_dirty(instance_path: &Path) -> bool {
-    match run(instance_path, &["status", "--porcelain", "--untracked-files=all"]) {
+    match git(instance_path, &["status", "--porcelain", "--untracked-files=all"]) {
         Ok(out) => !out.trim().is_empty(),
         // If we cannot tell, err on the side of "dirty" so cleanup is guarded.
         Err(_) => true,
@@ -117,7 +110,7 @@ pub fn remove_worktree(root: &Path, instance_path: &Path, force: bool) -> Result
         args.push("--force");
     }
     args.push(path_str);
-    run(root, &args).map_err(|e| anyhow!("worktree remove failed: {e}"))?;
+    git(root, &args).map_err(|e| anyhow!("worktree remove failed: {e}"))?;
     Ok(())
 }
 
@@ -130,7 +123,7 @@ pub struct WorktreeEntry {
 
 /// List all worktrees registered on `root`. The first entry is the main worktree.
 pub fn list_worktrees(root: &Path) -> Result<Vec<WorktreeEntry>> {
-    let out = run(root, &["worktree", "list", "--porcelain"])?;
+    let out = git(root, &["worktree", "list", "--porcelain"])?;
     let mut entries = Vec::new();
     let mut path: Option<String> = None;
     let mut branch: Option<String> = None;
@@ -168,7 +161,7 @@ pub fn worktree_for_branch(root: &Path, branch: &str) -> Result<Option<(String, 
 
 /// Drop registrations for worktrees whose directories no longer exist.
 pub fn prune_worktrees(root: &Path) -> Result<()> {
-    run(root, &["worktree", "prune"])?;
+    git(root, &["worktree", "prune"])?;
     Ok(())
 }
 
@@ -202,22 +195,6 @@ pub fn branch_is_merged(root: &Path, branch: &str) -> bool {
 
 /// Delete a local branch. `force` uses `-D` (drops unmerged commits).
 pub fn delete_branch(root: &Path, branch: &str, force: bool) -> Result<()> {
-    run(root, &["branch", if force { "-D" } else { "-d" }, branch])?;
+    git(root, &["branch", if force { "-D" } else { "-d" }, branch])?;
     Ok(())
-}
-
-fn run(cwd: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| anyhow!("failed to run git: {e}"))?;
-    if !output.status.success() {
-        bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }

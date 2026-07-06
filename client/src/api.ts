@@ -230,8 +230,36 @@ export interface VscodeTarget {
 import { Target } from "./connectionStore";
 import i18n from "./i18n";
 
-function baseOf(t: Target): string {
-  return t.baseUrl ? t.baseUrl.replace(/\/$/, "") : "";
+/** Base URL with any trailing slash stripped ("" targets the local origin). */
+function baseOf(baseUrl: string): string {
+  return baseUrl.replace(/\/$/, "");
+}
+
+// fetch rejects with an opaque TypeError when the host is unreachable
+// (connection refused, DNS, offline) — name the likely cause instead.
+function unreachableError(baseUrl: string): Error {
+  return new Error(
+    baseUrl ? i18n.t("api.unreachableAt", { baseUrl }) : i18n.t("api.unreachable"),
+  );
+}
+
+/**
+ * Message for a non-OK response: the JSON body's `error` when present
+ * (`fromBody: true`), else `status statusText`.
+ */
+async function errorMessage(res: Response): Promise<{ msg: string; fromBody: boolean }> {
+  let msg = `${res.status} ${res.statusText}`;
+  let fromBody = false;
+  try {
+    const body = await res.json();
+    if (body?.error) {
+      msg = body.error;
+      fromBody = true;
+    }
+  } catch {
+    /* ignore */
+  }
+  return { msg, fromBody };
 }
 
 async function req<T>(t: Target, path: string, init?: RequestInit): Promise<T> {
@@ -244,28 +272,13 @@ async function req<T>(t: Target, path: string, init?: RequestInit): Promise<T> {
 
   let res: Response;
   try {
-    res = await fetch(baseOf(t) + path, { ...init, headers });
+    res = await fetch(baseOf(t.baseUrl) + path, { ...init, headers });
   } catch {
-    // fetch rejects with an opaque TypeError when the host is unreachable
-    // (connection refused, DNS, offline) — name the likely cause instead.
-    throw new Error(
-      t.baseUrl
-        ? i18n.t("api.unreachableAt", { baseUrl: t.baseUrl })
-        : i18n.t("api.unreachable"),
-    );
+    throw unreachableError(t.baseUrl);
   }
   if (!res.ok) {
-    let msg = `${res.status} ${res.statusText}`;
-    let fromBody = false;
-    try {
-      const body = await res.json();
-      if (body?.error) {
-        msg = body.error;
-        fromBody = true;
-      }
-    } catch {
-      /* ignore */
-    }
+    const { msg: bodyMsg, fromBody } = await errorMessage(res);
+    let msg = bodyMsg;
     if (res.status === 401) {
       msg = i18n.t("api.unauthorized", { message: msg });
     } else if (!fromBody && (res.status === 502 || res.status === 504)) {
@@ -293,20 +306,12 @@ async function postBlob<T>(t: Target, path: string, blob: Blob): Promise<T> {
 
   let res: Response;
   try {
-    res = await fetch(baseOf(t) + path, { method: "POST", headers, body: blob });
+    res = await fetch(baseOf(t.baseUrl) + path, { method: "POST", headers, body: blob });
   } catch {
-    throw new Error(
-      t.baseUrl ? i18n.t("api.unreachableAt", { baseUrl: t.baseUrl }) : i18n.t("api.unreachable"),
-    );
+    throw unreachableError(t.baseUrl);
   }
   if (!res.ok) {
-    let msg = `${res.status} ${res.statusText}`;
-    try {
-      const body = await res.json();
-      if (body?.error) msg = body.error;
-    } catch {
-      /* ignore */
-    }
+    const { msg } = await errorMessage(res);
     throw Object.assign(new Error(msg), { status: res.status });
   }
   return res.json() as Promise<T>;
@@ -330,7 +335,7 @@ export async function enrollDevice(
   deviceName: string,
   relayKey?: string | null,
 ): Promise<{ server_id: string; device_id: string; device_token: string }> {
-  const b = baseUrl ? baseUrl.replace(/\/$/, "") : "";
+  const b = baseOf(baseUrl);
   const headers: Record<string, string> = { "content-type": "application/json" };
   if (relayKey) headers["X-ASM-Relay-Key"] = relayKey;
   let res: Response;
@@ -341,20 +346,9 @@ export async function enrollDevice(
       body: JSON.stringify({ enrollment_token: enrollmentToken, device_name: deviceName }),
     });
   } catch {
-    throw new Error(
-      baseUrl ? i18n.t("api.unreachableAt", { baseUrl }) : i18n.t("api.unreachable"),
-    );
+    throw unreachableError(baseUrl);
   }
-  if (!res.ok) {
-    let msg = `${res.status} ${res.statusText}`;
-    try {
-      const body = await res.json();
-      if (body?.error) msg = body.error;
-    } catch {
-      /* ignore */
-    }
-    throw new Error(msg);
-  }
+  if (!res.ok) throw new Error((await errorMessage(res)).msg);
   return res.json();
 }
 
@@ -364,7 +358,7 @@ export async function probeHealth(
   token: string | null,
   relayKey?: string | null,
 ): Promise<Health> {
-  const b = baseUrl ? baseUrl.replace(/\/$/, "") : "";
+  const b = baseOf(baseUrl);
   const headers: Record<string, string> = {};
   if (token) headers["Authorization"] = `Bearer ${token}`;
   if (relayKey) headers["X-ASM-Relay-Key"] = relayKey;
@@ -372,9 +366,7 @@ export async function probeHealth(
   try {
     res = await fetch(b + "/health", { headers });
   } catch {
-    throw new Error(
-      baseUrl ? i18n.t("api.unreachableAt", { baseUrl }) : i18n.t("api.unreachable"),
-    );
+    throw unreachableError(baseUrl);
   }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json();

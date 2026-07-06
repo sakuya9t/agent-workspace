@@ -670,8 +670,6 @@ impl SessionManager {
                     // The holder has a real completion record.
                     let (status, code) = if entry.exit_signal != 0 {
                         (SessionStatus::Failed, None)
-                    } else if entry.exit_code == 0 {
-                        (SessionStatus::Exited, Some(0))
                     } else {
                         (SessionStatus::Exited, Some(entry.exit_code))
                     };

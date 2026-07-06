@@ -88,20 +88,7 @@ impl AgentPlugin for CodexPlugin {
         }]
     }
     fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
-        let command = self
-            .detect_binary()
-            .ok_or_else(|| anyhow!("`codex` binary not found in PATH"))?;
-        let mut args = Vec::new();
-        if ctx.opt("bypass_approvals") {
-            args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
-        }
-        args.extend(ctx.extra_args.clone());
-        Ok(LaunchSpec {
-            command,
-            args,
-            env: ctx.extra_env.clone(),
-            requires_approval: false,
-        })
+        cli_launch(self, ctx, "bypass_approvals", "--dangerously-bypass-approvals-and-sandbox")
     }
 }
 
@@ -145,20 +132,7 @@ impl AgentPlugin for ClaudePlugin {
         }]
     }
     fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
-        let command = self
-            .detect_binary()
-            .ok_or_else(|| anyhow!("`claude` binary not found in PATH"))?;
-        let mut args = Vec::new();
-        if ctx.opt("skip_permissions") {
-            args.push("--dangerously-skip-permissions".to_string());
-        }
-        args.extend(ctx.extra_args.clone());
-        Ok(LaunchSpec {
-            command,
-            args,
-            env: ctx.extra_env.clone(),
-            requires_approval: false,
-        })
+        cli_launch(self, ctx, "skip_permissions", "--dangerously-skip-permissions")
     }
 }
 
@@ -193,20 +167,7 @@ impl AgentPlugin for OpencodePlugin {
         }]
     }
     fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
-        let command = self
-            .detect_binary()
-            .ok_or_else(|| anyhow!("`opencode` binary not found in PATH"))?;
-        let mut args = Vec::new();
-        if ctx.opt("auto_approve") {
-            args.push("--auto".to_string());
-        }
-        args.extend(ctx.extra_args.clone());
-        Ok(LaunchSpec {
-            command,
-            args,
-            env: ctx.extra_env.clone(),
-            requires_approval: false,
-        })
+        cli_launch(self, ctx, "auto_approve", "--auto")
     }
 }
 
@@ -239,6 +200,31 @@ impl AgentPlugin for CustomCommandPlugin {
             requires_approval: true,
         })
     }
+}
+
+/// The `build_launch` shape shared by the CLI agents (codex/claude/opencode):
+/// the detected binary, one optional danger flag, then the user's extra
+/// args/env. These plugins' ids double as their binary names.
+fn cli_launch(
+    plugin: &dyn AgentPlugin,
+    ctx: &AgentContext,
+    opt_key: &str,
+    flag: &str,
+) -> Result<LaunchSpec> {
+    let command = plugin
+        .detect_binary()
+        .ok_or_else(|| anyhow!("`{}` binary not found in PATH", plugin.id()))?;
+    let mut args = Vec::new();
+    if ctx.opt(opt_key) {
+        args.push(flag.to_string());
+    }
+    args.extend(ctx.extra_args.clone());
+    Ok(LaunchSpec {
+        command,
+        args,
+        env: ctx.extra_env.clone(),
+        requires_approval: false,
+    })
 }
 
 fn default_shell() -> String {
