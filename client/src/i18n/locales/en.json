@@ -185,7 +185,9 @@
       "didntOpen": "VS Code didn't open — it may not be installed on this machine.",
       "download": "Download VS Code",
       "remoteSshHint": "Already installed? Remote windows also need the “Remote - SSH” extension and SSH access to {{dest}}.",
-      "cliHint": "Or open it from a terminal on this machine:"
+      "cliHint": "Or open it from a terminal on this machine:",
+      "relayUnavailable": "Not available for relayed hosts yet — VS Code can't reach a node through the relay. A browser-based editor is planned.",
+      "relayUnavailableTitle": "Relayed hosts have no direct route from this machine, so VS Code can't open their workspace yet"
     },
     "riskBanner": "⚠ Unsafe session — agent guardrails disabled (skip-permissions / bypass-sandbox)",
     "riskBannerTitle": "This session was started with agent guardrails disabled",
