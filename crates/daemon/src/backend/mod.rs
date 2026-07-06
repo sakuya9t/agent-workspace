@@ -172,6 +172,12 @@ pub trait BackendSession: Send + Sync {
     /// Current emulator snapshot without subscribing.
     fn snapshot(&self) -> Snapshot;
 
+    /// Plain-text rendering of the current visible screen — rows joined by `\n`,
+    /// no formatting escapes. Screen-based attention classifiers read this
+    /// instead of the raw output byte stream, so a prompt whose question isn't
+    /// the last thing written (a boxed menu, a redraw-frame tail) is still seen.
+    fn screen_text(&self) -> String;
+
     fn send_input(&self, data: &[u8]) -> Result<()>;
     fn resize(&self, rows: u16, cols: u16) -> Result<()>;
     fn stop(&self) -> Result<()>;

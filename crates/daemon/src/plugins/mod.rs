@@ -4,9 +4,11 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde::Serialize;
 
+pub(crate) mod attention;
 pub mod builtin;
 pub mod usage;
 
+use crate::domain::AttentionState;
 use usage::{AgentUsage, UsageContext};
 
 /// User-supplied launch inputs for an agent. The working directory is resolved
@@ -70,6 +72,28 @@ pub trait AgentPlugin: Send + Sync {
     /// A plain shell rings the bell as UI noise, so this is **off by default**
     /// and only opted into by agents whose bells are meaningful.
     fn bell_means_attention(&self) -> bool {
+        false
+    }
+
+    /// Classify the session's current attention state (working / idle / blocked)
+    /// from recent terminal output. `text` is the rendered **visible screen**
+    /// when [`attention_uses_screen`](Self::attention_uses_screen) is true, and
+    /// otherwise the raw decoded **output tail**. `bell` is whether the latest
+    /// output chunk rang a real terminal bell (already gated by
+    /// [`bell_means_attention`](Self::bell_means_attention)).
+    ///
+    /// The default is the shared prompt/bell heuristic over the tail. A provider
+    /// whose approval UI that heuristic can't read — Claude Code's boxed
+    /// selection menu — overrides this together with `attention_uses_screen`.
+    fn attention(&self, text: &str, bell: bool) -> (AttentionState, Option<String>) {
+        attention::default_attention(text, bell)
+    }
+
+    /// Whether [`attention`](Self::attention) wants the rendered screen instead
+    /// of the raw output tail. Rendering the screen costs a terminal snapshot
+    /// per output chunk, so it's opt-in; providers the tail heuristic handles
+    /// leave this false.
+    fn attention_uses_screen(&self) -> bool {
         false
     }
 

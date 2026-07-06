@@ -162,6 +162,10 @@ impl BackendSession for NativeSession {
         self.build_snapshot(&parser)
     }
 
+    fn screen_text(&self) -> String {
+        self.parser.lock().screen().contents()
+    }
+
     fn send_input(&self, data: &[u8]) -> Result<()> {
         let mut w = self.writer.lock();
         w.write_all(data).context("writing pty input")?;
