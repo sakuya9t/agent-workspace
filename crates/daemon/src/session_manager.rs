@@ -1167,10 +1167,15 @@ fn scan_bell(bytes: &[u8], in_osc: &mut bool) -> bool {
 /// `idle` by the silence timer, or kept "blocked" by the sticky rule in
 /// `on_output`).
 ///
-/// Matching only the last non-blank line keeps a prompt-like phrase mid-stream
-/// (with output after it) from flipping a working agent to blocked. The bell is
-/// applied per chunk (an event), not scanned from the accumulated tail, so a
-/// stale bell doesn't linger.
+/// Interactive agents render an approval prompt as the question on one line with
+/// the answer UI — numbered options, a selection pointer, a surrounding box —
+/// on the lines *below* it, so the question is rarely the last non-blank line.
+/// We therefore scan the trailing lines upward, matching the patterns on each
+/// and skipping past answer-UI [chrome](`is_menu_chrome`) (options, borders),
+/// but stop at the first line of real output. That keeps a prompt-like phrase
+/// the agent printed mid-stream — with genuine output after it — reading as
+/// activity, not blocked. The bell is applied per chunk (an event), not scanned
+/// from the accumulated tail, so a stale bell doesn't linger.
 fn classify_attention(tail: &str, bell: bool) -> (AttentionState, Option<String>) {
     const APPROVAL_PATTERNS: &[&str] = &[
         "(y/n)",
@@ -1185,17 +1190,32 @@ fn classify_attention(tail: &str, bell: bool) -> (AttentionState, Option<String>
         "are you sure",
         "press enter to continue",
     ];
-    let last_line = tail
-        .rsplit(|c: char| c == '\n' || c == '\r')
-        .find(|s| !s.trim().is_empty())
-        .unwrap_or(tail);
-    let lower = last_line.to_lowercase();
-    for p in APPROVAL_PATTERNS {
-        if lower.contains(p) {
-            return (
-                AttentionState::ApprovalNeeded,
-                Some(format!("prompt detected: {p}")),
-            );
+    // Upper bound on how far above the last line a prompt's question may sit
+    // (question + a handful of options + box borders). Bounded so a stale prompt
+    // buried deep in the tail can't be resurrected.
+    const MAX_SCAN: usize = 12;
+    let mut scanned = 0;
+    for line in tail.rsplit(['\n', '\r']) {
+        if line.trim().is_empty() {
+            continue; // blank padding — not content, and never halts the scan
+        }
+        if scanned >= MAX_SCAN {
+            break;
+        }
+        scanned += 1;
+        let lower = line.to_lowercase();
+        for p in APPROVAL_PATTERNS {
+            if lower.contains(p) {
+                return (
+                    AttentionState::ApprovalNeeded,
+                    Some(format!("prompt detected: {p}")),
+                );
+            }
+        }
+        // Keep climbing past the answer UI to reach the question; a real output
+        // line means the trailing text isn't a prompt, so stop here.
+        if !is_menu_chrome(line) {
+            break;
         }
     }
     if bell {
@@ -1205,6 +1225,33 @@ fn classify_attention(tail: &str, bell: bool) -> (AttentionState, Option<String>
         );
     }
     (AttentionState::Activity, None)
+}
+
+/// True when `line` is part of a prompt's answer UI rather than real output: a
+/// numbered option (optionally led by a selection pointer) or a box border /
+/// padding. Lets [`classify_attention`] scan *past* the options to the question
+/// line above, without mistaking ordinary streamed output for a prompt.
+fn is_menu_chrome(line: &str) -> bool {
+    let is_box = |c: char| ('\u{2500}'..='\u{257f}').contains(&c);
+    // Strip a surrounding box and indentation: `│ … │`, `╰──╯`, leading spaces.
+    let inner = line
+        .trim_matches(|c: char| c.is_whitespace() || is_box(c))
+        .trim();
+    if inner.is_empty() {
+        return true; // pure border or padding line
+    }
+    // Drop a leading selection pointer / bullet, then require a small integer
+    // followed by `.` or `)` — a menu option like "❯ 1. Yes" or "2) No".
+    let opt = inner
+        .trim_start_matches(|c: char| {
+            matches!(
+                c,
+                '\u{276f}' | '>' | '\u{25b6}' | '\u{2192}' | '*' | '-' | '\u{2022}'
+            )
+        })
+        .trim_start();
+    let digits = opt.chars().take_while(|c| c.is_ascii_digit()).count();
+    digits > 0 && matches!(opt[digits..].chars().next(), Some('.') | Some(')'))
 }
 
 /// Bound `tail` to at most `max` bytes by dropping the oldest content.
@@ -1248,6 +1295,41 @@ mod tests {
         // The prompt-like phrase is NOT the last line — the agent kept working,
         // so it must read as active, not blocked (no active<->blocked flicker).
         let (a, _) = classify_attention("Do you want to continue?\nDownloading 42%...", false);
+        assert_eq!(a, AttentionState::Activity);
+    }
+
+    #[test]
+    fn repro_multiline_menu_prompt_is_blocked() {
+        // The reported bug: an agent renders an approval prompt as a question
+        // line followed by numbered options, so the *last* non-blank line is an
+        // option ("2. No"), not the question. Matching only the last line missed
+        // it and the session read as "working".
+        let prompt = "Do you want to proceed?\n\u{276f} 1. Yes\n  2. No, and tell Claude what to do differently";
+        let (a, _) = classify_attention(prompt, false);
+        assert_eq!(a, AttentionState::ApprovalNeeded);
+    }
+
+    #[test]
+    fn repro_boxed_menu_prompt_is_blocked() {
+        // Same shape, wrapped in a rounded box (Claude Code's actual rendering):
+        // question and options each sit inside `│ … │`, and the last line is the
+        // box's bottom border.
+        let prompt = "\u{256d}────────────────╮\n\
+                      │ Do you want to proceed?        │\n\
+                      │ \u{276f} 1. Yes                       │\n\
+                      │   2. No                        │\n\
+                      \u{2570}────────────────╯";
+        let (a, _) = classify_attention(prompt, false);
+        assert_eq!(a, AttentionState::ApprovalNeeded);
+    }
+
+    #[test]
+    fn trailing_numbered_list_output_is_activity() {
+        // Skipping *past* numbered options to find the question must not turn an
+        // ordinary numbered list the agent printed into a blocked prompt: the
+        // line above the list carries no approval phrase, so the scan stops there.
+        let out = "Here is the plan:\n1. Read the file\n2. Edit it\n3. Run tests";
+        let (a, _) = classify_attention(out, false);
         assert_eq!(a, AttentionState::Activity);
     }
 
