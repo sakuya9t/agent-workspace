@@ -956,7 +956,12 @@ body.col-resizing iframe {
      overflow, instead of scrolling inside a fixed-size box. The flex column
      lets .diff-view fill whatever height the dialog is dragged to. */
   resize: both;
-  overflow: auto;
+  /* Drop the base .modal padding so .diff-view reaches the dialog's edges: the
+     resize grip (drawn at the dialog's bottom-right corner) then lands exactly
+     on the diff text area instead of ~18px outside it. overflow: hidden keeps
+     the rounded frame clipping the flush diff-view; the diff-view scrolls. */
+  padding: 0;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   max-height: calc(100vh - 40px);
@@ -966,14 +971,15 @@ body.col-resizing iframe {
   justify-content: space-between;
   align-items: center;
   flex: none;
+  padding: 14px 16px;
+  margin-bottom: 0;
 }
 .diff-view {
   flex: 1;
   min-height: 0;
   overflow: auto;
   background: #0b0e14;
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  border-top: 1px solid var(--border);
   padding: 8px;
   font-size: 12px;
   line-height: 1.45;

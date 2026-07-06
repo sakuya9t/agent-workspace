@@ -26,8 +26,18 @@ export function DiffModal({ target, sessionId, path, untracked, commit, onClose 
   });
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal diff-modal" onClick={(e) => e.stopPropagation()}>
+    <div
+      className="modal-backdrop"
+      onMouseDown={(e) => {
+        // Close only when the press *starts* on the backdrop itself. Resizing
+        // the dialog begins with a mousedown on its corner grip; releasing that
+        // drag over the backdrop fires a click on the backdrop (the nearest
+        // common ancestor of the press and release), which would otherwise
+        // close the dialog mid-resize. Guarding on the press target avoids that.
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="modal diff-modal">
         <div className="modal-title">
           <span className="mono">{path}</span>
           <button className="btn tiny" onClick={onClose}>
