@@ -1,7 +1,7 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState, type ChangeEvent } from "react";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { streamUrl } from "../api";
+import { streamUrl, api } from "../api";
 import { Target } from "../connectionStore";
 import { useUiStore } from "../store";
 import i18n from "../i18n";
@@ -25,6 +25,54 @@ interface Props {
  */
 export function TerminalView({ target, sessionId, live }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
+  // The live socket, mirrored out of the effect so the component-scope image
+  // upload can inject over it without the effect's listeners depending on it.
+  const wsRef = useRef<WebSocket | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const errorTimerRef = useRef<number | undefined>(undefined);
+  // Transient status for an in-flight / failed image paste, shown as a small
+  // overlay (never written into the terminal, which a TUI would repaint over).
+  const [pasteStatus, setPasteStatus] = useState<{ kind: "busy" | "error"; msg: string } | null>(
+    null,
+  );
+
+  // Upload a pasted/dropped/picked image, then inject its stored path over the
+  // live socket as prompt text — the drag-and-drop-equivalent the agent loads
+  // on submit. The upload finishes BEFORE the path is injected, so a slow or
+  // dropped link never leaves a dangling reference in the prompt. Lifted to
+  // component scope so the 📎 button and the terminal's paste/drop listeners
+  // share one implementation.
+  const uploadAndInject = async (blob: Blob) => {
+    if (!live) return;
+    setPasteStatus({ kind: "busy", msg: i18n.t("terminal.uploadingImage") });
+    try {
+      const r = await api.pasteImage(target, sessionId, blob);
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(
+          JSON.stringify({ t: "i", d: i18n.t("terminal.pastedImageRef", { path: r.relative_path }) }),
+        );
+      }
+      setPasteStatus(null);
+    } catch (e) {
+      setPasteStatus({
+        kind: "error",
+        msg: i18n.t("terminal.pasteFailed", { message: (e as Error).message }),
+      });
+      if (errorTimerRef.current) window.clearTimeout(errorTimerRef.current);
+      errorTimerRef.current = window.setTimeout(() => setPasteStatus(null), 4000);
+    }
+  };
+  // The effect's DOM listeners reach the latest closure through this ref, so
+  // they never become an effect dependency (which would rebuild the terminal).
+  const uploadRef = useRef(uploadAndInject);
+  uploadRef.current = uploadAndInject;
+
+  const onPickFile = (e: ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    if (f && f.type.startsWith("image/")) void uploadAndInject(f);
+    e.target.value = ""; // let the same file be picked again next time
+  };
 
   useEffect(() => {
     const container = containerRef.current;
@@ -62,6 +110,7 @@ export function TerminalView({ target, sessionId, live }: Props) {
       const socket = new WebSocket(streamUrl(target, sessionId));
       socket.binaryType = "arraybuffer";
       ws = socket;
+      wsRef.current = socket;
 
       socket.onopen = () => {
         // The attach snapshot replays scrollback history. Drop what this
@@ -96,11 +145,52 @@ export function TerminalView({ target, sessionId, live }: Props) {
       socket.onerror = () => socket.close();
     };
 
-    const dataSub = term.onData((d) => {
+    const sendInput = (d: string) => {
       if (live && ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ t: "i", d }));
       }
-    });
+    };
+
+    const dataSub = term.onData(sendInput);
+
+    // --- Image paste / drop --- (the upload+inject itself lives at component
+    // scope in `uploadAndInject`, reached here via `uploadRef` so these
+    // listeners don't become effect dependencies; the 📎 button shares it.)
+    const firstImage = (files: FileList | null | undefined): File | null =>
+      files ? (Array.from(files).find((f) => f.type.startsWith("image/")) ?? null) : null;
+
+    const onPaste = (e: ClipboardEvent) => {
+      if (!live || !e.clipboardData) return;
+      for (const item of Array.from(e.clipboardData.items)) {
+        if (item.kind === "file" && item.type.startsWith("image/")) {
+          const file = item.getAsFile();
+          if (file) {
+            // Swallow it so xterm doesn't also paste garbage; a plain-text
+            // paste (no image item) falls through to xterm untouched.
+            e.preventDefault();
+            e.stopPropagation();
+            void uploadRef.current(file);
+            return;
+          }
+        }
+      }
+    };
+    const onDragOver = (e: DragEvent) => {
+      if (live && e.dataTransfer && Array.from(e.dataTransfer.items).some((i) => i.kind === "file")) {
+        e.preventDefault();
+      }
+    };
+    const onDrop = (e: DragEvent) => {
+      if (!live) return;
+      const img = firstImage(e.dataTransfer?.files);
+      if (img) {
+        e.preventDefault();
+        void uploadRef.current(img);
+      }
+    };
+    container.addEventListener("paste", onPaste, true);
+    container.addEventListener("dragover", onDragOver);
+    container.addEventListener("drop", onDrop);
 
     const ro = new ResizeObserver(() => {
       safeFit(fit);
@@ -113,8 +203,13 @@ export function TerminalView({ target, sessionId, live }: Props) {
     return () => {
       mounted = false;
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      if (errorTimerRef.current) window.clearTimeout(errorTimerRef.current);
+      container.removeEventListener("paste", onPaste, true);
+      container.removeEventListener("dragover", onDragOver);
+      container.removeEventListener("drop", onDrop);
       ro.disconnect();
       dataSub.dispose();
+      wsRef.current = null;
       if (ws) {
         ws.onclose = null;
         try {
@@ -127,7 +222,39 @@ export function TerminalView({ target, sessionId, live }: Props) {
     };
   }, [sessionId, live, target.baseUrl, target.token]);
 
-  return <div className="terminal-host" ref={containerRef} />;
+  // xterm owns `terminal-mount` imperatively; the overlay is a React-managed
+  // sibling so the two never contend over the same DOM children.
+  return (
+    <div className="terminal-host">
+      <div className="terminal-mount" ref={containerRef} />
+      {live && (
+        <>
+          {/* Explicit attach affordance — the primary path on touch devices,
+              where clipboard-image paste is unreliable. The 📎 glyph is set in
+              CSS so there's no bare string literal in JSX. */}
+          <button
+            type="button"
+            className="term-attach"
+            title={i18n.t("terminal.attachImage")}
+            aria-label={i18n.t("terminal.attachImage")}
+            onClick={() => fileInputRef.current?.click()}
+          />
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            hidden
+            onChange={onPickFile}
+          />
+        </>
+      )}
+      {pasteStatus && (
+        <div className={`paste-status paste-status--${pasteStatus.kind}`} role="status">
+          {pasteStatus.msg}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function safeFit(fit: FitAddon) {

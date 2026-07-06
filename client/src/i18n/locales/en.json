@@ -253,7 +253,11 @@
     "renamed": "{{from}} → {{to}}"
   },
   "terminal": {
-    "takenOver": "This session was taken over by another client."
+    "takenOver": "This session was taken over by another client.",
+    "uploadingImage": "Uploading image…",
+    "pasteFailed": "Image paste failed: {{message}}",
+    "pastedImageRef": "[pasted image {{path}}] ",
+    "attachImage": "Attach image"
   },
   "api": {
     "unreachableAt": "cannot connect — daemon unreachable at {{baseUrl}} (not started?)",

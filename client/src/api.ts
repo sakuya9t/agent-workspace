@@ -280,6 +280,46 @@ async function req<T>(t: Target, path: string, init?: RequestInit): Promise<T> {
 }
 
 /**
+ * POST raw binary (e.g. a pasted image Blob) and parse a JSON reply. Mirrors
+ * `req`'s auth handling but sends the Blob as-is — fetch derives the multipart
+ * boundary-free `Content-Type` from the Blob, so we don't force JSON.
+ */
+async function postBlob<T>(t: Target, path: string, blob: Blob): Promise<T> {
+  const headers: Record<string, string> = {
+    "content-type": blob.type || "application/octet-stream",
+  };
+  if (t.token) headers["Authorization"] = `Bearer ${t.token}`;
+  if (t.relayKey) headers["X-ASM-Relay-Key"] = t.relayKey;
+
+  let res: Response;
+  try {
+    res = await fetch(baseOf(t) + path, { method: "POST", headers, body: blob });
+  } catch {
+    throw new Error(
+      t.baseUrl ? i18n.t("api.unreachableAt", { baseUrl: t.baseUrl }) : i18n.t("api.unreachable"),
+    );
+  }
+  if (!res.ok) {
+    let msg = `${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      if (body?.error) msg = body.error;
+    } catch {
+      /* ignore */
+    }
+    throw Object.assign(new Error(msg), { status: res.status });
+  }
+  return res.json() as Promise<T>;
+}
+
+/** Where a stored paste landed on the daemon host. */
+export interface PastedImage {
+  path: string;
+  relative_path: string;
+  filename: string;
+}
+
+/**
  * Enroll a device against a specific daemon; returns its device token. When the
  * daemon is reached through a relay, pass `relayKey` so the relay authorizes the
  * (public, at the daemon layer) enroll request.
@@ -442,6 +482,12 @@ export const api = {
     req<{ enrollment_token: string }>(t, "/api/auth/enrollment-token").then(
       (r) => r.enrollment_token,
     ),
+  /**
+   * Upload a pasted/dropped image; the daemon stores it under the session's
+   * working directory and returns the path to inject into the terminal.
+   */
+  pasteImage: (t: Target, id: string, blob: Blob) =>
+    postBlob<PastedImage>(t, `/api/sessions/${id}/paste`, blob),
 };
 
 export function streamUrl(t: Target, id: string): string {
