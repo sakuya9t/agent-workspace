@@ -19,6 +19,7 @@ use crate::util::now_millis;
 
 mod auth;
 mod fs;
+mod paste;
 mod scm;
 pub mod ws;
 
@@ -69,6 +70,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/:id/archive", post(archive_session))
         .route("/api/sessions/:id/cleanup", post(cleanup_instance))
         .route("/api/sessions/:id/resize", post(resize_session))
+        .route(
+            "/api/sessions/:id/paste",
+            // Raw image body; raise the transport limit above the enforced
+            // `MAX_PASTE_BYTES` so an oversize upload gets a clean 413 from the
+            // handler rather than a truncated-body error from the extractor.
+            post(paste::upload)
+                .layer(axum::extract::DefaultBodyLimit::max(paste::MAX_PASTE_BYTES + 512 * 1024)),
+        )
         .route("/api/sessions/:id/ack", post(ack_attention))
         .route("/api/sessions/:id/vscode-target", get(vscode_target))
         .route("/api/sessions/:id/stream", get(ws::stream))

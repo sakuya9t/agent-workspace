@@ -1,7 +1,9 @@
 # Backlog
 
 Last reconciled: **2026-07-05** (against `release/next` through `7d071b0`,
-which added `mobile-ui.md`).
+which added `mobile-ui.md`). Since then, **image/screenshot paste + the 📎
+button** landed on session branch `asm-session/3160afbb` (see "Already done"
+below and [`image-paste.md`](image-paste.md)) — not yet merged to `release/next`.
 
 This is the single cross-track index of work that is **designed but not yet
 implemented**. The detailed designs stay in their own documents
@@ -40,6 +42,12 @@ pick it up**.
   client tooling (`scripts/relay-test.mjs`, R3 CDP harness).
 - VS Code correctness fix: relayed hosts get a disabled button + honest hint
   instead of a misdirected Remote-SSH deep link.
+- Image/screenshot paste: paste, drag-drop, or the 📎 button feed an image into
+  a live terminal → daemon stores it under `<cwd>/.asm/pastes/`
+  (`POST /api/sessions/:id/paste`, magic-byte + size validated) → client injects
+  `[pasted image <path>]` over the existing WS input frame → the agent loads it
+  on submit. Design + as-built: [`image-paste.md`](image-paste.md); proofs
+  `scripts/paste-test.mjs` + a headless-Chrome click-through of the 📎 button.
 
 ## Backlog summary
 
@@ -50,6 +58,7 @@ pick it up**.
 | MOB | Mobile UI phases 1–3 + verify (adaptive shell, sheet CSS, terminal key bar) | **P1** | — (client-only) | mobile-ui.md → Execution plan |
 | MOB-PWA | Mobile UI phase 4: PWA manifest + iOS metas | **P2** | MOB | mobile-ui.md → Packaging path |
 | MOB-PUSH | Web Push for attention states | **P3** | MOB; daemon push plumbing (relay as carrier) | mobile-ui.md → Follow-ups |
+| IMG-2 | Image paste follow-ups: `.asm/pastes/` cleanup policy, per-agent capability hint | **P3** | image paste + 📎 button (done) | image-paste.md → Follow-ups |
 | SEC-2 | Constrain `/api/fs/list` + workspace roots | **P1** | — | security-followups.md → 2 (HIGH) |
 | SEC-1 | Transport encryption off-loopback (direct mode TLS; relay TLS ops) | **P1/P2** | partially ties to R5 | security-followups.md → 1 (HIGH) |
 | V0 | Web-editor de-risking spike (scratchpad only) | **P2** | R1–R3 (done) | vscode-over-relay-plan.md → V0 |
