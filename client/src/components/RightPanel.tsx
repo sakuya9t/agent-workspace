@@ -7,6 +7,7 @@ import { buildVscodeLaunch, launchVscode, vscodeReachable, VscodeLaunch } from "
 import { relTime } from "../i18n/time";
 import { attentionLabel, instanceStatusLabel, isolationLabel, statusLabel } from "../i18n/labels";
 import { isTerminal } from "../status";
+import { useIsPhone } from "../useIsPhone";
 import { shortPath } from "../paths";
 import { copyText } from "../clipboard";
 import { DiffModal } from "./DiffModal";
@@ -40,6 +41,9 @@ const STATUS_COLOR: Record<string, string> = {
  */
 export function RightPanel({ target, session }: Props) {
   const { t } = useTranslation();
+  // On a phone there's no local VS Code for the vscode:// deep link to reach, so
+  // the whole "Continue in VS Code" affordance is hidden (mobile shell only).
+  const isPhone = useIsPhone();
   const qc = useQueryClient();
   const [diffTarget, setDiffTarget] = useState<ChangedFile | null>(null);
   const [commitTarget, setCommitTarget] = useState<string | null>(null);
@@ -208,63 +212,67 @@ export function RightPanel({ target, session }: Props) {
     <div className="panel right">
       <div className="panel-header">{t("rightPanel.header")}</div>
       <div className="panel-body details">
-        <button
-          className="btn vscode-btn"
-          disabled={vscode.phase === "launching" || !vscodeCanReach}
-          onClick={continueInVscode}
-          title={
-            vscodeCanReach
-              ? t("rightPanel.vscode.title")
-              : t("rightPanel.vscode.relayUnavailableTitle")
-          }
-        >
-          {vscode.phase === "launching"
-            ? t("rightPanel.vscode.opening")
-            : t("rightPanel.vscode.button")}
-        </button>
-        {!vscodeCanReach && (
-          <div className="dim small">{t("rightPanel.vscode.relayUnavailable")}</div>
-        )}
-        {vscode.phase === "opened" && (
-          <div className="dim small">
-            {vscode.launch.kind === "remote-ssh"
-              ? t("rightPanel.vscode.openingRemote", { dest: vscode.launch.sshDest })
-              : t("rightPanel.vscode.openingLocal")}
-          </div>
-        )}
-        {vscode.phase === "not-installed" && (
-          <div className="vscode-fallback">
-            <div>{t("rightPanel.vscode.didntOpen")}</div>
-            <a
-              className="btn tiny"
-              href="https://code.visualstudio.com/download"
-              target="_blank"
-              rel="noreferrer"
+        {!isPhone && (
+          <>
+            <button
+              className="btn vscode-btn"
+              disabled={vscode.phase === "launching" || !vscodeCanReach}
+              onClick={continueInVscode}
+              title={
+                vscodeCanReach
+                  ? t("rightPanel.vscode.title")
+                  : t("rightPanel.vscode.relayUnavailableTitle")
+              }
             >
-              {t("rightPanel.vscode.download")}
-            </a>
-            {vscode.launch.kind === "remote-ssh" && (
+              {vscode.phase === "launching"
+                ? t("rightPanel.vscode.opening")
+                : t("rightPanel.vscode.button")}
+            </button>
+            {!vscodeCanReach && (
+              <div className="dim small">{t("rightPanel.vscode.relayUnavailable")}</div>
+            )}
+            {vscode.phase === "opened" && (
               <div className="dim small">
-                {t("rightPanel.vscode.remoteSshHint", { dest: vscode.launch.sshDest })}
+                {vscode.launch.kind === "remote-ssh"
+                  ? t("rightPanel.vscode.openingRemote", { dest: vscode.launch.sshDest })
+                  : t("rightPanel.vscode.openingLocal")}
               </div>
             )}
-            {vscode.launch.cliCommand && (
-              <>
-                <div className="dim small">{t("rightPanel.vscode.cliHint")}</div>
-                <div className="cli-row">
-                  <code>{vscode.launch.cliCommand}</code>
-                  <button
-                    className="btn tiny"
-                    onClick={() => copyCli(vscode.launch.cliCommand!)}
-                  >
-                    {copied ? t("common.copied") : t("common.copy")}
-                  </button>
-                </div>
-              </>
+            {vscode.phase === "not-installed" && (
+              <div className="vscode-fallback">
+                <div>{t("rightPanel.vscode.didntOpen")}</div>
+                <a
+                  className="btn tiny"
+                  href="https://code.visualstudio.com/download"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  {t("rightPanel.vscode.download")}
+                </a>
+                {vscode.launch.kind === "remote-ssh" && (
+                  <div className="dim small">
+                    {t("rightPanel.vscode.remoteSshHint", { dest: vscode.launch.sshDest })}
+                  </div>
+                )}
+                {vscode.launch.cliCommand && (
+                  <>
+                    <div className="dim small">{t("rightPanel.vscode.cliHint")}</div>
+                    <div className="cli-row">
+                      <code>{vscode.launch.cliCommand}</code>
+                      <button
+                        className="btn tiny"
+                        onClick={() => copyCli(vscode.launch.cliCommand!)}
+                      >
+                        {copied ? t("common.copied") : t("common.copy")}
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
             )}
-          </div>
+            {vscode.phase === "error" && <div className="error">{vscode.message}</div>}
+          </>
         )}
-        {vscode.phase === "error" && <div className="error">{vscode.message}</div>}
 
         {session.risky && (
           <div className="risk-banner" title={t("rightPanel.riskBannerTitle")}>

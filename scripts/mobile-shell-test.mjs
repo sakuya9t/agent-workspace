@@ -195,6 +195,7 @@ async function main() {
   await evalJs("document.querySelector('.mobile-details-btn').click()");
   check("details sheet opens on ⓘ", await waitFor("!!document.querySelector('.details-sheet')"));
   check("RightPanel mounted in the sheet", await evalJs("!!document.querySelector('.details-sheet .panel.right')"));
+  check("no 'Continue in VS Code' on mobile", await evalJs("!document.querySelector('.details-sheet .vscode-btn')"));
   check("terminal still mounted under the sheet", await evalJs("!!document.querySelector('.term-keybar')"));
   await evalJs("window.history.back()");
   check("back closes the sheet, stays on terminal", await waitFor("!document.querySelector('.details-sheet') && !!document.querySelector('.mobile-term-header')"));
@@ -202,6 +203,19 @@ async function main() {
   // 8. Back returns to the home screen (clears the active session).
   await evalJs("window.history.back()");
   check("back returns to sessions home", await waitFor("!!document.querySelector('.mobile-home-header') && !document.querySelector('.mobile-term-header')"));
+
+  // 9. Desktop mode (wide viewport): the 3-pane shell renders and the VS Code
+  //    affordance IS present — the parity break is mobile-only.
+  await S("Emulation.setDeviceMetricsOverride", { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false });
+  await S("Emulation.setTouchEmulationEnabled", { enabled: false });
+  await S("Page.navigate", { url: appUrl });
+  check("desktop 3-pane mounts at wide width", await waitFor("!!document.querySelector('.workspace')"));
+  await waitFor("!!document.querySelector('.session-row')");
+  await evalJs("document.querySelector('.session-row').click()");
+  check(
+    "desktop right panel DOES show Continue in VS Code",
+    await waitFor("!!document.querySelector('.panel.right .vscode-btn')", 6000),
+  );
 
   await conn.send("Target.closeTarget", { targetId }).catch(() => {});
   conn.ws.close();

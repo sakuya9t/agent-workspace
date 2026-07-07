@@ -56,7 +56,7 @@ terminal — and its WebSocket — stays mounted underneath).
 
 ```
 ┌─ Sessions (home) ─┐  tap session   ┌─ Terminal ────────┐  ⓘ   ┌─ Details sheet ─┐
-│ health · Daemons  │ ─────────────▶ │ ‹ agent·status ⓘ  │ ───▶ │ VS Code, fields │
+│ health · Daemons  │ ─────────────▶ │ ‹ agent·status ⓘ  │ ───▶ │ fields, cleanup │
 │ host ▸ ws ▸ rows  │ ◀───────────── │  xterm (fills)    │ ◀─── │ SCM, diffs,     │
 │ history (bottom)  │  ‹ back /      │ [Esc Tab ^ ⇧⇥ ↑↓] │ swipe│ pull/rebase,    │
 └───────────────────┘  system back   └───────────────────┘ down └─ commit graph ──┘
@@ -120,13 +120,17 @@ Terminal screen.
 ### Sheet — Details (RightPanel)
 
 Full-height sheet (~94 dvh, drag-handle + swipe-down/× to close) sliding over
-the terminal screen, hosting the unchanged `RightPanel`: Continue-in-VS-Code
-(kept for parity; on phones the deep link typically fails and the existing
-"didn't open" fallback with the copyable CLI command appears), risk banner,
-metadata fields, worktree cleanup, end-of-session summary, and the full source
-control block — branch, changed files → DiffModal, pull/rebase with branch
-picker, commit graph → CommitModal. Rendering it as an overlay (not a pushed
-screen) keeps the terminal mounted and attached underneath.
+the terminal screen, hosting the `RightPanel`: risk banner, metadata fields,
+worktree cleanup, end-of-session summary, and the full source control block —
+branch, changed files → DiffModal, pull/rebase with branch picker, commit graph
+→ CommitModal. Rendering it as an overlay (not a pushed screen) keeps the
+terminal mounted and attached underneath.
+
+**Continue-in-VS-Code is the one deliberate parity break:** the whole affordance
+is hidden on phones (`RightPanel` gates it behind `!useIsPhone()`). A phone has
+no local VS Code for the `vscode://` deep link to reach, so the button and its
+"didn't open"/CLI fallback are dead weight; the browser web editor (V-track)
+will be the mobile editing path.
 
 ### Modals → full-screen sheets
 
@@ -161,7 +165,7 @@ desktop (select session on load).
 | Stop / archive / takeover confirm / attention ack | Identical (row buttons + row tap) |
 | Terminal + status header + View usage | Terminal screen + header buttons |
 | Keyboard input incl. Esc/Ctrl/arrows | Soft keyboard + key bar (new) |
-| Right panel: VS Code, fields, cleanup, summary | Details sheet, same component |
+| Right panel: VS Code, fields, cleanup, summary | Details sheet, same component (VS Code hidden — see below) |
 | SCM: status, changed files, diff, pull, rebase, commit graph, commit detail | Details sheet, same components; modals as sheets |
 | New session / new workspace / directory picker / connection & relay manage / usage | Same dialogs as full-screen sheets |
 | Panel resize | N/A on phone (no panels) — desktop unchanged |
