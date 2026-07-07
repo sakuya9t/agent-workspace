@@ -4,10 +4,19 @@ import { FitAddon } from "@xterm/addon-fit";
 import { streamUrl, api } from "../api";
 import { Target } from "../connectionStore";
 import { useUiStore } from "../store";
+import { copyText } from "../clipboard";
 import i18n from "../i18n";
 
 /** WS close code the daemon uses when another client takes over the session. */
 const CLOSE_SUPERSEDED = 4001;
+
+/**
+ * Copy the terminal selection lives on ⌘-C (macOS) and Ctrl-Shift-C
+ * (Windows/Linux) so plain Ctrl-C stays SIGINT to the agent. macOS delivers
+ * ⌘-C as a native `copy` event; elsewhere the native copy gesture *is* Ctrl-C,
+ * so we must not claim it — hence the platform split.
+ */
+const isMac = /Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent);
 
 interface Props {
   target: Target;
@@ -88,6 +97,7 @@ export function TerminalView({ target, sessionId, live }: Props) {
         background: "#0b0e14",
         foreground: "#c7d0e0",
         cursor: "#7aa2f7",
+        selectionBackground: "#33467c",
       },
     });
     const fit = new FitAddon();
@@ -153,6 +163,47 @@ export function TerminalView({ target, sessionId, live }: Props) {
 
     const dataSub = term.onData(sendInput);
 
+    // --- Copy selection to the OS clipboard ---
+    // Selection requires Shift+drag while a TUI holds the mouse (it captures
+    // plain drags for its own mouse reporting); a plain shell selects on drag.
+    // On Windows/Linux we claim Ctrl-Shift-C here and leave Ctrl-C to xterm so
+    // it still forwards \x03 (SIGINT). macOS ⌘-C arrives as a native `copy`
+    // event (handled below), so this handler ignores it.
+    term.attachCustomKeyEventHandler((e) => {
+      if (
+        e.type === "keydown" &&
+        !isMac &&
+        e.ctrlKey &&
+        e.shiftKey &&
+        !e.altKey &&
+        !e.metaKey &&
+        (e.key === "c" || e.key === "C") &&
+        term.hasSelection()
+      ) {
+        void copyText(term.getSelection());
+        e.preventDefault();
+        return false; // swallow: don't let xterm forward it as input
+      }
+      return true;
+    });
+
+    // macOS ⌘-C (and any browser-native copy gesture) fills the clipboard
+    // synchronously from the selection — this path also works in insecure
+    // contexts, where navigator.clipboard is unavailable. Gated to macOS so
+    // that on Windows/Linux, where the native copy gesture IS Ctrl-C, we don't
+    // divert it away from SIGINT.
+    const onCopy = (e: ClipboardEvent) => {
+      if (!isMac || !term.hasSelection() || !e.clipboardData) return;
+      e.clipboardData.setData("text/plain", term.getSelection());
+      e.preventDefault();
+    };
+    // Right-click copies on every platform (the "universal" affordance).
+    const onContextMenu = (e: MouseEvent) => {
+      if (!term.hasSelection()) return; // nothing selected: leave the default
+      void copyText(term.getSelection());
+      e.preventDefault();
+    };
+
     // --- Image paste / drop --- (the upload+inject itself lives at component
     // scope in `uploadAndInject`, reached here via `uploadRef` so these
     // listeners don't become effect dependencies; the 📎 button shares it.)
@@ -188,6 +239,8 @@ export function TerminalView({ target, sessionId, live }: Props) {
         void uploadRef.current(img);
       }
     };
+    container.addEventListener("copy", onCopy);
+    container.addEventListener("contextmenu", onContextMenu);
     container.addEventListener("paste", onPaste, true);
     container.addEventListener("dragover", onDragOver);
     container.addEventListener("drop", onDrop);
@@ -204,6 +257,8 @@ export function TerminalView({ target, sessionId, live }: Props) {
       mounted = false;
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
       if (errorTimerRef.current) window.clearTimeout(errorTimerRef.current);
+      container.removeEventListener("copy", onCopy);
+      container.removeEventListener("contextmenu", onContextMenu);
       container.removeEventListener("paste", onPaste, true);
       container.removeEventListener("dragover", onDragOver);
       container.removeEventListener("drop", onDrop);

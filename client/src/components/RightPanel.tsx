@@ -7,6 +7,7 @@ import { buildVscodeLaunch, launchVscode, vscodeReachable, VscodeLaunch } from "
 import { relTime } from "../i18n/time";
 import { attentionLabel, instanceStatusLabel, isolationLabel, statusLabel } from "../i18n/labels";
 import { shortPath } from "../paths";
+import { copyText } from "../clipboard";
 import { DiffModal } from "./DiffModal";
 import { CommitModal } from "./CommitModal";
 
@@ -72,20 +73,7 @@ export function RightPanel({ target, session }: Props) {
   useEffect(() => setCopied(false), [vscode.phase, session?.id]);
 
   const copyCli = async (text: string) => {
-    try {
-      // clipboard API needs a secure context; plain-http LAN profiles don't
-      // have one, so fall back to the selection-based path.
-      await navigator.clipboard.writeText(text);
-    } catch {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand("copy");
-      ta.remove();
-    }
+    await copyText(text);
     setCopied(true);
   };
 
