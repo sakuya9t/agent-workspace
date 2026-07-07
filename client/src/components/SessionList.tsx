@@ -19,11 +19,14 @@ const STATUS_COLOR: Record<SessionStatus, string> = {
   indeterminate: "#ff9e64",
 };
 
+// Blocked (waiting on the user) is orange; error/failed (something went wrong)
+// is red — the badge color alone should say which kind of attention it is.
 const ATTENTION_COLOR: Partial<Record<AttentionState, string>> = {
   activity: "#7aa2f7",
   idle: "#565f89",
-  likely_blocked: "#e0af68",
-  approval_needed: "#f7768e",
+  likely_blocked: "#ff9e64",
+  approval_needed: "#ff9e64",
+  error: "#f7768e",
   failed: "#f7768e",
 };
 

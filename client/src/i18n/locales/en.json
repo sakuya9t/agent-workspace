@@ -30,6 +30,7 @@
     "idle": "idle",
     "likely_blocked": "blocked",
     "approval_needed": "blocked",
+    "error": "error",
     "failed": "failed"
   },
   "isolation": {

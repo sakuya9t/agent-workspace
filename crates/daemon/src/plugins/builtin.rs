@@ -117,6 +117,9 @@ impl AgentPlugin for ClaudePlugin {
     fn attention(&self, screen: &str, bell: bool) -> (AttentionState, Option<String>) {
         attention::claude_attention(screen, bell)
     }
+    fn idle_error(&self, screen: &str) -> Option<String> {
+        attention::claude_idle_error(screen)
+    }
     fn usage(&self, cx: &UsageContext) -> Option<AgentUsage> {
         usage::claude_usage(cx)
     }

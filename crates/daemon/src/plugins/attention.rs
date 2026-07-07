@@ -1,5 +1,5 @@
 //! Attention classification: turning recent terminal output into a
-//! working / idle / blocked signal.
+//! working / idle / blocked / error signal.
 //!
 //! Classification is **per-provider** — it hangs off [`AgentPlugin::attention`]
 //! (`super`), so each agent can read its own approval UI. This module holds the
@@ -158,6 +158,73 @@ pub(crate) fn claude_attention(screen: &str, bell: bool) -> (AttentionState, Opt
     (AttentionState::Activity, None)
 }
 
+/// Claude Code's stalled-on-error matcher, over the rendered visible **screen**.
+///
+/// When the API fails mid-turn Claude Code prints `● API Error: …` and simply
+/// stops — no bell, no prompt — so the silence timer used to settle the session
+/// to a calm "idle" even though the turn died. This runs at that settle moment
+/// ([`AgentPlugin::idle_error`](super::AgentPlugin::idle_error), called from the
+/// monitor's idle tick) and answers "did it stop *on an error*?".
+///
+/// The error must be the screen's **trailing content**, not merely visible:
+/// captured real screens show an old `API Error` line sitting mid-screen long
+/// after the user retried and a later turn streamed below it, so a whole-screen
+/// match would keep flagging a recovered session. We anchor at the input area —
+/// everything below the last box-drawing line (its bottom border) is footer
+/// hints — and climb upward past chrome: borders, the `❯` input line, and the
+/// spinner/status line (`✻ Worked for 32m 22s`, which stays on the frozen
+/// frame). The first `●`-bulleted line then decides: an `API Error` matches,
+/// any other response line means the turn ended normally. Un-bulleted text
+/// keeps the climb alive so an error message wrapped across lines is still
+/// found via its bulleted first line; a `⎿` continuation is checked too (the
+/// mid-retry `⎿ API Error … · Retrying…` shape) but otherwise skipped as tool
+/// output / tips.
+pub(crate) fn claude_idle_error(screen: &str) -> Option<String> {
+    // The error sits within a couple of content lines of the input area; deep
+    // scans would only resurrect stale text.
+    const MAX_SCAN: usize = 15;
+    // Spinner/status-line glyphs, both animating ("✽ Spinning…") and at rest
+    // ("✻ Worked for 32m 22s").
+    const STATUS_GLYPHS: &[char] = &['\u{b7}', '✢', '✳', '✶', '✻', '✽', '✺', '∗', '*'];
+    const BULLETS: &[char] = &['\u{25cf}', '\u{23fa}']; // ● / ⏺ turn bullets
+    let is_box = |c: char| ('\u{2500}'..='\u{257f}').contains(&c);
+
+    let lines: Vec<&str> = screen.lines().collect();
+    // The input area's bottom border is the last box-drawing line on screen
+    // (footer hints render below it). No input area, nothing at rest to read.
+    let anchor = lines
+        .iter()
+        .rposition(|l| l.trim_start().starts_with(is_box))?;
+
+    let mut scanned = 0;
+    for line in lines[..anchor].iter().rev() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if scanned >= MAX_SCAN {
+            break;
+        }
+        scanned += 1;
+        if t.starts_with(is_box) || t.starts_with('\u{276f}') || t.starts_with(STATUS_GLYPHS) {
+            continue; // input-area chrome or the spinner/status line
+        }
+        if let Some(rest) = t.strip_prefix(BULLETS).map(str::trim_start) {
+            // The trailing content block's bulleted header decides.
+            return rest.starts_with("API Error").then(|| rest.to_string());
+        }
+        if let Some(rest) = t.strip_prefix('\u{23bf}').map(str::trim_start) {
+            if rest.starts_with("API Error") {
+                return Some(rest.to_string());
+            }
+            continue; // ⎿ tool output / tip attached to the line above
+        }
+        // Plain text: possibly the wrapped tail of the bulleted line above —
+        // keep climbing.
+    }
+    None
+}
+
 /// A selection-pointer numbered menu option like "❯ 1. Yes" or "> 2. No": a
 /// `❯`/`>` pointer (after any indent), then a small integer followed by `.`
 /// or `)`. This is the signal that an interactive menu is *awaiting a choice*.
@@ -306,6 +373,98 @@ mod tests {
     fn claude_bell_is_blocked() {
         let (a, _) = claude_attention("just working", true);
         assert_eq!(a, AttentionState::LikelyBlocked);
+    }
+
+    // ---- Claude stalled-on-error (idle settle) ----
+
+    /// The captured real-world frame from the reported bug: the API died
+    /// mid-turn, Claude printed the error and froze — with the stale status
+    /// line still below it — and the session then read as a calm "idle".
+    #[test]
+    fn claude_stalled_api_error_screen_is_error() {
+        let screen = "\
+● The old marker scrolled out of view. Let me make the probe type its own fresh marker:\n\
+\n\
+● API Error: Server error mid-response. The response above may be incomplete.\n\
+\n\
+✻ Worked for 32m 22s\n\
+\n\
+────────────────────────────────────────\n\
+❯ \n\
+────────────────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents";
+        let reason = claude_idle_error(screen).unwrap();
+        assert!(reason.starts_with("API Error: Server error mid-response"));
+    }
+
+    #[test]
+    fn claude_recovered_screen_with_stale_error_above_is_not_error() {
+        // Also captured live: after the user retried, the old error line stays
+        // visible mid-screen while the next turn's output streams below it.
+        // Only the *trailing* content block may flag — here it's the new turn.
+        let screen = "\
+● API Error: Server error mid-response. The response above may be incomplete.\n\
+\n\
+● Making 2 scratchpad edits +20 -6, running 1 shell command…\n\
+  ⎿  $ cd /tmp/scratch && node rightclick-debug.mjs\n\
+\n\
+✽ Spinning… (1m 26s · ↓ 1.5k tokens)\n\
+\n\
+────────────────────────────────────────\n\
+❯ \n\
+────────────────────────────────────────\n\
+  ⏵⏵ bypass permissions on · 1 shell · esc to interrupt";
+        assert_eq!(claude_idle_error(screen), None);
+    }
+
+    #[test]
+    fn claude_wrapped_error_line_is_error() {
+        // On a narrow terminal the error message wraps; the un-bulleted
+        // continuation must not stop the climb before the bulleted header.
+        let screen = "\
+● API Error: Server error mid-response. The response\n\
+  above may be incomplete.\n\
+\n\
+✻ Worked for 5s\n\
+────────────────────\n\
+❯ \n\
+────────────────────";
+        assert!(claude_idle_error(screen).is_some());
+    }
+
+    #[test]
+    fn claude_prose_quoting_api_error_is_not_error() {
+        // A successful turn whose *text* mentions "API Error" (e.g. this very
+        // feature being discussed) must not flag: the bulleted header decides,
+        // and it doesn't start with the error marker.
+        let screen = "\
+● I added handling for the \"API Error: Server error mid-response.\" message.\n\
+\n\
+✻ Worked for 3s\n\
+────────────────────\n\
+❯ \n\
+────────────────────\n\
+  ? for shortcuts";
+        assert_eq!(claude_idle_error(screen), None);
+    }
+
+    #[test]
+    fn claude_retry_error_continuation_is_error() {
+        // The mid-retry shape attaches the error as a ⎿ continuation. If the
+        // console freezes there, it still counts.
+        let screen = "\
+● Let me try that again.\n\
+  ⎿  API Error (Request timed out.) · Retrying in 4 seconds… (attempt 3/10)\n\
+────────────────────\n\
+❯ \n\
+────────────────────";
+        assert!(claude_idle_error(screen).is_some());
+    }
+
+    #[test]
+    fn claude_screen_without_input_area_is_not_error() {
+        assert_eq!(claude_idle_error("plain scrollback, no box"), None);
+        assert_eq!(claude_idle_error(""), None);
     }
 
     #[test]
