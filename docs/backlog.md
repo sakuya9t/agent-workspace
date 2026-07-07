@@ -60,10 +60,14 @@ pick it up**.
   `isLive` predicates (+ `isTerminal`; the RightPanel ended-list's omission of
   `indeterminate` was decided deliberately — it is **neither** live nor
   terminal, matching all prior call sites); `showUsage` moved into `useUiStore`;
-  `useActiveSession()` extracted from `App.tsx` so both shells share one wiring;
-  clipboard-with-fallback hoisted to `src/clipboard.ts` for the MOB key bar's
-  Paste. `MobileShell` can now mount with no copied wiring. Full build gate
-  (tsc + eslint + check-locales + vite build) and proxy tests green.
+  `useActiveSession()` extracted from `App.tsx` so both shells share one wiring.
+  RF-MOB ride-along #4 (clipboard-with-fallback → `src/clipboard.ts`) was
+  delivered independently by the terminal-selection-copy feature (`7a56cd3` on
+  `release/next`), which hoisted the same `copyText()` out of `RightPanel` and
+  wired it into both `RightPanel` and `Terminal`; on rebase the duplicate hoist
+  was dropped and the shared util kept. `MobileShell` can now mount with no
+  copied wiring. Full build gate (tsc + eslint + check-locales + vite build) and
+  proxy tests green.
 
 ## Backlog summary
 
@@ -148,12 +152,17 @@ stacked `MobileShell` (Sessions home → full-screen Terminal → Details sheet
 over the live terminal); all panels/dialogs/stores/queries shared, so feature
 parity is structural. Phases: (1) shell split + pushState navigation,
 (2) touch-target + modal→bottom-sheet CSS, (3) terminal key bar
-(Esc/Tab/⇧Tab/Ctrl-latch/^C/arrows/⌨/Paste via a `TerminalView` input handle)
-+ visual-viewport keyboard geometry, (4) PWA manifest/icons (= MOB-PWA row),
+(Esc/Tab/⇧Tab/Ctrl-latch/^C/arrows/⌨/Paste **and Copy** via a `TerminalView`
+input handle) + visual-viewport keyboard geometry, (4) PWA manifest/icons
+(= MOB-PWA row),
 (5) headless-Chrome mobile-viewport verification + desktop regression.
 Phases 1–2 make the app usable on a phone; 1–3 make the terminal genuinely
 workable; each ships independently. No daemon changes; interleaves freely
-with R4/M4 (disjoint code). i18n rule applies to all new strings. This is the
+with R4/M4 (disjoint code). i18n rule applies to all new strings. **Copy** is on
+the phase-3 key bar because the terminal-selection-copy feature (`7a56cd3`) is
+reachable only via Ctrl-Shift-C/⌘-C/right-click — none of which exist on touch;
+the key-bar Copy calls `term.getSelection()` + the shared `copyText()` util, and
+Paste is its clipboard-read sibling. This is the
 natural consumer of the R3 milestone ("mobile-ready, zero client tooling").
 Smaller follow-ups noted in the doc (attention-pinned home group, font-size
 control, tap-and-hold tooltips) ride along or slot in later; **MOB-PUSH**

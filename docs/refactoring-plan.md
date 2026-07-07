@@ -84,7 +84,11 @@ built, per item below:
    daemon lost track of across a restart is unresolved, not ended) — this
    matched all three prior call sites, so the unification was behavior-
    preserving.
-4. Clipboard-with-fallback → `copyText()` in `client/src/clipboard.ts`.
+4. Clipboard-with-fallback → `copyText()` in `client/src/clipboard.ts` —
+   delivered by the terminal-selection-copy feature (`7a56cd3`), which hoisted
+   it out of `RightPanel` and reuses it for the xterm copy path too. Both call
+   sites (RightPanel CLI-copy, Terminal Ctrl-Shift-C/⌘-C/right-click) now share
+   the one util; the MOB key bar's Paste will build on it.
 
 Original scope (for reference):
 
