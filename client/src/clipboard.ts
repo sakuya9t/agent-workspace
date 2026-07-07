@@ -23,3 +23,18 @@ export async function copyText(text: string): Promise<void> {
   document.execCommand("copy");
   ta.remove();
 }
+
+/**
+ * Read text from the OS clipboard, or "" when unavailable. Unlike copy, reading
+ * has no execCommand fallback — `navigator.clipboard.readText` needs a secure
+ * context and user permission (the relay path is HTTPS; plain-http LAN profiles
+ * simply return ""). Used by the mobile key bar's Paste, since long-press paste
+ * into xterm is unreliable on touch.
+ */
+export async function readText(): Promise<string> {
+  try {
+    return await navigator.clipboard.readText();
+  } catch {
+    return "";
+  }
+}

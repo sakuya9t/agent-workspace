@@ -6,6 +6,7 @@ import { Target } from "../connectionStore";
 import { buildVscodeLaunch, launchVscode, vscodeReachable, VscodeLaunch } from "../vscode";
 import { relTime } from "../i18n/time";
 import { attentionLabel, instanceStatusLabel, isolationLabel, statusLabel } from "../i18n/labels";
+import { isTerminal } from "../status";
 import { shortPath } from "../paths";
 import { copyText } from "../clipboard";
 import { DiffModal } from "./DiffModal";
@@ -47,9 +48,7 @@ export function RightPanel({ target, session }: Props) {
   const [mergeOpen, setMergeOpen] = useState(false);
   const [mergeTarget, setMergeTarget] = useState("");
 
-  const terminal =
-    session &&
-    ["exited", "failed", "stopped", "archived"].includes(session.status);
+  const terminal = session && isTerminal(session.status);
   const base = target?.baseUrl ?? "";
 
   const { data: instance } = useQuery({

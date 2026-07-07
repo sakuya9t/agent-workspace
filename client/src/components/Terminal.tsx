@@ -1,14 +1,26 @@
-import { useEffect, useRef, useState, type ChangeEvent } from "react";
+import { useEffect, useRef, useState, type ChangeEvent, type MutableRefObject } from "react";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { streamUrl, api } from "../api";
 import { Target } from "../connectionStore";
 import { useUiStore } from "../store";
 import { copyText } from "../clipboard";
+import { CtrlLatch, TerminalHandle } from "../terminalTypes";
 import i18n from "../i18n";
 
 /** WS close code the daemon uses when another client takes over the session. */
 const CLOSE_SUPERSEDED = 4001;
+
+/** Map a single typed character to its control byte (Ctrl-A → \x01, etc.); pass
+ *  anything else (multi-char sequences, non-mappable keys) through untouched. */
+function toCtrl(s: string): string {
+  if (s.length !== 1) return s;
+  const c = s.charCodeAt(0);
+  if (c >= 0x61 && c <= 0x7a) return String.fromCharCode(c - 0x60); // a-z → ^A-^Z
+  if (c >= 0x40 && c <= 0x5f) return String.fromCharCode(c - 0x40); // @A-Z[\]^_ → ^@-^_
+  if (c === 0x20) return "\x00"; // space → ^@ (NUL)
+  return s;
+}
 
 /**
  * Copy the terminal selection lives on ⌘-C (macOS) and Ctrl-Shift-C
@@ -22,6 +34,14 @@ interface Props {
   target: Target;
   sessionId: string;
   live: boolean;
+  /** Mobile: receive an imperative handle when the terminal mounts, null on
+   *  unmount, so a key bar can inject input over the same WS path. */
+  onReady?: (handle: TerminalHandle | null) => void;
+  /** Mobile Ctrl latch, read on each typed key; when armed/locked the next
+   *  soft-keyboard key is transformed to its control code. */
+  ctrlRef?: MutableRefObject<CtrlLatch>;
+  /** Called after an "armed" one-shot latch is consumed, so the bar resets. */
+  onCtrlConsumed?: () => void;
 }
 
 /**
@@ -32,8 +52,21 @@ interface Props {
  * forward keystrokes and resize; for terminal sessions we render the replayed
  * history read-only. Live sockets auto-reconnect after transient loss.
  */
-export function TerminalView({ target, sessionId, live }: Props) {
+export function TerminalView({
+  target,
+  sessionId,
+  live,
+  onReady,
+  ctrlRef,
+  onCtrlConsumed,
+}: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
+  // Reached from inside the WS effect without becoming effect dependencies
+  // (which would tear down and rebuild the terminal on every render).
+  const onReadyRef = useRef(onReady);
+  onReadyRef.current = onReady;
+  const onCtrlConsumedRef = useRef(onCtrlConsumed);
+  onCtrlConsumedRef.current = onCtrlConsumed;
   // The live socket, mirrored out of the effect so the component-scope image
   // upload can inject over it without the effect's listeners depending on it.
   const wsRef = useRef<WebSocket | null>(null);
@@ -155,13 +188,26 @@ export function TerminalView({ target, sessionId, live }: Props) {
       socket.onerror = () => socket.close();
     };
 
-    const sendInput = (d: string) => {
+    // Raw send — used by the key bar handle (explicit control codes) and as the
+    // base for typed input.
+    const sendRaw = (d: string) => {
       if (live && ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ t: "i", d }));
       }
     };
+    // Soft-keyboard input honors the mobile Ctrl latch; an "armed" one-shot is
+    // consumed after a single key (key-bar buttons send raw and bypass this).
+    const sendTyped = (d: string) => {
+      const latch = ctrlRef?.current;
+      if (latch && latch !== "off") {
+        if (latch === "armed") onCtrlConsumedRef.current?.();
+        sendRaw(toCtrl(d));
+      } else {
+        sendRaw(d);
+      }
+    };
 
-    const dataSub = term.onData(sendInput);
+    const dataSub = term.onData(sendTyped);
 
     // --- Copy selection to the OS clipboard ---
     // Selection requires Shift+drag while a TUI holds the mouse (it captures
@@ -253,8 +299,16 @@ export function TerminalView({ target, sessionId, live }: Props) {
 
     connect();
 
+    // Hand a fresh input handle to the shell (the mobile key bar reads it).
+    onReadyRef.current?.({
+      write: sendRaw,
+      focus: () => term.focus(),
+      getSelection: () => term.getSelection(),
+    });
+
     return () => {
       mounted = false;
+      onReadyRef.current?.(null);
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
       if (errorTimerRef.current) window.clearTimeout(errorTimerRef.current);
       container.removeEventListener("copy", onCopy);

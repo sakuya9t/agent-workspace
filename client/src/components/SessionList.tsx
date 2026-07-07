@@ -5,6 +5,7 @@ import { api, Session, SessionStatus, AttentionState, Workspace } from "../api";
 import { daemonLabel, Target, targetOf, useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
 import { DaemonState, useDaemonStates } from "../useDaemons";
+import { isLive } from "../status";
 import { relTime } from "../i18n/time";
 import { attentionLabel, endedLabel, statusLabel } from "../i18n/labels";
 
@@ -25,10 +26,6 @@ const ATTENTION_COLOR: Partial<Record<AttentionState, string>> = {
   approval_needed: "#f7768e",
   failed: "#f7768e",
 };
-
-function isLive(s: SessionStatus): boolean {
-  return s === "running" || s === "starting";
-}
 
 type MutArgs = { target: Target; id: string };
 

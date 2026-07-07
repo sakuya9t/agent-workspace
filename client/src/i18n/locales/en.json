@@ -265,6 +265,25 @@
     "pastedImageRef": "[pasted image {{path}}] ",
     "attachImage": "Attach image"
   },
+  "mobile": {
+    "back": "Back to sessions",
+    "details": "Details"
+  },
+  "keybar": {
+    "label": "Terminal keys",
+    "esc": "Esc",
+    "tab": "Tab",
+    "shiftTab": "⇧Tab",
+    "ctrl": "Ctrl",
+    "ctrlC": "^C",
+    "up": "Arrow up",
+    "down": "Arrow down",
+    "left": "Arrow left",
+    "right": "Arrow right",
+    "keyboard": "Show keyboard",
+    "paste": "Paste",
+    "copy": "Copy"
+  },
   "api": {
     "unreachableAt": "cannot connect — daemon unreachable at {{baseUrl}} (not started?)",
     "unreachable": "cannot connect — daemon unreachable (not started?)",
