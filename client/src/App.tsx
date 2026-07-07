@@ -25,8 +25,9 @@ export function App() {
   const rightWidth = useUiStore((s) => s.rightWidth);
   const setLeftWidth = useUiStore((s) => s.setLeftWidth);
   const setRightWidth = useUiStore((s) => s.setRightWidth);
+  const showUsage = useUiStore((s) => s.showUsage);
+  const setShowUsage = useUiStore((s) => s.setShowUsage);
   const states = useDaemonStates();
-  const [showUsage, setShowUsage] = useState(false);
 
   // Fit the stored side-panel widths to the live viewport so the terminal keeps
   // a usable minimum. Tracks window resizes; the resizers drive off these

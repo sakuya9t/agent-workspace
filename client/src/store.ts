@@ -89,6 +89,9 @@ interface UiState {
   openNewWorkspace: (daemonId: string) => void;
   showConnection: boolean;
   setShowConnection: (v: boolean) => void;
+  /** Usage-transcript modal for the active session (per-agent, view-only). */
+  showUsage: boolean;
+  setShowUsage: (v: boolean) => void;
   /** Width (px) of the left session list; persisted across reloads. */
   leftWidth: number;
   /** Width (px) of the right details panel; persisted across reloads. */
@@ -120,6 +123,8 @@ export const useUiStore = create<UiState>((set, get) => ({
     set({ showNewWorkspace: true, newWorkspaceDaemonId: daemonId }),
   showConnection: false,
   setShowConnection: (v) => set({ showConnection: v }),
+  showUsage: false,
+  setShowUsage: (v) => set({ showUsage: v }),
   leftWidth: initialWidths.left,
   rightWidth: initialWidths.right,
   setLeftWidth: (px) => {
