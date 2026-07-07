@@ -1,4 +1,4 @@
-import { SessionStatus } from "./api";
+import { AttentionState, SessionStatus } from "./api";
 
 // Single source of truth for session-status semantics. Three copies of `isLive`
 // used to drift across App/SessionList/RightPanel (the last as an inverse
@@ -28,4 +28,14 @@ export function isTerminal(status: SessionStatus): boolean {
     status === "stopped" ||
     status === "archived"
   );
+}
+
+/**
+ * The agent is waiting on the user: it either likely hit a blocking prompt or is
+ * asking for approval. Both render as "blocked" in the UI. This is the signal
+ * that a session "needs attention" — the two states are grouped here so the tab
+ * alert, badges, and any future notifications all agree on what counts.
+ */
+export function needsAttention(attention: AttentionState): boolean {
+  return attention === "likely_blocked" || attention === "approval_needed";
 }

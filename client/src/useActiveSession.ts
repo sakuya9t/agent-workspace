@@ -2,7 +2,7 @@ import { ActiveRef, useUiStore } from "./store";
 import { Target, targetOf } from "./connectionStore";
 import { DaemonState, useDaemonStates } from "./useDaemons";
 import { Session } from "./api";
-import { isLive } from "./status";
+import { isLive, needsAttention } from "./status";
 
 /** Everything a shell needs to render the fleet and the selected session. */
 export interface ActiveSession {
@@ -12,6 +12,8 @@ export interface ActiveSession {
   reachable: number;
   /** Live sessions across all connected daemons (header count). */
   totalLive: number;
+  /** Sessions across all connected daemons that are blocked and need the user. */
+  blocked: number;
   /** The current selection ref, straight from the store. */
   active: ActiveRef | null;
   /** The daemon state owning the active session, if any. */
@@ -43,6 +45,14 @@ export function useActiveSession(): ActiveSession {
         : 0),
     0,
   );
+  const blocked = states.reduce(
+    (n, s) =>
+      n +
+      (s.daemon.connected
+        ? (s.data?.sessions.filter((x) => needsAttention(x.attention_state)).length ?? 0)
+        : 0),
+    0,
+  );
 
   const activeState = active
     ? states.find((s) => s.daemon.id === active.daemonId)
@@ -53,5 +63,5 @@ export function useActiveSession(): ActiveSession {
   const target = activeState ? targetOf(activeState.daemon) : undefined;
   const live = activeSession ? isLive(activeSession.status) : false;
 
-  return { states, reachable, totalLive, active, activeState, activeSession, target, live };
+  return { states, reachable, totalLive, blocked, active, activeState, activeSession, target, live };
 }

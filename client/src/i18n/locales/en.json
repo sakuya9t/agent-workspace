@@ -5,6 +5,8 @@
     "daemonSummary_other": "{{count}} daemons · {{reachable}} reachable · {{live}} live",
     "manage": "manage",
     "manageTitle": "Connect / manage daemons",
+    "blockedTab_one": "🔴 {{count}} session needs attention",
+    "blockedTab_other": "🔴 {{count}} sessions need attention",
     "terminal": "Terminal",
     "viewUsage": "view usage",
     "viewUsageTitle": "Token & context usage for this session",
