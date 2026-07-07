@@ -138,6 +138,28 @@ export function TerminalView({
     term.open(container);
     safeFit(fit);
 
+    // WORKAROUND (@xterm/xterm 5.5.0): the Viewport schedules deferred
+    // syncScrollArea() calls (a post-open setTimeout, plus dimensions-change and
+    // sync-scrollbar events). If the terminal is torn down while one is still
+    // queued — StrictMode's dev double-mount, or a live/session switch or a
+    // reconnect in prod — it runs after dispose and reads renderService
+    // .dimensions, whose renderer is already gone, throwing "Cannot read
+    // properties of undefined (reading 'dimensions')". Swallow that post-dispose
+    // throw; the terminal is gone, so there is nothing left to sync.
+    const viewport = (
+      term as unknown as { _core?: { viewport?: { syncScrollArea?: (bufferChanged?: boolean) => void } } }
+    )._core?.viewport;
+    if (viewport?.syncScrollArea) {
+      const syncScrollArea = viewport.syncScrollArea.bind(viewport);
+      viewport.syncScrollArea = (bufferChanged?: boolean) => {
+        try {
+          syncScrollArea(bufferChanged);
+        } catch {
+          /* fired after dispose — safe to ignore */
+        }
+      };
+    }
+
     let mounted = true;
     let ws: WebSocket | null = null;
     let reconnectTimer: number | undefined;
@@ -285,11 +307,61 @@ export function TerminalView({
         void uploadRef.current(img);
       }
     };
+    // --- Touch scroll ---
+    // xterm's built-in touch handler only nudges its own scrollback viewport, so
+    // on a TUI (an alternate-screen app, or anything with mouse reporting on) a
+    // swipe does nothing: there is no scrollback to move and the gesture is never
+    // forwarded to the app. Desktop avoids this because the *wheel* path forwards
+    // to the app — mouse-wheel reports, or ↑/↓ for a no-scrollback screen. Mirror
+    // that on touch: translate a vertical drag into wheel events aimed at xterm's
+    // element so the identical wheel logic runs (smooth scrollback for a shell,
+    // app-forwarded scroll for a TUI). Registered in the capture phase with
+    // stopPropagation so xterm's own touch handler on `.xterm` never also fires
+    // and double-scrolls.
+    let touchY: number | null = null;
+    let touchScrolling = false;
+    const TOUCH_SLOP = 6; // px of travel before a drag counts as a scroll (not a tap)
+    const onTouchStart = (e: TouchEvent) => {
+      touchScrolling = false;
+      touchY = e.touches.length === 1 ? e.touches[0].clientY : null;
+    };
+    const onTouchMove = (e: TouchEvent) => {
+      if (touchY === null || e.touches.length !== 1) return; // ignore taps / pinch
+      const y = e.touches[0].clientY;
+      if (!touchScrolling) {
+        if (Math.abs(y - touchY) < TOUCH_SLOP) return; // still might be a tap
+        touchScrolling = true;
+        touchY = y; // rebase so the first step isn't a jump of the whole slop
+      }
+      const deltaY = touchY - y; // finger down → deltaY<0 → scroll toward older, like a wheel
+      touchY = y;
+      if (deltaY !== 0) {
+        term.element?.dispatchEvent(
+          new WheelEvent("wheel", {
+            deltaY,
+            deltaMode: WheelEvent.DOM_DELTA_PIXEL,
+            bubbles: true,
+            cancelable: true,
+          }),
+        );
+      }
+      e.preventDefault(); // we own this gesture — suppress page bounce/overscroll
+      e.stopPropagation(); // and xterm's built-in touch scroll must not also run
+    };
+    const onTouchEnd = () => {
+      touchY = null;
+      touchScrolling = false;
+    };
+
     container.addEventListener("copy", onCopy);
     container.addEventListener("contextmenu", onContextMenu);
     container.addEventListener("paste", onPaste, true);
     container.addEventListener("dragover", onDragOver);
     container.addEventListener("drop", onDrop);
+    container.addEventListener("touchstart", onTouchStart, { capture: true, passive: true });
+    container.addEventListener("touchmove", onTouchMove, { capture: true, passive: false });
+    container.addEventListener("touchend", onTouchEnd, { capture: true });
+    container.addEventListener("touchcancel", onTouchEnd, { capture: true });
 
     const ro = new ResizeObserver(() => {
       safeFit(fit);
@@ -316,6 +388,10 @@ export function TerminalView({
       container.removeEventListener("paste", onPaste, true);
       container.removeEventListener("dragover", onDragOver);
       container.removeEventListener("drop", onDrop);
+      container.removeEventListener("touchstart", onTouchStart, { capture: true });
+      container.removeEventListener("touchmove", onTouchMove, { capture: true });
+      container.removeEventListener("touchend", onTouchEnd, { capture: true });
+      container.removeEventListener("touchcancel", onTouchEnd, { capture: true });
       ro.disconnect();
       dataSub.dispose();
       wsRef.current = null;
