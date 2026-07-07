@@ -31,11 +31,17 @@ export function isTerminal(status: SessionStatus): boolean {
 }
 
 /**
- * The agent is waiting on the user: it either likely hit a blocking prompt or is
- * asking for approval. Both render as "blocked" in the UI. This is the signal
- * that a session "needs attention" — the two states are grouped here so the tab
- * alert, badges, and any future notifications all agree on what counts.
+ * The agent is waiting on the user: it likely hit a blocking prompt, is asking
+ * for approval (both render as "blocked"), or stopped on an error mid-turn
+ * ("error" — e.g. an API failure killed the turn and only a retry resumes it).
+ * This is the signal that a session "needs attention" — the states are grouped
+ * here so the tab alert, badges, and any future notifications all agree on
+ * what counts.
  */
 export function needsAttention(attention: AttentionState): boolean {
-  return attention === "likely_blocked" || attention === "approval_needed";
+  return (
+    attention === "likely_blocked" ||
+    attention === "approval_needed" ||
+    attention === "error"
+  );
 }

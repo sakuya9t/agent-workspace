@@ -887,6 +887,7 @@ impl SessionManager {
                                         last_attn,
                                         AttentionState::LikelyBlocked
                                             | AttentionState::ApprovalNeeded
+                                            | AttentionState::Error
                                     )
                                 {
                                     last_attn = AttentionState::None;
@@ -902,7 +903,7 @@ impl SessionManager {
                         }
                     }
                     _ = idle_tick => {
-                        self.on_idle(&id, &mut last_attn, &sig);
+                        self.on_idle(&id, &handle, plugin.as_ref(), &mut last_attn, &sig);
                     }
                 }
             }
@@ -911,22 +912,32 @@ impl SessionManager {
     }
 
     /// Output has been silent for [`IDLE_AFTER`]: a *working* session is now idle,
-    /// waiting for the next input. A blocked session (bell / prompt) is sticky and
-    /// stays blocked — silence doesn't mean it stopped needing you.
-    fn on_idle(&self, id: &str, last_attn: &mut AttentionState, sig: &Interaction) {
-        if *last_attn == AttentionState::Activity {
-            *last_attn = AttentionState::Idle;
-            // Fresh idle prompt: whatever the user types next is composing again,
-            // so clear the submit latch — their keystroke echo is suppressed until
-            // they submit the next line.
-            sig.submitted.store(false, Ordering::Relaxed);
-            let _ = self.db.set_attention(
-                id,
-                AttentionState::Idle,
-                Some("idle — waiting for input"),
-                now_millis(),
-            );
+    /// waiting for the next input — unless the agent's screen says it stopped
+    /// **on an error** (Claude Code's "API Error: …" prints with no bell and no
+    /// prompt, so this settle is the only moment that distinguishes "finished,
+    /// waiting" from "died mid-turn"). A blocked/errored session is sticky and
+    /// stays that way — silence doesn't mean it stopped needing you.
+    fn on_idle(
+        &self,
+        id: &str,
+        handle: &Arc<dyn BackendSession>,
+        plugin: Option<&Arc<dyn AgentPlugin>>,
+        last_attn: &mut AttentionState,
+        sig: &Interaction,
+    ) {
+        if *last_attn != AttentionState::Activity {
+            return;
         }
+        // Fresh idle prompt: whatever the user types next is composing again,
+        // so clear the submit latch — their keystroke echo is suppressed until
+        // they submit the next line.
+        sig.submitted.store(false, Ordering::Relaxed);
+        let (state, reason) = match plugin.and_then(|p| p.idle_error(&handle.screen_text())) {
+            Some(reason) => (AttentionState::Error, reason),
+            None => (AttentionState::Idle, "idle — waiting for input".to_string()),
+        };
+        *last_attn = state;
+        let _ = self.db.set_attention(id, state, Some(&reason), now_millis());
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -983,13 +994,14 @@ impl SessionManager {
             return;
         }
 
-        // Sticky "blocked": agents ring the bell / show a prompt when they need
-        // you, then keep redrawing (TUIs) — plain redraw output must NOT demote
-        // that back to "working". It clears when the user views or answers (which
-        // resets `last_attn` in the monitor loop).
+        // Sticky "blocked"/"error": agents ring the bell / show a prompt when
+        // they need you, then keep redrawing (TUIs) — plain redraw output (or a
+        // still-running background shell's noise under a dead turn) must NOT
+        // demote that back to "working". It clears when the user views or
+        // answers (which resets `last_attn` in the monitor loop).
         let was_blocked = matches!(
             *last_attn,
-            AttentionState::LikelyBlocked | AttentionState::ApprovalNeeded
+            AttentionState::LikelyBlocked | AttentionState::ApprovalNeeded | AttentionState::Error
         );
         let attention = if raw == AttentionState::Activity && was_blocked {
             *last_attn
@@ -1651,6 +1663,71 @@ mod tests {
             &mut last_write, &mut last_attn, &mut false, 0, false,
         );
         assert_eq!(last_attn, AttentionState::ApprovalNeeded);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- stalled-on-error settle (working -> error, not idle) ----
+
+    #[test]
+    fn idle_settle_with_stalled_error_screen_reads_as_error() {
+        // The reported bug: the API died mid-turn, Claude printed "API Error: …"
+        // and froze — no bell, no prompt — and the silence timer settled the
+        // session to a calm "idle". The settle must consult the plugin's screen
+        // check and land on Error instead.
+        let (manager, dir) = test_manager();
+        let claude = manager.registry.get("claude").unwrap();
+        let screen = "\
+\u{25cf} API Error: Server error mid-response. The response above may be incomplete.\n\
+\n\
+✻ Worked for 32m 22s\n\
+\n\
+────────────────────\n\
+\u{276f} \n\
+────────────────────\n\
+  ⏵⏵ bypass permissions on · ← for agents";
+        let handle = mock_handle_with_screen(screen);
+        let sig = Interaction::default();
+        let mut last_attn = AttentionState::Activity;
+        manager.on_idle("sid", &handle, Some(&claude), &mut last_attn, &sig);
+        assert_eq!(last_attn, AttentionState::Error);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn idle_settle_with_clean_screen_reads_as_idle() {
+        let (manager, dir) = test_manager();
+        let claude = manager.registry.get("claude").unwrap();
+        let screen = "\
+\u{25cf} Done. All tests pass.\n\
+\n\
+✻ Worked for 3s\n\
+\n\
+────────────────────\n\
+\u{276f} \n\
+────────────────────\n\
+  ? for shortcuts";
+        let handle = mock_handle_with_screen(screen);
+        let sig = Interaction::default();
+        let mut last_attn = AttentionState::Activity;
+        manager.on_idle("sid", &handle, Some(&claude), &mut last_attn, &sig);
+        assert_eq!(last_attn, AttentionState::Idle);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn background_noise_does_not_clear_error() {
+        // The captured stall had "1 shell still running": a background
+        // command's later output under a dead turn must not demote the error
+        // back to "working" — it is sticky until the user views or types.
+        let (manager, dir) = test_manager();
+        let handle = mock_handle();
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::Error);
+        manager.on_output(
+            "sid", &handle, b"bg command output", None, &mut tail, &mut last_write,
+            &mut last_attn, &mut false, 0, false,
+        );
+        assert_eq!(last_attn, AttentionState::Error);
         let _ = std::fs::remove_dir_all(dir);
     }
 

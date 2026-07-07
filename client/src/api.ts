@@ -15,6 +15,7 @@ export type AttentionState =
   | "idle"
   | "likely_blocked"
   | "approval_needed"
+  | "error"
   | "failed";
 
 export interface Session {
