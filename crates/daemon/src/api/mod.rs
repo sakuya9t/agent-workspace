@@ -19,6 +19,7 @@ use crate::util::now_millis;
 
 mod auth;
 mod fs;
+mod paste;
 mod scm;
 pub mod ws;
 
@@ -31,6 +32,11 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub scm: Arc<dyn SourceControl>,
     pub started_at: i64,
+    /// This daemon's stable node id (== persisted `server_id`); advertised to
+    /// the relay and surfaced on `/health` so a gateway can probe it (R4).
+    pub node_id: String,
+    /// Human label for this node (`ASM_NODE_LABEL`, default hostname).
+    pub node_label: String,
     /// Tracks the single live WS attacher per session (takeover).
     pub attachments: Arc<ws::Attachments>,
 }
@@ -64,12 +70,24 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/:id/archive", post(archive_session))
         .route("/api/sessions/:id/cleanup", post(cleanup_instance))
         .route("/api/sessions/:id/resize", post(resize_session))
+        .route(
+            "/api/sessions/:id/paste",
+            // Raw image body; raise the transport limit above the enforced
+            // `MAX_PASTE_BYTES` so an oversize upload gets a clean 413 from the
+            // handler rather than a truncated-body error from the extractor.
+            post(paste::upload)
+                .layer(axum::extract::DefaultBodyLimit::max(paste::MAX_PASTE_BYTES + 512 * 1024)),
+        )
         .route("/api/sessions/:id/ack", post(ack_attention))
-        .route("/api/sessions/:id/open-vscode", post(open_vscode))
+        .route("/api/sessions/:id/vscode-target", get(vscode_target))
         .route("/api/sessions/:id/stream", get(ws::stream))
         .route("/api/sessions/:id/scm/status", get(scm::status))
         .route("/api/sessions/:id/scm/diff", get(scm::diff))
-        .route("/api/sessions/:id/scm/log", get(scm::log));
+        .route("/api/sessions/:id/scm/log", get(scm::log))
+        .route("/api/sessions/:id/scm/commit", get(scm::commit))
+        .route("/api/sessions/:id/scm/branches", get(scm::branches))
+        .route("/api/sessions/:id/scm/pull", post(scm::pull))
+        .route("/api/sessions/:id/scm/rebase", post(scm::rebase));
 
     // Optionally serve a packaged web client.
     if let Some(dir) = static_dir {
@@ -94,6 +112,8 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "status": "ok",
         "version": VERSION,
         "hostname": hostname(),
+        "node_id": state.node_id,
+        "label": state.node_label,
         "platform": current_platform(),
         "uptime_ms": now_millis() - state.started_at,
         "database": "ok",
@@ -321,20 +341,23 @@ async fn get_session_usage(
         .manager
         .get_session(&id)?
         .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "no such session".into()))?;
-    let usage = state
-        .manager
-        .registry
-        .get(&s.agent_plugin_id)
-        .and_then(|p| {
+    // File reads plus a possible (cached) rate-limit HTTP fetch — keep them off
+    // the async runtime.
+    let manager = state.manager.clone();
+    let usage = tokio::task::spawn_blocking(move || {
+        manager.registry.get(&s.agent_plugin_id).and_then(|p| {
             p.usage(&crate::plugins::usage::UsageContext {
                 cwd: std::path::PathBuf::from(&s.working_directory),
                 started_at_ms: s.created_at,
             })
         })
-        .unwrap_or_else(|| crate::plugins::usage::AgentUsage {
-            note: Some("No usage data available for this agent/session.".into()),
-            ..Default::default()
-        });
+    })
+    .await
+    .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("usage task: {e}")))?
+    .unwrap_or_else(|| crate::plugins::usage::AgentUsage {
+        note: Some("No usage data available for this agent/session.".into()),
+        ..Default::default()
+    });
     Ok(Json(json!({ "usage": usage })))
 }
 
@@ -349,9 +372,17 @@ async fn stop_session(
 async fn archive_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<CleanupParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let s = state.manager.archive_session(&id)?;
-    Ok(Json(json!({ "session": s })))
+    match state.manager.archive_session(&id, params.force) {
+        Ok(s) => Ok(Json(json!({ "session": s }))),
+        // Archiving would discard uncommitted/unmerged work: 409 so the client
+        // can confirm and retry with `?force=true`.
+        Err(e) if e.downcast_ref::<crate::session_manager::NeedsForce>().is_some() => {
+            Err(AppError(StatusCode::CONFLICT, format!("{e:#}")))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -377,10 +408,12 @@ async fn ack_attention(
     Ok(Json(json!({ "session": s })))
 }
 
-/// Open the session's isolated workspace instance in VS Code. Opening the
-/// editor does not touch the running agent session; the working directory is
+/// Describe where the *client's* VS Code should connect to reach this
+/// session's workspace. The daemon never launches an editor itself — the web
+/// client turns this into a `vscode://` deep link (local folder when the
+/// daemon is on the browser's machine, Remote-SSH otherwise). The path is
 /// already the isolated instance (worktree) for isolated sessions.
-async fn open_vscode(
+async fn vscode_target(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -388,28 +421,22 @@ async fn open_vscode(
         .manager
         .get_session(&id)?
         .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "no such session".into()))?;
-    let target = session.working_directory;
 
-    let code = crate::plugins::find_in_path("code").ok_or_else(|| {
-        AppError(
-            StatusCode::BAD_REQUEST,
-            "VS Code CLI `code` not found in PATH on the daemon host. For a remote daemon, \
-             use VS Code Remote-SSH to open this path."
-                .into(),
-        )
-    })?;
+    Ok(Json(json!({
+        "path": session.working_directory,
+        "ssh_user": daemon_user(),
+        "hostname": hostname(),
+    })))
+}
 
-    std::process::Command::new(code)
-        .arg(&target)
-        .spawn()
-        .map_err(|e| {
-            AppError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to launch VS Code: {e}"),
-            )
-        })?;
-
-    Ok(Json(json!({ "opened": true, "path": target })))
+/// User the daemon runs as — the account VS Code Remote-SSH should log in
+/// with, since it owns the session worktrees.
+fn daemon_user() -> Option<String> {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 // ---------- error type ----------

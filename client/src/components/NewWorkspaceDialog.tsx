@@ -1,12 +1,14 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
 import { api } from "../api";
-import { targetOf, useConnStore } from "../connectionStore";
+import { daemonLabel, localTarget, targetOf, useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
 import { DirectoryPicker } from "./DirectoryPicker";
 
 /** Registers a directory on a specific daemon as a workspace. */
 export function NewWorkspaceDialog() {
+  const { t } = useTranslation();
   const qc = useQueryClient();
   const show = useUiStore((s) => s.showNewWorkspace);
   const setShow = useUiStore((s) => s.setShowNewWorkspace);
@@ -24,7 +26,7 @@ export function NewWorkspaceDialog() {
   }, [show, daemonId]);
 
   const daemon = daemons.find((d) => d.id === daemonId) ?? daemons[0];
-  const conn = daemon ? targetOf(daemon) : { baseUrl: "", token: null };
+  const conn = daemon ? targetOf(daemon) : localTarget();
 
   const register = useMutation({
     mutationFn: () =>
@@ -41,45 +43,46 @@ export function NewWorkspaceDialog() {
   return (
     <div className="modal-backdrop" onClick={() => setShow(false)}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <div className="modal-title">New workspace on {daemon?.label}</div>
+        <div className="modal-title">
+          {t("newWorkspace.title", { daemon: daemon && daemonLabel(daemon) })}
+        </div>
 
-        <label className="form-label">Root directory (on {daemon?.label})</label>
+        <label className="form-label">
+          {t("newWorkspace.rootLabel", { daemon: daemon && daemonLabel(daemon) })}
+        </label>
         <div className="path-row">
           <input
             className="input mono"
-            placeholder="/absolute/path/on/that/host"
+            placeholder={t("newWorkspace.pathPlaceholder")}
             value={path}
             onChange={(e) => setPath(e.target.value)}
           />
           <button className="btn" onClick={() => setPicking(true)}>
-            Browse…
+            {t("common.browse")}
           </button>
         </div>
 
-        <label className="form-label">Name</label>
+        <label className="form-label">{t("newWorkspace.nameLabel")}</label>
         <input
           className="input"
-          placeholder={dirLabel(path.trim()) || "name"}
+          placeholder={dirLabel(path.trim()) || t("newWorkspace.namePlaceholder")}
           value={name}
           onChange={(e) => setName(e.target.value)}
         />
-        <div className="dim small">
-          Sessions started in this workspace run in isolated worktrees when it is
-          a git repository.
-        </div>
+        <div className="dim small">{t("newWorkspace.worktreeHint")}</div>
 
         {register.error && <div className="error">{String(register.error)}</div>}
 
         <div className="modal-actions">
           <button className="btn" onClick={() => setShow(false)}>
-            Cancel
+            {t("common.cancel")}
           </button>
           <button
             className="btn primary"
             disabled={!path.trim() || register.isPending}
             onClick={() => register.mutate()}
           >
-            {register.isPending ? "Creating…" : "Create"}
+            {register.isPending ? t("newWorkspace.creating") : t("newWorkspace.create")}
           </button>
         </div>
       </div>
@@ -87,7 +90,7 @@ export function NewWorkspaceDialog() {
       {picking && (
         <DirectoryPicker
           target={conn}
-          title="Select workspace root"
+          title={t("directoryPicker.selectWorkspaceRoot")}
           initialPath={path}
           onPick={(p) => {
             setPath(p);

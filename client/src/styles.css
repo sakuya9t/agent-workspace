@@ -75,8 +75,54 @@ body {
 .workspace {
   flex: 1;
   display: grid;
-  grid-template-columns: 280px 1fr 320px;
+  /* Columns are set inline (App.tsx) from the persisted panel widths:
+     left  |  resizer  |  center (1fr)  |  resizer  |  right */
+  grid-template-columns: 280px 6px minmax(0, 1fr) 6px 320px;
   min-height: 0;
+}
+
+/* Draggable vertical divider between panels. */
+.col-resizer {
+  position: relative;
+  cursor: col-resize;
+  background: var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Widen the hit target beyond the visible 6px column without shifting layout. */
+  outline: none;
+}
+.col-resizer::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -3px;
+  right: -3px;
+}
+.col-resizer:hover,
+.col-resizer:focus-visible {
+  background: var(--accent);
+}
+.col-resizer-grip {
+  width: 2px;
+  height: 28px;
+  border-radius: 1px;
+  background: var(--dim);
+  opacity: 0.5;
+  pointer-events: none;
+}
+.col-resizer:hover .col-resizer-grip,
+.col-resizer:focus-visible .col-resizer-grip {
+  opacity: 0;
+}
+/* While dragging, suppress text selection and keep the resize cursor everywhere. */
+body.col-resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+body.col-resizing iframe {
+  pointer-events: none;
 }
 
 .panel {
@@ -84,11 +130,7 @@ body {
   flex-direction: column;
   min-height: 0;
   min-width: 0;
-  border-right: 1px solid var(--border);
   background: var(--panel);
-}
-.panel.right {
-  border-right: none;
 }
 
 .panel-header {
@@ -116,8 +158,61 @@ body {
 }
 
 .terminal-host {
+  position: relative;
   width: 100%;
   height: 100%;
+}
+.terminal-mount {
+  width: 100%;
+  height: 100%;
+}
+/* Transient image-paste status, floated over the terminal's top-right. */
+.paste-status {
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  z-index: 5;
+  max-width: 60%;
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  pointer-events: none;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+}
+.paste-status--busy {
+  border-color: var(--accent);
+}
+.paste-status--error {
+  border-color: var(--danger, #e5484d);
+  color: var(--danger, #e5484d);
+}
+/* Floating attach-image button; the primary paste affordance on touch. */
+.term-attach {
+  position: absolute;
+  bottom: 10px;
+  right: 14px;
+  z-index: 5;
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  line-height: 1;
+  border-radius: 8px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  opacity: 0.5;
+  transition: opacity 0.15s ease;
+}
+.term-attach::before {
+  content: "📎";
+}
+.term-attach:hover {
+  opacity: 1;
 }
 
 /* sessions */
@@ -300,6 +395,7 @@ body {
   font-size: 11px;
 }
 .tree-label {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -308,6 +404,13 @@ body {
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.4px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* Secondary text: yield to the host label so a short name never truncates
+     just because the subtitle is long. Only after the subtitle is fully
+     squeezed does the label itself start to ellipsize. */
+  flex-shrink: 100;
 }
 .tree-badge {
   margin-left: auto;
@@ -316,6 +419,7 @@ body {
   border-radius: 10px;
   padding: 0 7px;
   font-size: 11px;
+  flex: none;
 }
 .tree-add {
   background: transparent;
@@ -411,6 +515,9 @@ body {
 .picker-entry:hover {
   background: var(--panel-2);
 }
+.picker-entry.selected {
+  background: var(--accent-2);
+}
 .picker-icon {
   color: var(--accent);
   flex: none;
@@ -491,6 +598,12 @@ body {
   font-weight: 600;
   border-top: 1px solid var(--border);
   padding-top: 12px;
+}
+.section-title.with-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 /* misc */
@@ -598,6 +711,40 @@ body {
   font-weight: 600;
 }
 
+.vscode-fallback {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+  padding: 8px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.vscode-fallback .btn {
+  align-self: flex-start;
+}
+.vscode-fallback .cli-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.vscode-fallback .cli-row code {
+  flex: 1;
+  padding: 4px 6px;
+  font-size: 11px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  white-space: nowrap;
+  overflow-x: auto;
+}
+.vscode-fallback .cli-row .btn {
+  align-self: center;
+  flex-shrink: 0;
+}
+
 /* segmented control + workspace register box */
 .seg {
   display: flex;
@@ -640,6 +787,91 @@ body {
 }
 
 /* source control */
+.scm-actions {
+  display: flex;
+  gap: 4px;
+}
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 22px;
+  padding: 0;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+.icon-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.icon-btn.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.icon-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.rebase-picker {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0 4px;
+  padding: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.rebase-picker-label {
+  width: 100%;
+  color: var(--dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.rebase-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+}
+.rebase-select {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.rebase-select:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.rebase-select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.rebase-picker-row .btn {
+  flex: none;
+}
+.scm-op-result {
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 4px 0;
+  padding: 6px 8px;
+  background: var(--panel-2);
+  border-radius: 6px;
+  line-height: 1.4;
+}
 .branch-pill {
   float: right;
   color: var(--accent);
@@ -689,6 +921,13 @@ body {
   display: flex;
   gap: 10px;
   min-height: 34px;
+  cursor: pointer;
+  border-radius: 4px;
+  margin: 0 -4px;
+  padding: 0 4px;
+}
+.commit-row:hover {
+  background: var(--panel-2);
 }
 .commit-rail {
   position: relative;
@@ -764,19 +1003,36 @@ body {
 /* diff viewer */
 .diff-modal {
   width: 900px;
+  min-width: 360px;
   max-width: calc(100vw - 40px);
+  /* Let the reviewer drag the dialog larger to check whether code lines
+     overflow, instead of scrolling inside a fixed-size box. The flex column
+     lets .diff-view fill whatever height the dialog is dragged to. */
+  resize: both;
+  /* Drop the base .modal padding so .diff-view reaches the dialog's edges: the
+     resize grip (drawn at the dialog's bottom-right corner) then lands exactly
+     on the diff text area instead of ~18px outside it. overflow: hidden keeps
+     the rounded frame clipping the flush diff-view; the diff-view scrolls. */
+  padding: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 40px);
 }
 .diff-modal .modal-title {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex: none;
+  padding: 14px 16px;
+  margin-bottom: 0;
 }
 .diff-view {
-  max-height: 70vh;
+  flex: 1;
+  min-height: 0;
   overflow: auto;
   background: #0b0e14;
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  border-top: 1px solid var(--border);
   padding: 8px;
   font-size: 12px;
   line-height: 1.45;
@@ -799,6 +1055,91 @@ body {
 }
 .diff-line.meta {
   color: var(--dim);
+}
+
+/* commit detail modal */
+.commit-modal {
+  width: 620px;
+  max-width: calc(100vw - 40px);
+}
+.commit-modal .modal-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+.commit-modal-subject {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.commit-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.commit-detail-meta {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.commit-detail-body {
+  margin: 6px 0;
+  padding: 10px;
+  background: #0b0e14;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 30vh;
+  overflow: auto;
+}
+.commit-detail-stat {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  font-size: 12px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+  margin-top: 2px;
+}
+.stat-add {
+  color: #9ece6a;
+}
+.stat-del {
+  color: #f7768e;
+}
+.commit-files {
+  display: flex;
+  flex-direction: column;
+  max-height: 40vh;
+  overflow: auto;
+}
+.commit-file {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 3px 4px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.commit-file:hover {
+  background: var(--panel-2);
+}
+.commit-file-nums {
+  display: flex;
+  gap: 6px;
+  font-size: 11px;
+  width: 84px;
+  flex: none;
+  justify-content: flex-end;
+}
+.commit-file-path {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* modal */

@@ -1,9 +1,12 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
 import { api, Session, SessionStatus, AttentionState, Workspace } from "../api";
-import { Target, targetOf, useConnStore } from "../connectionStore";
+import { daemonLabel, Target, targetOf, useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
 import { DaemonState, useDaemonStates } from "../useDaemons";
+import { relTime } from "../i18n/time";
+import { attentionLabel, endedLabel, statusLabel } from "../i18n/labels";
 
 const STATUS_COLOR: Record<SessionStatus, string> = {
   starting: "#e0af68",
@@ -13,16 +16,6 @@ const STATUS_COLOR: Record<SessionStatus, string> = {
   stopped: "#565f89",
   archived: "#414868",
   indeterminate: "#ff9e64",
-};
-
-// working = producing output; idle = waiting for the next input (calm);
-// blocked = needs input to proceed (urgent).
-const ATTENTION_LABEL: Partial<Record<AttentionState, string>> = {
-  activity: "working",
-  idle: "idle",
-  likely_blocked: "blocked",
-  approval_needed: "blocked",
-  failed: "failed",
 };
 
 const ATTENTION_COLOR: Partial<Record<AttentionState, string>> = {
@@ -37,18 +30,10 @@ function isLive(s: SessionStatus): boolean {
   return s === "running" || s === "starting";
 }
 
-function relTime(ms: number): string {
-  const d = Date.now() - ms;
-  if (d < 5000) return "just now";
-  if (d < 60000) return `${Math.floor(d / 1000)}s ago`;
-  if (d < 3600000) return `${Math.floor(d / 60000)}m ago`;
-  if (d < 86400000) return `${Math.floor(d / 3600000)}h ago`;
-  return `${Math.floor(d / 86400000)}d ago`;
-}
-
 type MutArgs = { target: Target; id: string };
 
 export function SessionList() {
+  const { t } = useTranslation();
   const qc = useQueryClient();
   const active = useUiStore((s) => s.activeSession);
   const setActive = useUiStore((s) => s.setActive);
@@ -74,9 +59,25 @@ export function SessionList() {
     mutationFn: ({ target, id }: MutArgs) => api.stopSession(target, id),
     onSuccess: refresh,
   });
+  // Archiving removes the session from history and deletes its branch. When the
+  // daemon guards uncommitted/unmerged work it answers 409 — confirm, then retry
+  // with force so nothing is discarded without the user's say-so.
   const archive = useMutation({
-    mutationFn: ({ target, id }: MutArgs) => api.archiveSession(target, id),
+    mutationFn: async ({ target, id }: MutArgs) => {
+      try {
+        return await api.archiveSession(target, id);
+      } catch (e) {
+        if ((e as { status?: number }).status === 409) {
+          if (confirm(t("sessionList.confirmArchiveForce", { message: (e as Error).message }))) {
+            return api.archiveSession(target, id, true);
+          }
+          return; // declined — leave it in history
+        }
+        throw e;
+      }
+    },
     onSuccess: refresh,
+    onError: (e) => alert(String(e)),
   });
   const ack = useMutation({
     mutationFn: ({ target, id }: MutArgs) => api.ackAttention(target, id),
@@ -93,11 +94,7 @@ export function SessionList() {
     // Single-attacher: opening a session another client holds takes it over,
     // disconnecting them — so confirm first.
     if (s.attached && !isMine && isLive(s.status)) {
-      if (
-        !confirm(
-          "This session is open on another client.\n\nTake over? The other client will be disconnected from it.",
-        )
-      ) {
+      if (!confirm(t("sessionList.confirmTakeOver"))) {
         return;
       }
     }
@@ -105,18 +102,39 @@ export function SessionList() {
     if (s.attention_state !== "none") ack.mutate({ target, id: s.id });
   };
 
-  // History aggregates ended sessions across all daemons.
-  const history: { daemon: DaemonState["daemon"]; target: Target; s: Session }[] = [];
+  // History aggregates finished sessions across all daemons: ended but not yet
+  // archived. Archiving is the deliberate "throw this away" step — it drops the
+  // session from history and deletes its branch, so archived sessions are hidden
+  // here. Workspace names are resolved per daemon; a session whose workspace was
+  // since removed (or an ad-hoc session) falls back to its working directory.
+  const history: {
+    daemon: DaemonState["daemon"];
+    target: Target;
+    s: Session;
+    workspaceName?: string;
+  }[] = [];
   for (const st of states) {
     if (!st.data) continue;
     const target = targetOf(st.daemon);
+    const wsNames = new Map(st.data.workspaces.map((w) => [w.id, w.name]));
     for (const s of st.data.sessions) {
-      if (!isLive(s.status)) history.push({ daemon: st.daemon, target, s });
+      if (!isLive(s.status) && s.status !== "archived")
+        history.push({
+          daemon: st.daemon,
+          target,
+          s,
+          workspaceName: s.workspace_id ? wsNames.get(s.workspace_id) : undefined,
+        });
     }
   }
   history.sort((a, b) => b.s.last_activity_at - a.s.last_activity_at);
 
-  const row = (daemonId: string, target: Target, s: Session, daemonLabel?: string) => {
+  const row = (
+    daemonId: string,
+    target: Target,
+    s: Session,
+    ctx?: { daemonLabel?: string; workspaceName?: string },
+  ) => {
     const selected = active?.daemonId === daemonId && active?.sessionId === s.id;
     return (
       <div
@@ -128,25 +146,22 @@ export function SessionList() {
           <span
             className="status-dot"
             style={{ background: STATUS_COLOR[s.status] }}
-            title={s.status}
+            title={statusLabel(s.status)}
           />
           <span className="session-agent">{s.agent_plugin_id}</span>
           {s.risky && (
-            <span
-              className="risk-badge"
-              title="Launched with guardrails disabled (skip-permissions / bypass-sandbox)"
-            >
-              ⚠ unsafe
+            <span className="risk-badge" title={t("sessionList.riskTitle")}>
+              {t("sessionList.riskBadge")}
             </span>
           )}
-          {daemonLabel && <span className="daemon-tag">{daemonLabel}</span>}
+          {ctx?.daemonLabel && <span className="daemon-tag">{ctx.daemonLabel}</span>}
           {s.attached && !selected && isLive(s.status) && (
             <span
               className="attn-badge"
               style={{ background: "#565f89" }}
-              title="Open on another client — click to take over"
+              title={t("sessionList.inUseTitle")}
             >
-              in use
+              {t("sessionList.inUse")}
             </span>
           )}
           {s.attention_state !== "none" && (
@@ -154,12 +169,14 @@ export function SessionList() {
               className="attn-badge"
               style={{ background: ATTENTION_COLOR[s.attention_state] }}
             >
-              {ATTENTION_LABEL[s.attention_state]}
+              {attentionLabel(s.attention_state)}
             </span>
           )}
         </div>
         <div className="session-sub">
-          <span className="mono">{basename(s.working_directory)}</span>
+          <span className="mono" title={s.working_directory}>
+            {ctx?.workspaceName ?? basename(s.working_directory)}
+          </span>
           <span className="dim">{relTime(s.last_activity_at)}</span>
         </div>
         <div className="session-actions">
@@ -171,11 +188,11 @@ export function SessionList() {
                 stop.mutate({ target, id: s.id });
               }}
             >
-              stop
+              {t("sessionList.stop")}
             </button>
           ) : (
             <>
-              <span className="ended-status" title={s.status}>
+              <span className="ended-status" title={statusLabel(s.status)}>
                 {endedLabel(s.status)}
                 {s.exit_code !== null ? ` · ${s.exit_code}` : ""}
               </span>
@@ -187,7 +204,7 @@ export function SessionList() {
                     archive.mutate({ target, id: s.id });
                   }}
                 >
-                  archive
+                  {t("sessionList.archive")}
                 </button>
               )}
             </>
@@ -213,7 +230,9 @@ export function SessionList() {
           <span className="tree-icon">{w.is_git ? "◆" : "▪"}</span>
           <span
             className="tree-label"
-            title={missing ? `${w.root_path} — no longer exists on the host` : w.root_path}
+            title={
+              missing ? t("sessionList.missingTitle", { path: w.root_path }) : w.root_path
+            }
             style={missing ? { color: "#f7768e" } : undefined}
           >
             {w.name}
@@ -222,17 +241,19 @@ export function SessionList() {
             <span
               className="tree-sub"
               style={{ color: "#f7768e" }}
-              title={`${w.root_path} — no longer exists on the host`}
+              title={t("sessionList.missingTitle", { path: w.root_path })}
             >
-              missing
+              {t("common.missing")}
             </span>
           ) : (
-            <span className="tree-sub">{w.is_git ? "git" : "plain"}</span>
+            <span className="tree-sub">
+              {w.is_git ? t("common.git") : t("common.plain")}
+            </span>
           )}
           {sessions.length > 0 && <span className="tree-badge">{sessions.length}</span>}
           <button
             className="tree-add"
-            title="New session in this workspace"
+            title={t("sessionList.newSessionTitle")}
             onClick={(e) => {
               e.stopPropagation();
               openNewSession(daemonId, w.id);
@@ -242,14 +263,10 @@ export function SessionList() {
           </button>
           <button
             className="tree-add"
-            title="Remove (unregister) this workspace"
+            title={t("sessionList.removeWsTitle")}
             onClick={(e) => {
               e.stopPropagation();
-              if (
-                confirm(
-                  `Remove workspace "${w.name}"?\n\nThis only unregisters it from this daemon — sessions and files on disk are left intact.`,
-                )
-              ) {
+              if (confirm(t("sessionList.confirmRemoveWorkspace", { name: w.name }))) {
                 removeWs.mutate({ target, id: w.id });
               }
             }}
@@ -262,7 +279,7 @@ export function SessionList() {
             {sessions.length ? (
               sessions.map((s) => row(daemonId, target, s))
             ) : (
-              <div className="tree-empty">no active sessions</div>
+              <div className="tree-empty">{t("sessionList.noActiveSessions")}</div>
             )}
           </div>
         )}
@@ -284,27 +301,30 @@ export function SessionList() {
     const active = bundle?.sessions.filter((s) => isLive(s.status)) ?? [];
     const wsIds = new Set((bundle?.workspaces ?? []).map((w) => w.id));
     const adhoc = active.filter((s) => !s.workspace_id || !wsIds.has(s.workspace_id));
+    const adhocKey = daemon.id + ":adhoc";
 
     return (
       <div key={daemon.id} className={"tree-branch" + (connected ? "" : " disconnected")}>
         <div className="tree-node lvl0" onClick={() => toggle(daemon.id)}>
           <span className="chevron">{open ? "▾" : "▸"}</span>
           <span className="tree-icon">⬢</span>
-          <span className="tree-label">{daemon.label}</span>
+          <span className="tree-label" title={daemonLabel(daemon)}>
+            {daemonLabel(daemon)}
+          </span>
           <span className="tree-sub">
             {!connected
-              ? "disconnected"
+              ? t("sessionList.disconnected")
               : bundle
                 ? `${bundle.health.hostname} · ${bundle.health.platform}`
                 : unreachable
-                  ? "unreachable"
-                  : "connecting…"}
+                  ? t("sessionList.unreachable")
+                  : t("sessionList.connecting")}
           </span>
           {connected && bundle && <span className="tree-badge">{active.length}</span>}
           {connected && (
             <button
               className="tree-add"
-              title="New workspace on this host"
+              title={t("sessionList.newWorkspaceTitle")}
               onClick={(e) => {
                 e.stopPropagation();
                 openNewWorkspace(daemon.id);
@@ -317,26 +337,26 @@ export function SessionList() {
             className="btn tiny conn-toggle"
             title={
               connected
-                ? "Disconnect — keep the host listed but stop polling it"
-                : "Connect — resume polling with the same token"
+                ? t("sessionList.disconnectTitle")
+                : t("sessionList.connectTitle")
             }
             onClick={(e) => {
               e.stopPropagation();
               updateDaemon(daemon.id, { connected: !connected });
             }}
           >
-            {connected ? "disconnect" : "connect"}
+            {connected ? t("sessionList.disconnect") : t("sessionList.connect")}
           </button>
         </div>
 
         {open && !connected && (
-          <div className="tree-empty">disconnected — not polling</div>
+          <div className="tree-empty">{t("sessionList.disconnectedNotPolling")}</div>
         )}
 
         {open && unreachable && (
           <div className="tree-empty error-line">
-            {daemon.baseUrl || "local"} —{" "}
-            {(st.error as Error)?.message ?? "unreachable"}
+            {daemon.baseUrl || t("sessionList.local")} —{" "}
+            {(st.error as Error)?.message ?? t("sessionList.unreachable")}
           </div>
         )}
 
@@ -352,18 +372,13 @@ export function SessionList() {
             )}
             {adhoc.length > 0 && (
               <div className="tree-branch">
-                <div
-                  className="tree-node lvl2"
-                  onClick={() => toggle(daemon.id + ":adhoc")}
-                >
-                  <span className="chevron">
-                    {isOpen(daemon.id + ":adhoc") ? "▾" : "▸"}
-                  </span>
+                <div className="tree-node lvl2" onClick={() => toggle(adhocKey)}>
+                  <span className="chevron">{isOpen(adhocKey) ? "▾" : "▸"}</span>
                   <span className="tree-icon">▫</span>
-                  <span className="tree-label">Ad-hoc directories</span>
+                  <span className="tree-label">{t("sessionList.adhoc")}</span>
                   <span className="tree-badge">{adhoc.length}</span>
                 </div>
-                {isOpen(daemon.id + ":adhoc") && (
+                {isOpen(adhocKey) && (
                   <div className="tree-leaves">
                     {adhoc.map((s) => row(daemon.id, target, s))}
                   </div>
@@ -371,7 +386,7 @@ export function SessionList() {
               </div>
             )}
             {bundle.workspaces.length === 0 && adhoc.length === 0 && (
-              <div className="tree-empty">No active sessions.</div>
+              <div className="tree-empty">{t("sessionList.noActiveSessionsDot")}</div>
             )}
           </div>
         )}
@@ -382,17 +397,17 @@ export function SessionList() {
   return (
     <div className="panel sessions">
       <div className="panel-header">
-        <span>Sessions</span>
+        <span>{t("sessionList.sessionsHeader")}</span>
         <div className="header-actions">
           <button
             className="btn tiny"
             onClick={() => setShowConnection(true)}
-            title="Manage daemons"
+            title={t("sessionList.manageTitle")}
           >
-            daemons
+            {t("sessionList.daemonsBtn")}
           </button>
           <button className="btn primary" onClick={() => openNewSession(null, null)}>
-            + New
+            {t("sessionList.newBtn")}
           </button>
         </div>
       </div>
@@ -405,13 +420,13 @@ export function SessionList() {
         <div className={"history-section" + (historyOpen ? " open" : "")}>
           <div className="history-header" onClick={() => setHistoryOpen((v) => !v)}>
             <span className="chevron">{historyOpen ? "▾" : "▸"}</span>
-            <span>History</span>
+            <span>{t("sessionList.historyHeader")}</span>
             <span className="history-count">{history.length}</span>
           </div>
           {historyOpen && (
             <div className="history-list">
-              {history.map(({ daemon, target, s }) =>
-                row(daemon.id, target, s, states.length > 1 ? daemon.label : undefined),
+              {history.map(({ daemon, target, s, workspaceName }) =>
+                row(daemon.id, target, s, { daemonLabel: daemonLabel(daemon), workspaceName }),
               )}
             </div>
           )}
@@ -424,9 +439,4 @@ export function SessionList() {
 function basename(p: string): string {
   const parts = p.split(/[/\\]/).filter(Boolean);
   return parts.length ? parts[parts.length - 1] : p;
-}
-
-/// A user-stopped session ended deliberately, not by failure — show "finished".
-function endedLabel(s: SessionStatus): string {
-  return s === "stopped" ? "finished" : s;
 }

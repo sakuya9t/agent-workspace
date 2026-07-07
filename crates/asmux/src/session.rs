@@ -117,6 +117,27 @@ pub struct Session {
     attacher: Mutex<Option<Attacher>>,
 }
 
+/// Remove inherited env vars that identify an *enclosing* agent session.
+///
+/// If asmux (or the daemon, for the in-process backend) was itself started from
+/// inside Claude Code or Codex, vars like `CLAUDE_CODE_SESSION_ID`,
+/// `CLAUDECODE` and `CLAUDE_CODE_SSE_PORT` leak into every spawned agent. A
+/// Claude Code launched with them treats itself as a nested *child* session of
+/// the outer one and stops writing its own per-project transcript, which
+/// breaks per-session usage reporting (and any other transcript consumer).
+/// Explicit `SpawnSpec.env` entries are applied after this, so a caller can
+/// still set these deliberately.
+pub fn scrub_inherited_agent_env(cmd: &mut CommandBuilder) {
+    const EXACT: &[&str] = &["CLAUDECODE", "CLAUDE_EFFORT", "AI_AGENT"];
+    const PREFIXES: &[&str] = &["CLAUDE_CODE_", "CODEX_SANDBOX"];
+    for (key, _) in std::env::vars_os() {
+        let Some(k) = key.to_str() else { continue };
+        if EXACT.contains(&k) || PREFIXES.iter().any(|p| k.starts_with(p)) {
+            cmd.env_remove(k);
+        }
+    }
+}
+
 impl Session {
     /// Spawn the child and start the reader/writer threads. The returned
     /// `Arc<Session>` is what the registry stores and the server shares.
@@ -138,6 +159,7 @@ impl Session {
         if !spec.cwd.is_empty() {
             cmd.cwd(&spec.cwd);
         }
+        scrub_inherited_agent_env(&mut cmd);
         let mut have_term = false;
         for (k, v) in &spec.env {
             if k == "TERM" {
@@ -324,20 +346,14 @@ impl Session {
         if !self.is_alive() {
             return;
         }
-        if signal == 0 {
-            if let Some(k) = self.killer.lock().as_mut() {
-                let _ = k.kill();
-            }
-            return;
-        }
         #[cfg(unix)]
-        {
+        if signal != 0 {
             if let Ok(sig) = nix::sys::signal::Signal::try_from(signal) {
                 let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(self.pid), sig);
                 return;
             }
         }
-        // Unknown signal or non-unix: fall back to the default terminate.
+        // signal == 0, unknown signal, or non-unix: the default terminate.
         if let Some(k) = self.killer.lock().as_mut() {
             let _ = k.kill();
         }
@@ -518,6 +534,25 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         cond()
+    }
+
+    #[test]
+    fn scrubs_enclosing_agent_session_env() {
+        std::env::set_var("CLAUDE_CODE_SESSION_ID", "outer-session");
+        std::env::set_var("CLAUDECODE", "1");
+        std::env::set_var("CLAUDE_CONFIG_DIR", "/keep/me");
+        let mut cmd = CommandBuilder::new("true");
+        scrub_inherited_agent_env(&mut cmd);
+        assert_eq!(cmd.get_env("CLAUDE_CODE_SESSION_ID"), None);
+        assert_eq!(cmd.get_env("CLAUDECODE"), None);
+        // User-level config vars survive the scrub…
+        assert!(cmd.get_env("CLAUDE_CONFIG_DIR").is_some());
+        // …and an explicit spec env applied afterwards still wins.
+        cmd.env("CLAUDE_CODE_SESSION_ID", "explicit");
+        assert_eq!(
+            cmd.get_env("CLAUDE_CODE_SESSION_ID").and_then(|s| s.to_str()),
+            Some("explicit")
+        );
     }
 
     #[test]

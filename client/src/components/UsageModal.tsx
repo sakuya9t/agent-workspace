@@ -1,6 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
+import { useTranslation } from "react-i18next";
 import { api, SessionUsage } from "../api";
 import { Target } from "../connectionStore";
+import { fmtReset } from "../i18n/time";
 
 interface Props {
   target: Target;
@@ -15,6 +17,7 @@ interface Props {
  * Best-effort: the daemon matches the newest agent transcript for the session.
  */
 export function UsageModal({ target, sessionId, agent, onClose }: Props) {
+  const { t } = useTranslation();
   const { data, error, isLoading } = useQuery({
     queryKey: ["usage", target.baseUrl, sessionId],
     queryFn: () => api.sessionUsage(target, sessionId),
@@ -27,18 +30,18 @@ export function UsageModal({ target, sessionId, agent, onClose }: Props) {
       <div className="modal usage-modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-title">
           <span>
-            Session usage <span className="dim">· {agent}</span>
+            {t("usage.title")} <span className="dim">· {agent}</span>
           </span>
           <button className="btn tiny" onClick={onClose}>
-            close
+            {t("common.close")}
           </button>
         </div>
 
         <div className="usage-view">
-          {isLoading && <div className="dim">Reading usage…</div>}
+          {isLoading && <div className="dim">{t("usage.reading")}</div>}
           {error && <div className="error">{String(error)}</div>}
           {data && !data.available && (
-            <div className="dim">{data.note ?? "No usage data available for this session."}</div>
+            <div className="dim">{data.note ?? t("usage.noData")}</div>
           )}
           {data && data.available && <UsageBody u={data} />}
         </div>
@@ -48,6 +51,7 @@ export function UsageModal({ target, sessionId, agent, onClose }: Props) {
 }
 
 function UsageBody({ u }: { u: SessionUsage }) {
+  const { t } = useTranslation();
   const ctxPct =
     u.context_tokens != null && u.context_window
       ? Math.min(100, (u.context_tokens / u.context_window) * 100)
@@ -62,7 +66,7 @@ function UsageBody({ u }: { u: SessionUsage }) {
       {u.context_tokens != null && (
         <div className="usage-block">
           <div className="usage-block-head">
-            <span>Context window</span>
+            <span>{t("usage.contextWindow")}</span>
             <span className="mono">
               {fmt(u.context_tokens)}
               {u.context_window ? ` / ${fmt(u.context_window)}` : ""}
@@ -78,24 +82,27 @@ function UsageBody({ u }: { u: SessionUsage }) {
       )}
 
       <div className="usage-grid">
-        <Stat label="Input" value={u.input_tokens} />
-        <Stat label="Cached input" value={u.cached_input_tokens} />
-        <Stat label="Output" value={u.output_tokens} />
-        {u.reasoning_tokens != null && <Stat label="Reasoning" value={u.reasoning_tokens} />}
-        {u.total_tokens != null && <Stat label="Total" value={u.total_tokens} strong />}
+        <Stat label={t("usage.input")} value={u.input_tokens} />
+        <Stat label={t("usage.cachedInput")} value={u.cached_input_tokens} />
+        <Stat label={t("usage.output")} value={u.output_tokens} />
+        {u.reasoning_tokens != null && (
+          <Stat label={t("usage.reasoning")} value={u.reasoning_tokens} />
+        )}
+        {u.total_tokens != null && <Stat label={t("usage.total")} value={u.total_tokens} strong />}
       </div>
 
       {u.rate_limits.length > 0 && (
         <div className="usage-block">
           <div className="usage-block-head">
-            <span>Rate limits</span>
+            <span>{t("usage.rateLimits")}</span>
           </div>
           {u.rate_limits.map((r, i) => (
             <div className="usage-rl" key={i}>
               <div className="usage-block-head sub">
                 <span>{r.label}</span>
                 <span className="mono">
-                  {r.used_percent.toFixed(1)}%{r.resets_at ? ` · resets ${fmtReset(r.resets_at)}` : ""}
+                  {r.used_percent.toFixed(1)}%
+                  {r.resets_at ? ` · ${t("usage.resets", { when: fmtReset(r.resets_at) })}` : ""}
                 </span>
               </div>
               <div className="usage-bar">
@@ -110,7 +117,7 @@ function UsageBody({ u }: { u: SessionUsage }) {
       )}
 
       <div className="usage-foot dim">
-        {u.updated_at && <div>Reading: {u.updated_at}</div>}
+        {u.updated_at && <div>{t("usage.readingLine", { when: u.updated_at })}</div>}
         {u.source && <div className="mono usage-src">{u.source}</div>}
         {u.note && <div>{u.note}</div>}
       </div>
@@ -135,17 +142,4 @@ function heat(pct: number): string {
   if (pct >= 90) return "hot";
   if (pct >= 70) return "warm";
   return "cool";
-}
-
-function fmtReset(unixSecs: number): string {
-  const ms = unixSecs * 1000;
-  const diff = ms - Date.now();
-  if (diff <= 0) return "now";
-  const mins = Math.round(diff / 60000);
-  if (mins < 60) return `in ${mins}m`;
-  const hours = Math.floor(mins / 60);
-  const rem = mins % 60;
-  if (hours < 24) return rem ? `in ${hours}h ${rem}m` : `in ${hours}h`;
-  const days = Math.floor(hours / 24);
-  return `in ${days}d ${hours % 24}h`;
 }

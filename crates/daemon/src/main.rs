@@ -111,19 +111,28 @@ async fn main() -> Result<()> {
         config: Arc::new(config.clone()),
         scm: Arc::new(source_control::GitSourceControl),
         started_at: now_millis(),
+        node_id: server_id.clone(),
+        node_label: config.node_label.clone(),
         attachments: api::ws::Attachments::new(),
     };
     let app = api::router(state);
+
+    // Optionally register outbound to a relay so this daemon is reachable from
+    // behind NAT. Relayed traffic is served on a separate loopback tunnel
+    // listener that is NOT loopback-trusted (a device token is always required).
+    let relay_agent = start_relay_if_configured(&config, &server_id, app.clone()).await?;
 
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("binding {}", config.bind))?;
     tracing::info!("listening on http://{}", config.bind);
 
-    // Connect-info exposes the peer address so auth can trust loopback.
+    // Connect-info exposes the peer address so auth can trust loopback. The
+    // primary listener stamps `Primary`, so genuine loopback here is trusted.
+    let primary_app = app.layer(axum::Extension(auth::ListenerKind::Primary));
     let server = axum::serve(
         listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        primary_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     );
 
     // Race the server against a shutdown signal. We do NOT wait for open
@@ -138,7 +147,57 @@ async fn main() -> Result<()> {
             tracing::info!("shutdown signal received; stopped {killed} live session(s)");
         }
     }
+    if let Some(handle) = relay_agent {
+        handle.abort();
+    }
     Ok(())
+}
+
+/// If `ASM_RELAY_URL` + `ASM_RELAY_KEY` are set, bind a loopback tunnel listener
+/// (serving the same API, but stamped `Tunnel` so it is never loopback-trusted)
+/// and spawn the relay agent that registers this daemon outbound and dials data
+/// streams back to that listener. Returns the agent task handle so shutdown can
+/// abort it.
+async fn start_relay_if_configured(
+    config: &Config,
+    server_id: &str,
+    app: axum::Router,
+) -> Result<Option<tokio::task::JoinHandle<()>>> {
+    let (Some(url), Some(key)) = (config.relay_url.clone(), config.relay_key.clone()) else {
+        if config.relay_url.is_some() != config.relay_key.is_some() {
+            tracing::warn!("set BOTH ASM_RELAY_URL and ASM_RELAY_KEY to enable the relay; disabled");
+        }
+        return Ok(None);
+    };
+
+    let tunnel_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("binding relay tunnel listener")?;
+    let tunnel_addr = tunnel_listener
+        .local_addr()
+        .context("reading relay tunnel listener address")?;
+    let tunnel_app = app.layer(axum::Extension(auth::ListenerKind::Tunnel));
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(
+            tunnel_listener,
+            tunnel_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        {
+            tracing::error!("relay tunnel listener error: {e}");
+        }
+    });
+
+    let agent_cfg = asm_relay::agent::AgentConfig {
+        relay_url: url.clone(),
+        relay_key: key,
+        node_id: server_id.to_string(),
+        label: config.node_label.clone(),
+        local_target: tunnel_addr,
+        downstreams: Vec::new(),
+    };
+    tracing::info!(relay = %url, node = %server_id, tunnel = %tunnel_addr, "registering with relay");
+    Ok(Some(tokio::spawn(asm_relay::agent::run(agent_cfg))))
 }
 
 /// Ensure the asmux holder is reachable, auto-spawning it (detached) if the

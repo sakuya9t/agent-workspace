@@ -54,6 +54,9 @@ impl SessionBackend for NativePtyBackend {
             cmd.arg(a);
         }
         cmd.cwd(&spec.cwd);
+        // Don't let an enclosing Claude/Codex session leak its identity into
+        // the agent (it would run as a nested child session; see asmux).
+        asmux::session::scrub_inherited_agent_env(&mut cmd);
         let mut have_term = false;
         for (k, v) in &spec.env {
             if k == "TERM" {
@@ -118,45 +121,19 @@ struct NativeSession {
     seq: Arc<AtomicU64>,
 }
 
-impl NativeSession {
-    fn build_snapshot(&self, parser: &vt100::Parser) -> Snapshot {
-        let screen = parser.screen();
-        let (rows, cols) = screen.size();
-        let repaint: Arc<[u8]> = Arc::from(screen.contents_formatted().into_boxed_slice());
-        Snapshot {
-            rows,
-            cols,
-            repaint,
-            last_seq: self.seq.load(Ordering::SeqCst),
-        }
-    }
-}
-
 impl BackendSession for NativeSession {
     fn attach(&self) -> (Snapshot, broadcast::Receiver<Arc<[u8]>>) {
-        // Hold the emulator lock across snapshot+subscribe. The reader also
-        // processes+broadcasts under this same lock, so the receiver is
-        // guaranteed to start exactly where the snapshot ends.
-        let mut parser = self.parser.lock();
-        let (rows, cols) = parser.screen().size();
-        // Attach repaints include scrollback history so the client can scroll
-        // up to output from before it attached.
-        let repaint: Arc<[u8]> =
-            Arc::from(super::repaint_with_history(&mut parser).into_boxed_slice());
-        let snap = Snapshot {
-            rows,
-            cols,
-            repaint,
-            last_seq: self.seq.load(Ordering::SeqCst),
-        };
-        let rx = self.tx.subscribe();
-        drop(parser);
-        (snap, rx)
+        // The reader processes+broadcasts under the emulator lock the helper
+        // holds, so the receiver starts exactly where the snapshot ends.
+        super::attach_with_history(&self.parser, &self.tx, &self.seq)
     }
 
     fn snapshot(&self) -> Snapshot {
-        let parser = self.parser.lock();
-        self.build_snapshot(&parser)
+        super::snapshot_screen(&self.parser.lock(), &self.seq)
+    }
+
+    fn screen_text(&self) -> String {
+        self.parser.lock().screen().contents()
     }
 
     fn send_input(&self, data: &[u8]) -> Result<()> {

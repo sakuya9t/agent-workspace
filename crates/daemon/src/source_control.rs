@@ -38,14 +38,59 @@ pub struct Commit {
     pub parents: Vec<String>,
 }
 
+/// Per-file line churn for one commit (the `git show --numstat` view).
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitFileStat {
+    pub path: String,
+    /// For renames, the previous path; else `None`.
+    pub orig_path: Option<String>,
+    /// Added/removed line counts; `None` for binary files (`-` in numstat).
+    pub additions: Option<u64>,
+    pub deletions: Option<u64>,
+}
+
+/// Full detail for a single commit: metadata, body, and per-file churn.
+/// This is what the history panel shows when a commit is clicked.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitDetail {
+    pub hash: String,
+    pub short: String,
+    pub subject: String,
+    pub body: String,
+    pub author: String,
+    pub email: String,
+    pub timestamp: i64,
+    pub parents: Vec<String>,
+    pub files: Vec<CommitFileStat>,
+    /// Totals across all non-binary files.
+    pub additions: u64,
+    pub deletions: u64,
+}
+
 /// Source-control plugin boundary. The Git provider is the MVP built-in;
 /// other VCS providers implement the same trait behind the same panel.
 pub trait SourceControl: Send + Sync {
     fn detect(&self, cwd: &Path) -> bool;
     fn status(&self, cwd: &Path) -> Result<ScmStatus>;
-    /// Unified diff for one path. `untracked` files diff against /dev/null.
-    fn diff(&self, cwd: &Path, path: &str, untracked: bool) -> Result<String>;
+    /// Unified diff for one path. When `commit` is set, show that path's diff
+    /// as introduced by the commit; otherwise diff the working tree (with
+    /// `untracked` files diffed against /dev/null).
+    fn diff(&self, cwd: &Path, path: &str, untracked: bool, commit: Option<&str>)
+        -> Result<String>;
     fn log(&self, cwd: &Path, limit: usize) -> Result<Vec<Commit>>;
+    /// Full detail (metadata + per-file churn) for a single commit.
+    fn show(&self, cwd: &Path, hash: &str) -> Result<CommitDetail>;
+    /// Local branch names and the current branch (`None` when detached).
+    fn branches(&self, cwd: &Path) -> Result<(Vec<String>, Option<String>)>;
+    /// Fast-forward-only pull of the current branch from its upstream. Never
+    /// creates a merge commit or leaves the worktree in a conflicted state; if
+    /// the branch has diverged it fails cleanly (the user can rebase instead).
+    /// Returns git's combined stdout+stderr for display.
+    fn pull(&self, cwd: &Path) -> Result<String>;
+    /// Rebase the current branch onto `onto` (a local branch). On any failure
+    /// (conflicts, dirty tree) the rebase is aborted so the worktree is left in
+    /// a clean, usable state rather than half-rebased.
+    fn rebase(&self, cwd: &Path, onto: &str) -> Result<String>;
 }
 
 pub struct GitSourceControl;
@@ -70,12 +115,8 @@ impl SourceControl for GitSourceControl {
             });
         }
 
-        let branch_raw = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let detached = branch_raw == "HEAD" || branch_raw.is_empty();
-        let branch = if detached { None } else { Some(branch_raw) };
+        let branch = current_branch(cwd);
+        let detached = branch.is_none();
         let head = git(cwd, &["rev-parse", "--short", "HEAD"])
             .ok()
             .map(|s| s.trim().to_string())
@@ -94,8 +135,23 @@ impl SourceControl for GitSourceControl {
         })
     }
 
-    fn diff(&self, cwd: &Path, path: &str, untracked: bool) -> Result<String> {
+    fn diff(
+        &self,
+        cwd: &Path,
+        path: &str,
+        untracked: bool,
+        commit: Option<&str>,
+    ) -> Result<String> {
         guard_path(path)?;
+        if let Some(hash) = commit {
+            // One file's change as introduced by a specific commit. `--format=`
+            // drops the commit message so only the diff body is returned.
+            guard_ref(hash)?;
+            return git_allow_diff(
+                cwd,
+                &["show", "--no-color", "--format=", hash, "--", path],
+            );
+        }
         if untracked {
             // /dev/null diff shows the whole file as added; git exits 1 here.
             let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
@@ -138,6 +194,181 @@ impl SourceControl for GitSourceControl {
         }
         Ok(commits)
     }
+
+    fn show(&self, cwd: &Path, hash: &str) -> Result<CommitDetail> {
+        guard_ref(hash)?;
+        // Metadata fields are unit-separated and terminated by a record
+        // separator (\x1e); the `--numstat` block follows on the next lines.
+        // `%b` (body) may contain newlines, so the \x1e is what marks its end.
+        let fmt = "%H%x1f%h%x1f%s%x1f%an%x1f%ae%x1f%ct%x1f%P%x1f%b%x1e";
+        let out = git(
+            cwd,
+            &[
+                "show",
+                "--no-color",
+                "--numstat",
+                &format!("--format=format:{fmt}"),
+                hash,
+            ],
+        )?;
+        parse_show(&out).ok_or_else(|| anyhow!("could not parse commit {hash}"))
+    }
+
+    fn branches(&self, cwd: &Path) -> Result<(Vec<String>, Option<String>)> {
+        if !self.detect(cwd) {
+            return Ok((vec![], None));
+        }
+        let out = git(cwd, &["branch", "--format=%(refname:short)"])?;
+        let branches: Vec<String> = out
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        Ok((branches, current_branch(cwd)))
+    }
+
+    fn pull(&self, cwd: &Path) -> Result<String> {
+        if !self.detect(cwd) {
+            bail!("not a git repository");
+        }
+        // Only a branch with somewhere to pull *from* can be pulled. Prefer the
+        // configured upstream; if none is set (common for local-only session
+        // branches) fall back to origin/<same-name> when it has been fetched
+        // before. Otherwise there is genuinely nothing to pull, so say so
+        // plainly instead of surfacing git's multi-line tracking-info error.
+        let has_upstream = git(
+            cwd,
+            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        )
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+
+        let out = if has_upstream {
+            git_output(cwd, &["pull", "--ff-only"])?
+        } else {
+            let branch = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?
+                .trim()
+                .to_string();
+            if branch.is_empty() || branch == "HEAD" {
+                bail!("cannot pull: HEAD is detached");
+            }
+            if remote_tracking_exists(cwd, "origin", &branch) {
+                git_output(cwd, &["pull", "--ff-only", "origin", &branch])?
+            } else {
+                bail!(
+                    "current branch '{branch}' is not tracking a remote branch, so there is \
+                     nothing to pull. Push it first (git push -u), or use Rebase to bring in \
+                     another branch's commits."
+                );
+            }
+        };
+
+        if out.status.success() {
+            Ok(combined_output(&out))
+        } else {
+            bail!("git pull failed: {}", combined_output(&out).trim());
+        }
+    }
+
+    fn rebase(&self, cwd: &Path, onto: &str) -> Result<String> {
+        if !self.detect(cwd) {
+            bail!("not a git repository");
+        }
+        guard_branch(onto)?;
+        // Only rebase onto a branch that actually exists here. Beyond catching
+        // typos, the exact-match membership check makes argument/option
+        // injection impossible even though `onto` reaches git positionally.
+        let (branches, head) = self.branches(cwd)?;
+        if !branches.iter().any(|b| b == onto) {
+            bail!("unknown branch: {onto}");
+        }
+        if head.as_deref() == Some(onto) {
+            bail!("cannot rebase a branch onto itself");
+        }
+        let out = git_output(cwd, &["rebase", onto])?;
+        if out.status.success() {
+            return Ok(combined_output(&out));
+        }
+        // A failed rebase (conflicts, or a dirty tree it refused to touch) can
+        // leave a rebase in progress; abort so the session's worktree returns
+        // to a clean state instead of a confusing half-rebased one.
+        let _ = git_output(cwd, &["rebase", "--abort"]);
+        bail!(
+            "git rebase onto {onto} failed (rebase aborted): {}",
+            combined_output(&out).trim()
+        );
+    }
+}
+
+/// Parse the `git show --numstat --format=…\x1e` output into a `CommitDetail`.
+fn parse_show(out: &str) -> Option<CommitDetail> {
+    let (header, rest) = out.split_once('\u{1e}')?;
+    let f: Vec<&str> = header.split('\u{1f}').collect();
+    if f.len() < 8 {
+        return None;
+    }
+
+    let mut files = Vec::new();
+    let (mut additions, mut deletions) = (0u64, 0u64);
+    // Skip the blank line(s) git may insert before the numstat block; only
+    // lines shaped `<add>\t<del>\t<path>` are file entries.
+    for line in rest.lines() {
+        let mut cols = line.splitn(3, '\t');
+        let (Some(a), Some(d), Some(p)) = (cols.next(), cols.next(), cols.next()) else {
+            continue;
+        };
+        if p.is_empty() {
+            continue;
+        }
+        let add = a.parse::<u64>().ok();
+        let del = d.parse::<u64>().ok();
+        additions += add.unwrap_or(0);
+        deletions += del.unwrap_or(0);
+        let (path, orig_path) = split_rename(p);
+        files.push(CommitFileStat {
+            path,
+            orig_path,
+            additions: add,
+            deletions: del,
+        });
+    }
+
+    Some(CommitDetail {
+        hash: f[0].to_string(),
+        short: f[1].to_string(),
+        subject: f[2].to_string(),
+        author: f[3].to_string(),
+        email: f[4].to_string(),
+        timestamp: f[5].parse().unwrap_or(0),
+        parents: f[6].split_whitespace().map(|s| s.to_string()).collect(),
+        body: f[7].trim_end().to_string(),
+        files,
+        additions,
+        deletions,
+    })
+}
+
+/// Reconstruct the (new, old) paths from a numstat rename entry. Handles both
+/// `old => new` and the braced `pre/{old => new}/post` forms; returns
+/// `(path, None)` for a plain (non-rename) entry.
+fn split_rename(p: &str) -> (String, Option<String>) {
+    let Some(arrow) = p.find(" => ") else {
+        return (p.to_string(), None);
+    };
+    if let (Some(lb), Some(rb)) = (p.find('{'), p.find('}')) {
+        if lb < arrow && arrow < rb {
+            let prefix = &p[..lb];
+            let suffix = &p[rb + 1..];
+            let old = &p[lb + 1..arrow];
+            let new = &p[arrow + 4..rb];
+            return (
+                format!("{prefix}{new}{suffix}"),
+                Some(format!("{prefix}{old}{suffix}")),
+            );
+        }
+    }
+    let (old, new) = p.split_at(arrow);
+    (new[4..].to_string(), Some(old.to_string()))
 }
 
 /// Parse `git status --porcelain` (v1) into changed-file entries.
@@ -180,7 +411,21 @@ fn parse_porcelain(text: &str) -> Vec<ChangedFile> {
     out
 }
 
-fn git(cwd: &Path, args: &[&str]) -> Result<String> {
+/// The checked-out branch name, or `None` when detached (or unreadable —
+/// `git` failing degrades to the detached presentation, not an error).
+pub(crate) fn current_branch(cwd: &Path) -> Option<String> {
+    let raw = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if raw == "HEAD" || raw.is_empty() {
+        None
+    } else {
+        Some(raw)
+    }
+}
+
+pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -194,6 +439,49 @@ fn git(cwd: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Run git and return the raw `Output` (both streams, exit status) without
+/// treating a non-zero exit as an error. Used by pull/rebase, which want git's
+/// message on both success and failure and decide how to react themselves.
+fn git_output(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
+    Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| anyhow!("failed to run git: {e}"))
+}
+
+/// Whether `refs/remotes/<remote>/<branch>` exists locally (i.e. the branch has
+/// been fetched before). Checked without touching the network so pull can pick
+/// a fallback source for a branch whose tracking config was never set.
+fn remote_tracking_exists(cwd: &Path, remote: &str, branch: &str) -> bool {
+    git(
+        cwd,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/{remote}/{branch}"),
+        ],
+    )
+    .map(|s| !s.trim().is_empty())
+    .unwrap_or(false)
+}
+
+/// Merge git's stdout and stderr into one human-readable blob. Porcelain like
+/// "Already up to date." lands on stdout; progress ("From …", conflict notes)
+/// on stderr — the panel wants both.
+fn combined_output(out: &std::process::Output) -> String {
+    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+    let err = String::from_utf8_lossy(&out.stderr);
+    if !err.trim().is_empty() {
+        if !s.is_empty() && !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push_str(&err);
+    }
+    s.trim_end().to_string()
 }
 
 /// Like `git`, but tolerates exit code 1 (used by diff, which returns 1 when
@@ -224,6 +512,36 @@ fn guard_path(path: &str) -> Result<()> {
     }
     if path.split(['/', '\\']).any(|c| c == "..") {
         bail!("path traversal is not allowed");
+    }
+    Ok(())
+}
+
+/// Reject anything that isn't a bare commit hash. The value reaches git as a
+/// positional argument, so restricting it to hex digits blocks both option
+/// injection (a leading `-`) and revision expressions.
+fn guard_ref(hash: &str) -> Result<()> {
+    if !(4..=64).contains(&hash.len()) || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("invalid commit hash");
+    }
+    Ok(())
+}
+
+/// Reject anything that could be mistaken for an option or shell/ref trickery
+/// before a branch name reaches git positionally. The caller additionally
+/// checks membership against the repo's real branch list, so this is defence
+/// in depth rather than the sole guard.
+fn guard_branch(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("empty branch name");
+    }
+    if name.starts_with('-') {
+        bail!("invalid branch name");
+    }
+    if name
+        .bytes()
+        .any(|b| b == 0 || b == b'\n' || b == b'\r' || b == b' ')
+    {
+        bail!("invalid branch name");
     }
     Ok(())
 }
@@ -275,5 +593,70 @@ mod tests {
         assert!(guard_path("../secret").is_err());
         assert!(guard_path("a/../../b").is_err());
         assert!(guard_path("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn guard_ref_only_accepts_hashes() {
+        assert!(guard_ref("1176c78").is_ok());
+        assert!(guard_ref("1176c7817edc4f99eea0d10da6200322b4acad66").is_ok());
+        assert!(guard_ref("").is_err());
+        assert!(guard_ref("abc").is_err()); // too short
+        assert!(guard_ref("--format=%s").is_err());
+        assert!(guard_ref("HEAD~1").is_err());
+        assert!(guard_ref("main").is_err());
+    }
+
+    #[test]
+    fn guard_branch_rejects_options_and_whitespace() {
+        assert!(guard_branch("main").is_ok());
+        assert!(guard_branch("release/next").is_ok());
+        assert!(guard_branch("feature/foo-bar_1").is_ok());
+        assert!(guard_branch("").is_err());
+        assert!(guard_branch("--onto").is_err());
+        assert!(guard_branch("-x").is_err());
+        assert!(guard_branch("has space").is_err());
+        assert!(guard_branch("has\nnewline").is_err());
+    }
+
+    #[test]
+    fn split_rename_handles_all_forms() {
+        assert_eq!(split_rename("src/a.rs"), ("src/a.rs".into(), None));
+        assert_eq!(
+            split_rename("old.rs => new.rs"),
+            ("new.rs".into(), Some("old.rs".into()))
+        );
+        assert_eq!(
+            split_rename("src/{old.rs => new.rs}"),
+            ("src/new.rs".into(), Some("src/old.rs".into()))
+        );
+        assert_eq!(
+            split_rename("a/{b => c}/d.rs"),
+            ("a/c/d.rs".into(), Some("a/b/d.rs".into()))
+        );
+    }
+
+    #[test]
+    fn parse_show_reads_metadata_and_numstat() {
+        // \x1f = unit sep, \x1e = record sep — the format `show` emits.
+        let out = "H1\u{1f}h1\u{1f}Subject line\u{1f}Ann\u{1f}ann@x.io\u{1f}1700000000\u{1f}P1 P2\u{1f}Body line one\nBody line two\u{1e}\n\
+            10\t2\tsrc/a.rs\n\
+            -\t-\tassets/logo.png\n\
+            1\t1\tsrc/{old.rs => new.rs}\n";
+        let d = parse_show(out).expect("parses");
+        assert_eq!(d.hash, "H1");
+        assert_eq!(d.short, "h1");
+        assert_eq!(d.subject, "Subject line");
+        assert_eq!(d.email, "ann@x.io");
+        assert_eq!(d.timestamp, 1_700_000_000);
+        assert_eq!(d.parents, vec!["P1", "P2"]);
+        assert_eq!(d.body, "Body line one\nBody line two");
+        assert_eq!(d.files.len(), 3);
+        assert_eq!(d.files[0].additions, Some(10));
+        assert_eq!(d.files[1].additions, None); // binary
+        assert_eq!(d.files[2].path, "src/new.rs");
+        assert_eq!(d.files[2].orig_path.as_deref(), Some("src/old.rs"));
+        // Totals ignore the binary file.
+        assert_eq!(d.additions, 11);
+        assert_eq!(d.deletions, 3);
     }
 }

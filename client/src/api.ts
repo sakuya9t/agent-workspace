@@ -121,6 +121,27 @@ export interface Commit {
   parents: string[];
 }
 
+export interface CommitFileStat {
+  path: string;
+  orig_path: string | null;
+  additions: number | null;
+  deletions: number | null;
+}
+
+export interface CommitDetail {
+  hash: string;
+  short: string;
+  subject: string;
+  body: string;
+  author: string;
+  email: string;
+  timestamp: number;
+  parents: string[];
+  files: CommitFileStat[];
+  additions: number;
+  deletions: number;
+}
+
 export interface Health {
   status: string;
   version: string;
@@ -199,10 +220,46 @@ export interface BranchList {
   head: string | null;
 }
 
-import { Target } from "./connectionStore";
+/** Where a client-side VS Code should connect to reach a session's workspace. */
+export interface VscodeTarget {
+  path: string;
+  ssh_user: string | null;
+  hostname: string;
+}
 
-function baseOf(t: Target): string {
-  return t.baseUrl ? t.baseUrl.replace(/\/$/, "") : "";
+import { Target } from "./connectionStore";
+import i18n from "./i18n";
+
+/** Base URL with any trailing slash stripped ("" targets the local origin). */
+function baseOf(baseUrl: string): string {
+  return baseUrl.replace(/\/$/, "");
+}
+
+// fetch rejects with an opaque TypeError when the host is unreachable
+// (connection refused, DNS, offline) — name the likely cause instead.
+function unreachableError(baseUrl: string): Error {
+  return new Error(
+    baseUrl ? i18n.t("api.unreachableAt", { baseUrl }) : i18n.t("api.unreachable"),
+  );
+}
+
+/**
+ * Message for a non-OK response: the JSON body's `error` when present
+ * (`fromBody: true`), else `status statusText`.
+ */
+async function errorMessage(res: Response): Promise<{ msg: string; fromBody: boolean }> {
+  let msg = `${res.status} ${res.statusText}`;
+  let fromBody = false;
+  try {
+    const body = await res.json();
+    if (body?.error) {
+      msg = body.error;
+      fromBody = true;
+    }
+  } catch {
+    /* ignore */
+  }
+  return { msg, fromBody };
 }
 
 async function req<T>(t: Target, path: string, init?: RequestInit): Promise<T> {
@@ -211,84 +268,105 @@ async function req<T>(t: Target, path: string, init?: RequestInit): Promise<T> {
     ...((init?.headers as Record<string, string>) ?? {}),
   };
   if (t.token) headers["Authorization"] = `Bearer ${t.token}`;
+  if (t.relayKey) headers["X-ASM-Relay-Key"] = t.relayKey;
 
   let res: Response;
   try {
-    res = await fetch(baseOf(t) + path, { ...init, headers });
+    res = await fetch(baseOf(t.baseUrl) + path, { ...init, headers });
   } catch {
-    // fetch rejects with an opaque TypeError when the host is unreachable
-    // (connection refused, DNS, offline) — name the likely cause instead.
-    throw new Error(
-      `cannot connect — daemon unreachable${t.baseUrl ? ` at ${t.baseUrl}` : ""} (not started?)`,
-    );
+    throw unreachableError(t.baseUrl);
   }
   if (!res.ok) {
-    let msg = `${res.status} ${res.statusText}`;
-    let fromBody = false;
-    try {
-      const body = await res.json();
-      if (body?.error) {
-        msg = body.error;
-        fromBody = true;
-      }
-    } catch {
-      /* ignore */
-    }
+    const { msg: bodyMsg, fromBody } = await errorMessage(res);
+    let msg = bodyMsg;
     if (res.status === 401) {
-      msg = `unauthorized — enroll or reconnect (${msg})`;
+      msg = i18n.t("api.unauthorized", { message: msg });
     } else if (!fromBody && (res.status === 502 || res.status === 504)) {
       // A bare gateway error means a proxy sits in front of a dead daemon.
-      msg = `cannot connect — daemon unreachable (${msg})`;
+      msg = i18n.t("api.gatewayUnreachable", { message: msg });
     }
-    throw new Error(msg);
+    // Expose the HTTP status so callers can branch on it (e.g. 409 → confirm
+    // and retry a guarded, destructive action with force).
+    throw Object.assign(new Error(msg), { status: res.status });
   }
   return res.json() as Promise<T>;
 }
 
-/** Enroll a device against a specific daemon; returns its device token. */
+/**
+ * POST raw binary (e.g. a pasted image Blob) and parse a JSON reply. Mirrors
+ * `req`'s auth handling but sends the Blob as-is — fetch derives the multipart
+ * boundary-free `Content-Type` from the Blob, so we don't force JSON.
+ */
+async function postBlob<T>(t: Target, path: string, blob: Blob): Promise<T> {
+  const headers: Record<string, string> = {
+    "content-type": blob.type || "application/octet-stream",
+  };
+  if (t.token) headers["Authorization"] = `Bearer ${t.token}`;
+  if (t.relayKey) headers["X-ASM-Relay-Key"] = t.relayKey;
+
+  let res: Response;
+  try {
+    res = await fetch(baseOf(t.baseUrl) + path, { method: "POST", headers, body: blob });
+  } catch {
+    throw unreachableError(t.baseUrl);
+  }
+  if (!res.ok) {
+    const { msg } = await errorMessage(res);
+    throw Object.assign(new Error(msg), { status: res.status });
+  }
+  return res.json() as Promise<T>;
+}
+
+/** Where a stored paste landed on the daemon host. */
+export interface PastedImage {
+  path: string;
+  relative_path: string;
+  filename: string;
+}
+
+/**
+ * Enroll a device against a specific daemon; returns its device token. When the
+ * daemon is reached through a relay, pass `relayKey` so the relay authorizes the
+ * (public, at the daemon layer) enroll request.
+ */
 export async function enrollDevice(
   baseUrl: string,
   enrollmentToken: string,
   deviceName: string,
+  relayKey?: string | null,
 ): Promise<{ server_id: string; device_id: string; device_token: string }> {
-  const b = baseUrl ? baseUrl.replace(/\/$/, "") : "";
+  const b = baseOf(baseUrl);
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (relayKey) headers["X-ASM-Relay-Key"] = relayKey;
   let res: Response;
   try {
     res = await fetch(b + "/api/auth/enroll", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers,
       body: JSON.stringify({ enrollment_token: enrollmentToken, device_name: deviceName }),
     });
   } catch {
-    throw new Error(
-      `cannot connect — daemon unreachable${baseUrl ? ` at ${baseUrl}` : ""} (not started?)`,
-    );
+    throw unreachableError(baseUrl);
   }
-  if (!res.ok) {
-    let msg = `${res.status} ${res.statusText}`;
-    try {
-      const body = await res.json();
-      if (body?.error) msg = body.error;
-    } catch {
-      /* ignore */
-    }
-    throw new Error(msg);
-  }
+  if (!res.ok) throw new Error((await errorMessage(res)).msg);
   return res.json();
 }
 
 /** Probe a daemon's /health (used to validate a connection). */
-export async function probeHealth(baseUrl: string, token: string | null): Promise<Health> {
-  const b = baseUrl ? baseUrl.replace(/\/$/, "") : "";
+export async function probeHealth(
+  baseUrl: string,
+  token: string | null,
+  relayKey?: string | null,
+): Promise<Health> {
+  const b = baseOf(baseUrl);
   const headers: Record<string, string> = {};
   if (token) headers["Authorization"] = `Bearer ${token}`;
+  if (relayKey) headers["X-ASM-Relay-Key"] = relayKey;
   let res: Response;
   try {
     res = await fetch(b + "/health", { headers });
   } catch {
-    throw new Error(
-      `cannot connect — daemon unreachable${baseUrl ? ` at ${baseUrl}` : ""} (not started?)`,
-    );
+    throw unreachableError(baseUrl);
   }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json();
@@ -313,10 +391,12 @@ export const api = {
     req<{ session: Session }>(t, `/api/sessions/${id}/stop`, { method: "POST" }).then(
       (r) => r.session,
     ),
-  archiveSession: (t: Target, id: string) =>
-    req<{ session: Session }>(t, `/api/sessions/${id}/archive`, { method: "POST" }).then(
-      (r) => r.session,
-    ),
+  archiveSession: (t: Target, id: string, force = false) =>
+    req<{ session: Session }>(
+      t,
+      `/api/sessions/${id}/archive${force ? "?force=true" : ""}`,
+      { method: "POST" },
+    ).then((r) => r.session),
   ackAttention: (t: Target, id: string) =>
     req<{ session: Session }>(t, `/api/sessions/${id}/ack`, { method: "POST" }).then(
       (r) => r.session,
@@ -328,15 +408,32 @@ export const api = {
     }),
   scmStatus: (t: Target, id: string) =>
     req<{ status: ScmStatus }>(t, `/api/sessions/${id}/scm/status`).then((r) => r.status),
-  scmDiff: (t: Target, id: string, path: string, untracked: boolean) =>
+  scmDiff: (t: Target, id: string, path: string, untracked: boolean, commit?: string) =>
     req<{ path: string; diff: string }>(
       t,
-      `/api/sessions/${id}/scm/diff?path=${encodeURIComponent(path)}&untracked=${untracked}`,
+      `/api/sessions/${id}/scm/diff?path=${encodeURIComponent(path)}&untracked=${untracked}` +
+        (commit ? `&commit=${encodeURIComponent(commit)}` : ""),
     ).then((r) => r.diff),
   scmLog: (t: Target, id: string, limit = 30) =>
     req<{ commits: Commit[] }>(t, `/api/sessions/${id}/scm/log?limit=${limit}`).then(
       (r) => r.commits,
     ),
+  scmCommit: (t: Target, id: string, hash: string) =>
+    req<{ commit: CommitDetail }>(
+      t,
+      `/api/sessions/${id}/scm/commit?hash=${encodeURIComponent(hash)}`,
+    ).then((r) => r.commit),
+  scmBranches: (t: Target, id: string) =>
+    req<BranchList>(t, `/api/sessions/${id}/scm/branches`),
+  scmPull: (t: Target, id: string) =>
+    req<{ output: string }>(t, `/api/sessions/${id}/scm/pull`, { method: "POST" }).then(
+      (r) => r.output,
+    ),
+  scmRebase: (t: Target, id: string, onto: string) =>
+    req<{ output: string }>(t, `/api/sessions/${id}/scm/rebase`, {
+      method: "POST",
+      body: JSON.stringify({ onto }),
+    }).then((r) => r.output),
   listWorkspaces: (t: Target) =>
     req<{ workspaces: Workspace[] }>(t, "/api/workspaces").then((r) => r.workspaces),
   addWorkspace: (t: Target, name: string, root_path: string) =>
@@ -366,10 +463,8 @@ export const api = {
     req<{ ok: boolean }>(t, `/api/sessions/${id}/cleanup?force=${force}`, {
       method: "POST",
     }),
-  openVscode: (t: Target, id: string) =>
-    req<{ opened: boolean; path: string }>(t, `/api/sessions/${id}/open-vscode`, {
-      method: "POST",
-    }),
+  vscodeTarget: (t: Target, id: string) =>
+    req<VscodeTarget>(t, `/api/sessions/${id}/vscode-target`),
   fsList: (t: Target, path: string, showHidden: boolean) =>
     req<FsListing>(
       t,
@@ -379,20 +474,59 @@ export const api = {
     req<{ enrollment_token: string }>(t, "/api/auth/enrollment-token").then(
       (r) => r.enrollment_token,
     ),
+  /**
+   * Upload a pasted/dropped image; the daemon stores it under the session's
+   * working directory and returns the path to inject into the terminal.
+   */
+  pasteImage: (t: Target, id: string, blob: Blob) =>
+    postBlob<PastedImage>(t, `/api/sessions/${id}/paste`, blob),
 };
 
 export function streamUrl(t: Target, id: string): string {
-  let host: string;
-  let secure: boolean;
+  let base: string;
   if (t.baseUrl) {
     const u = new URL(t.baseUrl);
-    host = u.host;
-    secure = u.protocol === "https:";
+    const proto = u.protocol === "https:" ? "wss" : "ws";
+    // Preserve any path prefix (e.g. `/n/<node_id>` for a relayed daemon) —
+    // dropping it would bypass the relay route. Strip a trailing slash so we
+    // don't double it before `/api`.
+    const prefix = u.pathname.replace(/\/$/, "");
+    base = `${proto}://${u.host}${prefix}`;
   } else {
-    host = location.host;
-    secure = location.protocol === "https:";
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    base = `${proto}://${location.host}`;
   }
-  let url = `${secure ? "wss" : "ws"}://${host}/api/sessions/${id}/stream`;
-  if (t.token) url += `?access_token=${encodeURIComponent(t.token)}`;
-  return url;
+  const params: string[] = [];
+  if (t.token) params.push(`access_token=${encodeURIComponent(t.token)}`);
+  // Browsers cannot set WS headers, so the relay key rides as a query param.
+  if (t.relayKey) params.push(`relay_key=${encodeURIComponent(t.relayKey)}`);
+  const query = params.length ? `?${params.join("&")}` : "";
+  return `${base}/api/sessions/${id}/stream${query}`;
+}
+
+/** One node the relay knows about (mirrors asm-relay's NodeEntry). */
+export interface RelayNode {
+  node_id: string;
+  label: string;
+  kind: "leaf" | "gateway";
+  via: string | null;
+  online: boolean;
+  last_seen: string;
+}
+
+/** Discover the nodes registered with a relay (requires the relay access key). */
+export async function listRelayNodes(url: string, accessKey: string): Promise<RelayNode[]> {
+  const b = url.replace(/\/$/, "");
+  let res: Response;
+  try {
+    res = await fetch(b + "/nodes", { headers: { "X-ASM-Relay-Key": accessKey } });
+  } catch {
+    throw new Error(i18n.t("api.unreachableAt", { baseUrl: url }));
+  }
+  if (!res.ok) {
+    if (res.status === 401) throw new Error(i18n.t("relay.errBadKey"));
+    throw new Error(`${res.status} ${res.statusText}`);
+  }
+  const body = (await res.json()) as { nodes: RelayNode[] };
+  return body.nodes ?? [];
 }

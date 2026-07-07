@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,14 +14,35 @@ use uuid::Uuid;
 /// (finished its turn, waiting for the next input).
 const IDLE_AFTER: Duration = Duration::from_secs(4);
 
+/// After the user sends input, output arriving within this window is treated as
+/// the terminal *echoing* their keystrokes back — not the agent working — so an
+/// idle prompt stays idle while you type your next command into it. The window
+/// is bypassed once the input submits a line (CR/LF), which does hand control to
+/// the agent (see [`Interaction::submitted`]).
+const ECHO_WINDOW: Duration = Duration::from_millis(1000);
+
 use crate::backend::{BackendSession, BackendSpawnSpec, BackendStatus, HolderEntry, SessionBackend};
 use crate::db::Db;
 use crate::domain::{
     AttentionState, Session, SessionStatus, SessionSummary, Workspace, WorkspaceInstance,
 };
-use crate::plugins::{AgentContext, PluginRegistry};
+use crate::plugins::{attention, AgentContext, AgentPlugin, PluginRegistry};
 use crate::util::now_millis;
 use crate::workspace;
+
+/// A destructive operation was refused because it would discard uncommitted or
+/// unmerged work. Carried as a typed error so the API can answer `409 Conflict`
+/// and the client can confirm and retry with `force`.
+#[derive(Debug)]
+pub struct NeedsForce(pub String);
+
+impl std::fmt::Display for NeedsForce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for NeedsForce {}
 
 /// Request to start a new session.
 #[derive(Debug, Clone)]
@@ -51,6 +72,24 @@ pub struct CreateSessionRequest {
     pub options: Vec<(String, bool)>,
 }
 
+/// Per-session signal shared from the input path (the API's WebSocket handler)
+/// to the monitor task, letting the monitor tell keystroke *echo* apart from the
+/// agent actually working. Consistent with the rest of the monitor: cheap atomic
+/// stores on the hot input path, read when output arrives.
+#[derive(Default)]
+struct Interaction {
+    /// Set when the user views or answers a session — tells the monitor to clear
+    /// a sticky "blocked" (needs-attention) state.
+    reset: AtomicBool,
+    /// Wall-clock ms of the user's most recent input (`0` = none yet). Output
+    /// within [`ECHO_WINDOW`] of this is likely the terminal echoing keystrokes.
+    last_input_ms: AtomicI64,
+    /// The user's most recent input submitted a line (contained CR/LF), i.e. it
+    /// likely handed control to the agent, so its output *is* real work — not
+    /// echo. Latched on submit, cleared when the session settles back to idle.
+    submitted: AtomicBool,
+}
+
 /// Owns session lifecycle: plugin resolution, backend spawn, persistence, and
 /// the per-session monitor task that tracks exit, summaries, and attention.
 pub struct SessionManager {
@@ -60,9 +99,8 @@ pub struct SessionManager {
     live: Mutex<HashMap<String, Arc<dyn BackendSession>>>,
     /// Base directory under which per-session Git worktrees are created.
     worktree_root: PathBuf,
-    /// Per-session flag: set when the user views or interacts, telling the
-    /// monitor to clear a sticky "blocked" (needs-attention) state.
-    attn_reset: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Per-session interaction signals, keyed by session id (see [`Interaction`]).
+    interactions: Mutex<HashMap<String, Arc<Interaction>>>,
 }
 
 impl SessionManager {
@@ -78,7 +116,7 @@ impl SessionManager {
             backend,
             live: Mutex::new(HashMap::new()),
             worktree_root,
-            attn_reset: Mutex::new(HashMap::new()),
+            interactions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -196,7 +234,7 @@ impl SessionManager {
             .update_status(&id, SessionStatus::Running, None, now_millis())?;
 
         self.clone()
-            .spawn_monitor(id.clone(), handle, session.created_at, plugin.bell_means_attention());
+            .spawn_monitor(id.clone(), handle, session.created_at, Some(plugin.clone()));
 
         self.db
             .get_session(&id)?
@@ -238,6 +276,40 @@ impl SessionManager {
                         .map(str::trim)
                         .filter(|b| !b.is_empty())
                         .unwrap_or("HEAD");
+
+                    // Picking an existing branch that is already checked out
+                    // somewhere: share that working tree rather than fail. Git
+                    // forbids a second checkout of one branch, and sharing is
+                    // exactly what lets two sessions (e.g. plan-with-CC then
+                    // review-with-codex) see the same diffs.
+                    if let Some(name) = requested {
+                        if !req.create_branch {
+                            if let Some((existing_path, is_main)) =
+                                workspace::worktree_for_branch(&root, name)?
+                            {
+                                // The repo's own checkout can't become a second
+                                // worktree; sharing it is a direct checkout,
+                                // which owns no worktree or branch to reclaim.
+                                let (path, branch, isolation) = if is_main {
+                                    (ws.root_path.clone(), None, "direct")
+                                } else {
+                                    (existing_path, Some(name.to_string()), "shared")
+                                };
+                                let inst = WorkspaceInstance {
+                                    id: Uuid::new_v4().to_string(),
+                                    workspace_id: ws.id.clone(),
+                                    session_id: Some(session_id.to_string()),
+                                    path: path.clone(),
+                                    branch,
+                                    isolation: isolation.into(),
+                                    status: "active".into(),
+                                    created_at: now,
+                                };
+                                return Ok((path, Some(inst)));
+                            }
+                        }
+                    }
+
                     let spec = match requested {
                         Some(name) if req.create_branch => {
                             workspace::BranchSpec::New { name, base }
@@ -382,15 +454,18 @@ impl SessionManager {
         if inst.status == "released" {
             return Ok(());
         }
-        if inst.isolation == "worktree" {
+        if inst.isolation == "worktree" || inst.isolation == "shared" {
             if self.live_handle(session_id).is_some() {
                 bail!("stop the session before cleaning up its worktree");
             }
-            let ws = self
-                .db
-                .get_workspace(&inst.workspace_id)?
-                .ok_or_else(|| anyhow!("workspace record missing"))?;
-            workspace::remove_worktree(Path::new(&ws.root_path), Path::new(&inst.path), force)?;
+            // Only reclaim the worktree once the last session sharing it leaves.
+            if self.db.count_active_instances_at_path(&inst.path, &inst.id)? == 0 {
+                let ws = self
+                    .db
+                    .get_workspace(&inst.workspace_id)?
+                    .ok_or_else(|| anyhow!("workspace record missing"))?;
+                workspace::remove_worktree(Path::new(&ws.root_path), Path::new(&inst.path), force)?;
+            }
         }
         self.db.set_instance_status(&inst.id, "released")?;
         Ok(())
@@ -572,11 +647,9 @@ impl SessionManager {
             let sess = self.db.get_session(&id)?;
             let (rows, cols) = sess.as_ref().map(|s| (s.rows, s.cols)).unwrap_or((24, 80));
             let created_at = sess.as_ref().map(|s| s.created_at).unwrap_or_else(now_millis);
-            let bell_attention = sess
+            let plugin = sess
                 .as_ref()
-                .and_then(|s| self.registry.get(&s.agent_plugin_id))
-                .map(|p| p.bell_means_attention())
-                .unwrap_or(false);
+                .and_then(|s| self.registry.get(&s.agent_plugin_id));
 
             match by_id.get(&id) {
                 Some(entry) if entry.alive => match self.backend.adopt(&id, rows, cols) {
@@ -584,7 +657,7 @@ impl SessionManager {
                         self.live.lock().insert(id.clone(), handle.clone());
                         self.db
                             .update_status(&id, SessionStatus::Running, None, now_millis())?;
-                        self.clone().spawn_monitor(id.clone(), handle, created_at, bell_attention);
+                        self.clone().spawn_monitor(id.clone(), handle, created_at, plugin.clone());
                         adopted += 1;
                         tracing::info!(session = %id, "adopted live holder session");
                     }
@@ -597,8 +670,6 @@ impl SessionManager {
                     // The holder has a real completion record.
                     let (status, code) = if entry.exit_signal != 0 {
                         (SessionStatus::Failed, None)
-                    } else if entry.exit_code == 0 {
-                        (SessionStatus::Exited, Some(0))
                     } else {
                         (SessionStatus::Exited, Some(entry.exit_code))
                     };
@@ -630,7 +701,12 @@ impl SessionManager {
         Ok(())
     }
 
-    pub fn archive_session(&self, id: &str) -> Result<Session> {
+    /// Archive a finished session. Unlike a plain "finished" session (which stays
+    /// in history with its branch kept), archiving is the "throw this away" step:
+    /// it removes the session's managed worktree and deletes its branch, then
+    /// marks the record `archived` (dropped from the history view). Refuses to
+    /// discard uncommitted or unmerged work unless `force` — see `discard_instance`.
+    pub fn archive_session(&self, id: &str, force: bool) -> Result<Session> {
         let s = self
             .db
             .get_session(id)?
@@ -638,11 +714,83 @@ impl SessionManager {
         if !s.status.is_terminal() {
             bail!("cannot archive a live session; stop it first");
         }
+        self.discard_instance(id, force)?;
         self.db
             .update_status(id, SessionStatus::Archived, s.exit_code, now_millis())?;
         self.db
             .get_session(id)?
             .ok_or_else(|| anyhow!("session vanished"))
+    }
+
+    /// Tear down a session's managed worktree and delete its branch, reclaiming
+    /// both. A no-op for ad-hoc sessions and direct/plain instances (which share
+    /// the source checkout and own no branch). Guards against data loss unless
+    /// `force`: a dirty worktree or an unmerged branch raises [`NeedsForce`] so
+    /// the caller can confirm before anything is removed. The unmerged check runs
+    /// before the worktree is touched, so a refusal leaves everything intact.
+    fn discard_instance(&self, session_id: &str, force: bool) -> Result<()> {
+        let Some(inst) = self.db.get_instance_for_session(session_id)? else {
+            return Ok(()); // ad-hoc session: nothing managed to remove
+        };
+        if inst.isolation != "worktree" && inst.isolation != "shared" {
+            return Ok(()); // direct/plain: no owned worktree or branch
+        }
+        let ws = self
+            .db
+            .get_workspace(&inst.workspace_id)?
+            .ok_or_else(|| anyhow!("workspace record missing"))?;
+        let root = Path::new(&ws.root_path);
+        let inst_path = Path::new(&inst.path);
+        let active = inst.status == "active";
+
+        if active && self.live_handle(session_id).is_some() {
+            bail!("stop the session before archiving it");
+        }
+
+        // Another session is still working in this shared worktree: relinquish
+        // our own claim but leave the directory and branch for the remaining
+        // sharer(s). Whoever leaves last (this check returns 0) reclaims both.
+        // No `force` bypass — force discards *our* work, never evicts a sharer.
+        if self.db.count_active_instances_at_path(&inst.path, &inst.id)? > 0 {
+            if active {
+                self.db.set_instance_status(&inst.id, "released")?;
+            }
+            return Ok(());
+        }
+
+        // Refuse to silently discard work unless forced. Both guards surface as
+        // `NeedsForce` (→ HTTP 409) so the client can confirm and retry.
+        if !force {
+            if active && workspace::worktree_is_dirty(inst_path) {
+                return Err(NeedsForce(
+                    "worktree has uncommitted changes; archiving would discard them".into(),
+                )
+                .into());
+            }
+            if let Some(branch) = inst.branch.as_deref() {
+                if workspace::branch_exists(root, branch)
+                    && !workspace::branch_is_merged(root, branch)
+                {
+                    return Err(NeedsForce(format!(
+                        "branch `{branch}` has unmerged commits; archiving would delete them"
+                    ))
+                    .into());
+                }
+            }
+        }
+
+        // Safe (or forced): drop the worktree first (a branch checked out in a
+        // worktree cannot be deleted), then the branch itself.
+        if active {
+            workspace::remove_worktree(root, inst_path, force)?;
+            self.db.set_instance_status(&inst.id, "released")?;
+        }
+        if let Some(branch) = inst.branch.as_deref() {
+            if workspace::branch_exists(root, branch) {
+                workspace::delete_branch(root, branch, force)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn resize_session(&self, id: &str, rows: u16, cols: u16) -> Result<()> {
@@ -665,16 +813,23 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("no such session"))
     }
 
-    /// The user interacted with a session (sent input), which resolves any
-    /// pending "blocked" state — tell the monitor to stop holding it. Cheap: sets
-    /// a flag; the badge itself clears on the next output (working) or on view.
-    pub fn note_interaction(&self, id: &str) {
-        self.signal_attn_reset(id);
+    /// The user sent input to a session. Records when (so the monitor can treat
+    /// the imminent keystroke echo as *not* the agent working) and whether it
+    /// submitted a line, and resolves any pending "blocked" state. Cheap: atomic
+    /// stores only; the badge itself updates on the next output or on view.
+    pub fn note_interaction(&self, id: &str, data: &[u8]) {
+        if let Some(sig) = self.interactions.lock().get(id) {
+            sig.last_input_ms.store(now_millis(), Ordering::Relaxed);
+            if data.iter().any(|&b| b == b'\r' || b == b'\n') {
+                sig.submitted.store(true, Ordering::Relaxed);
+            }
+            sig.reset.store(true, Ordering::Relaxed);
+        }
     }
 
     fn signal_attn_reset(&self, id: &str) {
-        if let Some(flag) = self.attn_reset.lock().get(id) {
-            flag.store(true, Ordering::Relaxed);
+        if let Some(sig) = self.interactions.lock().get(id) {
+            sig.reset.store(true, Ordering::Relaxed);
         }
     }
 
@@ -683,16 +838,19 @@ impl SessionManager {
         id: String,
         handle: Arc<dyn BackendSession>,
         started_at: i64,
-        bell_attention: bool,
+        plugin: Option<Arc<dyn AgentPlugin>>,
     ) {
-        let reset = Arc::new(AtomicBool::new(false));
-        self.attn_reset.lock().insert(id.clone(), reset.clone());
+        let sig = Arc::new(Interaction::default());
+        self.interactions.lock().insert(id.clone(), sig.clone());
         tokio::spawn(async move {
             let mut status_rx = handle.watch_status();
             let (_snap, mut out_rx) = handle.attach();
             let mut tail = String::new();
             let mut last_activity_write = 0i64;
             let mut last_attn = AttentionState::None;
+            // Carries OSC-escape state across chunks so a window-title update
+            // split over two reads isn't miscounted as a bell (see `scan_bell`).
+            let mut in_osc = false;
 
             loop {
                 // Only a *working* session needs the close idle watch; a blocked
@@ -720,11 +878,22 @@ impl SessionManager {
                         match recv {
                             Ok(bytes) => {
                                 // If the user viewed/answered since the last chunk,
-                                // clear the sticky block before classifying anew.
-                                if reset.swap(false, Ordering::Relaxed) {
+                                // drop a sticky *block* so fresh output reclassifies.
+                                // A plain idle prompt is left untouched here — its
+                                // keystroke echo must not read as work, which
+                                // `on_output` handles via the input timing below.
+                                if sig.reset.swap(false, Ordering::Relaxed)
+                                    && matches!(
+                                        last_attn,
+                                        AttentionState::LikelyBlocked
+                                            | AttentionState::ApprovalNeeded
+                                    )
+                                {
                                     last_attn = AttentionState::None;
                                 }
-                                self.on_output(&id, &handle, &bytes, bell_attention, &mut tail, &mut last_activity_write, &mut last_attn);
+                                let last_input_ms = sig.last_input_ms.load(Ordering::Relaxed);
+                                let submitted = sig.submitted.load(Ordering::Relaxed);
+                                self.on_output(&id, &handle, &bytes, plugin.as_ref(), &mut tail, &mut last_activity_write, &mut last_attn, &mut in_osc, last_input_ms, submitted);
                             }
                             Err(RecvError::Lagged(_)) => { /* attention is best-effort */ }
                             Err(RecvError::Closed) => {
@@ -733,20 +902,24 @@ impl SessionManager {
                         }
                     }
                     _ = idle_tick => {
-                        self.on_idle(&id, &mut last_attn);
+                        self.on_idle(&id, &mut last_attn, &sig);
                     }
                 }
             }
-            self.attn_reset.lock().remove(&id);
+            self.interactions.lock().remove(&id);
         });
     }
 
     /// Output has been silent for [`IDLE_AFTER`]: a *working* session is now idle,
     /// waiting for the next input. A blocked session (bell / prompt) is sticky and
     /// stays blocked — silence doesn't mean it stopped needing you.
-    fn on_idle(&self, id: &str, last_attn: &mut AttentionState) {
+    fn on_idle(&self, id: &str, last_attn: &mut AttentionState, sig: &Interaction) {
         if *last_attn == AttentionState::Activity {
             *last_attn = AttentionState::Idle;
+            // Fresh idle prompt: whatever the user types next is composing again,
+            // so clear the submit latch — their keystroke echo is suppressed until
+            // they submit the next line.
+            sig.submitted.store(false, Ordering::Relaxed);
             let _ = self.db.set_attention(
                 id,
                 AttentionState::Idle,
@@ -762,18 +935,53 @@ impl SessionManager {
         id: &str,
         handle: &Arc<dyn BackendSession>,
         bytes: &[u8],
-        bell_attention: bool,
+        plugin: Option<&Arc<dyn AgentPlugin>>,
         tail: &mut String,
         last_write: &mut i64,
         last_attn: &mut AttentionState,
+        in_osc: &mut bool,
+        last_input_ms: i64,
+        submitted: bool,
     ) {
-        // Maintain a small decoded tail for prompt/approval detection.
+        // Maintain a small decoded tail for the default (tail-based) classifier.
         tail.push_str(&String::from_utf8_lossy(bytes));
         trim_tail(tail, 4096);
         // Only trust the bell as an attention signal for agents that opt in
-        // (a plain shell rings it as UI noise).
-        let bell = bell_attention && bytes.contains(&0x07);
-        let (raw, reason) = classify_attention(tail, bell);
+        // (a plain shell rings it as UI noise), and only a *real* bell — not the
+        // BEL that terminates an OSC window-title update, which agents like
+        // Claude Code emit constantly while working (`ESC ] 0 ; <title> BEL`).
+        let bell = plugin.is_some_and(|p| p.bell_means_attention()) && scan_bell(bytes, in_osc);
+        // Classification is per-provider. Most agents read the raw output tail;
+        // one whose approval UI the tail can't see (Claude Code's boxed menu)
+        // asks for the rendered screen instead — bounded to the visible grid and
+        // always current, so a prompt buried above a footer / redraw frames is
+        // still seen. An unknown plugin falls back to the default heuristic.
+        let screen;
+        let (raw, reason) = match plugin {
+            Some(p) if p.attention_uses_screen() => {
+                screen = handle.screen_text();
+                p.attention(&screen, bell)
+            }
+            Some(p) => p.attention(tail, bell),
+            None => attention::default_attention(tail, bell),
+        };
+        let now = now_millis();
+
+        // Keystroke echo at an idle prompt: the user is composing their next
+        // command, the agent is not working. Output that lands within
+        // [`ECHO_WINDOW`] of their last input — and that hasn't yet submitted a
+        // line — is that echo, so the prompt stays idle. A submit (CR/LF) hands
+        // off to the agent, so its output *is* real work and falls through. This
+        // only guards the idle state; spontaneous agent output (no recent input)
+        // is outside the window and reads as activity as before.
+        if raw == AttentionState::Activity
+            && *last_attn == AttentionState::Idle
+            && !submitted
+            && last_input_ms != 0
+            && now.saturating_sub(last_input_ms) < ECHO_WINDOW.as_millis() as i64
+        {
+            return;
+        }
 
         // Sticky "blocked": agents ring the bell / show a prompt when they need
         // you, then keep redrawing (TUIs) — plain redraw output must NOT demote
@@ -790,7 +998,6 @@ impl SessionManager {
         };
         *last_attn = attention;
 
-        let now = now_millis();
         // Debounce activity writes, but always flush a blocking/approval signal.
         if attention != AttentionState::Activity || now - *last_write >= 400 {
             *last_write = now;
@@ -929,51 +1136,37 @@ fn delete_orphan_branch(
     }
 }
 
-/// Classify one output chunk. A session is **blocked** (needs input) when an
-/// input prompt sits at the current end of output, or when the agent rang the
-/// terminal **bell** — the explicit "I need you" signal agents emit for approval
-/// or turn-complete. Otherwise it is working **activity** (later settled to
-/// `idle` by the silence timer, or kept "blocked" by the sticky rule in
-/// `on_output`).
+/// Scan an output chunk for a *genuine* terminal bell (a standalone `0x07`),
+/// ignoring the BEL that terminates an OSC control string (`ESC ] … BEL`).
+/// Agents like Claude Code set the window title to their current task on every
+/// redraw — `ESC ] 0 ; <title> BEL` — so a naive `contains(0x07)` reads those
+/// title updates as attention bells and pins a working session to "blocked".
 ///
-/// Matching only the last non-blank line keeps a prompt-like phrase mid-stream
-/// (with output after it) from flipping a working agent to blocked. The bell is
-/// applied per chunk (an event), not scanned from the accumulated tail, so a
-/// stale bell doesn't linger.
-fn classify_attention(tail: &str, bell: bool) -> (AttentionState, Option<String>) {
-    const APPROVAL_PATTERNS: &[&str] = &[
-        "(y/n)",
-        "[y/n]",
-        "(yes/no)",
-        "do you want to",
-        "proceed?",
-        "continue? (",
-        "overwrite?",
-        "password:",
-        "passphrase:",
-        "are you sure",
-        "press enter to continue",
-    ];
-    let last_line = tail
-        .rsplit(|c: char| c == '\n' || c == '\r')
-        .find(|s| !s.trim().is_empty())
-        .unwrap_or(tail);
-    let lower = last_line.to_lowercase();
-    for p in APPROVAL_PATTERNS {
-        if lower.contains(p) {
-            return (
-                AttentionState::ApprovalNeeded,
-                Some(format!("prompt detected: {p}")),
-            );
+/// OSC strings end at either BEL or ST (`ESC \`). `in_osc` carries the parser
+/// state across chunk boundaries so a title split over two reads (its `ESC ]`
+/// in one chunk, its BEL in the next) still isn't miscounted. Only a BEL seen
+/// outside an OSC string counts as a real bell.
+fn scan_bell(bytes: &[u8], in_osc: &mut bool) -> bool {
+    let mut bell = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if *in_osc {
+            if b == 0x07 {
+                *in_osc = false; // OSC terminator — not an attention bell.
+            } else if b == 0x1b && bytes.get(i + 1) == Some(&b'\\') {
+                *in_osc = false; // ST terminator (ESC \).
+                i += 1;
+            }
+        } else if b == 0x1b && bytes.get(i + 1) == Some(&b']') {
+            *in_osc = true; // OSC introducer (ESC ]).
+            i += 1;
+        } else if b == 0x07 {
+            bell = true; // a real, standalone bell.
         }
+        i += 1;
     }
-    if bell {
-        return (
-            AttentionState::LikelyBlocked,
-            Some("agent rang the terminal bell".to_string()),
-        );
-    }
-    (AttentionState::Activity, None)
+    bell
 }
 
 /// Bound `tail` to at most `max` bytes by dropping the oldest content.
@@ -1000,38 +1193,50 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use tokio::sync::{broadcast, watch};
 
-    // ---- attention classifier ----
+    // Attention classification lives in `plugins::attention` (per-provider); its
+    // unit tests are colocated there. This module keeps the byte-stream
+    // mechanics: bell scanning and tail trimming.
+
+    // ---- bell scanning (OSC title vs. real bell) ----
 
     #[test]
-    fn detects_approval_prompt_at_end() {
-        let (a, reason) = classify_attention("Proceed? (y/n)", false);
-        assert_eq!(a, AttentionState::ApprovalNeeded);
-        assert!(reason.is_some());
-        // A prompt on a prior line (cursor sits after it, no trailing output).
-        let (a2, _) = classify_attention("Working...\nPassword: ", false);
-        assert_eq!(a2, AttentionState::ApprovalNeeded);
+    fn osc_title_bel_is_not_a_bell() {
+        // The real bug: Claude Code sets the window title to its current task on
+        // every redraw via `ESC ] 0 ; <title> BEL`. That BEL must NOT read as an
+        // attention bell, or an actively-working session shows as "blocked".
+        let mut in_osc = false;
+        let title = b"\x1b]0;Design multi-hop private network architecture\x07";
+        assert!(!scan_bell(title, &mut in_osc));
+        assert!(!in_osc, "a complete OSC leaves us outside OSC state");
     }
 
     #[test]
-    fn prompt_phrase_mid_stream_is_activity() {
-        // The prompt-like phrase is NOT the last line — the agent kept working,
-        // so it must read as active, not blocked (no active<->blocked flicker).
-        let (a, _) = classify_attention("Do you want to continue?\nDownloading 42%...", false);
-        assert_eq!(a, AttentionState::Activity);
+    fn standalone_bel_is_a_bell() {
+        let mut in_osc = false;
+        assert!(scan_bell(b"work\x07more", &mut in_osc));
+        // A real bell after a title update still registers.
+        assert!(scan_bell(b"\x1b]0;title\x07 done\x07", &mut false));
     }
 
     #[test]
-    fn plain_output_is_activity() {
-        let (a, reason) = classify_attention("building project...", false);
-        assert_eq!(a, AttentionState::Activity);
-        assert!(reason.is_none());
+    fn st_terminated_osc_is_not_a_bell() {
+        // OSC may also end with ST (`ESC \`) rather than BEL; a following real
+        // bell must still count.
+        let mut in_osc = false;
+        assert!(!scan_bell(b"\x1b]0;title\x1b\\", &mut in_osc));
+        assert!(!in_osc);
+        assert!(scan_bell(b"\x1b]0;t\x1b\\\x07", &mut false));
     }
 
     #[test]
-    fn bell_signals_blocked() {
-        // The bell is the agent explicitly asking for attention.
-        let (a, _) = classify_attention("some output", true);
-        assert_eq!(a, AttentionState::LikelyBlocked);
+    fn osc_title_split_across_chunks_is_not_a_bell() {
+        // A title update whose BEL lands in the next read: the carried `in_osc`
+        // state keeps the terminator from being miscounted.
+        let mut in_osc = false;
+        assert!(!scan_bell(b"\x1b]0;Design multi-hop", &mut in_osc));
+        assert!(in_osc, "unterminated OSC carries into the next chunk");
+        assert!(!scan_bell(b" network architecture\x07", &mut in_osc));
+        assert!(!in_osc);
     }
 
     // ---- tail trimming ----
@@ -1072,6 +1277,9 @@ mod tests {
         status_tx: watch::Sender<BackendStatus>,
         status_rx: watch::Receiver<BackendStatus>,
         seq: AtomicU64,
+        /// Canned rendered screen returned by `screen_text` (for screen-based
+        /// attention tests); empty for the byte-stream mocks.
+        screen: String,
     }
 
     impl BackendSession for MockSession {
@@ -1085,6 +1293,9 @@ mod tests {
                 repaint: Arc::from(Vec::new().into_boxed_slice()),
                 last_seq: self.seq.load(std::sync::atomic::Ordering::SeqCst),
             }
+        }
+        fn screen_text(&self) -> String {
+            self.screen.clone()
         }
         fn send_input(&self, _data: &[u8]) -> Result<()> {
             Ok(())
@@ -1118,6 +1329,7 @@ mod tests {
                 status_tx,
                 status_rx,
                 seq: AtomicU64::new(0),
+                screen: String::new(),
             }))
         }
     }
@@ -1221,12 +1433,302 @@ mod tests {
         let (manager, dir) = test_manager();
         let s = manager.create_session(shell_req()).unwrap();
         // Live session cannot be archived.
-        assert!(manager.archive_session(&s.id).is_err());
+        assert!(manager.archive_session(&s.id, false).is_err());
         // After stop it can.
         manager.stop_session(&s.id).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        let archived = manager.archive_session(&s.id).unwrap();
+        let archived = manager.archive_session(&s.id, false).unwrap();
         assert_eq!(archived.status, SessionStatus::Archived);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Init a git repo with one commit so it can host managed worktrees.
+    fn git_init(path: &Path) {
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "init"]);
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    fn ws_req(workspace_id: &str) -> CreateSessionRequest {
+        let mut r = shell_req();
+        r.workspace_id = Some(workspace_id.to_string());
+        r
+    }
+
+    #[tokio::test]
+    async fn archive_removes_worktree_and_branch() {
+        let (manager, dir) = test_manager();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+
+        // Managed-worktree session on an auto branch off the clean HEAD.
+        let s = manager.create_session(ws_req(&ws.id)).unwrap();
+        let inst = manager.get_instance_for_session(&s.id).unwrap().unwrap();
+        let branch = inst.branch.clone().unwrap();
+        assert!(Path::new(&inst.path).is_dir());
+        assert!(workspace::branch_exists(&repo, &branch));
+
+        manager.stop_session(&s.id).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Branch is merged (points at HEAD) and worktree is clean → archives
+        // without force, taking the worktree and branch with it.
+        let archived = manager.archive_session(&s.id, false).unwrap();
+        assert_eq!(archived.status, SessionStatus::Archived);
+        assert!(!Path::new(&inst.path).exists());
+        assert!(!workspace::branch_exists(&repo, &branch));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn archive_guards_unmerged_branch_until_forced() {
+        let (manager, dir) = test_manager();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+
+        let s = manager.create_session(ws_req(&ws.id)).unwrap();
+        let inst = manager.get_instance_for_session(&s.id).unwrap().unwrap();
+        let branch = inst.branch.clone().unwrap();
+        let wt = Path::new(&inst.path);
+
+        // Add a commit on the session branch so it is no longer merged into HEAD.
+        git_in(wt, &["commit", "-q", "--allow-empty", "-m", "work"]);
+
+        manager.stop_session(&s.id).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Non-force archive refuses (unmerged) with a NeedsForce error, leaving
+        // the worktree, branch, and status untouched.
+        let err = manager.archive_session(&s.id, false).unwrap_err();
+        assert!(err.downcast_ref::<NeedsForce>().is_some());
+        assert!(workspace::branch_exists(&repo, &branch));
+        assert!(wt.is_dir());
+        assert_eq!(
+            manager.get_session(&s.id).unwrap().unwrap().status,
+            SessionStatus::Stopped
+        );
+
+        // Forced archive removes both.
+        let archived = manager.archive_session(&s.id, true).unwrap();
+        assert_eq!(archived.status, SessionStatus::Archived);
+        assert!(!wt.exists());
+        assert!(!workspace::branch_exists(&repo, &branch));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- keystroke echo vs. real work (idle-prompt accuracy) ----
+
+    fn mock_handle() -> Arc<dyn BackendSession> {
+        mock_handle_with_screen("")
+    }
+
+    fn mock_handle_with_screen(screen: &str) -> Arc<dyn BackendSession> {
+        let (tx, _) = broadcast::channel(16);
+        let (status_tx, status_rx) = watch::channel(BackendStatus::Running);
+        Arc::new(MockSession {
+            tx,
+            status_tx,
+            status_rx,
+            seq: AtomicU64::new(0),
+            screen: screen.to_string(),
+        })
+    }
+
+    #[test]
+    fn typing_at_idle_prompt_stays_idle() {
+        // The bug: at an idle prompt, the PTY echoes each keystroke as output,
+        // which used to read as the agent "working". A keystroke echo (recent
+        // input, no line submitted) must leave the prompt idle — and write
+        // nothing (`last_write` untouched).
+        let (manager, dir) = test_manager();
+        let handle = mock_handle();
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::Idle);
+        manager.on_output(
+            "sid", &handle, b"l", None, &mut tail, &mut last_write, &mut last_attn,
+            &mut false, now_millis(), false,
+        );
+        assert_eq!(last_attn, AttentionState::Idle);
+        assert_eq!(last_write, 0, "echo must not record activity");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn submitting_a_line_from_idle_reads_as_working() {
+        // Pressing Enter (input contained CR/LF -> `submitted`) hands off to the
+        // agent, so its output is real work, not echo.
+        let (manager, dir) = test_manager();
+        let handle = mock_handle();
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::Idle);
+        manager.on_output(
+            "sid", &handle, b"thinking...", None, &mut tail, &mut last_write,
+            &mut last_attn, &mut false, now_millis(), true,
+        );
+        assert_eq!(last_attn, AttentionState::Activity);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn spontaneous_output_after_idle_reads_as_working() {
+        // Output with no recent input (e.g. the agent resumed on its own) is
+        // outside the echo window, so it must read as working — the echo guard
+        // only covers keystrokes the user just typed.
+        let (manager, dir) = test_manager();
+        let handle = mock_handle();
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::Idle);
+        let stale_input = now_millis() - ECHO_WINDOW.as_millis() as i64 - 500;
+        manager.on_output(
+            "sid", &handle, b"progress 40%", None, &mut tail, &mut last_write,
+            &mut last_attn, &mut false, stale_input, false,
+        );
+        assert_eq!(last_attn, AttentionState::Activity);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn echo_guard_does_not_mask_an_approval_prompt() {
+        // If what lands at the idle prompt is itself an approval prompt, that is
+        // a *block* — the echo timing must not swallow it.
+        let (manager, dir) = test_manager();
+        let handle = mock_handle();
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::Idle);
+        manager.on_output(
+            "sid", &handle, b"Proceed? (y/n)", None, &mut tail, &mut last_write,
+            &mut last_attn, &mut false, now_millis(), false,
+        );
+        assert_eq!(last_attn, AttentionState::ApprovalNeeded);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn claude_screen_prompt_blocks_via_on_output() {
+        // End-to-end wiring: the Claude plugin opts into screen-based detection,
+        // so `on_output` must classify from the handle's rendered screen (not the
+        // raw byte tail). The byte chunk here is a spinner-frame redraw — exactly
+        // what the tail sees while the prompt sits above a footer — yet the screen
+        // shows the approval menu, so it must read as ApprovalNeeded.
+        let (manager, dir) = test_manager();
+        let claude = manager.registry.get("claude").unwrap();
+        let screen = " Do you want to proceed?\n \u{276f} 1. Yes\n   2. No\n\n Esc to cancel \u{b7} Tab to amend";
+        let handle = mock_handle_with_screen(screen);
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::Activity);
+        manager.on_output(
+            "sid", &handle, b"\x1b[35B\xe2\x97\x8f", Some(&claude), &mut tail,
+            &mut last_write, &mut last_attn, &mut false, 0, false,
+        );
+        assert_eq!(last_attn, AttentionState::ApprovalNeeded);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn existing_branch_shares_worktree() {
+        let (manager, dir) = test_manager();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+
+        // First session gets its own managed worktree on an auto branch.
+        let a = manager.create_session(ws_req(&ws.id)).unwrap();
+        let inst_a = manager.get_instance_for_session(&a.id).unwrap().unwrap();
+        let branch = inst_a.branch.clone().unwrap();
+        assert_eq!(inst_a.isolation, "worktree");
+
+        // Second session pointed at that branch shares the first's worktree
+        // instead of failing with git's "already checked out".
+        let mut req = ws_req(&ws.id);
+        req.branch = Some(branch.clone());
+        req.create_branch = false;
+        let b = manager.create_session(req).unwrap();
+        let inst_b = manager.get_instance_for_session(&b.id).unwrap().unwrap();
+
+        assert_eq!(inst_b.isolation, "shared");
+        assert_eq!(inst_b.path, inst_a.path, "sharer runs in the owner's worktree");
+        assert_eq!(inst_b.branch.as_deref(), Some(branch.as_str()));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn shared_worktree_survives_until_last_session_leaves() {
+        let (manager, dir) = test_manager();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+
+        let a = manager.create_session(ws_req(&ws.id)).unwrap();
+        let inst_a = manager.get_instance_for_session(&a.id).unwrap().unwrap();
+        let branch = inst_a.branch.clone().unwrap();
+        let wt = inst_a.path.clone();
+
+        let mut req = ws_req(&ws.id);
+        req.branch = Some(branch.clone());
+        let b = manager.create_session(req).unwrap();
+        assert_eq!(
+            manager.get_instance_for_session(&b.id).unwrap().unwrap().path,
+            wt
+        );
+
+        // Archive the owner first while the sharer is still active: the shared
+        // worktree and branch must survive — the sharer is still using them.
+        manager.stop_session(&a.id).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        manager.archive_session(&a.id, false).unwrap();
+        assert!(Path::new(&wt).is_dir(), "worktree kept while a sharer lives");
+        assert!(
+            workspace::branch_exists(&repo, &branch),
+            "branch kept while a sharer lives"
+        );
+
+        // The last session out reclaims both.
+        manager.stop_session(&b.id).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        manager.archive_session(&b.id, false).unwrap();
+        assert!(!Path::new(&wt).exists(), "last session removes the worktree");
+        assert!(
+            !workspace::branch_exists(&repo, &branch),
+            "last session deletes the branch"
+        );
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }
