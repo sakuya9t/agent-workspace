@@ -1518,3 +1518,69 @@ body.col-resizing iframe {
     max-height: 40dvh;
   }
 }
+
+/* Mobile phase 3: terminal key bar (phone-only; rendered by MobileShell for
+   live sessions, so no media guard needed). A horizontally-scrollable row of
+   the keys soft keyboards lack, docked above the terminal body. */
+.term-keybar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+.term-keybar::-webkit-scrollbar {
+  display: none;
+}
+.term-keybar .kb {
+  flex: none;
+  min-width: 40px;
+  height: 36px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  line-height: 1;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+  touch-action: manipulation;
+}
+.term-keybar .kb:active {
+  background: var(--accent-2);
+}
+/* Ctrl latch: armed (outlined) vs locked (filled). */
+.term-keybar .kb.on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.term-keybar .kb.locked {
+  background: var(--accent-2);
+  color: var(--accent);
+}
+.term-keybar .kb.up::before {
+  content: "↑";
+}
+.term-keybar .kb.down::before {
+  content: "↓";
+}
+.term-keybar .kb.left::before {
+  content: "←";
+}
+.term-keybar .kb.right::before {
+  content: "→";
+}
+.term-keybar .kb.kbd::before {
+  content: "⌨";
+  font-size: 16px;
+}

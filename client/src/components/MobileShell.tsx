@@ -1,12 +1,15 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useUiStore } from "../store";
 import { daemonLabel } from "../connectionStore";
 import { useActiveSession } from "../useActiveSession";
+import { useVisualViewportHeight } from "../useVisualViewportHeight";
 import { USAGE_AGENTS } from "../agents";
+import { CtrlLatch, TerminalHandle } from "../terminalTypes";
 import { statusLabel } from "../i18n/labels";
 import { SessionList } from "./SessionList";
 import { TerminalView } from "./Terminal";
+import { TermKeyBar } from "./TermKeyBar";
 import { RightPanel } from "./RightPanel";
 import { UsageModal } from "./UsageModal";
 
@@ -72,6 +75,22 @@ export function MobileShell() {
 
   useMobileHistory();
 
+  // Terminal input handle (set by TerminalView.onReady) that the key bar reads.
+  const handleRef = useRef<TerminalHandle | null>(null);
+  // Ctrl latch: React state drives the key-bar visual; the ref lets
+  // TerminalView read it per keystroke without an effect dependency.
+  const [ctrl, setCtrl] = useState<CtrlLatch>("off");
+  const ctrlRef = useRef<CtrlLatch>("off");
+  ctrlRef.current = ctrl;
+  const consumeCtrl = useCallback(() => setCtrl((c) => (c === "armed" ? "off" : c)), []);
+  useEffect(() => {
+    if (!live) setCtrl("off");
+  }, [live]);
+
+  // Track the visual viewport so the key bar stays above the soft keyboard.
+  const vh = useVisualViewportHeight();
+  const shellStyle = vh != null ? { height: `${vh}px` } : undefined;
+
   // Every backward move goes through the browser so popstate is the one place
   // that unwinds a layer (see useMobileHistory).
   const back = () => window.history.back();
@@ -79,7 +98,7 @@ export function MobileShell() {
   // Home screen — the session tree + history, with a compact status header.
   if (!active) {
     return (
-      <div className="mobile-shell">
+      <div className="mobile-shell" style={shellStyle}>
         <header className="mobile-home-header">
           <span className="brand">{t("app.title")}</span>
           <span className="health">
@@ -96,7 +115,7 @@ export function MobileShell() {
 
   // Terminal screen — full-screen xterm with the details sheet as an overlay.
   return (
-    <div className="mobile-shell">
+    <div className="mobile-shell" style={shellStyle}>
       <header className="mobile-term-header">
         <button className="mobile-back" onClick={back} aria-label={t("mobile.back")} />
         <span className="mobile-term-title mono">
@@ -133,11 +152,16 @@ export function MobileShell() {
             target={target}
             sessionId={activeSession.id}
             live={live}
+            onReady={(h) => (handleRef.current = h)}
+            ctrlRef={ctrlRef}
+            onCtrlConsumed={consumeCtrl}
           />
         ) : (
           <div className="empty big">{t("app.emptyTerminal")}</div>
         )}
       </div>
+
+      {live && <TermKeyBar handleRef={handleRef} ctrl={ctrl} setCtrl={setCtrl} />}
 
       {showDetails && (
         <div className="details-sheet-backdrop" onClick={back}>
