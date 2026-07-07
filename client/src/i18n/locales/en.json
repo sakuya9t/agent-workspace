@@ -269,7 +269,9 @@
     "uploadingImage": "Uploading image…",
     "pasteFailed": "Image paste failed: {{message}}",
     "pastedImageRef": "[pasted image {{path}}] ",
-    "attachImage": "Attach image"
+    "attachImage": "Attach image",
+    "copied": "Copied",
+    "copyFailed": "Copy failed"
   },
   "mobile": {
     "back": "Back to sessions",

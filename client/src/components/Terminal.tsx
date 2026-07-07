@@ -23,10 +23,11 @@ function toCtrl(s: string): string {
 }
 
 /**
- * Copy the terminal selection lives on ⌘-C (macOS) and Ctrl-Shift-C
- * (Windows/Linux) so plain Ctrl-C stays SIGINT to the agent. macOS delivers
- * ⌘-C as a native `copy` event; elsewhere the native copy gesture *is* Ctrl-C,
- * so we must not claim it — hence the platform split.
+ * Copying the terminal selection lives on ⌘-C (macOS) and Ctrl-Shift-C
+ * (Windows/Linux) so plain Ctrl-C stays SIGINT to the agent. macOS ⌘-C is
+ * served natively by xterm's own `copy`-event listener; elsewhere the native
+ * copy gesture *is* Ctrl-C, so we claim the Ctrl-Shift-C chord instead —
+ * hence the platform split.
  */
 const isMac = /Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent);
 
@@ -72,11 +73,13 @@ export function TerminalView({
   const wsRef = useRef<WebSocket | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const errorTimerRef = useRef<number | undefined>(undefined);
-  // Transient status for an in-flight / failed image paste, shown as a small
-  // overlay (never written into the terminal, which a TUI would repaint over).
-  const [pasteStatus, setPasteStatus] = useState<{ kind: "busy" | "error"; msg: string } | null>(
-    null,
-  );
+  // Transient status for an in-flight / failed image paste or a copy receipt,
+  // shown as a small overlay (never written into the terminal, which a TUI
+  // would repaint over).
+  const [pasteStatus, setPasteStatus] = useState<{
+    kind: "busy" | "ok" | "error";
+    msg: string;
+  } | null>(null);
 
   // Upload a pasted/dropped/picked image, then inject its stored path over the
   // live socket as prompt text — the drag-and-drop-equivalent the agent loads
@@ -126,6 +129,9 @@ export function TerminalView({
       fontSize: 13,
       scrollback: 5000,
       cursorBlink: live,
+      // macOS-native gesture for selecting while a TUI holds mouse reporting
+      // (Shift+drag is also honored — see the shouldForceSelection patch below).
+      macOptionClickForcesSelection: true,
       theme: {
         background: "#0b0e14",
         foreground: "#c7d0e0",
@@ -158,6 +164,24 @@ export function TerminalView({
           /* fired after dispose — safe to ignore */
         }
       };
+    }
+
+    // WORKAROUND (@xterm/xterm 5.5.0): while a TUI holds mouse reporting the
+    // selection service is disabled, and only a "forced" selection can happen.
+    // Upstream forces on Shift+drag everywhere EXCEPT macOS, where it only
+    // offers Option+drag (behind macOptionClickForcesSelection) — so on a Mac,
+    // Shift+drag over an agent's TUI selected nothing at all. We document
+    // Shift+drag as THE selection gesture, so widen the predicate to accept
+    // Shift on every platform. The mouse-reporting mousedown path consults the
+    // same predicate, so a forced drag is also kept away from the app.
+    const selection = (
+      term as unknown as {
+        _core?: { _selectionService?: { shouldForceSelection?: (e: MouseEvent) => boolean } };
+      }
+    )._core?._selectionService;
+    if (selection?.shouldForceSelection) {
+      const shouldForceSelection = selection.shouldForceSelection.bind(selection);
+      selection.shouldForceSelection = (e: MouseEvent) => e.shiftKey || shouldForceSelection(e);
     }
 
     let mounted = true;
@@ -234,9 +258,25 @@ export function TerminalView({
     // --- Copy selection to the OS clipboard ---
     // Selection requires Shift+drag while a TUI holds the mouse (it captures
     // plain drags for its own mouse reporting); a plain shell selects on drag.
+    // The clipboard has no observable state, so flash the outcome over the
+    // terminal — a silent success is indistinguishable from "copy is broken".
+    const copySelection = async () => {
+      const ok = await copyText(term.getSelection());
+      setPasteStatus({
+        kind: ok ? "ok" : "error",
+        msg: i18n.t(ok ? "terminal.copied" : "terminal.copyFailed"),
+      });
+      if (errorTimerRef.current) window.clearTimeout(errorTimerRef.current);
+      errorTimerRef.current = window.setTimeout(() => setPasteStatus(null), ok ? 1500 : 4000);
+    };
+
     // On Windows/Linux we claim Ctrl-Shift-C here and leave Ctrl-C to xterm so
-    // it still forwards \x03 (SIGINT). macOS ⌘-C arrives as a native `copy`
-    // event (handled below), so this handler ignores it.
+    // it still forwards \x03 (SIGINT). macOS ⌘-C needs nothing from us: xterm
+    // doesn't cancel the ⌘-C keydown, so the browser fires a native `copy`
+    // event that xterm's own listener serves from the selection — synchronously,
+    // which also covers insecure contexts. (Paste is native too: ⌘-V and
+    // Ctrl-Shift-V keydowns pass through xterm uncancelled, and the browser's
+    // paste event lands on xterm's textarea. Plain Ctrl-V stays ^V to the app.)
     term.attachCustomKeyEventHandler((e) => {
       if (
         e.type === "keydown" &&
@@ -248,27 +288,29 @@ export function TerminalView({
         (e.key === "c" || e.key === "C") &&
         term.hasSelection()
       ) {
-        void copyText(term.getSelection());
+        void copySelection();
         e.preventDefault();
         return false; // swallow: don't let xterm forward it as input
       }
       return true;
     });
 
-    // macOS ⌘-C (and any browser-native copy gesture) fills the clipboard
-    // synchronously from the selection — this path also works in insecure
-    // contexts, where navigator.clipboard is unavailable. Gated to macOS so
-    // that on Windows/Linux, where the native copy gesture IS Ctrl-C, we don't
-    // divert it away from SIGINT.
-    const onCopy = (e: ClipboardEvent) => {
-      if (!isMac || !term.hasSelection() || !e.clipboardData) return;
-      e.clipboardData.setData("text/plain", term.getSelection());
-      e.preventDefault();
+    // A right-click on a selection must never be REPORTED to a mouse-tracking
+    // TUI: xterm clears the selection on any user input — and the report IS
+    // user input — wiping it before contextmenu fires, so the copy below would
+    // read "". Swallow the press in capture phase (xterm's bubble listeners on
+    // a descendant never see it); the browser still fires contextmenu.
+    const onMouseDownCapture = (e: MouseEvent) => {
+      if (e.button === 2 && term.hasSelection()) e.stopPropagation();
     };
-    // Right-click copies on every platform (the "universal" affordance).
+    // Right-click copies on every platform (the "universal" affordance), then
+    // clears the selection so the NEXT right-click falls through to the
+    // browser menu — whose Paste works even in insecure contexts (xterm parks
+    // its hidden textarea under the cursor for exactly that).
     const onContextMenu = (e: MouseEvent) => {
       if (!term.hasSelection()) return; // nothing selected: leave the default
-      void copyText(term.getSelection());
+      void copySelection();
+      term.clearSelection();
       e.preventDefault();
     };
 
@@ -353,7 +395,7 @@ export function TerminalView({
       touchScrolling = false;
     };
 
-    container.addEventListener("copy", onCopy);
+    container.addEventListener("mousedown", onMouseDownCapture, true);
     container.addEventListener("contextmenu", onContextMenu);
     container.addEventListener("paste", onPaste, true);
     container.addEventListener("dragover", onDragOver);
@@ -383,7 +425,7 @@ export function TerminalView({
       onReadyRef.current?.(null);
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
       if (errorTimerRef.current) window.clearTimeout(errorTimerRef.current);
-      container.removeEventListener("copy", onCopy);
+      container.removeEventListener("mousedown", onMouseDownCapture, true);
       container.removeEventListener("contextmenu", onContextMenu);
       container.removeEventListener("paste", onPaste, true);
       container.removeEventListener("dragover", onDragOver);

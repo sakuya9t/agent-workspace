@@ -189,6 +189,9 @@ body.col-resizing iframe {
 .paste-status--busy {
   border-color: var(--accent);
 }
+.paste-status--ok {
+  border-color: var(--ok, #46a758);
+}
 .paste-status--error {
   border-color: var(--danger, #e5484d);
   color: var(--danger, #e5484d);
