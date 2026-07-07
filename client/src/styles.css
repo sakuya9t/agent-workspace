@@ -1281,9 +1281,14 @@ body.col-resizing iframe {
 .mobile-shell {
   display: flex;
   flex-direction: column;
-  height: 100%;
+  /* dvh tracks the shrinking viewport as browser chrome collapses; phase 3
+     overrides this with a JS visual-viewport height while the keyboard is up. */
+  height: 100dvh;
   overflow: hidden;
   background: var(--bg);
+  /* Keep chrome out from under the notch / home indicator (viewport-fit=cover). */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right)
+    env(safe-area-inset-bottom) env(safe-area-inset-left);
 }
 
 /* Home screen — compact status header over the shared session tree. */
@@ -1388,6 +1393,7 @@ body.col-resizing iframe {
   border-top: 1px solid var(--border);
   border-radius: 14px 14px 0 0;
   overflow: hidden;
+  padding-bottom: env(safe-area-inset-bottom);
 }
 .details-sheet-handle {
   flex: none;
@@ -1404,4 +1410,111 @@ body.col-resizing iframe {
 .details-sheet > .panel.right {
   flex: 1;
   min-height: 0;
+}
+
+/* ===================================================================
+   Mobile phase 2: touch targets + modal→bottom-sheet, applied to the
+   SHARED components (tree, buttons, dialogs) only at phone-class
+   viewports so the desktop shell is untouched. Must match PHONE_MQ in
+   useIsPhone.ts so CSS and the JS shell switch agree.
+   =================================================================== */
+@media (max-width: 599px), (max-height: 599px) and (pointer: coarse) {
+  /* --- touch targets (≥44px rows, ≥32px controls) --- */
+  .tree-node {
+    min-height: 44px;
+    padding: 8px 12px;
+  }
+  .tree-node.lvl1 {
+    padding-left: 26px;
+  }
+  .tree-node.lvl2 {
+    padding-left: 38px;
+  }
+  .tree-add {
+    width: 34px;
+    height: 34px;
+    font-size: 18px;
+  }
+  .tree-empty {
+    padding-left: 38px;
+  }
+  .btn {
+    min-height: 36px;
+  }
+  .btn.tiny {
+    min-height: 32px;
+    padding: 5px 12px;
+  }
+  .icon-btn {
+    width: 36px;
+    height: 32px;
+  }
+  .session-row {
+    padding: 12px;
+  }
+  .session-actions {
+    margin-top: 10px;
+    gap: 12px;
+  }
+  .history-header {
+    padding: 12px;
+  }
+  .changed-file {
+    padding: 9px 4px;
+  }
+  .commit-row {
+    min-height: 44px;
+  }
+  .picker-entry {
+    padding: 11px 8px;
+  }
+  .picker-list {
+    height: 44vh;
+  }
+
+  /* --- modal → bottom sheet --- */
+  .modal-backdrop {
+    align-items: flex-end;
+  }
+  .modal {
+    width: 100vw;
+    max-width: none;
+    max-height: 92dvh;
+    border-radius: 14px 14px 0 0;
+    padding: 16px;
+    padding-top: max(16px, env(safe-area-inset-top));
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  /* Keep the confirm/cancel row reachable as the form scrolls. */
+  .modal-actions {
+    position: sticky;
+    bottom: 0;
+    margin: 14px -16px 0;
+    padding: 12px 16px;
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+  }
+  /* Diff sheet: full height, flush (keeps its own internal scroll — don't let
+     the generic .modal padding/overflow above re-wrap it), no resize grip. */
+  .diff-modal {
+    width: 100vw;
+    height: 92dvh;
+    max-height: 92dvh;
+    resize: none;
+    padding: 0;
+    overflow: hidden;
+  }
+  .diff-view {
+    font-size: 11px;
+  }
+  /* Commit sheet inherits the generic padded/scrolling .modal sheet; just tame
+     its inner scroll regions to the sheet height. */
+  .commit-detail-body {
+    max-height: 40dvh;
+  }
+  .commit-files {
+    max-height: 40dvh;
+  }
 }
