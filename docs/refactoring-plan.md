@@ -70,9 +70,23 @@ the M4 seams were pre-placed before M4 exists).
 
 ## 3. Refactors
 
-### RF-MOB — client shell prep (P1; do with/before MOB phase 1)
+### RF-MOB — client shell prep ✅ landed 2026-07-06
 
-MOB's only real structural obstacle. All items are hours, not days.
+MOB's only real structural obstacle. All items are hours, not days. **Done**
+(client-only, zero behavior change; full build gate + proxy tests green) — as
+built, per item below:
+
+1. `useActiveSession()` → `client/src/useActiveSession.ts` (poll + derivation +
+   health counts; App destructures it).
+2. `showUsage` → `useUiStore` (`client/src/store.ts`).
+3. `isLive`/`isTerminal` → `client/src/status.ts`. Decision on the
+   `indeterminate` semantics: **neither** live nor terminal (a session the
+   daemon lost track of across a restart is unresolved, not ended) — this
+   matched all three prior call sites, so the unification was behavior-
+   preserving.
+4. Clipboard-with-fallback → `copyText()` in `client/src/clipboard.ts`.
+
+Original scope (for reference):
 
 1. Extract **`useActiveSession()`** from `App.tsx` (the `useDaemonStates`
    poll, the `activeState`/`activeSession`/`target`/`live` derivation, and
@@ -178,13 +192,13 @@ closes each.
 | MVP client stack (shadcn/Tailwind/Dockview/Electron) never adopted; shipped client outgrew the plan | backlog → DEC-1 | DEC-1 (decision, then RF-QUERY) |
 | architecture.md still names yamux as relay framing default | backlog → DOC-1 | DOC-1 one-liner |
 | `vt100` 0.15 unmaintained + overflow-checks workaround + repaint invariant | root `Cargo.toml` comment; `backend/mod.rs` | RF-VT100 |
-| Client `isLive` ×3 divergence; `RightPanel` ended-list omits `indeterminate` (possible bug) | this doc | RF-MOB #3 |
+| ~~Client `isLive` ×3 divergence; `RightPanel` ended-list omits `indeterminate`~~ | this doc | ✅ RF-MOB #3 (2026-07-06): `src/status.ts`; `indeterminate` decided neither-live-nor-terminal |
 | rustfmt divergence (105 sites; compact style is hand-managed, no rustfmt.toml) | this doc | Decide once: run `cargo fmt` in a dedicated commit + enforce, **or** record "hand-formatted — don't run fmt" in the repo docs so contributors/agents stop re-litigating it |
 | Accepted micro-duplication: `now_ms` in asmux lib+bin; client `basename` trio (divergent fallbacks) | this doc | Accepted — do not "fix" without need |
 
 ## 5. Sequencing (mirrors backlog → Suggested order)
 
-1. **RF-MOB** (hours) → MOB phases 1–3.
+1. ~~**RF-MOB**~~ ✅ (landed 2026-07-06) → **MOB** phases 1–3.
 2. **R4** — no refactor needed; the daemon side is a `Config` field + probe
    loop; relay/agent scaffolding already complete.
 3. **RF-M4** → **M4** (cold-stitch flip only after RF-M4 #4's tests exist).

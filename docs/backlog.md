@@ -55,6 +55,15 @@ pick it up**.
   `build_launch` helper, db.rs idiom alignment, client `api.ts` error/URL
   helpers + shared `shortPath`; clippy silent, all suites green. Analysis and
   the follow-up RF-\* refactors: [`refactoring-plan.md`](refactoring-plan.md).
+- **RF-MOB** — client shell prep for the MOB phase-1 split (2026-07-06,
+  client-only, zero behavior change): `src/status.ts` unifies the three drifted
+  `isLive` predicates (+ `isTerminal`; the RightPanel ended-list's omission of
+  `indeterminate` was decided deliberately — it is **neither** live nor
+  terminal, matching all prior call sites); `showUsage` moved into `useUiStore`;
+  `useActiveSession()` extracted from `App.tsx` so both shells share one wiring;
+  clipboard-with-fallback hoisted to `src/clipboard.ts` for the MOB key bar's
+  Paste. `MobileShell` can now mount with no copied wiring. Full build gate
+  (tsc + eslint + check-locales + vite build) and proxy tests green.
 
 ## Backlog summary
 
@@ -63,8 +72,7 @@ pick it up**.
 | R4 | Gateway mode (egress-less downstreams) | **P1** | R1–R3 (done) | connectivity-execution-plan.md → R4 |
 | RF-M4 | Pre-M4 daemon refactor bundle (SessionManager split, asmux reconnect-supervisor seam, adopt-path test coverage) | **P1** | — (land immediately before M4) | refactoring-plan.md → RF-M4 |
 | M4 | Holder hardening + exact cold-stitch adopt | **P1** | M1–M3 (done); RF-M4 | durable-sessions.md → M4 |
-| RF-MOB | Client shell prep (`useActiveSession` hook, `showUsage`→store, unify `isLive`) | **P1** | — (do with/before MOB phase 1) | refactoring-plan.md → RF-MOB |
-| MOB | Mobile UI phases 1–3 + verify (adaptive shell, sheet CSS, terminal key bar) | **P1** | RF-MOB (client-only) | mobile-ui.md → Execution plan |
+| MOB | Mobile UI phases 1–3 + verify (adaptive shell, sheet CSS, terminal key bar) | **P1** | RF-MOB (done) | mobile-ui.md → Execution plan |
 | MOB-PWA | Mobile UI phase 4: PWA manifest + iOS metas | **P2** | MOB | mobile-ui.md → Packaging path |
 | MOB-PUSH | Web Push for attention states | **P3** | MOB; daemon push plumbing (relay as carrier) | mobile-ui.md → Follow-ups |
 | IMG-2 | Image paste follow-ups: `.asm/pastes/` cleanup policy, per-agent capability hint | **P3** | image paste + 📎 button (done) | image-paste.md → Follow-ups |
@@ -131,16 +139,6 @@ stitch from SQLite cold history, `attach FromCursor(backend_cursor)`, real gap
 marker on `BUFFER_GAP`; everything is scaffolded, ring-replay is currently the
 default). This closes the headline "terminal intact after restart" promise for
 long-lived sessions whose output outgrew the ring.
-
-### RF-MOB — client shell prep (P1, client-only, hours)
-
-MOB phase 1's only structural obstacle: `App.tsx` entangles shared data
-wiring with desktop-only layout, so a naive `MobileShell` would duplicate the
-wiring. Extract `useActiveSession()` (daemon poll + active-session derivation
-+ health counts), move `showUsage` into `useUiStore` (the only dialog flag
-not in the store), and unify the three divergent `isLive` definitions —
-note `RightPanel`'s ended-list omits `indeterminate`, a possible bug to
-decide while unifying. Detail: refactoring-plan.md → RF-MOB.
 
 ### MOB — mobile adaptive shell (P1, client-only)
 
@@ -292,9 +290,9 @@ parity gate, typed keys); adding a locale is the 3-step recipe in `i18n.md`.
 
 ## Suggested order (cross-track)
 
-1. **RF-MOB** (hours) → **MOB** phases 1–3 — freshest design, client-only,
-   immediately usable value on top of the just-shipped relay path; runs in
-   parallel with any daemon work.
+1. **MOB** phases 1–3 (**RF-MOB** landed 2026-07-06) — freshest design,
+   client-only, immediately usable value on top of the just-shipped relay path;
+   runs in parallel with any daemon work.
 2. **R4** — finishes the connectivity story the product is built around; no
    refactor needed (relay/agent scaffolding is complete; daemon side is a
    `Config` field + probe loop).
