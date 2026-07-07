@@ -98,7 +98,7 @@ pick it up**.
 | IMG-2 | Image paste follow-ups: `.asm/pastes/` cleanup policy, per-agent capability hint | **P3** | image paste + 📎 button (done) | image-paste.md → Follow-ups |
 | RF-ERR | Typed daemon error → HTTP status mapping (RelayError-style) | **P2** | — (pair with SEC-2 or RF-M4) | refactoring-plan.md → RF-ERR |
 | SEC-2 | Constrain `/api/fs/list` + workspace roots | **P1** | RF-ERR recommended (403 mapping) | security-followups.md → 2 (HIGH) |
-| SEC-1 | Transport encryption off-loopback (direct mode TLS; relay TLS ops) | **P1/P2** | partially ties to R5 | security-followups.md → 1 (HIGH) |
+| SEC-1 | Transport encryption off-loopback (direct mode TLS; relay TLS — **agent `wss://` (code) + relay rustls/proxy**) | **P1/P2** | partially ties to R5 | security-followups.md → 1 (HIGH) |
 | V0 | Web-editor de-risking spike (scratchpad only) | **P2** | R1–R3 (done) | vscode-over-relay-plan.md → V0 |
 | V1 | Relay cookie auth + daemon editor proxy | **P2** | V0 go decision | vscode-over-relay-plan.md → V1 |
 | V2 | IDE launcher, detection, editor tickets | **P2** | V1 | vscode-over-relay-plan.md → V2 |
@@ -191,8 +191,14 @@ Gate exposing ASM beyond a trusted LAN. SEC-2 (fs-list browses the whole host
 filesystem; any client can register any workspace root) is self-contained
 daemon work: server-side allowed-roots config enforced for both browsing and
 registration. SEC-1 (plaintext HTTP/WS off loopback) splits: the **relay path**
-gets TLS via `ASM_RELAY_TLS_CERT/KEY` + deployment guidance (an R5 ops item);
-**direct mode** needs the Phase-8 TLS/mTLS deliverable (self-signed +
+(the product path) is plaintext today and is **not just an ops item** — it needs
+(i) a TLS feature enabled on the daemon agent's `tokio-tungstenite` so it can
+dial `wss://` at all (it is currently compiled without TLS, so a TLS reverse
+proxy in front of the relay is useless until this lands — a code change), plus
+(ii) relay-side rustls (`ASM_RELAY_TLS_CERT/KEY`, described in
+connectivity-execution-plan.md but **not yet implemented** in the relay binary)
+or a TLS-terminating proxy, with a real ACME cert so there is no client UX
+change; **direct mode** needs the Phase-8 TLS/mTLS deliverable (self-signed +
 pinning or ACME). Until then the SSH-tunnel recommendation stays prominent.
 
 ### V0–V3 — browser VS Code over the relay (P2)

@@ -143,6 +143,19 @@ TLS: the relay binary optionally terminates TLS natively
 plain HTTP for dev or behind a TLS-terminating reverse proxy. Production
 guidance (deployment.md addition, R5): real certificate, port 443.
 
+> **Status (not yet implemented — SEC-1).** As of this writing the relay TLS
+> path above is *design only*. The relay binary does not read
+> `ASM_RELAY_TLS_CERT/KEY` — `RelayConfig` is `bind` + `keys` only and `run()`
+> binds a plain `TcpListener`. And the daemon's relay agent pulls in
+> `tokio-tungstenite` with **no TLS feature**, so `connect_async` can only dial
+> `ws://`; the `wss://relay.example.com` form below fails at runtime. This is a
+> **code prerequisite, not just ops**: a TLS-terminating reverse proxy in front
+> of the relay is useless until the agent can speak `wss://`, because the daemon
+> dials outbound from behind NAT and must make the TLS connection itself. Order
+> of work: enable `rustls-tls-webpki-roots` on `tokio-tungstenite` + wire the
+> connector, then relay-side rustls or a proxy, with a real ACME cert (no client
+> UX change). Tracked in `security-followups.md` → 1 and `backlog.md` → SEC-1.
+
 ### Daemon-side auth interaction (existing conventions, unchanged)
 
 - HTTP: `Authorization: Bearer <device_token>` (`crates/daemon/src/auth.rs`).
@@ -177,11 +190,12 @@ asm-relay (bin):
                         note: binding 0.0.0.0 is permission-denied for agents
                         in this dev environment — tests always bind loopback)
   ASM_RELAY_KEYS        comma-separated accepted access keys (MVP: one)
-  ASM_RELAY_TLS_CERT / ASM_RELAY_TLS_KEY   optional rustls
+  ASM_RELAY_TLS_CERT / ASM_RELAY_TLS_KEY   optional rustls (NOT IMPLEMENTED — SEC-1)
 
 asm-daemon additions:
-  ASM_RELAY_URL         e.g. wss://relay.example.com — presence enables the
-                        registration task (R2)
+  ASM_RELAY_URL         e.g. ws://relay.example.com — presence enables the
+                        registration task (R2). NOTE: wss:// not supported yet
+                        (agent tokio-tungstenite has no TLS feature — SEC-1)
   ASM_RELAY_KEY         relay access key
   ASM_NODE_LABEL        default: hostname
   ASM_RELAY_DOWNSTREAMS comma-separated host:port targets on the private net
