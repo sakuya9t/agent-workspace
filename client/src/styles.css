@@ -877,6 +877,30 @@ body.col-resizing iframe {
   border-radius: 6px;
   line-height: 1.4;
 }
+.scm-op-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.scm-op-text {
+  flex: 1;
+  min-width: 0;
+}
+.scm-op-dismiss {
+  flex: none;
+  margin: -1px -2px 0 0;
+  padding: 0 3px;
+  background: none;
+  border: none;
+  color: inherit;
+  opacity: 0.55;
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1.2;
+}
+.scm-op-dismiss:hover {
+  opacity: 1;
+}
 .branch-pill {
   float: right;
   color: var(--accent);

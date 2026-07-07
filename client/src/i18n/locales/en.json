@@ -57,6 +57,7 @@
   "common": {
     "cancel": "Cancel",
     "close": "close",
+    "dismiss": "Dismiss",
     "copy": "Copy",
     "copied": "Copied",
     "browse": "Browse…",

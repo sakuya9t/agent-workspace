@@ -530,12 +530,36 @@ export function RightPanel({ target, session }: Props) {
             {scmBusy && (
               <div className="dim small">{t("rightPanel.scmRunning")}</div>
             )}
-            {pull.error && <div className="error">{String(pull.error)}</div>}
-            {rebase.error && <div className="error">{String(rebase.error)}</div>}
-            {merge.error && <div className="error">{String(merge.error)}</div>}
-            {pull.data && <div className="scm-op-result mono small dim">{pull.data}</div>}
-            {rebase.data && <div className="scm-op-result mono small dim">{rebase.data}</div>}
-            {merge.data && <div className="scm-op-result mono small dim">{merge.data}</div>}
+            {pull.error && (
+              <ScmOpNotice className="error" text={String(pull.error)} onDismiss={pull.reset} />
+            )}
+            {rebase.error && (
+              <ScmOpNotice className="error" text={String(rebase.error)} onDismiss={rebase.reset} />
+            )}
+            {merge.error && (
+              <ScmOpNotice className="error" text={String(merge.error)} onDismiss={merge.reset} />
+            )}
+            {pull.data && (
+              <ScmOpNotice
+                className="scm-op-result mono small dim"
+                text={pull.data}
+                onDismiss={pull.reset}
+              />
+            )}
+            {rebase.data && (
+              <ScmOpNotice
+                className="scm-op-result mono small dim"
+                text={rebase.data}
+                onDismiss={rebase.reset}
+              />
+            )}
+            {merge.data && (
+              <ScmOpNotice
+                className="scm-op-result mono small dim"
+                text={merge.data}
+                onDismiss={merge.reset}
+              />
+            )}
 
             {commits && commits.length > 0 ? (
               <CommitGraph commits={commits} head={scm.head} onSelect={setCommitTarget} />
@@ -620,6 +644,37 @@ function CommitGraph({
           </div>
         );
       })}
+    </div>
+  );
+}
+
+/**
+ * A source-control op message (pull/rebase/merge result or error) with a dismiss
+ * control. These three share one area and otherwise linger until the next op or a
+ * session switch, so `onDismiss` clears the underlying mutation via its reset(),
+ * which drops the message from the UI.
+ */
+function ScmOpNotice({
+  text,
+  className,
+  onDismiss,
+}: {
+  text: string;
+  className: string;
+  onDismiss: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className={`scm-op-notice ${className}`}>
+      <span className="scm-op-text">{text}</span>
+      <button
+        className="scm-op-dismiss"
+        onClick={onDismiss}
+        title={t("common.dismiss")}
+        aria-label={t("common.dismiss")}
+      >
+        ×
+      </button>
     </div>
   );
 }
