@@ -610,6 +610,18 @@ body.col-resizing iframe {
   justify-content: space-between;
   gap: 8px;
 }
+/* Source-control header: label on the left, branch pill on the right. Flex (not
+   a float) keeps the pill in flow so a long branch name ellipsizes instead of
+   wrapping down and covering the first changed file. */
+.section-title.with-branch {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.section-title.with-branch > span:first-child {
+  flex: none;
+}
 
 /* misc */
 .empty {
@@ -902,12 +914,15 @@ body.col-resizing iframe {
   opacity: 1;
 }
 .branch-pill {
-  float: right;
+  min-width: 0;
   color: var(--accent);
   font-size: 11px;
   font-weight: 400;
   text-transform: none;
   letter-spacing: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .changed-file {
   display: flex;

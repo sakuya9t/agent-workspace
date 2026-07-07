@@ -347,8 +347,8 @@ export function RightPanel({ target, session }: Props) {
           </>
         )}
 
-        <div className="section-title">
-          {t("rightPanel.scmHeader")}
+        <div className="section-title with-branch">
+          <span>{t("rightPanel.scmHeader")}</span>
           {scm?.is_repo && (
             <span className="branch-pill mono">
               {scm.detached ? t("rightPanel.detached") : scm.branch}
