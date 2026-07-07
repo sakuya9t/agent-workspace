@@ -68,6 +68,22 @@ pick it up**.
   was dropped and the shared util kept. `MobileShell` can now mount with no
   copied wiring. Full build gate (tsc + eslint + check-locales + vite build) and
   proxy tests green.
+- **MOB phases 1–3** — mobile adaptive shell (2026-07-06, client-only, no daemon
+  changes). Phase 1: `useIsPhone()` (PHONE_MQ) switches the root between the
+  extracted `DesktopShell` and a new stacked `MobileShell` (Sessions home →
+  full-screen Terminal → Details sheet overlay keeping the WS mounted);
+  `App.tsx` is now the device switch + shared dialogs + `#s=` deep-link; browser
+  history mirrors the layer stack via pushState so system-back unwinds one layer;
+  new store flag `showDetails`. Phase 2: a `@media PHONE_MQ` block gives the
+  shared components touch targets (≥44px rows) and turns modals into bottom
+  sheets; 100dvh + safe-area insets; `viewport-fit=cover`. Phase 3: `TermKeyBar`
+  (Esc/Tab/⇧Tab/Ctrl-latch/^C/arrows/⌨/Paste/Copy) drives a new `TerminalView`
+  input handle (write/focus/getSelection) over the same WS path; the Ctrl latch
+  transforms the next soft-keyboard key; `useVisualViewportHeight` keeps the bar
+  above the keyboard (interactive-widget meta). All shared components reused
+  unchanged — parity is structural. Verified end-to-end at 390×844 against a live
+  shell session (`scripts/mobile-shell-test.mjs`, ALL PASS) + desktop regression.
+  Remaining: **MOB-PWA** (phase 4) and **MOB-PUSH** below.
 
 ## Backlog summary
 
@@ -76,9 +92,8 @@ pick it up**.
 | R4 | Gateway mode (egress-less downstreams) | **P1** | R1–R3 (done) | connectivity-execution-plan.md → R4 |
 | RF-M4 | Pre-M4 daemon refactor bundle (SessionManager split, asmux reconnect-supervisor seam, adopt-path test coverage) | **P1** | — (land immediately before M4) | refactoring-plan.md → RF-M4 |
 | M4 | Holder hardening + exact cold-stitch adopt | **P1** | M1–M3 (done); RF-M4 | durable-sessions.md → M4 |
-| MOB | Mobile UI phases 1–3 + verify (adaptive shell, sheet CSS, terminal key bar) | **P1** | RF-MOB (done) | mobile-ui.md → Execution plan |
-| MOB-PWA | Mobile UI phase 4: PWA manifest + iOS metas | **P2** | MOB | mobile-ui.md → Packaging path |
-| MOB-PUSH | Web Push for attention states | **P3** | MOB; daemon push plumbing (relay as carrier) | mobile-ui.md → Follow-ups |
+| MOB-PWA | Mobile UI phase 4: PWA manifest + iOS metas | **P2** | MOB (done) | mobile-ui.md → Packaging path |
+| MOB-PUSH | Web Push for attention states | **P3** | MOB (done); daemon push plumbing (relay as carrier) | mobile-ui.md → Follow-ups |
 | IMG-2 | Image paste follow-ups: `.asm/pastes/` cleanup policy, per-agent capability hint | **P3** | image paste + 📎 button (done) | image-paste.md → Follow-ups |
 | RF-ERR | Typed daemon error → HTTP status mapping (RelayError-style) | **P2** | — (pair with SEC-2 or RF-M4) | refactoring-plan.md → RF-ERR |
 | SEC-2 | Constrain `/api/fs/list` + workspace roots | **P1** | RF-ERR recommended (403 mapping) | security-followups.md → 2 (HIGH) |
@@ -144,31 +159,20 @@ marker on `BUFFER_GAP`; everything is scaffolded, ring-replay is currently the
 default). This closes the headline "terminal intact after restart" promise for
 long-lived sessions whose output outgrew the ring.
 
-### MOB — mobile adaptive shell (P1, client-only)
+### MOB follow-ups — phases 4–5 remaining (P2/P3)
 
-Newly designed 2026-07-05 (`mobile-ui.md`). One codebase: `useIsPhone()`
-(`PHONE_MQ`) switches between the existing 3-pane `DesktopShell` and a new
-stacked `MobileShell` (Sessions home → full-screen Terminal → Details sheet
-over the live terminal); all panels/dialogs/stores/queries shared, so feature
-parity is structural. Phases: (1) shell split + pushState navigation,
-(2) touch-target + modal→bottom-sheet CSS, (3) terminal key bar
-(Esc/Tab/⇧Tab/Ctrl-latch/^C/arrows/⌨/Paste **and Copy** via a `TerminalView`
-input handle) + visual-viewport keyboard geometry, (4) PWA manifest/icons
-(= MOB-PWA row),
-(5) headless-Chrome mobile-viewport verification + desktop regression.
-Phases 1–2 make the app usable on a phone; 1–3 make the terminal genuinely
-workable; each ships independently. No daemon changes; interleaves freely
-with R4/M4 (disjoint code). i18n rule applies to all new strings. **Copy** is on
-the phase-3 key bar because the terminal-selection-copy feature (`7a56cd3`) is
-reachable only via Ctrl-Shift-C/⌘-C/right-click — none of which exist on touch;
-the key-bar Copy calls `term.getSelection()` + the shared `copyText()` util, and
-Paste is its clipboard-read sibling. This is the
-natural consumer of the R3 milestone ("mobile-ready, zero client tooling").
-Smaller follow-ups noted in the doc (attention-pinned home group, font-size
-control, tap-and-hold tooltips) ride along or slot in later; **MOB-PUSH**
-(Web Push for `approval_needed`/`likely_blocked`) is its own row because it
-needs daemon-side push plumbing with the relay as carrier — design that
-before building.
+Phases 1–3 shipped (see "Already done"); the mobile app is usable and the
+terminal genuinely workable on a phone, verified against a live session. What's
+left of the `mobile-ui.md` plan:
+
+- **MOB-PWA** (phase 4): web-app manifest (`display: standalone`, theme/bg
+  `#0b0e14`, icons) + iOS meta tags → "Add to Home Screen" becomes the zero-cost
+  phone app, and future store apps are thin wrappers around the same origin.
+- **MOB-PUSH**: Web Push for `approval_needed`/`likely_blocked` — its own row
+  because it needs daemon-side push plumbing with the relay as carrier; design
+  that before building.
+- Smaller follow-ups noted in the doc (attention-pinned home group, font-size
+  control, tap-and-hold tooltips) slot in later.
 
 ### RF-ERR — typed daemon error mapping (P2, pairs with SEC-2)
 
@@ -299,9 +303,9 @@ parity gate, typed keys); adding a locale is the 3-step recipe in `i18n.md`.
 
 ## Suggested order (cross-track)
 
-1. **MOB** phases 1–3 (**RF-MOB** landed 2026-07-06) — freshest design,
-   client-only, immediately usable value on top of the just-shipped relay path;
-   runs in parallel with any daemon work.
+1. ~~**MOB** phases 1–3~~ ✅ landed 2026-07-06 (RF-MOB + phases 1–3). Remaining
+   mobile work: **MOB-PWA** (phase 4) then **MOB-PUSH** (needs daemon push
+   plumbing) — see item 7.
 2. **R4** — finishes the connectivity story the product is built around; no
    refactor needed (relay/agent scaffolding is complete; daemon side is a
    `Config` field + probe loop).

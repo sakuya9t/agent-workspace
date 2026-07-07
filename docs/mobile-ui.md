@@ -1,8 +1,9 @@
 # Mobile UI Design
 
 Goal: the full ASM control center on a phone — same features as the desktop web
-client, laid out for a narrow touch screen. This is a design + execution plan;
-nothing here is implemented yet.
+client, laid out for a narrow touch screen. **Status (2026-07-06): execution
+plan phases 1–3 shipped** (adaptive shell, touch/sheet CSS, terminal key bar);
+phase 4 (PWA packaging) and the follow-ups remain. See the Execution plan below.
 
 ## Constraints
 
@@ -178,26 +179,29 @@ desktop (select session on load).
 
 ## Execution plan
 
-1. **Shell split** — `useIsPhone()`; extract the current 3-pane JSX from
-   `App.tsx` into `DesktopShell`; add `MobileShell` (home screen + terminal
-   screen + details sheet + navigation state in `useUiStore`:
-   `showDetails`, derived screen from `activeSession`). History/pushState
-   integration. *(new: MobileShell.tsx, useIsPhone.ts; touch: App.tsx,
-   store.ts, main.tsx)*
-2. **Touch & sheet CSS** — `PHONE_MQ` media block in `styles.css`: touch
-   targets, modal→sheet, safe-area, dvh root. *(touch: styles.css,
-   index.html)*
-3. **Terminal on touch** — key bar component + `TerminalView` input handle +
-   `useVisualViewportHeight`. i18n keys for key labels/tooltips. *(new:
-   TermKeyBar.tsx; touch: Terminal.tsx, en.json)*
+1. ✅ **Shell split** (landed 2026-07-06) — `useIsPhone()`; extracted the 3-pane
+   JSX from `App.tsx` into `DesktopShell`; added `MobileShell` (home + terminal
+   + details sheet). Nav state in `useUiStore` (`showDetails`) + browser-history
+   pushState mirroring the layer stack + `#s=` deep-link. *(new: MobileShell.tsx,
+   useIsPhone.ts, agents.ts, DesktopShell.tsx; touch: App.tsx, store.ts)* — note
+   the shared dialogs live in `App.tsx`, not `main.tsx`.
+2. ✅ **Touch & sheet CSS** (landed 2026-07-06) — one `@media PHONE_MQ` block in
+   `styles.css`: touch targets, modal→bottom-sheet, safe-area, 100dvh root;
+   `viewport-fit=cover`. *(touch: styles.css, index.html)*
+3. ✅ **Terminal on touch** (landed 2026-07-06) — `TermKeyBar` +
+   `TerminalView` input handle (write/focus/getSelection) + Ctrl latch +
+   `useVisualViewportHeight` + `interactive-widget=resizes-content`. i18n
+   `keybar.*`. *(new: TermKeyBar.tsx, terminalTypes.ts, useVisualViewportHeight.ts;
+   touch: Terminal.tsx, MobileShell.tsx, clipboard.ts, en.json, index.html)*
 4. **PWA wrapper** — manifest, icons, theme-color, iOS metas. *(touch:
    index.html; new: public/manifest.webmanifest, icons)*
-5. **Verify** — headless-Chrome mobile-viewport pass (390×844 + 844×390)
-   driving: connect → new workspace → new session → type via key bar → diff →
-   pull → archive; plus desktop regression at 1280×800.
+5. ✅ **Verify** (for phases 1–3) — `scripts/mobile-shell-test.mjs`: headless
+   Chrome at 390×844 against a live shell session drives device switch → session
+   tap → key-bar/Ctrl-latch input over the WS → details sheet → back navigation
+   (ALL PASS), plus desktop regression at 1280×800. Re-run after phase 4.
 
 Phases 1–2 make the app usable on a phone; 3 makes the terminal genuinely
-workable; 4 is packaging. Each phase ships independently.
+workable (all shipped); 4 is packaging. Each phase ships independently.
 
 ## Follow-ups (out of scope, noted so they aren't lost)
 
