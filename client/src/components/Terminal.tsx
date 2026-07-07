@@ -132,6 +132,10 @@ export function TerminalView({
       // macOS-native gesture for selecting while a TUI holds mouse reporting
       // (Shift+drag is also honored — see the shouldForceSelection patch below).
       macOptionClickForcesSelection: true,
+      // Defaults ON for macOS, where it quietly REPLACES the user's selection
+      // with the word under the pointer on right-click — and the context-menu
+      // copy below then faithfully "succeeds" on that single word.
+      rightClickSelectsWord: false,
       theme: {
         background: "#0b0e14",
         foreground: "#c7d0e0",
@@ -174,14 +178,76 @@ export function TerminalView({
     // Shift+drag as THE selection gesture, so widen the predicate to accept
     // Shift on every platform. The mouse-reporting mousedown path consults the
     // same predicate, so a forced drag is also kept away from the app.
-    const selection = (
+    const core = (
       term as unknown as {
-        _core?: { _selectionService?: { shouldForceSelection?: (e: MouseEvent) => boolean } };
+        _core?: {
+          _selectionService?: {
+            shouldForceSelection?: (e: MouseEvent) => boolean;
+            clearSelection?: () => void;
+            disable?: () => void;
+          };
+          coreMouseService?: {
+            triggerMouseEvent?: (ev: { button: number; action: number }) => boolean;
+          };
+          coreService?: {
+            triggerDataEvent?: (data: string, wasUserInput?: boolean) => void;
+          };
+        };
       }
-    )._core?._selectionService;
+    )._core;
+    const selection = core?._selectionService;
     if (selection?.shouldForceSelection) {
       const shouldForceSelection = selection.shouldForceSelection.bind(selection);
       selection.shouldForceSelection = (e: MouseEvent) => e.shiftKey || shouldForceSelection(e);
+    }
+
+    // WORKAROUND (@xterm/xterm 5.5.0): a Shift+drag selection under mouse
+    // reporting died before it could be copied, three ways — all downstream of
+    // "any user input clears the selection", where a report TO the app counts
+    // as user input:
+    //  1. Under ?1003h (any-motion tracking — Claude Code runs this) merely
+    //     MOVING the mouse after releasing the drag sends a motion report.
+    //  2. A wheel scroll or a focus in/out report (?1004h) does the same.
+    //  3. Re-asserting mouse modes — which Claude Code does on every redraw,
+    //     spinner ticks included — fires onProtocolChange (the setter doesn't
+    //     dedupe same-value writes), whose handler disable()s the selection
+    //     service, and disable() clears too.
+    // Suppress the clear for exactly those synchronous paths. Real button
+    // presses still dismiss the highlight, and real keystrokes still clear via
+    // the keyboard path, so click-to-deselect UX is unchanged.
+    const coreMouse = core?.coreMouseService;
+    const coreSvc = core?.coreService;
+    if (
+      selection?.clearSelection &&
+      selection.disable &&
+      coreMouse?.triggerMouseEvent &&
+      coreSvc?.triggerDataEvent
+    ) {
+      let passiveInput = false;
+      const guard = <A extends unknown[], R>(fn: (...args: A) => R, isPassive: (...args: A) => boolean) => {
+        return (...args: A): R => {
+          const prev = passiveInput;
+          passiveInput = prev || isPassive(...args);
+          try {
+            return fn(...args);
+          } finally {
+            passiveInput = prev;
+          }
+        };
+      };
+      coreMouse.triggerMouseEvent = guard(
+        coreMouse.triggerMouseEvent.bind(coreMouse),
+        (ev) => ev.action === 32 /* move */ || ev.button === 4 /* wheel */,
+      );
+      coreSvc.triggerDataEvent = guard(
+        coreSvc.triggerDataEvent.bind(coreSvc),
+        (data) => data === "\x1b[I" || data === "\x1b[O", // focus reports
+      );
+      selection.disable = guard(selection.disable.bind(selection), () => true);
+      const clearSelection = selection.clearSelection.bind(selection);
+      selection.clearSelection = () => {
+        if (!passiveInput) clearSelection();
+      };
     }
 
     let mounted = true;
@@ -438,11 +504,22 @@ export function TerminalView({
       dataSub.dispose();
       wsRef.current = null;
       if (ws) {
-        ws.onclose = null;
-        try {
-          ws.close();
-        } catch {
-          /* ignore */
+        const socket = ws;
+        socket.onclose = null;
+        socket.onmessage = null;
+        socket.onerror = null;
+        if (socket.readyState === WebSocket.CONNECTING) {
+          // close() mid-handshake makes the browser log "WebSocket is closed
+          // before the connection is established" (StrictMode's dev double-
+          // mount and fast session switches both land here) — let the
+          // handshake finish, then close.
+          socket.onopen = () => socket.close();
+        } else {
+          try {
+            socket.close();
+          } catch {
+            /* ignore */
+          }
         }
       }
       term.dispose();

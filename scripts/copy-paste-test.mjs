@@ -59,6 +59,7 @@ async function browserWs() {
 function makeConn(wsUrl) {
   const ws = new WebSocket(wsUrl);
   const pending = new Map();
+  const logs = []; // every browser/console log line from every tab
   let idc = 1;
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
@@ -67,6 +68,9 @@ function makeConn(wsUrl) {
       pending.delete(m.id);
       m.error ? reject(new Error(JSON.stringify(m.error))) : resolve(m.result);
     }
+    if (m.method === "Log.entryAdded") logs.push(m.params.entry.text ?? "");
+    if (m.method === "Runtime.consoleAPICalled")
+      logs.push((m.params.args ?? []).map((a) => a.value ?? a.description ?? "").join(" "));
     // A confirm()/alert() left open blocks every same-process evaluate —
     // auto-accept (e.g. the session take-over prompt).
     if (m.method === "Page.javascriptDialogOpening") {
@@ -82,7 +86,7 @@ function makeConn(wsUrl) {
       pending.set(id, { resolve, reject });
       ws.send(JSON.stringify({ id, method, params, sessionId }));
     });
-  return { ws, ready, send };
+  return { ws, ready, send, logs };
 }
 
 const WS_TAP = `(() => {
@@ -142,6 +146,12 @@ async function main() {
     await drag(t, "MARK1SEC", 8);
     check("T1 shift+drag selects under mouse reporting", await hasSelection(t));
 
+    // moving the released mouse used to wipe the selection: ?1003h reports
+    // every buttonless move, and reports counted as selection-clearing input
+    await moveAcross(t, "MARK1SEC");
+    check("T1 motion reports reached the app (?1003h live)", await sentHas(t, "[<35;"));
+    check("T1 selection survives any-motion reports", await hasSelection(t));
+
     // Ctrl-Shift-C copies, flashes receipt, no SIGINT leak
     await clipSeed("RESET1");
     await t.S("Page.bringToFront");
@@ -168,11 +178,13 @@ async function main() {
     await sleep(200);
     check("T1 plain Ctrl+V forwards ^V to app", await sentHas(t, "\\u0016"));
 
-    // right-click: copies, clears selection (so next right-click = browser menu)
+    // right-click: copies, clears selection (so next right-click = browser menu).
+    // The mouse travels to the click point first, like a real hand does.
     await drag(t, "MARK1SEC", 8);
     check("T1 re-select for right-click", await hasSelection(t));
     await clipSeed("RESET2");
     await t.S("Page.bringToFront");
+    await moveAcross(t, "MARK1SEC");
     await rightClick(t, "MARK1SEC");
     await sleep(400);
     const clip2 = await clipRead();
@@ -196,6 +208,16 @@ async function main() {
     await drag(t, "MARK2MAC", 8);
     check("T2 shift+drag selects on macOS (the fix)", await hasSelection(t));
 
+    // ?1003h motion reports and ?1004h focus reports must not deselect
+    await moveAcross(t, "MARK2MAC");
+    check("T2 selection survives ?1003h motion reports", await hasSelection(t));
+    await t.eval(
+      `(() => { const ta = document.querySelector('.xterm-helper-textarea'); ta.blur(); ta.focus(); })()`,
+    );
+    await sleep(200);
+    check("T2 focus out was reported (?1004h live)", await sentHas(t, "\\u001b[O"));
+    check("T2 selection survives focus in/out reports", await hasSelection(t));
+
     // ⌘-C equivalent: native copy command served by xterm's own copy listener
     await clipSeed("RESET3");
     await t.S("Page.bringToFront");
@@ -206,16 +228,55 @@ async function main() {
     check("T2 ⌘-C native copy picked up selection", /MARK2MAC/.test(clip3), clip3);
 
     // Option+drag also selects (macOptionClickForcesSelection): select a
-    // DIFFERENT row (the command-echo line containing "printf"), re-copy, and
-    // require the clipboard to change — proves a fresh selection was made.
+    // DIFFERENT row (the lowercase target line), re-copy, and require the
+    // clipboard to change — proves a fresh selection was made.
     await t.S("Page.bringToFront");
-    await drag(t, "printf", 1, true); // alt held
+    await drag(t, "mark2mac", 1); // alt held
     check("T2 option+drag selects on macOS", await hasSelection(t));
     await key(t, { type: "keyDown", modifiers: 4, key: "c", code: "KeyC", windowsVirtualKeyCode: 67, commands: ["copy"] });
     await key(t, { type: "keyUp", modifiers: 4, key: "c", code: "KeyC", windowsVirtualKeyCode: 67 });
     await sleep(400);
     const clip3b = await clipRead();
-    check("T2 option+drag selection is fresh (copied new row)", /printf/.test(clip3b), clip3b);
+    check("T2 option+drag selection is fresh (copied new row)", /mark2mac/.test(clip3b), clip3b);
+
+    // Claude Code re-asserts its mouse modes on every redraw (spinner ticks
+    // included); each DECSET fired onProtocolChange → disable() → clear, so a
+    // selection died within a second of any TUI activity. Flush the mouse-
+    // report junk the earlier tests fed the prompt line before typing.
+    await t.S("Page.bringToFront");
+    await focusTerm(t);
+    for (let i = 0; i < 2; i++) {
+      await key(t, { type: "keyDown", modifiers: 2, key: "u", code: "KeyU", windowsVirtualKeyCode: 85 });
+      await key(t, { type: "keyUp", modifiers: 2, key: "u", code: "KeyU", windowsVirtualKeyCode: 85 });
+    }
+    await key(t, { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" });
+    await key(t, { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+    await sleep(300);
+    await typeText(t, `(sleep 2; printf '\\033[?1000h\\033[?1002h\\033[?1003h') &`);
+    await key(t, { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" });
+    await key(t, { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+    await sleep(300);
+    await drag(t, "MARK2MAC", 8);
+    check("T2 re-selected before mode re-assert", await hasSelection(t));
+    await sleep(2700);
+    check("T2 selection survives TUI mode re-assertion", await hasSelection(t));
+
+    // The reported bug, end to end: selection made, mouse travels, right-click
+    // over a DIFFERENT word. The clipboard must hold the selection — not the
+    // word under the pointer (rightClickSelectsWord defaults ON for macOS and
+    // used to replace the selection on the contextmenu's own mousedown).
+    await clipSeed("RESET-RC");
+    await t.S("Page.bringToFront");
+    await moveAcross(t, "mark2mac");
+    await rightClick(t, "mark2mac");
+    const flashRC = await waitFor(t, `document.querySelector('.paste-status--ok')?.textContent || ''`, 2000);
+    check("T2 right-click flashed 'Copied'", /Copied/.test(flashRC || ""), flashRC);
+    const clipRC = await clipRead();
+    check(
+      "T2 right-click copied the selection, not the word under the pointer",
+      /MARK2MAC/.test(clipRC) && !/mark2mac/.test(clipRC),
+      clipRC,
+    );
 
     // ⌘-V paste
     await clipSeed("PASTE2-QQ7");
@@ -262,6 +323,12 @@ async function main() {
     await t.close();
   }
 
+  // Across every tab (T3's dev-mode StrictMode double-mount is the
+  // deterministic repro): tearing down a still-connecting socket must not
+  // log the browser's close-mid-handshake warning.
+  const wsWarn = conn.logs.filter((l) => l.includes("closed before the connection"));
+  check("no 'closed before the connection is established' WS warnings", wsWarn.length === 0, wsWarn[0]);
+
   await reader.close();
   conn.ws.close();
   console.log(failures ? `\n${failures} FAILURE(S)` : "\nALL PASS");
@@ -276,6 +343,7 @@ async function openTab(conn, url, uaOverride) {
   const S = (method, params) => conn.send(method, params, sessionId);
   await S("Runtime.enable");
   await S("Page.enable");
+  await S("Log.enable"); // surfaces browser-generated warnings (e.g. WS close-mid-handshake)
   await S("Network.enable");
   await S("Network.setCacheDisabled", { cacheDisabled: true }); // always run the freshly built bundle
   if (uaOverride) await S("Emulation.setUserAgentOverride", uaOverride);
@@ -345,7 +413,15 @@ async function attachTerminal(tab, marker) {
   await key(tab, { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" });
   await key(tab, { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
   await sleep(300);
-  await typeText(tab, `echo ${marker}; printf '\\033[?1000h\\033[?1006h'`);
+  // The full mode set Claude Code asserts: click+drag+any-motion tracking,
+  // focus reporting, SGR encoding. ?1003h is the crucial one — motion reports
+  // fire on every buttonless mouse move. The lowercase echo is a second,
+  // always-visible target row whose text can't be mistaken for the marker in
+  // a clipboard assertion (matching is case-sensitive).
+  await typeText(
+    tab,
+    `echo ${marker}; echo ${marker.toLowerCase()}; printf '\\033[?1000h\\033[?1002h\\033[?1003h\\033[?1004h\\033[?1006h'`,
+  );
   await key(tab, { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" });
   await key(tab, { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
   const seen = await waitFor(
@@ -376,14 +452,37 @@ async function drag(tab, marker, modifiers, fuzzy = false) {
   await sleep(150);
 }
 
-async function rightClick(tab, marker) {
+async function rowRect(tab, marker, fuzzy = false) {
   const rect = await tab.eval(`(() => {
     const rows = [...document.querySelectorAll('.xterm-rows > div')];
-    const row = rows.find(r => r.textContent.trim() === ${JSON.stringify(marker)});
+    const row = rows.find(r => ${fuzzy}
+      ? r.textContent.includes(${JSON.stringify(marker)})
+      : r.textContent.trim() === ${JSON.stringify(marker)});
     if (!row) return null;
     const r = row.getBoundingClientRect();
-    return { x: r.left + 30, y: r.top + r.height / 2 };
+    return { x: r.left + 30, y: r.top + r.height / 2, w: Math.min(r.width, 220) };
   })()`);
+  if (!rect) throw new Error("marker row not found: " + marker);
+  return rect;
+}
+
+// Buttonless mouse travel across the marker's row — under ?1003h every step
+// is reported to the app, which historically wiped the selection.
+async function moveAcross(tab, marker, fuzzy = false) {
+  const rect = await rowRect(tab, marker, fuzzy);
+  for (let i = 1; i <= 4; i++) {
+    await tab.S("Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x: rect.x + (rect.w * i) / 4,
+      y: rect.y,
+      buttons: 0,
+    });
+  }
+  await sleep(150);
+}
+
+async function rightClick(tab, marker, fuzzy = false) {
+  const rect = await rowRect(tab, marker, fuzzy);
   await tab.S("Input.dispatchMouseEvent", { type: "mousePressed", x: rect.x, y: rect.y, button: "right", buttons: 2, clickCount: 1 });
   await tab.S("Input.dispatchMouseEvent", { type: "mouseReleased", x: rect.x, y: rect.y, button: "right", buttons: 0, clickCount: 1 });
 }
