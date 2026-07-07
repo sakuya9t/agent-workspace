@@ -14,7 +14,8 @@ implemented**. The detailed designs stay in their own documents
 [`mobile-ui.md`](mobile-ui.md),
 [`security-followups.md`](security-followups.md),
 [`mvp-execution-plan.md`](mvp-execution-plan.md),
-[`refactoring-plan.md`](refactoring-plan.md)); this file only records
+[`refactoring-plan.md`](refactoring-plan.md),
+[`classifier-measurement.md`](classifier-measurement.md)); this file only records
 **what is pending, why it matters, what it depends on, and in what order to
 pick it up**.
 
@@ -90,6 +91,7 @@ pick it up**.
 | SEC-8 | Terminal-escape policy at capture/replay + fuzzing | **P3** | — | security-followups.md → 8 (LOW) |
 | DEC-1 | Decide: adopt planned client stack (shadcn/Tailwind/Dockview/Electron) or amend the plan | **P2** (decision, cheap) | — | mvp-execution-plan.md → Baseline Technology |
 | RF-VT100 | Terminal emulator dependency review (`vt100` 0.15 unmaintained) | **P3** | — (trigger: M4 cold-stitch work or upstream CVE) | refactoring-plan.md → RF-VT100 |
+| MEAS | Classifier measurement: local-LLM shadow classification of any registered heuristic (attention first), disagreement snapshots + triage (dev-only, default-off) | **P2** | RF-M4 recommended first (shares the `on_output`/`on_idle` seams); needs a local Ollama/llama-server on the dev host | classifier-measurement.md → Milestones |
 | DOC-1 | Doc sync: architecture.md still calls yamux the relay default | **P3** (one-liner) | — | architecture.md → Open Decisions |
 | I18N-2 | Additional locales beyond `en` | **P4** (deferred by user) | — | i18n.md → Adding a locale |
 
@@ -285,6 +287,25 @@ snapshot path, or an upstream CVE. Detail: refactoring-plan.md → RF-VT100.
 default is yamux with dial-out as fallback. R1 locked **dial-out-per-stream**
 (recorded in connectivity-execution-plan.md); fix the architecture.md line.
 
+### MEAS — classifier measurement / shadow classification (P2, dev-only)
+
+A general shadow-classification harness: any classification heuristic in
+the project registers a `TaskSpec` (labels, prompt, projection, replay) and
+calls `observe()`; a local 1–2 B LLM (Ollama / llama-server on the dev
+host, never a cloud API) re-classifies the same snapshotted inputs in
+**shadow**. Agreement is recorded; disagreements persist a replayable
+snapshot + both labels + the LLM's reasoning into `measure_samples`. Triage
+loop turns `heuristic_gap` rows into regression-test fixtures and pattern
+fixes, and `llm_wrong` rows into banked training data for a future
+distilled classifier. Attention is the first registered task;
+`exit_outcome` and remote (client/asmux) submitters follow in MEAS-3.
+Default-off (`ASM_MEASURE=1`), zero effect on live state, rate-capped for
+CPU inference budgets. Full design incl. schema, sampling policy, adoption
+recipe, and the two-pass label/reasoning protocol:
+[`classifier-measurement.md`](classifier-measurement.md). Milestones
+MEAS-1..3 (task-agnostic core + attention → reasoning + triage/export →
+second task + remote observe).
+
 ### I18N-2 — additional locales (P4)
 
 Deferred by explicit user choice. Infrastructure is ready (`check-locales.mjs`
@@ -301,15 +322,21 @@ parity gate, typed keys); adding a locale is the 3-step recipe in `i18n.md`.
 3. **RF-M4** → **M4** — durability hardening; the only remaining gap in the
    headline restart promise. Can interleave with R4 (different subsystems);
    the cold-stitch flip waits for RF-M4's adopt-path tests.
-4. **SEC-2 + RF-ERR** (together), then **SEC-1(direct)** — before any
+4. **MEAS-1** — right after RF-M4's SessionManager split settles the
+   `on_output`/`on_idle` seams it hooks (landing it earlier just makes the
+   refactor carry the hooks). Dev-only and parallel-friendly: once enabled
+   on a dev daemon it accrues heuristic-disagreement data passively while
+   every later item proceeds, so earlier = more signal for free. MEAS-2/3
+   ride along opportunistically (item 10 tier).
+5. **SEC-2 + RF-ERR** (together), then **SEC-1(direct)** — before any
    exposure beyond trusted networks.
-5. **DEC-1** (an hour of thought) → **RF-QUERY** → **MVP-RICH**.
-6. **V0** spike → V1–V3 as a block.
-7. **MOB-PWA**, then **MOB-PUSH** (design the push plumbing first).
-8. **R5** items as deployment needs them (TLS/ops first, ACLs next,
+6. **DEC-1** (an hour of thought) → **RF-QUERY** → **MVP-RICH**.
+7. **V0** spike → V1–V3 as a block.
+8. **MOB-PWA**, then **MOB-PUSH** (design the push plumbing first).
+9. **R5** items as deployment needs them (TLS/ops first, ACLs next,
    E2E-crypto decision when V-track ships).
-9. **MVP-HOOKS**, **MVP-CKPT** opportunistically.
-10. **M5** → **MVP-PKG** when cross-platform/packaging becomes the goal.
+10. **MVP-HOOKS**, **MVP-CKPT**, **MEAS-2/3** opportunistically.
+11. **M5** → **MVP-PKG** when cross-platform/packaging becomes the goal.
 
 Constraints to respect when reordering: nothing in R-track may assume M4
 features exist; V1's relay change must not add daemon-API parsing to the
