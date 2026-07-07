@@ -228,6 +228,10 @@ socket path), `ASMUX_MEMORY_LIMIT` (holder ring-memory cap, bytes).
 | GET | `/api/sessions/:id/scm/status` | repo status, branch, changed files |
 | GET | `/api/sessions/:id/scm/diff?path=&untracked=` | unified diff for a file |
 | GET | `/api/sessions/:id/scm/log?limit=` | commit history |
+| GET | `/api/sessions/:id/scm/branches` | local branches + current HEAD |
+| POST | `/api/sessions/:id/scm/pull` | fast-forward-only pull for the session branch |
+| POST | `/api/sessions/:id/scm/rebase` | rebase the session branch onto a target branch |
+| POST | `/api/sessions/:id/scm/merge` | merge the session branch into a target branch |
 
 WebSocket protocol: the server sends binary frames of terminal output (the
 first frame is the snapshot repaint). The client sends terminal input as binary

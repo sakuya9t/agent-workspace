@@ -44,6 +44,8 @@ export function RightPanel({ target, session }: Props) {
   const [commitTarget, setCommitTarget] = useState<string | null>(null);
   const [rebaseOpen, setRebaseOpen] = useState(false);
   const [rebaseOnto, setRebaseOnto] = useState("");
+  const [mergeOpen, setMergeOpen] = useState(false);
+  const [mergeTarget, setMergeTarget] = useState("");
 
   const terminal =
     session &&
@@ -118,16 +120,16 @@ export function RightPanel({ target, session }: Props) {
     retry: false,
   });
 
-  // Branch list backing the rebase-target picker; only fetched while the picker
-  // is open so it doesn't poll needlessly.
+  // Branch list backing the rebase/merge target pickers; only fetched while a
+  // picker is open so it doesn't poll needlessly.
   const { data: branchList, error: branchesError } = useQuery({
     queryKey: ["scmbranches", base, session?.id],
     queryFn: () => api.scmBranches(target!, session!.id),
-    enabled: !!session && !!target && !!scm?.is_repo && rebaseOpen,
+    enabled: !!session && !!target && !!scm?.is_repo && (rebaseOpen || mergeOpen),
     retry: false,
   });
 
-  // Refresh status + history after a pull/rebase changes the branch.
+  // Refresh status + history after a source-control operation changes refs.
   const refreshScm = () => {
     qc.invalidateQueries({ queryKey: ["scm", base, session?.id] });
     qc.invalidateQueries({ queryKey: ["scmlog", base, session?.id] });
@@ -147,24 +149,49 @@ export function RightPanel({ target, session }: Props) {
     },
   });
 
-  // A pull and a rebase share one result/error line, so starting one clears the
-  // other's stale output.
+  const merge = useMutation({
+    mutationFn: (targetBranch: string) => api.scmMerge(target!, session!.id, targetBranch),
+    onSuccess: () => {
+      setMergeOpen(false);
+      setMergeTarget("");
+      refreshScm();
+    },
+    onError: (e) => {
+      if ((e as { status?: number }).status === 409) {
+        alert(t("rightPanel.mergeConflictPrompt", { message: (e as Error).message }));
+      }
+    },
+  });
+
+  // Pull/rebase/merge share one result/error area, so starting one clears the
+  // others' stale output.
   const startPull = () => {
     rebase.reset();
+    merge.reset();
     pull.mutate();
   };
   const startRebase = (onto: string) => {
     pull.reset();
+    merge.reset();
     rebase.mutate(onto);
   };
+  const startMerge = (targetBranch: string) => {
+    pull.reset();
+    rebase.reset();
+    merge.mutate(targetBranch);
+  };
+  const scmBusy = pull.isPending || rebase.isPending || merge.isPending;
 
-  // Don't carry an open picker or a previous session's pull/rebase output onto
-  // the next session (this panel is reused, not remounted, across selections).
+  // Don't carry an open picker or a previous session's SCM output onto the next
+  // session (this panel is reused, not remounted, across selections).
   useEffect(() => {
     setRebaseOpen(false);
     setRebaseOnto("");
+    setMergeOpen(false);
+    setMergeTarget("");
     pull.reset();
     rebase.reset();
+    merge.reset();
   }, [session?.id, base]);
 
   if (!session || !target) {
@@ -358,7 +385,7 @@ export function RightPanel({ target, session }: Props) {
                 <span className="scm-actions">
                   <button
                     className="icon-btn"
-                    disabled={pull.isPending || rebase.isPending}
+                    disabled={scmBusy}
                     onClick={startPull}
                     title={t("rightPanel.pullTitle")}
                     aria-label={t("rightPanel.pullTitle")}
@@ -367,12 +394,27 @@ export function RightPanel({ target, session }: Props) {
                   </button>
                   <button
                     className={"icon-btn" + (rebaseOpen ? " active" : "")}
-                    disabled={pull.isPending || rebase.isPending}
-                    onClick={() => setRebaseOpen((o) => !o)}
+                    disabled={scmBusy}
+                    onClick={() => {
+                      setMergeOpen(false);
+                      setRebaseOpen((o) => !o);
+                    }}
                     title={t("rightPanel.rebaseTitle")}
                     aria-label={t("rightPanel.rebaseTitle")}
                   >
                     ⎇
+                  </button>
+                  <button
+                    className={"icon-btn" + (mergeOpen ? " active" : "")}
+                    disabled={scmBusy}
+                    onClick={() => {
+                      setRebaseOpen(false);
+                      setMergeOpen((o) => !o);
+                    }}
+                    title={t("rightPanel.mergeTitle")}
+                    aria-label={t("rightPanel.mergeTitle")}
+                  >
+                    ⤴
                   </button>
                 </span>
               )}
@@ -401,7 +443,7 @@ export function RightPanel({ target, session }: Props) {
                       <select
                         className="rebase-select mono"
                         value={rebaseOnto}
-                        disabled={rebase.isPending}
+                        disabled={scmBusy}
                         onChange={(e) => setRebaseOnto(e.target.value)}
                       >
                         <option value="" disabled>
@@ -415,7 +457,7 @@ export function RightPanel({ target, session }: Props) {
                       </select>
                       <button
                         className="btn tiny"
-                        disabled={!rebaseOnto || rebase.isPending}
+                        disabled={!rebaseOnto || scmBusy}
                         onClick={() => startRebase(rebaseOnto)}
                       >
                         {rebase.isPending
@@ -428,13 +470,65 @@ export function RightPanel({ target, session }: Props) {
               </div>
             )}
 
-            {(pull.isPending || rebase.isPending) && (
+            {mergeOpen && !scm.detached && (
+              <div className="rebase-picker">
+                <div className="rebase-picker-label">
+                  {t("rightPanel.mergeInto", { branch: scm.branch })}
+                </div>
+                {(() => {
+                  const candidates = branchList
+                    ? branchList.branches.filter((b) => b !== branchList.head)
+                    : [];
+                  if (branchesError) {
+                    return <div className="error">{String(branchesError)}</div>;
+                  }
+                  if (!branchList) {
+                    return <div className="dim small">{t("rightPanel.loadingBranches")}</div>;
+                  }
+                  if (candidates.length === 0) {
+                    return <div className="dim small">{t("rightPanel.noMergeBranches")}</div>;
+                  }
+                  return (
+                    <div className="rebase-picker-row">
+                      <select
+                        className="rebase-select mono"
+                        value={mergeTarget}
+                        disabled={scmBusy}
+                        onChange={(e) => setMergeTarget(e.target.value)}
+                      >
+                        <option value="" disabled>
+                          {t("rightPanel.mergeSelectPlaceholder")}
+                        </option>
+                        {candidates.map((b) => (
+                          <option key={b} value={b}>
+                            {b}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        className="btn tiny"
+                        disabled={!mergeTarget || scmBusy}
+                        onClick={() => startMerge(mergeTarget)}
+                      >
+                        {merge.isPending
+                          ? t("rightPanel.scmRunning")
+                          : t("rightPanel.mergeConfirm")}
+                      </button>
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
+
+            {scmBusy && (
               <div className="dim small">{t("rightPanel.scmRunning")}</div>
             )}
             {pull.error && <div className="error">{String(pull.error)}</div>}
             {rebase.error && <div className="error">{String(rebase.error)}</div>}
+            {merge.error && <div className="error">{String(merge.error)}</div>}
             {pull.data && <div className="scm-op-result mono small dim">{pull.data}</div>}
             {rebase.data && <div className="scm-op-result mono small dim">{rebase.data}</div>}
+            {merge.data && <div className="scm-op-result mono small dim">{merge.data}</div>}
 
             {commits && commits.length > 0 ? (
               <CommitGraph commits={commits} head={scm.head} onSelect={setCommitTarget} />

@@ -222,8 +222,14 @@
     "rebaseOnto": "Rebase {{branch}} onto",
     "rebaseSelectPlaceholder": "Select a branch…",
     "rebaseConfirm": "Rebase",
+    "mergeTitle": "Merge this branch into…",
+    "mergeInto": "Merge {{branch}} into",
+    "mergeSelectPlaceholder": "Select a branch…",
+    "mergeConfirm": "Merge",
+    "mergeConflictPrompt": "{{message}}\n\nThe merge was aborted; no conflict files were left behind.",
     "loadingBranches": "Loading branches…",
     "noOtherBranches": "No other branches to rebase onto.",
+    "noMergeBranches": "No other branches to merge into.",
     "scmRunning": "Running…"
   },
   "usage": {

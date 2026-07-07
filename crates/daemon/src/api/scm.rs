@@ -6,6 +6,8 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::source_control::MergeConflict;
+
 use super::{AppError, AppState};
 
 async fn session_cwd(state: &AppState, id: &str) -> Result<PathBuf, AppError> {
@@ -58,8 +60,7 @@ pub async fn diff(
     let path = params.path.clone();
     let untracked = params.untracked;
     let commit = params.commit.clone();
-    let diff =
-        run_blocking(move || scm.diff(&cwd, &path, untracked, commit.as_deref())).await?;
+    let diff = run_blocking(move || scm.diff(&cwd, &path, untracked, commit.as_deref())).await?;
     Ok(Json(json!({ "path": params.path, "diff": diff })))
 }
 
@@ -136,4 +137,30 @@ pub async fn rebase(
     let onto = body.onto;
     let output = run_blocking(move || scm.rebase(&cwd, &onto)).await?;
     Ok(Json(json!({ "output": output })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MergeBody {
+    target: String,
+}
+
+/// Merge the session's current branch into another local branch.
+pub async fn merge(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<MergeBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let cwd = session_cwd(&state, &id).await?;
+    let scm = state.scm.clone();
+    let target = body.target;
+    let result = tokio::task::spawn_blocking(move || scm.merge_to_branch(&cwd, &target))
+        .await
+        .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("task join: {e}")))?;
+    match result {
+        Ok(output) => Ok(Json(json!({ "output": output }))),
+        Err(e) if e.downcast_ref::<MergeConflict>().is_some() => {
+            Err(AppError(StatusCode::CONFLICT, format!("{e:#}")))
+        }
+        Err(e) => Err(AppError::from(e)),
+    }
 }

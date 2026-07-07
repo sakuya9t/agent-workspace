@@ -1,8 +1,11 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
+
+use crate::workspace;
 
 /// A changed file in the working tree.
 #[derive(Debug, Clone, Serialize)]
@@ -67,6 +70,14 @@ pub struct CommitDetail {
     pub deletions: u64,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("merge from `{source_branch}` into `{target}` had conflicts and was aborted: {output}")]
+pub struct MergeConflict {
+    pub source_branch: String,
+    pub target: String,
+    pub output: String,
+}
+
 /// Source-control plugin boundary. The Git provider is the MVP built-in;
 /// other VCS providers implement the same trait behind the same panel.
 pub trait SourceControl: Send + Sync {
@@ -91,6 +102,9 @@ pub trait SourceControl: Send + Sync {
     /// (conflicts, dirty tree) the rebase is aborted so the worktree is left in
     /// a clean, usable state rather than half-rebased.
     fn rebase(&self, cwd: &Path, onto: &str) -> Result<String>;
+    /// Merge the current branch into `target` (a local branch). Failed merges
+    /// are aborted so conflict files are not left in either worktree.
+    fn merge_to_branch(&self, cwd: &Path, target: &str) -> Result<String>;
 }
 
 pub struct GitSourceControl;
@@ -147,10 +161,7 @@ impl SourceControl for GitSourceControl {
             // One file's change as introduced by a specific commit. `--format=`
             // drops the commit message so only the diff body is returned.
             guard_ref(hash)?;
-            return git_allow_diff(
-                cwd,
-                &["show", "--no-color", "--format=", hash, "--", path],
-            );
+            return git_allow_diff(cwd, &["show", "--no-color", "--format=", hash, "--", path]);
         }
         if untracked {
             // /dev/null diff shows the whole file as added; git exits 1 here.
@@ -296,6 +307,79 @@ impl SourceControl for GitSourceControl {
         bail!(
             "git rebase onto {onto} failed (rebase aborted): {}",
             combined_output(&out).trim()
+        );
+    }
+
+    fn merge_to_branch(&self, cwd: &Path, target: &str) -> Result<String> {
+        if !self.detect(cwd) {
+            bail!("not a git repository");
+        }
+        guard_branch(target)?;
+        let (branches, head) = self.branches(cwd)?;
+        if !branches.iter().any(|b| b == target) {
+            bail!("unknown branch: {target}");
+        }
+        let source = head.ok_or_else(|| anyhow!("cannot merge to branch: HEAD is detached"))?;
+        if source == target {
+            bail!("cannot merge a branch into itself");
+        }
+        ensure_clean_worktree(cwd, &format!("source branch `{source}`"))?;
+
+        let mut temp_path = None;
+        let merge_dir = match workspace::worktree_for_branch(cwd, target)? {
+            Some((path, _)) => PathBuf::from(path),
+            None => {
+                let path = temp_merge_worktree_path(target);
+                let path_str = path_arg(&path)?;
+                git(cwd, &["worktree", "add", path_str, target]).map_err(|e| {
+                    anyhow!("could not create temporary worktree for `{target}`: {e}")
+                })?;
+                temp_path = Some(path.clone());
+                path
+            }
+        };
+
+        if let Err(e) = ensure_clean_worktree(&merge_dir, &format!("target branch `{target}`")) {
+            cleanup_temp_worktree(cwd, temp_path.as_deref());
+            return Err(e);
+        }
+
+        let out = match git_output(&merge_dir, &["merge", "--no-edit", &source]) {
+            Ok(out) => out,
+            Err(e) => {
+                cleanup_temp_worktree(cwd, temp_path.as_deref());
+                return Err(e);
+            }
+        };
+        let output = combined_output(&out);
+        if out.status.success() {
+            let message = if output.trim().is_empty() {
+                format!("Merged {source} into {target}.")
+            } else {
+                format!("Merged {source} into {target}.\n{output}")
+            };
+            if let Err(e) = remove_temp_worktree(cwd, temp_path.as_deref()) {
+                return Ok(format!(
+                    "{message}\n\nWarning: could not remove temporary worktree: {e:#}"
+                ));
+            }
+            return Ok(message);
+        }
+
+        let had_conflicts = has_unmerged_paths(&merge_dir) || output.contains("CONFLICT");
+        let _ = git_output(&merge_dir, &["merge", "--abort"]);
+        cleanup_temp_worktree(cwd, temp_path.as_deref());
+        if had_conflicts {
+            return Err(MergeConflict {
+                source_branch: source,
+                target: target.to_string(),
+                output,
+            }
+            .into());
+        }
+        bail!(
+            "git merge {source} into {target} failed (merge aborted): {}",
+            output.trim()
         );
     }
 }
@@ -469,6 +553,57 @@ fn remote_tracking_exists(cwd: &Path, remote: &str, branch: &str) -> bool {
     .unwrap_or(false)
 }
 
+fn ensure_clean_worktree(cwd: &Path, label: &str) -> Result<()> {
+    let out = git(cwd, &["status", "--porcelain", "--untracked-files=all"])?;
+    if !out.trim().is_empty() {
+        bail!("{label} has uncommitted changes; commit or stash them before merging");
+    }
+    Ok(())
+}
+
+fn has_unmerged_paths(cwd: &Path) -> bool {
+    git(cwd, &["diff", "--name-only", "--diff-filter=U"])
+        .map(|out| !out.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn temp_merge_worktree_path(target: &str) -> PathBuf {
+    let safe_target: String = target
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "asm-merge-{safe_target}-{}-{now}",
+        std::process::id()
+    ))
+}
+
+fn path_arg(path: &Path) -> Result<&str> {
+    path.to_str()
+        .ok_or_else(|| anyhow!("non-UTF8 worktree path"))
+}
+
+fn remove_temp_worktree(root: &Path, path: Option<&Path>) -> Result<()> {
+    if let Some(path) = path {
+        git(root, &["worktree", "remove", "--force", path_arg(path)?])?;
+    }
+    Ok(())
+}
+
+fn cleanup_temp_worktree(root: &Path, path: Option<&Path>) {
+    let _ = remove_temp_worktree(root, path);
+}
+
 /// Merge git's stdout and stderr into one human-readable blob. Porcelain like
 /// "Already up to date." lands on stdout; progress ("From …", conflict notes)
 /// on stderr — the panel wants both.
@@ -549,6 +684,47 @@ fn guard_branch(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn test_repo(name: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "asm-source-control-{name}-{}-{now}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        git_test(&dir, &["init", "-q"]);
+        git_test(&dir, &["config", "user.name", "ASM Test"]);
+        git_test(&dir, &["config", "user.email", "asm-test@example.com"]);
+        git_test(&dir, &["checkout", "-b", "main"]);
+        dir
+    }
+
+    fn git_test(cwd: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run git {args:?}: {e}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn write_file(cwd: &Path, path: &str, contents: &str) {
+        fs::write(cwd.join(path), contents).unwrap();
+    }
+
+    fn commit_all(cwd: &Path, message: &str) {
+        git_test(cwd, &["add", "."]);
+        git_test(cwd, &["commit", "-q", "-m", message]);
+    }
 
     #[test]
     fn parses_all_change_kinds() {
@@ -658,5 +834,90 @@ mod tests {
         // Totals ignore the binary file.
         assert_eq!(d.additions, 11);
         assert_eq!(d.deletions, 3);
+    }
+
+    #[test]
+    fn merge_to_branch_merges_current_branch_into_target() {
+        let repo = test_repo("merge-success");
+        write_file(&repo, "base.txt", "base\n");
+        commit_all(&repo, "initial");
+        git_test(&repo, &["checkout", "-b", "feature"]);
+        write_file(&repo, "feature.txt", "feature\n");
+        commit_all(&repo, "feature work");
+
+        let output = GitSourceControl.merge_to_branch(&repo, "main").unwrap();
+
+        assert!(output.contains("Merged feature into main."));
+        assert_eq!(git_test(&repo, &["show", "main:feature.txt"]), "feature\n");
+        assert_eq!(
+            git_test(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "feature"
+        );
+        assert_eq!(git_test(&repo, &["status", "--porcelain"]), "");
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn merge_to_branch_conflict_aborts_without_changing_target() {
+        let repo = test_repo("merge-conflict");
+        write_file(&repo, "file.txt", "base\n");
+        commit_all(&repo, "initial");
+        git_test(&repo, &["checkout", "-b", "feature"]);
+        write_file(&repo, "file.txt", "feature\n");
+        commit_all(&repo, "feature edit");
+        git_test(&repo, &["checkout", "main"]);
+        write_file(&repo, "file.txt", "main\n");
+        commit_all(&repo, "main edit");
+        git_test(&repo, &["checkout", "feature"]);
+
+        let err = GitSourceControl.merge_to_branch(&repo, "main").unwrap_err();
+
+        assert!(err.downcast_ref::<MergeConflict>().is_some());
+        assert_eq!(git_test(&repo, &["show", "main:file.txt"]), "main\n");
+        assert_eq!(
+            git_test(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "feature"
+        );
+        assert_eq!(git_test(&repo, &["status", "--porcelain"]), "");
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn merge_to_branch_uses_targets_live_worktree() {
+        // The ASM model checks each session's branch out in its own worktree,
+        // so the target branch is frequently already live. That takes the
+        // "merge in place" path instead of the temporary-worktree path.
+        let repo = test_repo("merge-livewt");
+        write_file(&repo, "base.txt", "base\n");
+        commit_all(&repo, "initial");
+        git_test(&repo, &["checkout", "-b", "feature"]);
+        let main_wt = repo.with_extension("main-wt");
+        git_test(
+            &repo,
+            &["worktree", "add", main_wt.to_str().unwrap(), "main"],
+        );
+        write_file(&repo, "feature.txt", "feature\n");
+        commit_all(&repo, "feature work");
+
+        let output = GitSourceControl.merge_to_branch(&repo, "main").unwrap();
+
+        assert!(output.contains("Merged feature into main."));
+        // The merge landed in main's live worktree, which stays checked out and
+        // clean; nothing was removed since no temporary worktree was created.
+        assert_eq!(
+            fs::read_to_string(main_wt.join("feature.txt")).unwrap(),
+            "feature\n"
+        );
+        assert_eq!(
+            git_test(&main_wt, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "main"
+        );
+        assert_eq!(git_test(&main_wt, &["status", "--porcelain"]), "");
+        assert_eq!(
+            git_test(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "feature"
+        );
+        let _ = fs::remove_dir_all(&main_wt);
+        let _ = fs::remove_dir_all(repo);
     }
 }

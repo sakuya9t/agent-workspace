@@ -87,7 +87,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/:id/scm/commit", get(scm::commit))
         .route("/api/sessions/:id/scm/branches", get(scm::branches))
         .route("/api/sessions/:id/scm/pull", post(scm::pull))
-        .route("/api/sessions/:id/scm/rebase", post(scm::rebase));
+        .route("/api/sessions/:id/scm/rebase", post(scm::rebase))
+        .route("/api/sessions/:id/scm/merge", post(scm::merge));
 
     // Optionally serve a packaged web client.
     if let Some(dir) = static_dir {

@@ -434,6 +434,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ onto }),
     }).then((r) => r.output),
+  scmMerge: (t: Target, id: string, target: string) =>
+    req<{ output: string }>(t, `/api/sessions/${id}/scm/merge`, {
+      method: "POST",
+      body: JSON.stringify({ target }),
+    }).then((r) => r.output),
   listWorkspaces: (t: Target) =>
     req<{ workspaces: Workspace[] }>(t, "/api/workspaces").then((r) => r.workspaces),
   addWorkspace: (t: Target, name: string, root_path: string) =>
