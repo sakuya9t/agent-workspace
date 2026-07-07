@@ -1,9 +1,8 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { fitPanels, RESIZER_W, useUiStore } from "./store";
-import { daemonLabel, targetOf } from "./connectionStore";
-import { useDaemonStates } from "./useDaemons";
-import { isLive } from "./status";
+import { daemonLabel } from "./connectionStore";
+import { useActiveSession } from "./useActiveSession";
 import { statusLabel } from "./i18n/labels";
 import { SessionList } from "./components/SessionList";
 import { TerminalView } from "./components/Terminal";
@@ -19,7 +18,6 @@ const USAGE_AGENTS = new Set(["claude", "codex"]);
 
 export function App() {
   const { t } = useTranslation();
-  const active = useUiStore((s) => s.activeSession);
   const setShowConnection = useUiStore((s) => s.setShowConnection);
   const leftWidth = useUiStore((s) => s.leftWidth);
   const rightWidth = useUiStore((s) => s.rightWidth);
@@ -27,7 +25,8 @@ export function App() {
   const setRightWidth = useUiStore((s) => s.setRightWidth);
   const showUsage = useUiStore((s) => s.showUsage);
   const setShowUsage = useUiStore((s) => s.setShowUsage);
-  const states = useDaemonStates();
+  const { states, reachable, totalLive, active, activeState, activeSession, target, live } =
+    useActiveSession();
 
   // Fit the stored side-panel widths to the live viewport so the terminal keeps
   // a usable minimum. Tracks window resizes; the resizers drive off these
@@ -39,23 +38,6 @@ export function App() {
     return () => window.removeEventListener("resize", onResize);
   }, []);
   const { left: effLeft, right: effRight } = fitPanels(leftWidth, rightWidth, viewportW);
-
-  const reachable = states.filter((s) => s.daemon.connected && s.data).length;
-  const totalLive = states.reduce(
-    (n, s) =>
-      n +
-      (s.daemon.connected
-        ? (s.data?.sessions.filter((x) => isLive(x.status)).length ?? 0)
-        : 0),
-    0,
-  );
-
-  const activeState = active ? states.find((s) => s.daemon.id === active.daemonId) : undefined;
-  const activeSession = activeState?.data?.sessions.find(
-    (s) => s.id === active?.sessionId,
-  );
-  const target = activeState ? targetOf(activeState.daemon) : undefined;
-  const live = activeSession ? isLive(activeSession.status) : false;
 
   return (
     <div className="app">
