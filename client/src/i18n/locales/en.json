@@ -265,6 +265,10 @@
     "pastedImageRef": "[pasted image {{path}}] ",
     "attachImage": "Attach image"
   },
+  "mobile": {
+    "back": "Back to sessions",
+    "details": "Details"
+  },
   "api": {
     "unreachableAt": "cannot connect — daemon unreachable at {{baseUrl}} (not started?)",
     "unreachable": "cannot connect — daemon unreachable (not started?)",

@@ -92,6 +92,12 @@ interface UiState {
   /** Usage-transcript modal for the active session (per-agent, view-only). */
   showUsage: boolean;
   setShowUsage: (v: boolean) => void;
+  /**
+   * Mobile-only: the Details sheet (RightPanel) is open over the terminal
+   * screen. Ignored by the desktop shell, which always shows the panel.
+   */
+  showDetails: boolean;
+  setShowDetails: (v: boolean) => void;
   /** Width (px) of the left session list; persisted across reloads. */
   leftWidth: number;
   /** Width (px) of the right details panel; persisted across reloads. */
@@ -125,6 +131,8 @@ export const useUiStore = create<UiState>((set, get) => ({
   setShowConnection: (v) => set({ showConnection: v }),
   showUsage: false,
   setShowUsage: (v) => set({ showUsage: v }),
+  showDetails: false,
+  setShowDetails: (v) => set({ showDetails: v }),
   leftWidth: initialWidths.left,
   rightWidth: initialWidths.right,
   setLeftWidth: (px) => {
