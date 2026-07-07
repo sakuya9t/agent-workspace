@@ -1101,6 +1101,54 @@ body.col-resizing iframe {
   color: var(--dim);
 }
 
+/* Image preview: center the picture(s) in the scroll area instead of the
+   line-oriented text layout. */
+.diff-view.diff-image-view {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+/* Before/after sit side by side, wrapping to stacked on a narrow dialog. */
+.image-diff {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: flex-start;
+  justify-content: center;
+  max-width: 100%;
+}
+.image-side {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+  margin: 0;
+}
+.image-side figcaption {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.diff-image {
+  max-width: 100%;
+  max-height: 65vh;
+  object-fit: contain;
+  /* Checkerboard so a transparent PNG stays legible on the dark panel. */
+  background-image:
+    linear-gradient(45deg, #1a1e28 25%, transparent 25%),
+    linear-gradient(-45deg, #1a1e28 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #1a1e28 75%),
+    linear-gradient(-45deg, transparent 75%, #1a1e28 75%);
+  background-size: 16px 16px;
+  background-position:
+    0 0,
+    0 8px,
+    8px -8px,
+    -8px 0;
+}
+
 /* commit detail modal */
 .commit-modal {
   width: 620px;

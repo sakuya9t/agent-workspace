@@ -317,6 +317,29 @@ async function postBlob<T>(t: Target, path: string, blob: Blob): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/**
+ * GET raw bytes as a Blob (e.g. an image file for the diff preview). Mirrors
+ * `req`'s auth handling but returns the body untouched, so the caller can wrap
+ * it in an object URL — `<img>` can't carry an Authorization header itself.
+ */
+async function getBlob(t: Target, path: string): Promise<Blob> {
+  const headers: Record<string, string> = {};
+  if (t.token) headers["Authorization"] = `Bearer ${t.token}`;
+  if (t.relayKey) headers["X-ASM-Relay-Key"] = t.relayKey;
+
+  let res: Response;
+  try {
+    res = await fetch(baseOf(t.baseUrl) + path, { headers });
+  } catch {
+    throw unreachableError(t.baseUrl);
+  }
+  if (!res.ok) {
+    const { msg } = await errorMessage(res);
+    throw Object.assign(new Error(msg), { status: res.status });
+  }
+  return res.blob();
+}
+
 /** Where a stored paste landed on the daemon host. */
 export interface PastedImage {
   path: string;
@@ -414,6 +437,17 @@ export const api = {
       `/api/sessions/${id}/scm/diff?path=${encodeURIComponent(path)}&untracked=${untracked}` +
         (commit ? `&commit=${encodeURIComponent(commit)}` : ""),
     ).then((r) => r.diff),
+  /**
+   * One side of a changed file's image preview, as a Blob. `side` picks the
+   * new content (`after`) or the prior version (`before`); a side with no
+   * content (a new file's before, a deleted file's after) rejects with 404.
+   */
+  scmFile: (t: Target, id: string, path: string, side: "before" | "after", commit?: string) =>
+    getBlob(
+      t,
+      `/api/sessions/${id}/scm/file?path=${encodeURIComponent(path)}&side=${side}` +
+        (commit ? `&commit=${encodeURIComponent(commit)}` : ""),
+    ),
   scmLog: (t: Target, id: string, limit = 30) =>
     req<{ commits: Commit[] }>(t, `/api/sessions/${id}/scm/log?limit=${limit}`).then(
       (r) => r.commits,

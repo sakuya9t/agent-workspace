@@ -54,6 +54,14 @@ items below are additional, tracked here so we don't forget.
   configured set of allowed roots that a client cannot expand without host-side
   approval; treat "browse anywhere" as an explicit, host-granted capability.
   Enforce the workspace allowlist for the picker, not just for raw-cwd sessions.
+- **Related (image preview):** `GET /api/sessions/:id/scm/file` serves a changed
+  file's raw bytes so the diff panel can show image previews. It is deliberately
+  narrow: `guard_path` blocks `..`/absolute paths, the working-tree read is
+  canonicalized and confined to the session `cwd` (a repo symlink pointing
+  outside is refused), and only bytes that magic-sniff as PNG/JPEG/GIF/WebP are
+  returned. The residual exposure is the same as the picker's: `cwd` itself is
+  host-chosen, so the allowed-roots work above also bounds what this endpoint can
+  ever reach.
 
 ## 3. Enrollment token is a static, non-expiring shared secret — MEDIUM
 

@@ -7,6 +7,11 @@ use serde::Serialize;
 
 use crate::workspace;
 
+/// Largest file we'll read into memory to serve as an inline preview. A blob
+/// above this is refused rather than buffered, so a single click on a giant
+/// tracked file can't balloon daemon memory.
+pub const MAX_PREVIEW_BYTES: u64 = 10 * 1024 * 1024;
+
 /// A changed file in the working tree.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChangedFile {
@@ -88,6 +93,15 @@ pub trait SourceControl: Send + Sync {
     /// `untracked` files diffed against /dev/null).
     fn diff(&self, cwd: &Path, path: &str, untracked: bool, commit: Option<&str>)
         -> Result<String>;
+    /// Raw bytes of one file for inline preview (images in the diff panel).
+    /// The working-tree version when `commit` is `None`; the version at that
+    /// commit otherwise. `Ok(None)` means the file has no content at that
+    /// version (added later, or deleted) — the caller shows the other side.
+    fn file_bytes(&self, cwd: &Path, path: &str, commit: Option<&str>) -> Result<Option<Vec<u8>>>;
+    /// Resolve a controlled revision expression (`HEAD`, `<hash>^`) to a bare
+    /// commit hash, or `None` when it does not resolve (a root commit's parent,
+    /// or `HEAD` in an empty repo). Never called with raw client input.
+    fn resolve_commit(&self, cwd: &Path, rev: &str) -> Result<Option<String>>;
     fn log(&self, cwd: &Path, limit: usize) -> Result<Vec<Commit>>;
     /// Full detail (metadata + per-file churn) for a single commit.
     fn show(&self, cwd: &Path, hash: &str) -> Result<CommitDetail>;
@@ -171,6 +185,73 @@ impl SourceControl for GitSourceControl {
             // Everything changed vs HEAD (staged + unstaged).
             git_allow_diff(cwd, &["diff", "HEAD", "--", path])
         }
+    }
+
+    fn file_bytes(&self, cwd: &Path, path: &str, commit: Option<&str>) -> Result<Option<Vec<u8>>> {
+        guard_path(path)?;
+        if let Some(hash) = commit {
+            // The blob as it existed at that commit. The `./` prefix keeps the
+            // path resolved relative to `cwd`, matching the working-tree branch
+            // below rather than defaulting to the repo root.
+            guard_ref(hash)?;
+            let output = Command::new("git")
+                .args(["show", &format!("{hash}:./{path}")])
+                .current_dir(cwd)
+                .output()
+                .map_err(|e| anyhow!("failed to run git: {e}"))?;
+            // git ran but the path isn't present at that commit (added later, or
+            // this is the parent side of an addition): an absent version, not an
+            // error — the caller renders only the other side of the diff.
+            if !output.status.success() {
+                return Ok(None);
+            }
+            if output.stdout.len() as u64 > MAX_PREVIEW_BYTES {
+                bail!("file too large to preview");
+            }
+            return Ok(Some(output.stdout));
+        }
+        // Working-tree version, straight from disk. `guard_path` already blocked
+        // `..` and absolute paths; canonicalizing the result and confining it to
+        // `cwd` additionally stops a symlink committed in the repo from serving a
+        // file outside the session's working directory.
+        let abs = cwd.join(path);
+        let real = match std::fs::canonicalize(&abs) {
+            Ok(p) => p,
+            // A deleted file has no working-tree version — absent, not an error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(anyhow!("resolve {path}: {e}")),
+        };
+        let root = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        if !real.starts_with(&root) {
+            bail!("path escapes the working directory");
+        }
+        let meta = std::fs::metadata(&real).map_err(|e| anyhow!("stat {path}: {e}"))?;
+        if meta.len() > MAX_PREVIEW_BYTES {
+            bail!("file too large to preview");
+        }
+        Ok(Some(
+            std::fs::read(&real).map_err(|e| anyhow!("read {path}: {e}"))?,
+        ))
+    }
+
+    fn resolve_commit(&self, cwd: &Path, rev: &str) -> Result<Option<String>> {
+        // `--verify --quiet` exits non-zero with empty output when the rev does
+        // not resolve. Peeling with `^{commit}` guarantees a commit hash out.
+        let output = Command::new("git")
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{rev}^{{commit}}"),
+            ])
+            .current_dir(cwd)
+            .output()
+            .map_err(|e| anyhow!("failed to run git: {e}"))?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(if hash.is_empty() { None } else { Some(hash) })
     }
 
     fn log(&self, cwd: &Path, limit: usize) -> Result<Vec<Commit>> {
@@ -654,8 +735,15 @@ fn guard_path(path: &str) -> Result<()> {
 /// Reject anything that isn't a bare commit hash. The value reaches git as a
 /// positional argument, so restricting it to hex digits blocks both option
 /// injection (a leading `-`) and revision expressions.
+/// Whether a string is a bare commit hash (4–64 hex chars). Shared by the ref
+/// guard and the preview endpoint, which validates a client-supplied commit
+/// before building a `<hash>^` parent expression from it.
+pub(crate) fn is_commit_hash(hash: &str) -> bool {
+    (4..=64).contains(&hash.len()) && hash.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn guard_ref(hash: &str) -> Result<()> {
-    if !(4..=64).contains(&hash.len()) || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !is_commit_hash(hash) {
         bail!("invalid commit hash");
     }
     Ok(())
@@ -834,6 +922,57 @@ mod tests {
         // Totals ignore the binary file.
         assert_eq!(d.additions, 11);
         assert_eq!(d.deletions, 3);
+    }
+
+    #[test]
+    fn file_bytes_reads_working_tree_and_committed_versions() {
+        // Two distinct blobs standing in for an image's before/after content.
+        // (`file_bytes` doesn't sniff — the header just mirrors a real PNG.)
+        const V1: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 1, 1];
+        const V2: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 2, 2, 2, 2];
+        let repo = test_repo("file-bytes");
+
+        fs::write(repo.join("img.png"), V1).unwrap();
+        commit_all(&repo, "add image v1");
+        let c1 = git_test(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+        fs::write(repo.join("img.png"), V2).unwrap();
+        commit_all(&repo, "image v2");
+        let c2 = git_test(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+
+        let bytes = |commit: Option<&str>| GitSourceControl.file_bytes(&repo, "img.png", commit);
+
+        // Working-tree and HEAD both read v2; the parent commit reads v1 — the
+        // "before" and "after" sides of the diff differ, as they must.
+        assert_eq!(bytes(None).unwrap().as_deref(), Some(V2));
+        assert_eq!(bytes(Some(&c2)).unwrap().as_deref(), Some(V2));
+        assert_eq!(bytes(Some(&c1)).unwrap().as_deref(), Some(V1));
+
+        // Parent resolution powers the "before" side of a commit diff.
+        assert_eq!(GitSourceControl.resolve_commit(&repo, "HEAD").unwrap(), Some(c2));
+        assert_eq!(GitSourceControl.resolve_commit(&repo, &format!("{c1}^")).unwrap(), None);
+
+        // A path absent at a commit is `Ok(None)` (not an error) so the caller
+        // can drop that side; traversal is still rejected outright.
+        assert_eq!(GitSourceControl.file_bytes(&repo, "nope.png", Some(&c1)).unwrap(), None);
+        assert!(GitSourceControl.file_bytes(&repo, "../secret", None).is_err());
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_bytes_rejects_symlink_escaping_the_working_dir() {
+        let repo = test_repo("file-bytes-symlink");
+        // A file outside the repo that a repo symlink points at.
+        let outside = std::env::temp_dir().join(format!("asm-outside-{}.png", std::process::id()));
+        fs::write(&outside, [0x89, b'P', b'N', b'G', 1, 2, 3]).unwrap();
+        std::os::unix::fs::symlink(&outside, repo.join("evil.png")).unwrap();
+
+        // The symlink resolves outside `cwd`, so the read is refused even though
+        // it names a real image — a repo can't exfiltrate host files this way.
+        assert!(GitSourceControl.file_bytes(&repo, "evil.png", None).is_err());
+
+        let _ = fs::remove_file(outside);
+        let _ = fs::remove_dir_all(repo);
     }
 
     #[test]
