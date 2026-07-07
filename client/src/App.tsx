@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { fitPanels, RESIZER_W, useUiStore } from "./store";
 import { daemonLabel, targetOf } from "./connectionStore";
 import { useDaemonStates } from "./useDaemons";
-import { Session } from "./api";
+import { isLive } from "./status";
 import { statusLabel } from "./i18n/labels";
 import { SessionList } from "./components/SessionList";
 import { TerminalView } from "./components/Terminal";
@@ -13,10 +13,6 @@ import { NewSessionDialog } from "./components/NewSessionDialog";
 import { NewWorkspaceDialog } from "./components/NewWorkspaceDialog";
 import { ConnectionDialog } from "./components/ConnectionDialog";
 import { UsageModal } from "./components/UsageModal";
-
-function isLive(s: Session): boolean {
-  return s.status === "running" || s.status === "starting";
-}
 
 /** Agents that persist usage transcripts the daemon can read (view-usage). */
 const USAGE_AGENTS = new Set(["claude", "codex"]);
@@ -45,7 +41,11 @@ export function App() {
 
   const reachable = states.filter((s) => s.daemon.connected && s.data).length;
   const totalLive = states.reduce(
-    (n, s) => n + (s.daemon.connected ? (s.data?.sessions.filter(isLive).length ?? 0) : 0),
+    (n, s) =>
+      n +
+      (s.daemon.connected
+        ? (s.data?.sessions.filter((x) => isLive(x.status)).length ?? 0)
+        : 0),
     0,
   );
 
@@ -54,7 +54,7 @@ export function App() {
     (s) => s.id === active?.sessionId,
   );
   const target = activeState ? targetOf(activeState.daemon) : undefined;
-  const live = activeSession ? isLive(activeSession) : false;
+  const live = activeSession ? isLive(activeSession.status) : false;
 
   return (
     <div className="app">
