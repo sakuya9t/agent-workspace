@@ -251,6 +251,9 @@
   },
   "diffModal": {
     "loading": "Loading diff…",
+    "loadingImage": "Loading image…",
+    "before": "Before",
+    "after": "After",
     "noChanges": "No changes to display."
   },
   "commitModal": {
