@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -8,6 +9,54 @@ use tokio::sync::{broadcast, watch};
 pub mod native;
 pub mod sidecar;
 pub mod asmux_client;
+
+/// Per-session cap on the in-memory raw-output ring that backs the attach
+/// snapshot for normal-buffer agents (codex, shell). Codex's stream is
+/// redraw-heavy — roughly 4 KB of raw bytes per *surviving* scrollback line —
+/// so 8 MB reaches the start of a typical session while bounding worst-case
+/// memory. History older than this is not replayed on attach (that gap is M4
+/// cold-stitch territory). See `docs/terminal-scrollback.md`.
+pub(crate) const HISTORY_RING_BYTES: usize = 8 * 1024 * 1024;
+
+/// A bounded ring of the raw PTY output chunks a session has produced, oldest
+/// first. Fed to a fresh client on attach (for normal-buffer agents) so its own
+/// terminal emulator reconstructs scrollback + screen exactly — the daemon's
+/// `vt100` cannot, because it drops the scrollback of a bottom-margin scroll
+/// region (the shape codex renders in). Whole chunks are evicted from the front
+/// once the byte budget is exceeded, so replay may begin mid-frame; the repaint
+/// preamble puts the client in a known state so the app's next full redraw
+/// heals it.
+pub(crate) struct HistoryRing {
+    chunks: VecDeque<Arc<[u8]>>,
+    bytes: usize,
+    cap: usize,
+}
+
+impl HistoryRing {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self { chunks: VecDeque::new(), bytes: 0, cap }
+    }
+
+    /// Append one raw output chunk, evicting whole oldest chunks to stay within
+    /// the byte cap. MUST be called in the same critical section as the matching
+    /// `tx.send`, so the ring and the broadcast stay a single consistent stream
+    /// (see `attach_with_history`).
+    pub(crate) fn push(&mut self, chunk: Arc<[u8]>) {
+        self.bytes += chunk.len();
+        self.chunks.push_back(chunk);
+        while self.bytes > self.cap && self.chunks.len() > 1 {
+            if let Some(front) = self.chunks.pop_front() {
+                self.bytes -= front.len();
+            }
+        }
+    }
+
+    fn extend_into(&self, out: &mut Vec<u8>) {
+        for c in &self.chunks {
+            out.extend_from_slice(c);
+        }
+    }
+}
 
 /// One session the holder still knows about, from `holder_list()`. Used at
 /// startup to decide adopt (alive) vs reconcile-from-exit (dead) vs
@@ -135,31 +184,62 @@ pub(crate) fn repaint_with_history(parser: &mut vt100::Parser) -> Vec<u8> {
     out
 }
 
+/// Preamble + raw ring, the attach repaint for a **normal-buffer** session.
+/// The preamble parks the client in a known state — normal buffer, no scroll
+/// region, cleared screen + scrollback, default attributes — so a ring that was
+/// truncated to its byte cap (and may therefore begin mid-frame), or a client
+/// reconnecting with a stale scroll region, both render cleanly once the app's
+/// next full repaint lands. The ring bytes then reconstruct scrollback AND the
+/// current screen in the client's own emulator (it ends at the live screen, so
+/// no separate screen repaint is appended).
+fn raw_history_repaint(history: &HistoryRing) -> Vec<u8> {
+    let mut out = Vec::with_capacity(history.bytes + 16);
+    out.extend_from_slice(b"\x1b[?1049l\x1b[r\x1b[H\x1b[2J\x1b[3J\x1b[m");
+    history.extend_into(&mut out);
+    out
+}
+
 /// Shared `BackendSession::attach` body for the emulator-holding backends.
-/// Captures the history-inclusive repaint and subscribes to the output stream
-/// while holding the emulator lock; a writer that processes+broadcasts under
-/// this same lock therefore hands the receiver a stream that starts exactly
-/// where the snapshot ends.
+/// Captures the attach repaint and subscribes to the output stream so the
+/// receiver's first byte is exactly the one after the repaint — no gap, no
+/// duplicate. Two paths, by how the agent renders:
+///
+/// - **Alternate screen** (claude, or any TUI holding `?1049`): the app owns its
+///   own scrolling, so the repaint is `repaint_with_history` (arms the alt
+///   buffer + mouse/paste modes + screen, no history). Subscribe under the
+///   parser lock — the writer processes under that lock, so this stays ordered.
+/// - **Normal buffer** (codex, shell): the daemon's `vt100` drops the scrollback
+///   of the bottom-margin scroll region codex renders in, so a rendered repaint
+///   would carry no history. Replay the raw byte ring instead; read it and
+///   subscribe under the *ring* lock — the writer pushes+broadcasts under that
+///   same lock, so the live stream begins precisely where the ring ends.
+///
+/// See `docs/terminal-scrollback.md`.
 pub(crate) fn attach_with_history(
     parser: &Mutex<vt100::Parser>,
+    history: &Mutex<HistoryRing>,
     tx: &broadcast::Sender<Arc<[u8]>>,
     seq: &AtomicU64,
 ) -> (Snapshot, broadcast::Receiver<Arc<[u8]>>) {
     let mut parser = parser.lock();
     let (rows, cols) = parser.screen().size();
-    // Attach repaints include scrollback history so the client can scroll
-    // up to output from before it attached.
-    let repaint: Arc<[u8]> =
-        Arc::from(repaint_with_history(&mut parser).into_boxed_slice());
-    let snap = Snapshot {
-        rows,
-        cols,
-        repaint,
-        last_seq: seq.load(Ordering::SeqCst),
-    };
+
+    if parser.screen().alternate_screen() {
+        let repaint: Arc<[u8]> =
+            Arc::from(repaint_with_history(&mut parser).into_boxed_slice());
+        let rx = tx.subscribe();
+        let last_seq = seq.load(Ordering::SeqCst);
+        drop(parser);
+        return (Snapshot { rows, cols, repaint, last_seq }, rx);
+    }
+
+    let history = history.lock();
+    let repaint: Arc<[u8]> = Arc::from(raw_history_repaint(&history).into_boxed_slice());
     let rx = tx.subscribe();
+    let last_seq = seq.load(Ordering::SeqCst);
+    drop(history);
     drop(parser);
-    (snap, rx)
+    (Snapshot { rows, cols, repaint, last_seq }, rx)
 }
 
 /// Shared `BackendSession::snapshot` body: a screen-only repaint (no history
@@ -230,7 +310,17 @@ pub trait BackendSession: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::repaint_with_history;
+    use super::{
+        attach_with_history, repaint_with_history, HistoryRing, HISTORY_RING_BYTES,
+    };
+    use parking_lot::Mutex;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    use tokio::sync::broadcast;
+
+    /// The normal-buffer preamble every raw-replay repaint starts with: normal
+    /// buffer, reset scroll region, clear screen + scrollback, reset attrs.
+    const PREAMBLE: &[u8] = b"\x1b[?1049l\x1b[r\x1b[H\x1b[2J\x1b[3J\x1b[m";
 
     /// Feed the attach repaint to a fresh client-side emulator (standing in
     /// for xterm.js) and check both the visible screen and the scrollback.
@@ -318,5 +408,102 @@ mod tests {
         );
         assert!(client.screen().bracketed_paste());
         assert_eq!(client.screen().contents(), server.screen().contents());
+    }
+
+    // ---- TERM-SCROLL: raw-history ring + per-buffer-model attach ----
+
+    /// The ring stays under its byte cap by evicting whole oldest chunks, never
+    /// dropping below one chunk (so the newest write always survives).
+    #[test]
+    fn history_ring_evicts_oldest_over_cap() {
+        let mut ring = HistoryRing::new(10);
+        for i in 0..6u8 {
+            ring.push(Arc::from(vec![i, i, i, i].into_boxed_slice())); // 4-byte chunks
+        }
+        // cap=10, 4-byte chunks: at most 2 fit (8 ≤ 10); a 3rd would push to 12.
+        assert!(ring.bytes <= 10, "bytes over cap: {}", ring.bytes);
+        let mut out = Vec::new();
+        ring.extend_into(&mut out);
+        // Oldest chunks evicted; the two most recent (4,4,4,4 / 5,5,5,5) remain.
+        assert_eq!(out, vec![4, 4, 4, 4, 5, 5, 5, 5]);
+    }
+
+    /// A single chunk larger than the cap is still retained (eviction never
+    /// empties the ring), so the current screen is never lost.
+    #[test]
+    fn history_ring_keeps_a_lone_oversized_chunk() {
+        let mut ring = HistoryRing::new(4);
+        ring.push(Arc::from(vec![1, 2, 3, 4, 5, 6, 7, 8].into_boxed_slice()));
+        let mut out = Vec::new();
+        ring.extend_into(&mut out);
+        assert_eq!(out, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    fn attach_fixture(
+        raw: &[u8],
+    ) -> (Mutex<vt100::Parser>, Mutex<HistoryRing>, broadcast::Sender<Arc<[u8]>>, AtomicU64) {
+        let mut parser = vt100::Parser::new(5, 20, 1000);
+        parser.process(raw);
+        let mut ring = HistoryRing::new(HISTORY_RING_BYTES);
+        ring.push(Arc::from(raw.to_vec().into_boxed_slice()));
+        let (tx, _keep) = broadcast::channel(16);
+        (Mutex::new(parser), Mutex::new(ring), tx, AtomicU64::new(0))
+    }
+
+    /// Normal-buffer attach replays the raw ring (preamble + bytes), and feeding
+    /// it to a fresh emulator reconstructs the screen AND the scrollback —
+    /// matching a client that had processed the raw stream live. (Uses a plain
+    /// full-screen scroll, which vt100 *does* capture, so the reconstruction is
+    /// checkable in-crate; the bottom-margin-region case only xterm.js/tmux
+    /// reconstruct and is covered by the headless harness.)
+    #[test]
+    fn attach_normal_buffer_replays_raw_ring() {
+        let mut raw = Vec::new();
+        for i in 1..=12 {
+            raw.extend_from_slice(format!("line {i}\r\n").as_bytes());
+        }
+        raw.extend_from_slice(b"\x1b[31mprompt>\x1b[m ");
+
+        let (parser, history, tx, seq) = attach_fixture(&raw);
+        let (snap, _rx) = attach_with_history(&parser, &history, &tx, &seq);
+
+        assert!(snap.repaint.starts_with(PREAMBLE), "missing normal-buffer preamble");
+        assert!(
+            snap.repaint.windows(raw.len()).any(|w| w == raw.as_slice()),
+            "repaint does not contain the raw ring bytes"
+        );
+
+        // Reference: a client that saw the raw stream live.
+        let mut reference = vt100::Parser::new(5, 20, 1000);
+        reference.process(&raw);
+        // Fresh client fed only the attach repaint.
+        let mut client = vt100::Parser::new(5, 20, 1000);
+        client.process(&snap.repaint);
+
+        assert_eq!(client.screen().contents(), reference.screen().contents());
+        assert_eq!(
+            client.screen().cursor_position(),
+            reference.screen().cursor_position()
+        );
+        client.set_scrollback(usize::MAX);
+        reference.set_scrollback(usize::MAX);
+        assert_eq!(client.screen().scrollback(), reference.screen().scrollback());
+        assert!(client.screen().scrollback() > 0, "expected reconstructed scrollback");
+    }
+
+    /// Alternate-screen attach (claude) is unchanged: a rendered repaint that
+    /// arms the alt buffer — never the normal-buffer raw-replay preamble.
+    #[test]
+    fn attach_alt_screen_stays_rendered_repaint() {
+        let (parser, history, tx, seq) =
+            attach_fixture(b"\x1b[?1049h\x1b[?1006h\x1b[Hfullscreen app");
+        let (snap, _rx) = attach_with_history(&parser, &history, &tx, &seq);
+
+        assert!(snap.repaint.starts_with(b"\x1b[?1049h"), "alt repaint must arm alt buffer");
+        assert!(!snap.repaint.starts_with(PREAMBLE), "alt path must not raw-replay");
+
+        let mut client = vt100::Parser::new(5, 20, 1000);
+        client.process(&snap.repaint);
+        assert!(client.screen().alternate_screen());
     }
 }

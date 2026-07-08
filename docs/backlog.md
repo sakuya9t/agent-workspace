@@ -8,7 +8,10 @@ before the milestones they make cheaper. **Update 2026-07-07:** **R4 (gateway
 mode)** and **RF-M4 #1/#3/#4** (the pre-M4 daemon refactor: `SessionManager`
 split, `db`/`registry` encapsulation, adopt-path test seams) both landed — moved
 to *Already done*. RF-M4 #2 (reconnect-supervisor home + `AsmuxClient` trait) is
-folded into **M4**, which is now the next P1 on the durability track.
+folded into **M4**, which is now the next P1 on the durability track. **Update
+2026-07-08:** **TERM-SCROLL** (P1) — a diagnosed user-visible bug where the codex
+attach snapshot carried no scrollback — is **implemented and verified**; moved to
+*Already done*. Design + as-built: [`terminal-scrollback.md`](terminal-scrollback.md).
 
 This is the single cross-track index of work that is **designed but not yet
 implemented**. The detailed designs stay in their own documents
@@ -75,6 +78,23 @@ pick it up**.
   guard M4's ring-replay→cold-stitch flip before it lands. 86 daemon tests pass;
   clippy clean; full smoke loop green. **#2 (reconnect-supervisor home +
   `AsmuxClient` trait) folded into M4** — see refactoring-plan.md → RF-M4 status.
+- **TERM-SCROLL** — codex (normal-buffer agents) attach scrollback (2026-07-08,
+  daemon-only, user-visible bug fix). Attaching to a running **codex** session,
+  the client could scroll only a few lines and never reach the conversation
+  start; **claude** was fine. Cause: codex renders its transcript in the normal
+  buffer inside a bottom-margin `DECSTBM` scroll region (`ESC[1;47r`), and the
+  daemon's snapshot emulator `vt100` drops lines scrolled off the top of such a
+  region (real terminals + the client's xterm.js keep them — measured 0 vs 907 vs
+  ~994), so `repaint_with_history` carried no history. Fix: a per-buffer-model
+  attach strategy — alt-screen/self-scrolling apps (claude) keep the rendered
+  repaint **unchanged**; normal-buffer apps replay a bounded (8 MB) in-memory
+  raw-byte ring, appended under the broadcast lock in `reader_loop`/`drain_loop`,
+  so the client's own emulator reconstructs scrollback + screen. Verified by the
+  emulator matrix, `backend::tests`, and self-contained
+  `scripts/termscroll-test.mjs` (codex-shape history delivered on attach; claude
+  path unchanged). Design + as-built:
+  [`terminal-scrollback.md`](terminal-scrollback.md). Adjacent to M4 cold-stitch
+  (history beyond the ring) and RF-VT100 (the concrete defect motivating it).
 - **RF-MOB** — client shell prep for the MOB phase-1 split (2026-07-06,
   client-only, zero behavior change): `src/status.ts` unifies the three drifted
   `isLive` predicates (+ `isTerminal`; the RightPanel ended-list's omission of
@@ -301,7 +321,14 @@ starting with confidence.
 (root `Cargo.toml` comment) and `repaint_with_history` carries a
 deep-scrollback invariant. Evaluate `termwiz`/`alacritty_terminal` behind the
 existing snapshot interface. Trigger: M4 cold-stitch work stressing the
-snapshot path, or an upstream CVE. Detail: refactoring-plan.md → RF-VT100.
+snapshot path, or an upstream CVE. **Concrete defect on record (2026-07-07):**
+`vt100` drops lines scrolled off the top of a sub-screen bottom-margin
+`DECSTBM` region, unlike real terminals / xterm.js — this was the codex-scrollback
+bug, now worked around by raw-history replay in **TERM-SCROLL**
+([`terminal-scrollback.md`](terminal-scrollback.md); the `repaint_with_history`
+history branch is now dead in production, exercised only by tests). A replacement
+with correct region-scrollback would let TERM-SCROLL's normal-buffer branch fold
+back to a compact rendered repaint. Detail: refactoring-plan.md → RF-VT100.
 
 ### DOC-1 — stale relay-framing line (P3, one-liner)
 
@@ -347,6 +374,9 @@ parity gate, typed keys); adding a locale is the 3-step recipe in `i18n.md`.
    headline restart promise. The cold-stitch flip is now guarded by RF-M4 #4's
    `startup_reconcile` branch tests. M4 also absorbs the reconnect-supervisor
    home + `AsmuxClient` trait (was RF-M4 #2).
+   - ~~**TERM-SCROLL**~~ ✅ landed 2026-07-08 (codex attach scrollback; per-buffer
+     -model attach strategy + raw-history ring). Independent of M4; on the same
+     snapshot/attach surface. Proof: `scripts/termscroll-test.mjs`.
 4. **MEAS-1** — right after RF-M4's SessionManager split settles the
    `on_output`/`on_idle` seams it hooks (landing it earlier just makes the
    refactor carry the hooks). Dev-only and parallel-friendly: once enabled
