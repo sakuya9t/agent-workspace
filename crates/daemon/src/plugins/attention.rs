@@ -148,6 +148,18 @@ pub(crate) fn claude_attention(screen: &str, bell: bool) -> (AttentionState, Opt
                 );
             }
         }
+        // A permission prompt carries one of the phrases above; the
+        // AskUserQuestion decision widget does not — its question is free-form
+        // ("How should the connection dialog be split…?"), so the phrase scan
+        // misses it and the session wrongly settles to idle. It is still an
+        // agent blocked on a human choice, so detect the widget by its own
+        // affordances and read it as ApprovalNeeded.
+        if is_ask_user_question(screen) {
+            return (
+                AttentionState::ApprovalNeeded,
+                Some("AskUserQuestion prompt awaiting a choice".to_string()),
+            );
+        }
     }
     if bell {
         return (
@@ -223,6 +235,22 @@ pub(crate) fn claude_idle_error(screen: &str) -> Option<String> {
         // keep climbing.
     }
     None
+}
+
+/// True when the rendered screen is Claude Code's **AskUserQuestion** decision
+/// widget: a free-form question with a `❯`-selected option menu (the caller has
+/// already confirmed the menu) that the agent posts to block on a human choice.
+///
+/// The generic selection footer ("Enter to select · ↑/↓ to navigate · Esc to
+/// cancel") is shared with ordinary pickers (theme, `/model`), so it can't tell
+/// them apart. What is *exclusive* to AskUserQuestion is its two extra
+/// affordances — the "add notes" hint and the "Chat about this" redirect — which
+/// no plain picker or permission prompt renders. Matching either (any-of, so one
+/// UI-string rename doesn't silently blind the detector) distinguishes the
+/// widget without mistaking a theme picker for a blocked prompt.
+fn is_ask_user_question(screen: &str) -> bool {
+    let lower = screen.to_lowercase();
+    lower.contains("chat about this") || lower.contains("to add notes")
 }
 
 /// A selection-pointer numbered menu option like "❯ 1. Yes" or "> 2. No": a
@@ -373,6 +401,59 @@ mod tests {
     fn claude_bell_is_blocked() {
         let (a, _) = claude_attention("just working", true);
         assert_eq!(a, AttentionState::LikelyBlocked);
+    }
+
+    /// The captured real-world AskUserQuestion widget from the reported bug: the
+    /// agent posted a free-form decision prompt ("How should the connection
+    /// dialog be split…?") and blocked, but with no approval phrase it read as
+    /// activity and settled to a calm idle. Its own affordances ("add notes",
+    /// "Chat about this") must flag it as blocked.
+    #[test]
+    fn claude_ask_user_question_is_approval() {
+        let screen = "\
+ \u{2610} Dialog layout\n\
+\n\
+How should the connection dialog be split so a long connection list never pushes out the add forms?\n\
+\u{276f} 1. Two screens, nested tabs\n\
+  2. Flat three tabs\n\
+  3. Two panes, one screen\n\
+                                  Notes: press n to add notes\n\
+  Chat about this\n\
+Enter to select \u{b7} \u{2191}/\u{2193} to navigate \u{b7} n to add notes \u{b7} Esc to cancel";
+        let (a, reason) = claude_attention(screen, false);
+        assert_eq!(a, AttentionState::ApprovalNeeded);
+        assert!(reason.unwrap().contains("AskUserQuestion"));
+    }
+
+    /// A second, unrelated captured AskUserQuestion ("Archive safety") — a
+    /// different question and options but the same widget chrome — to pin that
+    /// detection keys on the invariant affordances, not this run's wording.
+    #[test]
+    fn claude_ask_user_question_other_question_is_approval() {
+        let screen = "\
+ \u{2610} Archive safety\n\
+\n\
+When archiving a session whose branch has unmerged commits, how should branch removal behave?\n\
+  1. Guard, then confirm\n\
+\u{276f} 2. Always force-remove\n\
+  3. Confirm every archive\n\
+                                  Notes: press n to add notes\n\
+  Chat about this\n\
+Enter to select \u{b7} \u{2191}/\u{2193} to navigate \u{b7} n to add notes \u{b7} Esc to cancel";
+        let (a, _) = claude_attention(screen, false);
+        assert_eq!(a, AttentionState::ApprovalNeeded);
+    }
+
+    #[test]
+    fn claude_theme_picker_with_nav_footer_is_activity() {
+        // A theme/`/model` picker shares the generic selection footer ("Enter to
+        // select · ↑/↓ to navigate · Esc to cancel") with AskUserQuestion but has
+        // neither the "add notes" nor "Chat about this" affordance, so it must
+        // stay activity — the nav footer alone must not read as blocked.
+        let screen = " Select theme\n \u{276f} 1. Dark\n   2. Light\n\
+                      Enter to select \u{b7} \u{2191}/\u{2193} to navigate \u{b7} Esc to cancel";
+        let (a, _) = claude_attention(screen, false);
+        assert_eq!(a, AttentionState::Activity);
     }
 
     // ---- Claude stalled-on-error (idle settle) ----
