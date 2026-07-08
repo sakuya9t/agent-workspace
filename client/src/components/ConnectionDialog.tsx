@@ -5,6 +5,9 @@ import { api, enrollDevice, listRelayNodes, probeHealth } from "../api";
 import { daemonLabel, localTarget, RelayConn, useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
 
+type ConnectionMode = "existing" | "add";
+type AddKind = "daemon" | "relay";
+
 /**
  * Manage the daemons and relays the client talks to. The client aggregates all
  * daemons in the left panel. A daemon is added by URL (with an enrollment token
@@ -34,6 +37,8 @@ export function ConnectionDialog() {
   const [relayKey, setRelayKey] = useState("");
   const [relayLabel, setRelayLabel] = useState("");
   const [relayErr, setRelayErr] = useState<string | null>(null);
+  const [mode, setMode] = useState<ConnectionMode>("add");
+  const [addKind, setAddKind] = useState<AddKind>("daemon");
 
   const { data: localEnrollToken } = useQuery({
     queryKey: ["enrollment-token"],
@@ -68,6 +73,7 @@ export function ConnectionDialog() {
       setUrl("");
       setEnrollToken("");
       setName("");
+      setMode("existing");
     } catch (e) {
       setErr(String(e instanceof Error ? e.message : e));
     } finally {
@@ -85,132 +91,232 @@ export function ConnectionDialog() {
       setRelayErr(t("relay.errNoKey"));
       return;
     }
+    let label = relayLabel.trim();
+    if (!label) {
+      try {
+        label = new URL(u).host;
+      } catch {
+        setRelayErr(t("relay.errBadUrl"));
+        return;
+      }
+    }
     setRelayErr(null);
-    addRelay({ url: u, accessKey: relayKey.trim(), label: relayLabel.trim() || new URL(u).host });
+    addRelay({ url: u, accessKey: relayKey.trim(), label });
     setRelayUrl("");
     setRelayKey("");
     setRelayLabel("");
+    setMode("existing");
   };
 
   return (
     <div className="modal-backdrop" onClick={() => setShow(false)}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <div className="modal-title">{t("connection.title")}</div>
-
-        <div className="daemon-list">
-          {daemons.map((d) => (
-            <div key={d.id} className="daemon-row">
-              <span className="tree-icon">⬢</span>
-              <div className="daemon-meta">
-                <div className="daemon-name">{daemonLabel(d)}</div>
-                <div className="dim small mono">
-                  {d.baseUrl || t("connection.sameOrigin")}
-                  {d.token && <>{" · "}{t("connection.tokenTag")}</>}
-                </div>
-              </div>
-              {d.id !== "local" && (
-                <button
-                  className="btn tiny"
-                  onClick={() => {
-                    removeDaemon(d.id);
-                    qc.invalidateQueries({ queryKey: ["daemon"] });
-                  }}
-                >
-                  {t("connection.remove")}
-                </button>
-              )}
-            </div>
-          ))}
+      <div className="modal conn-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="conn-modal-head">
+          <div>
+            <div className="modal-title">{t("connection.title")}</div>
+            <div className="dim small">{t("connection.subtitle")}</div>
+          </div>
         </div>
 
-        {localEnrollToken && (
-          <div className="dim small enroll-token">
-            {t("connection.enrollTokenLabel")}{" "}
-            <span className="mono selectable">{localEnrollToken}</span>
+        <div className="conn-primary-tabs" role="tablist" aria-label={t("connection.operationTabs")}>
+          <button
+            type="button"
+            role="tab"
+            className={"conn-primary-tab" + (mode === "existing" ? " on" : "")}
+            aria-selected={mode === "existing"}
+            onClick={() => setMode("existing")}
+          >
+            <span className="conn-primary-tab-title">{t("connection.existingTab")}</span>
+            <span className="conn-primary-tab-desc">{t("connection.existingTabDesc")}</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            className={"conn-primary-tab" + (mode === "add" ? " on" : "")}
+            aria-selected={mode === "add"}
+            onClick={() => setMode("add")}
+          >
+            <span className="conn-primary-tab-title">{t("connection.addTab")}</span>
+            <span className="conn-primary-tab-desc">{t("connection.addTabDesc")}</span>
+          </button>
+        </div>
+
+        {mode === "existing" ? (
+          <div className="conn-pane">
+            <section className="conn-section">
+              <div className="conn-section-head">
+                <div>
+                  <div className="conn-section-title">{t("connection.currentDaemonsTitle")}</div>
+                  <div className="dim small">{t("connection.currentDaemonsHint")}</div>
+                </div>
+                <span className="conn-count">{t("connection.daemonCount", { count: daemons.length })}</span>
+              </div>
+
+              <div className="daemon-list conn-daemon-list">
+                {daemons.map((d) => (
+                  <div key={d.id} className="daemon-row">
+                    <span className="tree-icon">⬢</span>
+                    <div className="daemon-meta">
+                      <div className="daemon-name">{daemonLabel(d)}</div>
+                      <div className="dim small mono">
+                        {d.baseUrl || t("connection.sameOrigin")}
+                        {d.token && <>{" · "}{t("connection.tokenTag")}</>}
+                      </div>
+                    </div>
+                    {d.id !== "local" && (
+                      <button
+                        className="btn tiny"
+                        onClick={() => {
+                          removeDaemon(d.id);
+                          qc.invalidateQueries({ queryKey: ["daemon"] });
+                        }}
+                      >
+                        {t("connection.remove")}
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              {localEnrollToken && (
+                <div className="conn-callout">
+                  <div className="conn-callout-title">{t("connection.enrollTokenLabel")}</div>
+                  <span className="mono selectable">{localEnrollToken}</span>
+                </div>
+              )}
+            </section>
+
+            <section className="conn-section">
+              <div className="conn-section-head">
+                <div>
+                  <div className="conn-section-title">{t("connection.savedRelaysTitle")}</div>
+                  <div className="dim small">{t("connection.savedRelaysHint")}</div>
+                </div>
+                <span className="conn-count">{t("connection.relayCount", { count: relays.length })}</span>
+              </div>
+
+              {relays.length === 0 ? (
+                <div className="conn-empty">{t("relay.empty")}</div>
+              ) : (
+                relays.map((r) => (
+                  <RelayRow key={r.id} relay={r} onRemove={() => removeRelay(r.id)} />
+                ))
+              )}
+            </section>
+          </div>
+        ) : (
+          <div className="conn-pane">
+            <div className="conn-add-shell">
+              <div className="conn-add-step">{t("connection.addChoiceLabel")}</div>
+              <div className="conn-type-tabs" role="tablist" aria-label={t("connection.typeTabs")}>
+                <button
+                  type="button"
+                  role="tab"
+                  className={"conn-type-tab" + (addKind === "daemon" ? " on" : "")}
+                  aria-selected={addKind === "daemon"}
+                  onClick={() => setAddKind("daemon")}
+                >
+                  <span className="conn-type-tab-title">{t("connection.directType")}</span>
+                  <span className="conn-type-tab-desc">{t("connection.directTypeDesc")}</span>
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  className={"conn-type-tab" + (addKind === "relay" ? " on" : "")}
+                  aria-selected={addKind === "relay"}
+                  onClick={() => setAddKind("relay")}
+                >
+                  <span className="conn-type-tab-title">{t("connection.relayType")}</span>
+                  <span className="conn-type-tab-desc">{t("connection.relayTypeDesc")}</span>
+                </button>
+              </div>
+
+              {addKind === "relay" ? (
+                <div className="conn-form">
+                  <div className="conn-form-title">{t("connection.addRelayTitle")}</div>
+                  <div className="dim small">{t("connection.addRelayHint")}</div>
+
+                  <label className="form-label">{t("relay.urlLabel")}</label>
+                  <input
+                    className="input mono"
+                    placeholder={t("relay.urlPlaceholder")}
+                    value={relayUrl}
+                    onChange={(e) => setRelayUrl(e.target.value)}
+                  />
+                  <label className="form-label">{t("relay.keyLabel")}</label>
+                  <input
+                    className="input mono"
+                    placeholder={t("relay.keyPlaceholder")}
+                    value={relayKey}
+                    onChange={(e) => setRelayKey(e.target.value)}
+                  />
+                  <label className="form-label">{t("relay.labelLabel")}</label>
+                  <input className="input" value={relayLabel} onChange={(e) => setRelayLabel(e.target.value)} />
+                  {relayErr && <div className="error conn-form-error">{relayErr}</div>}
+                  <div className="conn-hint dim small">{t("relay.tip")}</div>
+                  <div className="conn-form-actions">
+                    <button className="btn primary" onClick={addRelayConn}>
+                      {t("relay.add")}
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="conn-form">
+                  <div className="conn-form-title">{t("connection.addDirectTitle")}</div>
+                  <div className="dim small">{t("connection.addDirectHint")}</div>
+
+                  <label className="form-label">{t("connection.urlLabel")}</label>
+                  <input
+                    className="input mono"
+                    placeholder={t("connection.urlPlaceholder", {
+                      lan: "http://192.168.0.5:4600",
+                      tunnel: "http://localhost:4600",
+                    })}
+                    value={url}
+                    onChange={(e) => setUrl(e.target.value)}
+                  />
+
+                  <label className="form-label">
+                    {t("connection.tokenLabel")}{" "}
+                    <span className="dim">{t("connection.tokenHint")}</span>
+                  </label>
+                  <input
+                    className="input mono"
+                    placeholder={t("connection.tokenPlaceholder", { cmd: "asm-daemon token" })}
+                    value={enrollToken}
+                    onChange={(e) => setEnrollToken(e.target.value)}
+                  />
+
+                  <label className="form-label">{t("connection.nameLabel")}</label>
+                  <input className="input" value={name} onChange={(e) => setName(e.target.value)} />
+
+                  {err && <div className="error conn-form-error">{err}</div>}
+
+                  <div className="conn-hint dim small">
+                    <Trans
+                      i18nKey="connection.sshTip"
+                      components={{ cmd: <span className="mono" /> }}
+                      values={{
+                        ssh: "ssh -L 4600:127.0.0.1:4600 user@host",
+                        url: "http://localhost:4600",
+                      }}
+                    />
+                  </div>
+
+                  <div className="conn-form-actions">
+                    <button className="btn primary" disabled={busy} onClick={addRemote}>
+                      {busy ? t("connection.adding") : t("connection.add")}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
         )}
 
-        {/* Relays: reach private hosts that dial out to the relay, no tunnels. */}
-        <div className="conn-divider">{t("relay.sectionTitle")}</div>
-        {relays.length === 0 ? (
-          <div className="conn-hint dim small">{t("relay.empty")}</div>
-        ) : (
-          relays.map((r) => (
-            <RelayRow key={r.id} relay={r} onRemove={() => removeRelay(r.id)} />
-          ))
-        )}
-
-        <div className="conn-divider">{t("relay.addDivider")}</div>
-        <label className="form-label">{t("relay.urlLabel")}</label>
-        <input
-          className="input mono"
-          placeholder={t("relay.urlPlaceholder")}
-          value={relayUrl}
-          onChange={(e) => setRelayUrl(e.target.value)}
-        />
-        <label className="form-label">{t("relay.keyLabel")}</label>
-        <input
-          className="input mono"
-          placeholder={t("relay.keyPlaceholder")}
-          value={relayKey}
-          onChange={(e) => setRelayKey(e.target.value)}
-        />
-        <label className="form-label">{t("relay.labelLabel")}</label>
-        <input className="input" value={relayLabel} onChange={(e) => setRelayLabel(e.target.value)} />
-        {relayErr && <div className="error">{relayErr}</div>}
-        <div className="conn-hint dim small">{t("relay.tip")}</div>
-        <div className="modal-actions">
-          <button className="btn" onClick={addRelayConn}>
-            {t("relay.add")}
-          </button>
-        </div>
-
-        <div className="conn-divider">{t("connection.addDivider")}</div>
-
-        <label className="form-label">{t("connection.urlLabel")}</label>
-        <input
-          className="input mono"
-          placeholder={t("connection.urlPlaceholder", {
-            lan: "http://192.168.0.5:4600",
-            tunnel: "http://localhost:4600",
-          })}
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-        />
-
-        <label className="form-label">
-          {t("connection.tokenLabel")}{" "}
-          <span className="dim">{t("connection.tokenHint")}</span>
-        </label>
-        <input
-          className="input mono"
-          placeholder={t("connection.tokenPlaceholder", { cmd: "asm-daemon token" })}
-          value={enrollToken}
-          onChange={(e) => setEnrollToken(e.target.value)}
-        />
-
-        <label className="form-label">{t("connection.nameLabel")}</label>
-        <input className="input" value={name} onChange={(e) => setName(e.target.value)} />
-
-        {err && <div className="error">{err}</div>}
-
-        <div className="conn-hint dim small">
-          <Trans
-            i18nKey="connection.sshTip"
-            components={{ cmd: <span className="mono" /> }}
-            values={{
-              ssh: "ssh -L 4600:127.0.0.1:4600 user@host",
-              url: "http://localhost:4600",
-            }}
-          />
-        </div>
-
-        <div className="modal-actions">
+        <div className="modal-actions conn-close-actions">
           <button className="btn" onClick={() => setShow(false)}>
             {t("connection.close")}
-          </button>
-          <button className="btn primary" disabled={busy} onClick={addRemote}>
-            {busy ? t("connection.adding") : t("connection.add")}
           </button>
         </div>
       </div>
@@ -277,10 +383,10 @@ function RelayRow({ relay, onRemove }: { relay: RelayConn; onRemove: () => void 
   };
 
   return (
-    <div className="daemon-row" style={{ flexDirection: "column", alignItems: "stretch" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+    <div className="conn-relay-card">
+      <div className="conn-relay-head">
         <span className="tree-icon">⬡</span>
-        <div className="daemon-meta" style={{ flex: 1 }}>
+        <div className="daemon-meta">
           <div className="daemon-name">{relay.label}</div>
           <div className="dim small mono">{relay.url}</div>
         </div>
@@ -289,54 +395,50 @@ function RelayRow({ relay, onRemove }: { relay: RelayConn; onRemove: () => void 
         </button>
       </div>
 
-      {error ? (
-        <div className="dim small" style={{ paddingLeft: 24 }}>
-          {t("relay.unreachable")}
-        </div>
-      ) : !nodes ? (
-        <div className="dim small" style={{ paddingLeft: 24 }}>
-          {t("relay.discovering")}
-        </div>
-      ) : nodes.length === 0 ? (
-        <div className="dim small" style={{ paddingLeft: 24 }}>
-          {t("relay.noNodes")}
-        </div>
-      ) : (
-        nodes.map((n) => (
-          <div key={n.node_id} style={{ paddingLeft: 24, marginTop: 6 }}>
-            <div className="small">
-              <span className="mono">{n.label || n.node_id.slice(0, 8)}</span>
-              {" · "}
-              <span className={n.online ? "ok" : "dim"}>
-                {n.online ? t("relay.online") : t("relay.offline")}
-              </span>
-              {n.via && <span className="dim">{" · "}{t("relay.viaGateway", { gateway: gatewayLabel(n.via) })}</span>}
-            </div>
-            {isConnected(n.node_id) ? (
-              <div className="dim small">{t("relay.connected")}</div>
-            ) : (
-              <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
-                <input
-                  className="input mono small"
-                  style={{ flex: 1 }}
-                  placeholder={t("relay.nodeTokenPlaceholder")}
-                  value={tokens[n.node_id] ?? ""}
-                  onChange={(e) => setTokens((p) => ({ ...p, [n.node_id]: e.target.value }))}
-                  disabled={!n.online}
-                />
-                <button
-                  className="btn tiny"
-                  disabled={!n.online || connecting === n.node_id}
-                  onClick={() => connect(n.node_id, n.label)}
-                >
-                  {connecting === n.node_id ? t("relay.connecting") : t("relay.connect")}
-                </button>
+      <div className="conn-relay-nodes">
+        <div className="conn-nested-label">{t("relay.nodesTitle")}</div>
+        {error ? (
+          <div className="dim small">{t("relay.unreachable")}</div>
+        ) : !nodes ? (
+          <div className="dim small">{t("relay.discovering")}</div>
+        ) : nodes.length === 0 ? (
+          <div className="dim small">{t("relay.noNodes")}</div>
+        ) : (
+          nodes.map((n) => (
+            <div key={n.node_id} className="conn-node-row">
+              <div className="small">
+                <span className="mono">{n.label || n.node_id.slice(0, 8)}</span>
+                {" · "}
+                <span className={n.online ? "ok" : "dim"}>
+                  {n.online ? t("relay.online") : t("relay.offline")}
+                </span>
+                {n.via && <span className="dim">{" · "}{t("relay.viaGateway", { gateway: gatewayLabel(n.via) })}</span>}
               </div>
-            )}
-          </div>
-        ))
-      )}
-      {nodeErr && <div className="error small">{nodeErr}</div>}
+              {isConnected(n.node_id) ? (
+                <div className="dim small">{t("relay.connected")}</div>
+              ) : (
+                <div className="conn-node-connect">
+                  <input
+                    className="input mono small"
+                    placeholder={t("relay.nodeTokenPlaceholder")}
+                    value={tokens[n.node_id] ?? ""}
+                    onChange={(e) => setTokens((p) => ({ ...p, [n.node_id]: e.target.value }))}
+                    disabled={!n.online}
+                  />
+                  <button
+                    className="btn tiny"
+                    disabled={!n.online || connecting === n.node_id}
+                    onClick={() => connect(n.node_id, n.label)}
+                  >
+                    {connecting === n.node_id ? t("relay.connecting") : t("relay.connect")}
+                  </button>
+                </div>
+              )}
+            </div>
+          ))
+        )}
+        {nodeErr && <div className="error small conn-node-error">{nodeErr}</div>}
+      </div>
     </div>
   );
 }
