@@ -300,12 +300,15 @@
     "gatewayUnreachable": "cannot connect — daemon unreachable ({{message}})"
   },
   "connection": {
-    "title": "Daemons",
+    "title": "Connections",
+    "navExisting": "Existing",
+    "navAdd": "Add",
+    "addTabDaemon": "Daemon",
+    "addTabRelay": "Relay",
     "sameOrigin": "same-origin (local)",
     "tokenTag": "🔒 token",
     "remove": "remove",
     "enrollTokenLabel": "Enrollment token for other devices:",
-    "addDivider": "— add a remote daemon —",
     "urlLabel": "Daemon URL",
     "urlPlaceholder": "{{lan}}  or  {{tunnel}} (SSH tunnel)",
     "tokenLabel": "Enrollment token",
@@ -320,8 +323,7 @@
   },
   "relay": {
     "sectionTitle": "— relays —",
-    "empty": "No relays yet. Relays don't appear on their own — add one below with its URL and access key. Hosts that dial out to it then show up here, ready to connect.",
-    "addDivider": "— add a relay —",
+    "empty": "No relays yet. Relays don't appear on their own — add one from the Add · Relay tab with its URL and access key. Hosts that dial out to it then show up here, ready to connect.",
     "urlLabel": "Relay URL",
     "urlPlaceholder": "http://relay-host:4700",
     "keyLabel": "Access key",

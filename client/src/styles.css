@@ -320,6 +320,15 @@ body.col-resizing iframe {
   margin: 8px 0;
   word-break: break-all;
 }
+/* The "Existing" screen scrolls within the dialog, so a long connection list
+   never grows the modal past the viewport or pushes the footer out of reach.
+   The add-new screen lives behind its own tab and is unaffected. */
+.conn-scroll {
+  max-height: 52vh;
+  overflow-y: auto;
+  /* room for the scrollbar so rows don't sit under it */
+  padding-right: 2px;
+}
 .header-actions {
   display: flex;
   gap: 6px;
@@ -1590,6 +1599,12 @@ body.col-resizing iframe {
     padding-bottom: max(12px, env(safe-area-inset-bottom));
     background: var(--panel);
     border-top: 1px solid var(--border);
+  }
+  /* The bottom sheet already scrolls and pins its footer — let the existing
+     list flow into that single scroll instead of nesting a second one. */
+  .conn-scroll {
+    max-height: none;
+    overflow-y: visible;
   }
   /* Diff sheet: full height, flush (keeps its own internal scroll — don't let
      the generic .modal padding/overflow above re-wrap it), no resize grip. */
