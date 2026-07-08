@@ -1,7 +1,9 @@
 # Connectivity Execution Plan: Relay + Gateway ("R-track")
 
-Status: **design decided, no code yet.** The connectivity model — contract,
-topology cases, phases, auth, client flow — is specified in
+Status: **R1–R4 implemented (2026-07-05 → 07-07); R5 (hardening) pending.** A
+NAT'd leaf and an egress-less downstream behind a gateway are both fully
+controllable from the browser with zero client tooling. The connectivity model —
+contract, topology cases, phases, auth, client flow — is specified in
 [`architecture.md`](architecture.md) → *Connectivity* (decision recorded
 2026-07-04: ASM owns the relay/gateway path; no third-party overlay). This
 document is the implementation plan: concrete wire contracts, crate layout,
@@ -200,6 +202,7 @@ asm-daemon additions:
   ASM_NODE_LABEL        default: hostname
   ASM_RELAY_DOWNSTREAMS comma-separated host:port targets on the private net
                         (R4; labels/node_ids discovered by probing /health)
+  ASM_RELAY_PROBE_INTERVAL_MS  downstream /health re-probe cadence (R4; default 5000)
 ```
 
 ## Client contract (R3)
@@ -303,24 +306,41 @@ starting the next, matching the M-track cadence. Rust work needs
   pass. **Milestone reached: the browser client reaches a relayed (NAT'd) node
   with zero client-side tooling — works on any client including mobile.**
 
-- **R4 — gateway mode (egress-less downstreams).**
-  Daemon parses `ASM_RELAY_DOWNSTREAMS`; probes each target's `/health` for
-  `node_id`/`label` (re-probe on interval; on change or failure, send a
-  `downstreams` control update); agent handles proxy streams whose
-  `{"target"}` preamble names a downstream by dialing that `host:port`
-  instead of the tunnel listener. Relay routes downstream node_ids via the
-  owning gateway connection and reports `via` in `/nodes`;
-  `downstream_unreachable` surfaced from probe state. Client renders the
-  `via` attribution (e.g. "D · via C").
-  *Acceptance:* extend `scripts/relay-test.mjs` (or add
-  `scripts/gateway-test.mjs`): relay + gateway daemon C + downstream daemon D
-  on distinct loopback addresses (127.0.0.1/2/3 — the established technique
-  for emulating separate hosts), where the client hits **only** the relay:
-  (1) `/nodes` lists D with `via: C`, (2) the full session loop works against
-  D through `/n/<D_id>`, (3) D receives C's address as peer (not loopback)
-  and enforces its token, (4) stopping D flips it to
-  `downstream_unreachable` while C stays online, (5) depth is invisible: the
-  client config for D differs from a direct node only in URL.
+- **R4 — gateway mode (egress-less downstreams). _Done 2026-07-07._**
+  Daemon parses `ASM_RELAY_DOWNSTREAMS` (comma-separated `host:port`) and runs a
+  probe loop that GETs each target's `/health` for `node_id`/`label` and tracks
+  reachability. **Design choice:** the probe lives in the daemon (blocking `ureq`
+  on a `spawn_blocking`, cadence `ASM_RELAY_PROBE_INTERVAL_MS`, default 5 s) and
+  publishes the resolved, identity-annotated set to the relay agent over a
+  `tokio::sync::watch` channel — so the reusable `asm-relay` lib gains no HTTP
+  client and `/health`-shape knowledge stays a daemon concern. The agent
+  advertises the current set in its `hello` and re-sends `NodeMsg::Downstreams`
+  whenever the watch changes, and `resolve()`s an `Open{target}` naming a
+  downstream by dialing that `host:port` instead of the tunnel listener. A
+  downstream that has answered once stays advertised as `reachable:false` when a
+  later probe fails (transient outage ⇒ offline, not vanished). Relay side was
+  already R4-ready from R1: `route()` finds the owning gateway, `snapshot()`
+  emits each downstream as a `via`-attributed leaf, and the proxy maps failure to
+  `downstream_unreachable`; R4 added a **fast-fail** so a target the gateway last
+  probed as unreachable 502s immediately instead of on the 10 s open timeout. The
+  client already renders `via` (R3); R4 upgraded it to show the gateway's **label**
+  ("D · via C") rather than its id.
+  *Acceptance (met):* `scripts/gateway-test.mjs` (self-contained) — relay +
+  gateway daemon C (127.0.0.2) + downstream daemon D (127.0.0.3), client hits
+  **only** the relay: (1) C online as `kind:gateway`; D discovered by C's probe
+  and listed as a leaf with `via:C` and its own label; (2) full session loop
+  against D through `/n/<D_id>` — enroll, create, WS marker echo, list; (3)
+  isolation — D's session lists on D but **not** on C (distinct daemons, both
+  driven through the one relay); (4) the relay key still gates downstream routing
+  (no key ⇒ 401); (5) stopping D flips it to offline / `downstream_unreachable`
+  while C stays online. All 15 checks pass. **Loopback caveat:** because C and D
+  are emulated on 127.0.0.x, D sees a loopback peer and grants loopback trust, so
+  cross-gateway *token* enforcement (which holds in production, where C→D is a
+  real network hop) cannot be reproduced and is not asserted — recorded as
+  `security-followups.md` → 11.
+
+  **Milestone reached:** an egress-less downstream (a host that cannot reach the
+  relay at all) is fully controllable through a gateway that bridges it.
 
 - **R5 — hardening & productization (scoped items, pick per need).**
   - **Splice-point confidentiality**: relay/gateway processes currently see

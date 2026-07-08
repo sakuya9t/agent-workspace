@@ -10,11 +10,14 @@ mod source_control;
 mod util;
 mod workspace;
 
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use asm_relay::agent::ResolvedDownstream;
 
 use api::AppState;
 use backend::asmux_client::AsmuxClient;
@@ -188,16 +191,128 @@ async fn start_relay_if_configured(
         }
     });
 
+    // Gateway mode (R4): bridge egress-less downstreams. A probe loop discovers
+    // each downstream's node_id/label from its /health and tracks reachability,
+    // publishing the live set to the agent (which advertises it to the relay and
+    // resolves inbound streams against it). For a leaf, `ds_tx` is dropped here
+    // and the watch simply never updates.
+    let (ds_tx, ds_rx) = tokio::sync::watch::channel(Vec::<ResolvedDownstream>::new());
+    let targets = parse_downstream_targets(&config.relay_downstreams);
+    if !targets.is_empty() {
+        tracing::info!(count = targets.len(), "relay gateway mode: probing downstreams");
+        tokio::spawn(probe_downstreams_loop(
+            targets,
+            config.relay_probe_interval,
+            ds_tx,
+        ));
+    }
+
     let agent_cfg = asm_relay::agent::AgentConfig {
         relay_url: url.clone(),
         relay_key: key,
         node_id: server_id.to_string(),
         label: config.node_label.clone(),
         local_target: tunnel_addr,
-        downstreams: Vec::new(),
+        downstreams: ds_rx,
     };
     tracing::info!(relay = %url, node = %server_id, tunnel = %tunnel_addr, "registering with relay");
     Ok(Some(tokio::spawn(asm_relay::agent::run(agent_cfg))))
+}
+
+/// Parse `host:port` downstream specs into `(authority, addr)` pairs: the
+/// authority string drives the probe URL, the resolved address drives the dial.
+/// Unparseable/unresolvable specs are logged and skipped.
+fn parse_downstream_targets(specs: &[String]) -> Vec<(String, SocketAddr)> {
+    use std::net::ToSocketAddrs;
+    let mut out = Vec::new();
+    for spec in specs {
+        match spec.to_socket_addrs() {
+            Ok(mut addrs) => match addrs.next() {
+                Some(addr) => out.push((spec.clone(), addr)),
+                None => {
+                    tracing::warn!("relay downstream `{spec}` resolved to no address; skipping")
+                }
+            },
+            Err(e) => tracing::warn!("invalid relay downstream `{spec}`: {e}; skipping"),
+        }
+    }
+    out
+}
+
+/// Periodically probe each downstream's `/health` and publish the reachable,
+/// identity-annotated set to the relay agent. A downstream that has answered at
+/// least once stays advertised (as `reachable: false`) when a later probe fails,
+/// so a transient outage surfaces as offline instead of making the node vanish.
+async fn probe_downstreams_loop(
+    targets: Vec<(String, SocketAddr)>,
+    interval: Duration,
+    tx: tokio::sync::watch::Sender<Vec<ResolvedDownstream>>,
+) {
+    // Last identity learned per address, kept across probe failures.
+    let mut known: HashMap<SocketAddr, (String, String)> = HashMap::new();
+    let mut tick = tokio::time::interval(interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let mut resolved = Vec::with_capacity(targets.len());
+        for (authority, addr) in &targets {
+            let url = format!("http://{authority}/health");
+            let probed = tokio::task::spawn_blocking(move || probe_health(&url))
+                .await
+                .unwrap_or(None);
+            match probed {
+                Some((node_id, label)) => {
+                    known.insert(*addr, (node_id.clone(), label.clone()));
+                    resolved.push(ResolvedDownstream {
+                        node_id,
+                        label,
+                        addr: *addr,
+                        reachable: true,
+                    });
+                }
+                None => {
+                    if let Some((node_id, label)) = known.get(addr) {
+                        resolved.push(ResolvedDownstream {
+                            node_id: node_id.clone(),
+                            label: label.clone(),
+                            addr: *addr,
+                            reachable: false,
+                        });
+                    }
+                    // Never-probed downstream: nothing to advertise yet.
+                }
+            }
+        }
+        // Publish only on a real change (the agent re-advertises on each update).
+        tx.send_if_modified(|cur| {
+            if *cur != resolved {
+                *cur = resolved;
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+/// Blocking `/health` probe: returns `(node_id, label)` when the downstream
+/// answers with a `node_id`. Any error (down, timeout, bad body) ⇒ `None`.
+fn probe_health(url: &str) -> Option<(String, String)> {
+    let body: serde_json::Value = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .get(url)
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+    let node_id = body.get("node_id")?.as_str()?.to_string();
+    let label = body
+        .get("label")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some((node_id, label))
 }
 
 /// Ensure the asmux holder is reachable, auto-spawning it (detached) if the

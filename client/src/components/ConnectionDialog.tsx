@@ -242,6 +242,9 @@ function RelayRow({ relay, onRemove }: { relay: RelayConn; onRemove: () => void 
   });
 
   const nodeBaseUrl = (nodeId: string) => `${relay.url.replace(/\/$/, "")}/n/${nodeId}`;
+  // Attribute a downstream to its gateway by label (falling back to the id).
+  const gatewayLabel = (id: string) =>
+    nodes?.find((x) => x.node_id === id)?.label || id.slice(0, 8);
   const isConnected = (nodeId: string) =>
     daemons.some((d) => d.via === relay.id && d.baseUrl === nodeBaseUrl(nodeId));
 
@@ -307,7 +310,7 @@ function RelayRow({ relay, onRemove }: { relay: RelayConn; onRemove: () => void 
               <span className={n.online ? "ok" : "dim"}>
                 {n.online ? t("relay.online") : t("relay.offline")}
               </span>
-              {n.via && <span className="dim">{" · "}{t("relay.viaGateway", { gateway: n.via.slice(0, 8) })}</span>}
+              {n.via && <span className="dim">{" · "}{t("relay.viaGateway", { gateway: gatewayLabel(n.via) })}</span>}
             </div>
             {isConnected(n.node_id) ? (
               <div className="dim small">{t("relay.connected")}</div>

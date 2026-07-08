@@ -140,3 +140,25 @@ items below are additional, tracked here so we don't forget.
   rate-limit rows.
 - **Guidance:** if a "no outbound network" deployment mode is added, gate this
   fetch behind it.
+
+## 11. Gateway→downstream trust relies on a non-loopback hop — LOW (topology-dependent)
+
+- **What:** a downstream reached through a gateway (R4) is dialed by the gateway
+  at its ordinary listener, so the downstream makes its own loopback-trust
+  decision from the **gateway's** source address. In the intended deployment the
+  gateway reaches the downstream over the private network — a non-loopback hop —
+  so the downstream enforces its device token on relayed traffic and the R2
+  invariant ("relayed traffic never inherits loopback trust") holds by topology.
+  A downstream **co-located on the gateway host** (a loopback hop) would instead
+  grant loopback trust to gatewayed traffic, i.e. tokenless access for any client
+  that can reach the gateway through the relay. (This is also why
+  `scripts/gateway-test.mjs`, which emulates the gateway and downstream on
+  127.0.0.x, cannot assert downstream token enforcement across the hop — it
+  proves the relay-key gate instead, and documents the caveat inline.)
+- **Current mitigation:** the gateway model exists for **egress-less**
+  downstreams (the downstream cannot reach the relay while the gateway can),
+  which implies a network boundary between them; co-location is a degenerate
+  configuration.
+- **Guidance:** ship the item-6 "always require a token" mode and recommend it on
+  any downstream that shares a host (or loopback range) with its gateway; fold
+  into item 1's off-loopback story.

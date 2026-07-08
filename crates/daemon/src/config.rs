@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
@@ -48,6 +49,14 @@ pub struct Config {
     /// Human label advertised to the relay and shown in clients
     /// (`ASM_NODE_LABEL`, default: hostname).
     pub node_label: String,
+    /// Egress-less downstreams this daemon bridges as a gateway
+    /// (`ASM_RELAY_DOWNSTREAMS`, comma-separated `host:port`). Each is probed on
+    /// `/health` for its `node_id`/`label`, then advertised to the relay so a
+    /// client can reach it through this gateway (R4). Empty ⇒ a leaf node.
+    pub relay_downstreams: Vec<String>,
+    /// How often to re-probe each downstream's `/health`
+    /// (`ASM_RELAY_PROBE_INTERVAL_MS`, default 5000).
+    pub relay_probe_interval: Duration,
 }
 
 impl Config {
@@ -98,6 +107,21 @@ impl Config {
         let relay_url = env_nonempty("ASM_RELAY_URL");
         let relay_key = env_nonempty("ASM_RELAY_KEY");
         let node_label = env_nonempty("ASM_NODE_LABEL").unwrap_or_else(hostname_label);
+        let relay_downstreams = env_nonempty("ASM_RELAY_DOWNSTREAMS")
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let relay_probe_interval = std::env::var("ASM_RELAY_PROBE_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_millis(5000));
 
         Ok(Self {
             bind,
@@ -112,6 +136,8 @@ impl Config {
             relay_url,
             relay_key,
             node_label,
+            relay_downstreams,
+            relay_probe_interval,
         })
     }
 

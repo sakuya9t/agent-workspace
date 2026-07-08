@@ -4,7 +4,9 @@ Last reconciled: **2026-07-06** (against `release/next` through `655f613`;
 image/screenshot paste + the 📎 button are now merged). This reconcile also
 added the **RF-\*** rows — code-structure refactors from the codebase
 analysis in [`refactoring-plan.md`](refactoring-plan.md), slotted directly
-before the milestones they make cheaper.
+before the milestones they make cheaper. **Update 2026-07-07:** **R4 (gateway
+mode)** landed — moved to *Already done*; the next P1 on the product path is now
+the RF-M4 → M4 durability bundle.
 
 This is the single cross-track index of work that is **designed but not yet
 implemented**. The detailed designs stay in their own documents
@@ -39,10 +41,17 @@ pick it up**.
 - Durable sessions **M1–M3**: `asmux` holder, `SidecarBackend`, adopt-on-restart
   (ring-replay), `indeterminate` state incl. client badge
   (`scripts/durable-restart-test.mjs` proves it).
-- Connectivity **R1–R3**: `asm-relay` (dial-out-per-stream), daemon
+- Connectivity **R1–R4**: `asm-relay` (dial-out-per-stream), daemon
   register-out + tunnel listener (loopback trust defeated), client relay
-  support — a NAT'd node is fully controllable from the browser with zero
-  client tooling (`scripts/relay-test.mjs`, R3 CDP harness).
+  support, and **gateway mode** — a NAT'd leaf *and* an egress-less downstream
+  behind a gateway are both fully controllable from the browser with zero
+  client tooling. Gateway (**R4**, 2026-07-07): the daemon probes
+  `ASM_RELAY_DOWNSTREAMS` `/health` (cadence `ASM_RELAY_PROBE_INTERVAL_MS`) and
+  feeds the relay agent a live reachable-annotated set over a `watch` channel;
+  the relay attributes each downstream `via` its gateway and fast-fails
+  `downstream_unreachable`; the client shows "D · via C". Proofs
+  `scripts/relay-test.mjs` + `scripts/gateway-test.mjs` (15 checks). Loopback
+  token-enforcement caveat: [`security-followups.md`](security-followups.md) → 11.
 - VS Code correctness fix: relayed hosts get a disabled button + honest hint
   instead of a misdirected Remote-SSH deep link.
 - Image/screenshot paste: paste, drag-drop, or the 📎 button feed an image into
@@ -90,7 +99,6 @@ pick it up**.
 
 | ID | Item | Priority | Depends on | Source (design) |
 | --- | --- | --- | --- | --- |
-| R4 | Gateway mode (egress-less downstreams) | **P1** | R1–R3 (done) | connectivity-execution-plan.md → R4 |
 | RF-M4 | Pre-M4 daemon refactor bundle (SessionManager split, asmux reconnect-supervisor seam, adopt-path test coverage) | **P1** | — (land immediately before M4) | refactoring-plan.md → RF-M4 |
 | M4 | Holder hardening + exact cold-stitch adopt | **P1** | M1–M3 (done); RF-M4 | durable-sessions.md → M4 |
 | MOB-PWA | Mobile UI phase 4: PWA manifest + iOS metas | **P2** | MOB (done) | mobile-ui.md → Packaging path |
@@ -123,18 +131,6 @@ pick it up**.
 | I18N-2 | Additional locales beyond `en` | **P4** (deferred by user) | — | i18n.md → Adding a locale |
 
 ## Detail
-
-### R4 — Gateway mode (P1)
-
-The next milestone on the product path (relay = the connection model; see the
-locked zero-client-tooling principle). Daemon parses `ASM_RELAY_DOWNSTREAMS`,
-probes downstream `/health` for `node_id`/`label`, advertises them over the
-control stream, and serves `open` frames targeting a downstream by dialing
-that host:port; relay routes downstream node_ids via the owning gateway and
-reports `via`; client renders "D · via C". Plumbing already exists on both
-sides (`downstreams` in the protocol, `via` in `/nodes`). Acceptance: the
-gateway-test script described in the plan (relay + gateway C + downstream D on
-distinct loopback addresses; 5 checks).
 
 ### RF-M4 — pre-M4 daemon refactor bundle (P1)
 
@@ -333,12 +329,13 @@ parity gate, typed keys); adding a locale is the 3-step recipe in `i18n.md`.
 1. ~~**MOB** phases 1–3~~ ✅ landed 2026-07-06 (RF-MOB + phases 1–3). Remaining
    mobile work: **MOB-PWA** (phase 4) then **MOB-PUSH** (needs daemon push
    plumbing) — see item 8.
-2. **R4** — finishes the connectivity story the product is built around; no
-   refactor needed (relay/agent scaffolding is complete; daemon side is a
-   `Config` field + probe loop).
+2. ~~**R4** — gateway mode~~ ✅ landed 2026-07-07 (daemon probe loop feeding the
+   relay agent over a `watch` channel; relay fast-fail; client `via` label).
+   Finishes the connectivity story the product is built around. Proof:
+   `scripts/gateway-test.mjs`.
 3. **RF-M4** → **M4** — durability hardening; the only remaining gap in the
-   headline restart promise. Can interleave with R4 (different subsystems);
-   the cold-stitch flip waits for RF-M4's adopt-path tests.
+   headline restart promise. The cold-stitch flip waits for RF-M4's adopt-path
+   tests.
 4. **MEAS-1** — right after RF-M4's SessionManager split settles the
    `on_output`/`on_idle` seams it hooks (landing it earlier just makes the
    refactor carry the hooks). Dev-only and parallel-friendly: once enabled

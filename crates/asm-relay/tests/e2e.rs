@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use asm_relay::agent::{run as run_agent, AgentConfig};
+use asm_relay::agent::{run as run_agent, AgentConfig, ResolvedDownstream};
 use asm_relay::server::{router, Registry};
 use axum::extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
@@ -121,13 +121,16 @@ async fn relayed_nat_host_is_controllable_end_to_end() {
     let node_http = spawn_fake_node().await;
     let node_id = "node-1".to_string();
 
+    // A leaf node: no downstreams. Keep the sender alive so the agent's watch
+    // never errors (it simply never updates).
+    let (_ds_tx, ds_rx) = tokio::sync::watch::channel(Vec::<ResolvedDownstream>::new());
     let agent = tokio::spawn(run_agent(AgentConfig {
         relay_url: format!("ws://{relay}"),
         relay_key: KEY.to_string(),
         node_id: node_id.clone(),
         label: "fake-node".to_string(),
         local_target: node_http,
-        downstreams: vec![],
+        downstreams: ds_rx,
     }));
 
     wait_online(relay, &node_id).await;

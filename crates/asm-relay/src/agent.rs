@@ -19,7 +19,7 @@ use anyhow::{bail, Context, Result};
 use futures::{SinkExt, StreamExt};
 use tokio::io::copy_bidirectional;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::protocol::{
@@ -28,12 +28,17 @@ use crate::protocol::{
 };
 use crate::transport::WsByteStream;
 
-/// A private-network target this node can reach inward and advertise (R4).
-#[derive(Debug, Clone)]
-pub struct DownstreamConfig {
+/// A downstream resolved by the gateway's probe loop (R4): a static address
+/// (from config) annotated with the identity and reachability learned by
+/// probing the downstream daemon's `/health`. Only downstreams whose `/health`
+/// has answered at least once — so their `node_id` is known — ever appear here,
+/// because the relay can route only to a known `node_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDownstream {
     pub node_id: String,
     pub label: String,
     pub addr: SocketAddr,
+    pub reachable: bool,
 }
 
 /// Everything the agent needs to register and serve.
@@ -49,28 +54,36 @@ pub struct AgentConfig {
     /// Where traffic addressed to this node itself is spliced (the daemon's
     /// tunnel listener, or a test server).
     pub local_target: SocketAddr,
-    /// Egress-less downstreams this node bridges (empty for a leaf).
-    pub downstreams: Vec<DownstreamConfig>,
+    /// Live view of the downstreams this node bridges (R4); empty for a leaf.
+    /// The gateway's probe loop publishes updates here; the agent re-advertises
+    /// the set over the control stream whenever it changes and resolves `Open`
+    /// targets against it. For a leaf, this is a receiver whose value stays the
+    /// empty vec (its sender may be dropped — the agent tolerates that).
+    pub downstreams: watch::Receiver<Vec<ResolvedDownstream>>,
 }
 
 impl AgentConfig {
-    fn hello_downstreams(&self) -> Vec<DownstreamInfo> {
+    /// The downstream set to advertise, taken from the current probe view.
+    fn advertised(&self) -> Vec<DownstreamInfo> {
         self.downstreams
+            .borrow()
             .iter()
             .map(|d| DownstreamInfo {
                 node_id: d.node_id.clone(),
                 label: d.label.clone(),
-                // R1/R2: advertised as reachable; R4 replaces this with a probe.
-                reachable: true,
+                reachable: d.reachable,
             })
             .collect()
     }
 
+    /// Map an `Open` target to the local address to dial: this node's own tunnel
+    /// listener, or one of its advertised downstreams.
     fn resolve(&self, target: &str) -> Option<SocketAddr> {
         if target == self.node_id {
             return Some(self.local_target);
         }
         self.downstreams
+            .borrow()
             .iter()
             .find(|d| d.node_id == target)
             .map(|d| d.addr)
@@ -122,13 +135,19 @@ async fn run_once(cfg: &AgentConfig) -> Result<()> {
         proto: PROTO_VERSION,
         node_id: cfg.node_id.clone(),
         label: cfg.label.clone(),
-        downstreams: cfg.hello_downstreams(),
+        downstreams: cfg.advertised(),
     };
     out_tx.send(Message::Text(serde_json::to_string(&hello)?))?;
 
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut seq: u64 = 0;
+
+    // A private clone of the downstreams view to await changes on (the shared
+    // `cfg.downstreams` is read via `advertised()`/`resolve()`). Starts "seen",
+    // so it fires only on updates *after* the hello above — never a duplicate.
+    let mut ds_rx = cfg.downstreams.clone();
+    let mut watch_live = true;
 
     let result = loop {
         tokio::select! {
@@ -138,6 +157,18 @@ async fn run_once(cfg: &AgentConfig) -> Result<()> {
                     break Ok(());
                 }
             }
+            changed = ds_rx.changed(), if watch_live => match changed {
+                // A probe result changed: re-advertise the whole set.
+                Ok(()) => {
+                    let msg = NodeMsg::Downstreams { downstreams: cfg.advertised() };
+                    if out_tx.send(Message::Text(serde_json::to_string(&msg)?)).is_err() {
+                        break Ok(());
+                    }
+                }
+                // All senders dropped (a leaf, or the gateway shutting down):
+                // stop polling so this branch cannot busy-loop on the error.
+                Err(_) => watch_live = false,
+            },
             msg = stream.next() => match msg {
                 Some(Ok(Message::Text(t))) => {
                     match serde_json::from_str::<RelayMsg>(t.as_str()) {
