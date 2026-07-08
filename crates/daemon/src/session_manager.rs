@@ -1327,26 +1327,68 @@ mod tests {
         }
     }
 
-    struct MockBackend;
+    /// A fresh, running `MockSession` handle — used by both `create` and the
+    /// holder `adopt` path.
+    fn mock_session() -> Arc<dyn BackendSession> {
+        let (tx, _) = broadcast::channel(16);
+        let (status_tx, status_rx) = watch::channel(BackendStatus::Running);
+        Arc::new(MockSession {
+            tx,
+            status_tx,
+            status_rx,
+            seq: AtomicU64::new(0),
+            screen: String::new(),
+        })
+    }
+
+    /// A `SessionBackend` test double. `Default` is native-like — sessions die on
+    /// shutdown and there is no holder. The holder knobs simulate an
+    /// out-of-process asmux holder so the startup adopt/reconcile branches can be
+    /// driven without a real socket.
+    #[derive(Default)]
+    struct MockBackend {
+        /// Simulate a holder that outlives the daemon (asmux): sessions are left
+        /// running on shutdown and offered back through `holder_list`/`adopt`.
+        keep_on_shutdown: bool,
+        /// Canned `holder_list()` result (only consulted when `keep_on_shutdown`).
+        holder: Vec<HolderEntry>,
+        /// Make `holder_list()` fail, exercising the "all live → indeterminate" arm.
+        holder_list_fails: bool,
+        /// Whether `adopt()` yields a live handle (`Some`) or gives up (`None`).
+        adopt_ok: bool,
+    }
 
     impl SessionBackend for MockBackend {
         fn id(&self) -> &'static str {
             "mock"
         }
         fn create(&self, _spec: BackendSpawnSpec) -> Result<Arc<dyn BackendSession>> {
-            let (tx, _) = broadcast::channel(16);
-            let (status_tx, status_rx) = watch::channel(BackendStatus::Running);
-            Ok(Arc::new(MockSession {
-                tx,
-                status_tx,
-                status_rx,
-                seq: AtomicU64::new(0),
-                screen: String::new(),
-            }))
+            Ok(mock_session())
+        }
+        fn keep_sessions_on_shutdown(&self) -> bool {
+            self.keep_on_shutdown
+        }
+        fn holder_list(&self) -> Result<Vec<HolderEntry>> {
+            if self.holder_list_fails {
+                bail!("mock holder_list failure");
+            }
+            Ok(self.holder.clone())
+        }
+        fn adopt(
+            &self,
+            _id: &str,
+            _rows: u16,
+            _cols: u16,
+        ) -> Result<Option<Arc<dyn BackendSession>>> {
+            Ok(self.adopt_ok.then(mock_session))
         }
     }
 
     fn test_manager() -> (Arc<SessionManager>, PathBuf) {
+        test_manager_with(Arc::new(MockBackend::default()))
+    }
+
+    fn test_manager_with(backend: Arc<dyn SessionBackend>) -> (Arc<SessionManager>, PathBuf) {
         let dir = std::env::temp_dir().join(format!("asm-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = Db::open(&dir.join("test.sqlite3")).unwrap();
@@ -1354,10 +1396,46 @@ mod tests {
         let manager = Arc::new(SessionManager::new(
             db,
             registry,
-            Arc::new(MockBackend),
+            backend,
             dir.join("worktrees"),
         ));
         (manager, dir)
+    }
+
+    /// Seed a session row already marked `running` (as if a prior daemon left it
+    /// live), so `startup_reconcile` finds it via `live_session_ids()`.
+    fn insert_running(db: &Db, id: &str) {
+        let now = now_millis();
+        db.insert_session(&Session {
+            id: id.to_string(),
+            agent_plugin_id: "shell".into(),
+            command: "sh".into(),
+            args: vec![],
+            env: vec![],
+            working_directory: std::env::temp_dir().to_string_lossy().into_owned(),
+            workspace_id: None,
+            status: SessionStatus::Running,
+            rows: 24,
+            cols: 80,
+            last_event_seq: 0,
+            exit_code: None,
+            attention_state: AttentionState::None,
+            attention_reason: None,
+            created_at: now,
+            updated_at: now,
+            last_activity_at: now,
+            risky: false,
+        })
+        .unwrap();
+    }
+
+    fn holder_entry(id: &str, alive: bool, exit_code: i32, exit_signal: i32) -> HolderEntry {
+        HolderEntry {
+            id: id.to_string(),
+            alive,
+            exit_code,
+            exit_signal,
+        }
     }
 
     fn shell_req() -> CreateSessionRequest {
@@ -1423,6 +1501,138 @@ mod tests {
             assert_eq!(s.status, SessionStatus::Stopped);
         }
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- startup_reconcile branches ----
+    //
+    // These pin every arm of the adopt/reconcile decision that runs when the
+    // daemon restarts with sessions still `running` in the DB. They exist so the
+    // planned M4 flip of adopt from ring-replay to exact cold-stitch is guarded
+    // *before* it lands (today that flip is untested — RF-M4 #4).
+
+    #[tokio::test]
+    async fn native_reconcile_marks_live_sessions_failed() {
+        // Default mock is native-like: it does not keep sessions on shutdown, so
+        // any row still `running` after a restart is unrecoverable → `failed`.
+        let (manager, dir) = test_manager();
+        insert_running(&manager.db, "s-native");
+
+        manager.startup_reconcile().await.unwrap();
+
+        let s = manager.get_session("s-native").unwrap().unwrap();
+        assert_eq!(s.status, SessionStatus::Failed);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn holder_alive_and_adoptable_is_adopted_running() {
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            holder: vec![holder_entry("s-adopt", true, 0, 0)],
+            adopt_ok: true,
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_with(backend);
+        insert_running(&manager.db, "s-adopt");
+
+        manager.startup_reconcile().await.unwrap();
+
+        let s = manager.get_session("s-adopt").unwrap().unwrap();
+        assert_eq!(s.status, SessionStatus::Running, "adopted → running");
+        assert!(
+            manager.live_handle("s-adopt").is_some(),
+            "adopted handle re-attached into the live map"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn holder_alive_but_unadoptable_is_indeterminate() {
+        // Alive in the holder, but adopt() cannot recover it → indeterminate.
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            holder: vec![holder_entry("s-noadopt", true, 0, 0)],
+            adopt_ok: false,
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_with(backend);
+        insert_running(&manager.db, "s-noadopt");
+
+        manager.startup_reconcile().await.unwrap();
+
+        let s = manager.get_session("s-noadopt").unwrap().unwrap();
+        assert_eq!(s.status, SessionStatus::Indeterminate);
+        assert!(manager.live_handle("s-noadopt").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn holder_dead_entry_reconciles_to_exit_outcome() {
+        // A real completion record from the holder → exited (clean) or failed
+        // (signalled), never indeterminate.
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            holder: vec![
+                holder_entry("s-exit", false, 7, 0),
+                holder_entry("s-signal", false, 0, 9),
+            ],
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_with(backend);
+        insert_running(&manager.db, "s-exit");
+        insert_running(&manager.db, "s-signal");
+
+        manager.startup_reconcile().await.unwrap();
+
+        let exited = manager.get_session("s-exit").unwrap().unwrap();
+        assert_eq!(exited.status, SessionStatus::Exited);
+        assert_eq!(exited.exit_code, Some(7));
+
+        let signalled = manager.get_session("s-signal").unwrap().unwrap();
+        assert_eq!(signalled.status, SessionStatus::Failed, "signalled → failed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn holder_absent_entry_is_indeterminate() {
+        // The session is gone from the holder (the holder itself died), so no
+        // completion record exists → indeterminate, flagged for the user.
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_with(backend);
+        insert_running(&manager.db, "s-absent");
+
+        manager.startup_reconcile().await.unwrap();
+
+        let s = manager.get_session("s-absent").unwrap().unwrap();
+        assert_eq!(s.status, SessionStatus::Indeterminate);
+        assert_eq!(s.attention_state, AttentionState::LikelyBlocked);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn holder_list_failure_reconciles_all_indeterminate() {
+        // If the holder cannot even be listed, every live session is unknown.
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            holder_list_fails: true,
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_with(backend);
+        insert_running(&manager.db, "s-a");
+        insert_running(&manager.db, "s-b");
+
+        manager.startup_reconcile().await.unwrap();
+
+        for id in ["s-a", "s-b"] {
+            assert_eq!(
+                manager.get_session(id).unwrap().unwrap().status,
+                SessionStatus::Indeterminate
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
