@@ -81,8 +81,8 @@ pub async fn require_auth(State(state): State<AppState>, mut req: Request, next:
     }
 
     if let Some(token) = extract_token(&req) {
-        if let Ok(Some(dev)) = state.manager.db.device_by_token(&token) {
-            let _ = state.manager.db.touch_device(&dev.id, now_millis());
+        if let Ok(Some(dev)) = state.manager.db().device_by_token(&token) {
+            let _ = state.manager.db().touch_device(&dev.id, now_millis());
             return next.run(req).await;
         }
     }

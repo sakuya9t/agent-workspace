@@ -139,7 +139,7 @@ fn hostname() -> String {
 }
 
 async fn list_plugins(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(json!({ "plugins": state.manager.registry.describe() }))
+    Json(json!({ "plugins": state.manager.registry().describe() }))
 }
 
 async fn list_workspaces(
@@ -347,7 +347,7 @@ async fn get_session_usage(
     // the async runtime.
     let manager = state.manager.clone();
     let usage = tokio::task::spawn_blocking(move || {
-        manager.registry.get(&s.agent_plugin_id).and_then(|p| {
+        manager.registry().get(&s.agent_plugin_id).and_then(|p| {
             p.usage(&crate::plugins::usage::UsageContext {
                 cwd: std::path::PathBuf::from(&s.working_directory),
                 started_at_ms: s.created_at,

@@ -93,8 +93,8 @@ struct Interaction {
 /// Owns session lifecycle: plugin resolution, backend spawn, persistence, and
 /// the per-session monitor task that tracks exit, summaries, and attention.
 pub struct SessionManager {
-    pub db: Db,
-    pub registry: Arc<PluginRegistry>,
+    db: Db,
+    registry: Arc<PluginRegistry>,
     backend: Arc<dyn SessionBackend>,
     live: Mutex<HashMap<String, Arc<dyn BackendSession>>>,
     /// Base directory under which per-session Git worktrees are created.
@@ -118,6 +118,19 @@ impl SessionManager {
             worktree_root,
             interactions: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The persistence handle. Crate-internal accessor so auth/ws handlers read
+    /// through one deliberate door instead of a public field (keeping the DB out
+    /// of any external surface). Session logic inside this module uses the field.
+    pub(crate) fn db(&self) -> &Db {
+        &self.db
+    }
+
+    /// The agent plugin registry (read-only, shared). Crate-internal accessor,
+    /// same rationale as [`Self::db`].
+    pub(crate) fn registry(&self) -> &PluginRegistry {
+        &self.registry
     }
 
     pub fn backend_id(&self) -> &'static str {

@@ -12,7 +12,7 @@ use crate::util::now_millis;
 
 /// Public: lets a client discover the server identity before it has a token.
 pub async fn status(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
-    let (server_id, _) = state.manager.db.identity()?;
+    let (server_id, _) = state.manager.db().identity()?;
     Ok(Json(json!({
         "server_id": server_id,
         // Loopback (incl. SSH tunnels) is trusted; remote needs a device token.
@@ -33,7 +33,7 @@ pub async fn enroll(
     State(state): State<AppState>,
     Json(body): Json<EnrollBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let (server_id, enrollment_token) = state.manager.db.identity()?;
+    let (server_id, enrollment_token) = state.manager.db().identity()?;
     if body.enrollment_token.trim() != enrollment_token {
         return Err(AppError(
             StatusCode::UNAUTHORIZED,
@@ -53,7 +53,7 @@ pub async fn enroll(
         last_seen_at: now,
         revoked: false,
     };
-    state.manager.db.insert_device(&device)?;
+    state.manager.db().insert_device(&device)?;
 
     Ok(Json(json!({
         "server_id": server_id,
@@ -79,7 +79,7 @@ pub async fn enrollment_token(
             "enrollment token is only visible from the daemon host (loopback)".into(),
         ));
     }
-    let (_, token) = state.manager.db.identity()?;
+    let (_, token) = state.manager.db().identity()?;
     Ok(Json(json!({ "enrollment_token": token })))
 }
 
@@ -89,7 +89,7 @@ pub async fn list_devices(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let devices: Vec<DeviceInfo> = state
         .manager
-        .db
+        .db()
         .list_devices()?
         .iter()
         .map(DeviceInfo::from)
@@ -101,7 +101,7 @@ pub async fn revoke_device(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let ok = state.manager.db.revoke_device(&id)?;
+    let ok = state.manager.db().revoke_device(&id)?;
     if !ok {
         return Err(AppError(StatusCode::NOT_FOUND, "no such device".into()));
     }

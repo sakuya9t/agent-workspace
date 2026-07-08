@@ -206,7 +206,7 @@ async fn handle_live(
 async fn handle_history(socket: WebSocket, id: String, state: AppState) {
     let (mut sender, mut receiver) = socket.split();
 
-    match state.manager.db.read_events_after(&id, 0) {
+    match state.manager.db().read_events_after(&id, 0) {
         Ok(bytes) if !bytes.is_empty() => {
             let _ = sender.send(Message::Binary(bytes)).await;
         }
