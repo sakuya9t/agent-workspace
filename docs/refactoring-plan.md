@@ -111,6 +111,20 @@ with no copied wiring.
 
 ### RF-M4 — pre-M4 daemon refactor bundle (P1; land immediately before M4)
 
+**Status (2026-07-07): items 1, 3, 4 landed; item 2 folded into M4.** The three
+behavior-free refactors that de-risk M4 are done — the `SessionManager` split
+(#1), the `db`/`registry` encapsulation (#3), and the `MockBackend` holder seams
++ `startup_reconcile` branch tests that guard the cold-stitch flip (#4). Item 2
+(reconnect-supervisor home + `AsmuxClient` trait) is **deliberately deferred into
+M4**: it is not meaningful zero-behavior-change structure on its own — the
+"home (dial → hello → re-attach → drain)" *is* M4's reconnect machinery and must
+be shaped with the logic it hosts, and the `AsmuxClient` trait exists only to
+unit-test that not-yet-written logic (and, because `create`/`attach`/`list` are
+async, needs `async-trait`/future-boxing best decided with its consumer). The
+seams M4 actually reuses are already pre-placed (`AsmuxClient::detach`,
+`instance_id`, `head_cursor`, `backend_cursor`), so nothing is lost by co-landing
+#2 with M4's reconnect work.
+
 M4's features land in the two worst structural spots; restructure first so M4
 is additive.
 
@@ -205,7 +219,9 @@ closes each.
 1. ~~**RF-MOB**~~ ✅ (landed 2026-07-06) → **MOB** phases 1–3.
 2. **R4** — no refactor needed; the daemon side is a `Config` field + probe
    loop; relay/agent scaffolding already complete.
-3. **RF-M4** → **M4** (cold-stitch flip only after RF-M4 #4's tests exist).
+3. ~~**RF-M4** (#1 split, #3 encapsulation, #4 test seams)~~ ✅ landed
+   2026-07-07; #2 folded into M4 → **M4** (cold-stitch flip is now guarded by
+   #4's `startup_reconcile` branch tests).
 4. **SEC-2 + RF-ERR** together, then SEC-1 (direct).
 5. **DEC-1** → **RF-QUERY** → MVP-RICH.
 6. RF-VT100 opportunistically (or on trigger events above).

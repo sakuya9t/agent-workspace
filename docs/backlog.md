@@ -5,8 +5,10 @@ image/screenshot paste + the 📎 button are now merged). This reconcile also
 added the **RF-\*** rows — code-structure refactors from the codebase
 analysis in [`refactoring-plan.md`](refactoring-plan.md), slotted directly
 before the milestones they make cheaper. **Update 2026-07-07:** **R4 (gateway
-mode)** landed — moved to *Already done*; the next P1 on the product path is now
-the RF-M4 → M4 durability bundle.
+mode)** and **RF-M4 #1/#3/#4** (the pre-M4 daemon refactor: `SessionManager`
+split, `db`/`registry` encapsulation, adopt-path test seams) both landed — moved
+to *Already done*. RF-M4 #2 (reconnect-supervisor home + `AsmuxClient` trait) is
+folded into **M4**, which is now the next P1 on the durability track.
 
 This is the single cross-track index of work that is **designed but not yet
 implemented**. The detailed designs stay in their own documents
@@ -65,6 +67,14 @@ pick it up**.
   `build_launch` helper, db.rs idiom alignment, client `api.ts` error/URL
   helpers + shared `shortPath`; clippy silent, all suites green. Analysis and
   the follow-up RF-\* refactors: [`refactoring-plan.md`](refactoring-plan.md).
+- **RF-M4 #1/#3/#4** — pre-M4 daemon refactor (2026-07-07, zero behavior change):
+  `SessionManager` split into `session_manager/{mod,workspaces,monitor}.rs` (#1,
+  method bodies verbatim, only `pub(super)` on the four cross-module methods);
+  `db`/`registry` made private behind `db()`/`registry()` accessors (#3); and
+  `MockBackend` holder seams + six `startup_reconcile` branch tests (#4) that
+  guard M4's ring-replay→cold-stitch flip before it lands. 86 daemon tests pass;
+  clippy clean; full smoke loop green. **#2 (reconnect-supervisor home +
+  `AsmuxClient` trait) folded into M4** — see refactoring-plan.md → RF-M4 status.
 - **RF-MOB** — client shell prep for the MOB phase-1 split (2026-07-06,
   client-only, zero behavior change): `src/status.ts` unifies the three drifted
   `isLive` predicates (+ `isTerminal`; the RightPanel ended-list's omission of
@@ -99,8 +109,7 @@ pick it up**.
 
 | ID | Item | Priority | Depends on | Source (design) |
 | --- | --- | --- | --- | --- |
-| RF-M4 | Pre-M4 daemon refactor bundle (SessionManager split, asmux reconnect-supervisor seam, adopt-path test coverage) | **P1** | — (land immediately before M4) | refactoring-plan.md → RF-M4 |
-| M4 | Holder hardening + exact cold-stitch adopt | **P1** | M1–M3 (done); RF-M4 | durable-sessions.md → M4 |
+| M4 | Holder hardening + exact cold-stitch adopt (now also absorbs RF-M4 #2: the reconnect-supervisor home + `AsmuxClient` trait) | **P1** | M1–M3 (done); RF-M4 #1/#3/#4 (done) | durable-sessions.md → M4; refactoring-plan.md → RF-M4 #2 |
 | MOB-PWA | Mobile UI phase 4: PWA manifest + iOS metas | **P2** | MOB (done) | mobile-ui.md → Packaging path |
 | MOB-PUSH | Web Push for attention states | **P3** | MOB (done); daemon push plumbing (relay as carrier) | mobile-ui.md → Follow-ups |
 | IMG-2 | Image paste follow-ups: `.asm/pastes/` cleanup policy, per-agent capability hint | **P3** | image paste + 📎 button (done) | image-paste.md → Follow-ups |
@@ -132,19 +141,19 @@ pick it up**.
 
 ## Detail
 
-### RF-M4 — pre-M4 daemon refactor bundle (P1)
-
-Land immediately before M4: M4's reconnect and mid-flight reconciliation
-otherwise land in the two worst structural spots. Scope (structure only, zero
-behavior change): split `SessionManager` into workspace service / session
-monitor / lifecycle core; create the daemon↔asmux **reconnect-supervisor
-home** (today connection loss is handled in three disconnected layers with no
-owner) with `AsmuxClient` behind a testable seam; make `db`/`registry`
-private; extend `MockBackend` with `holder_list`/`adopt` so the startup adopt
-path — exactly where cold-stitch lands — gets tests **before** the flip.
-Full scope + acceptance: refactoring-plan.md → RF-M4.
-
 ### M4 — Holder hardening (P1)
+
+**RF-M4 #1/#3/#4 landed 2026-07-07** (see "Already done"): the `SessionManager`
+split, the `db`/`registry` encapsulation, and the `MockBackend` holder seams +
+`startup_reconcile` branch tests are in, so M4's reconnect/reconciliation now
+lands in focused modules and the cold-stitch flip is test-guarded. **RF-M4 #2
+was folded into M4** — build the daemon↔asmux **reconnect-supervisor home** (one
+task owning the `AsmuxClient` lifecycle; today `sidecar.rs`'s `Detached` arm just
+logs + breaks) together with the reconnect behavior it hosts, and put
+`AsmuxClient` behind a trait at that point so the backoff/reconciliation logic is
+unit-testable (async `create`/`attach`/`list` ⇒ decide `async-trait` vs
+future-boxing there). Pre-placed seams to reuse: `AsmuxClient::detach`,
+`instance_id`, `head_cursor`, `backend_cursor`.
 
 Orthogonal to the R-track (explicitly: R code must not assume M4 exists).
 Scope: idle watchdog + daemon↔asmux reconnect with backoff,
@@ -333,9 +342,11 @@ parity gate, typed keys); adding a locale is the 3-step recipe in `i18n.md`.
    relay agent over a `watch` channel; relay fast-fail; client `via` label).
    Finishes the connectivity story the product is built around. Proof:
    `scripts/gateway-test.mjs`.
-3. **RF-M4** → **M4** — durability hardening; the only remaining gap in the
-   headline restart promise. The cold-stitch flip waits for RF-M4's adopt-path
-   tests.
+3. ~~**RF-M4** #1/#3/#4~~ ✅ landed 2026-07-07 (split, encapsulation, adopt-path
+   tests) → **M4** — durability hardening; the only remaining gap in the
+   headline restart promise. The cold-stitch flip is now guarded by RF-M4 #4's
+   `startup_reconcile` branch tests. M4 also absorbs the reconnect-supervisor
+   home + `AsmuxClient` trait (was RF-M4 #2).
 4. **MEAS-1** — right after RF-M4's SessionManager split settles the
    `on_output`/`on_idle` seams it hooks (landing it earlier just makes the
    refactor carry the hooks). Dev-only and parallel-friendly: once enabled
