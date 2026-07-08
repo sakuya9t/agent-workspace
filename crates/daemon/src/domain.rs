@@ -74,6 +74,11 @@ pub enum AttentionState {
     /// A decision-prompt was detected in recent output — the agent is blocked and
     /// needs input to *proceed* with what it is doing.
     ApprovalNeeded,
+    /// The agent stopped because something went wrong mid-turn (e.g. Claude
+    /// Code's "API Error: …"). The process is still alive — this is not
+    /// [`Failed`](Self::Failed) — but the turn aborted and the session will sit
+    /// silent until the user retries, so it must not read as a calm `Idle`.
+    Error,
     Failed,
 }
 
@@ -85,6 +90,7 @@ impl AttentionState {
             AttentionState::Idle => "idle",
             AttentionState::LikelyBlocked => "likely_blocked",
             AttentionState::ApprovalNeeded => "approval_needed",
+            AttentionState::Error => "error",
             AttentionState::Failed => "failed",
         }
     }
@@ -95,6 +101,7 @@ impl AttentionState {
             "idle" => AttentionState::Idle,
             "likely_blocked" => AttentionState::LikelyBlocked,
             "approval_needed" => AttentionState::ApprovalNeeded,
+            "error" => AttentionState::Error,
             "failed" => AttentionState::Failed,
             _ => AttentionState::None,
         }
@@ -228,6 +235,7 @@ mod tests {
             AttentionState::Idle,
             AttentionState::LikelyBlocked,
             AttentionState::ApprovalNeeded,
+            AttentionState::Error,
             AttentionState::Failed,
         ] {
             assert_eq!(AttentionState::from_str(a.as_str()), a);

@@ -794,7 +794,7 @@ Signal sources:
 Attention state:
 
 ```text
-attention_state: none | activity | likely_blocked | approval_needed | failed
+attention_state: none | activity | idle | likely_blocked | approval_needed | error | failed
 attention_reason
 attention_updated_at
 ```

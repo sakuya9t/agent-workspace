@@ -4,7 +4,11 @@ Last reconciled: **2026-07-06** (against `release/next` through `655f613`;
 image/screenshot paste + the 📎 button are now merged). This reconcile also
 added the **RF-\*** rows — code-structure refactors from the codebase
 analysis in [`refactoring-plan.md`](refactoring-plan.md), slotted directly
-before the milestones they make cheaper.
+before the milestones they make cheaper. **Update 2026-07-07:** **R4 (gateway
+mode)** and **RF-M4 #1/#3/#4** (the pre-M4 daemon refactor: `SessionManager`
+split, `db`/`registry` encapsulation, adopt-path test seams) both landed — moved
+to *Already done*. RF-M4 #2 (reconnect-supervisor home + `AsmuxClient` trait) is
+folded into **M4**, which is now the next P1 on the durability track.
 
 This is the single cross-track index of work that is **designed but not yet
 implemented**. The detailed designs stay in their own documents
@@ -14,7 +18,8 @@ implemented**. The detailed designs stay in their own documents
 [`mobile-ui.md`](mobile-ui.md),
 [`security-followups.md`](security-followups.md),
 [`mvp-execution-plan.md`](mvp-execution-plan.md),
-[`refactoring-plan.md`](refactoring-plan.md)); this file only records
+[`refactoring-plan.md`](refactoring-plan.md),
+[`classifier-measurement.md`](classifier-measurement.md)); this file only records
 **what is pending, why it matters, what it depends on, and in what order to
 pick it up**.
 
@@ -38,10 +43,17 @@ pick it up**.
 - Durable sessions **M1–M3**: `asmux` holder, `SidecarBackend`, adopt-on-restart
   (ring-replay), `indeterminate` state incl. client badge
   (`scripts/durable-restart-test.mjs` proves it).
-- Connectivity **R1–R3**: `asm-relay` (dial-out-per-stream), daemon
+- Connectivity **R1–R4**: `asm-relay` (dial-out-per-stream), daemon
   register-out + tunnel listener (loopback trust defeated), client relay
-  support — a NAT'd node is fully controllable from the browser with zero
-  client tooling (`scripts/relay-test.mjs`, R3 CDP harness).
+  support, and **gateway mode** — a NAT'd leaf *and* an egress-less downstream
+  behind a gateway are both fully controllable from the browser with zero
+  client tooling. Gateway (**R4**, 2026-07-07): the daemon probes
+  `ASM_RELAY_DOWNSTREAMS` `/health` (cadence `ASM_RELAY_PROBE_INTERVAL_MS`) and
+  feeds the relay agent a live reachable-annotated set over a `watch` channel;
+  the relay attributes each downstream `via` its gateway and fast-fails
+  `downstream_unreachable`; the client shows "D · via C". Proofs
+  `scripts/relay-test.mjs` + `scripts/gateway-test.mjs` (15 checks). Loopback
+  token-enforcement caveat: [`security-followups.md`](security-followups.md) → 11.
 - VS Code correctness fix: relayed hosts get a disabled button + honest hint
   instead of a misdirected Remote-SSH deep link.
 - Image/screenshot paste: paste, drag-drop, or the 📎 button feed an image into
@@ -55,22 +67,55 @@ pick it up**.
   `build_launch` helper, db.rs idiom alignment, client `api.ts` error/URL
   helpers + shared `shortPath`; clippy silent, all suites green. Analysis and
   the follow-up RF-\* refactors: [`refactoring-plan.md`](refactoring-plan.md).
+- **RF-M4 #1/#3/#4** — pre-M4 daemon refactor (2026-07-07, zero behavior change):
+  `SessionManager` split into `session_manager/{mod,workspaces,monitor}.rs` (#1,
+  method bodies verbatim, only `pub(super)` on the four cross-module methods);
+  `db`/`registry` made private behind `db()`/`registry()` accessors (#3); and
+  `MockBackend` holder seams + six `startup_reconcile` branch tests (#4) that
+  guard M4's ring-replay→cold-stitch flip before it lands. 86 daemon tests pass;
+  clippy clean; full smoke loop green. **#2 (reconnect-supervisor home +
+  `AsmuxClient` trait) folded into M4** — see refactoring-plan.md → RF-M4 status.
+- **RF-MOB** — client shell prep for the MOB phase-1 split (2026-07-06,
+  client-only, zero behavior change): `src/status.ts` unifies the three drifted
+  `isLive` predicates (+ `isTerminal`; the RightPanel ended-list's omission of
+  `indeterminate` was decided deliberately — it is **neither** live nor
+  terminal, matching all prior call sites); `showUsage` moved into `useUiStore`;
+  `useActiveSession()` extracted from `App.tsx` so both shells share one wiring.
+  RF-MOB ride-along #4 (clipboard-with-fallback → `src/clipboard.ts`) was
+  delivered independently by the terminal-selection-copy feature (`7a56cd3` on
+  `release/next`), which hoisted the same `copyText()` out of `RightPanel` and
+  wired it into both `RightPanel` and `Terminal`; on rebase the duplicate hoist
+  was dropped and the shared util kept. `MobileShell` can now mount with no
+  copied wiring. Full build gate (tsc + eslint + check-locales + vite build) and
+  proxy tests green.
+- **MOB phases 1–3** — mobile adaptive shell (2026-07-06, client-only, no daemon
+  changes). Phase 1: `useIsPhone()` (PHONE_MQ) switches the root between the
+  extracted `DesktopShell` and a new stacked `MobileShell` (Sessions home →
+  full-screen Terminal → Details sheet overlay keeping the WS mounted);
+  `App.tsx` is now the device switch + shared dialogs + `#s=` deep-link; browser
+  history mirrors the layer stack via pushState so system-back unwinds one layer;
+  new store flag `showDetails`. Phase 2: a `@media PHONE_MQ` block gives the
+  shared components touch targets (≥44px rows) and turns modals into bottom
+  sheets; 100dvh + safe-area insets; `viewport-fit=cover`. Phase 3: `TermKeyBar`
+  (Esc/Tab/⇧Tab/Ctrl-latch/^C/arrows/⌨/Paste/Copy) drives a new `TerminalView`
+  input handle (write/focus/getSelection) over the same WS path; the Ctrl latch
+  transforms the next soft-keyboard key; `useVisualViewportHeight` keeps the bar
+  above the keyboard (interactive-widget meta). All shared components reused
+  unchanged — parity is structural. Verified end-to-end at 390×844 against a live
+  shell session (`scripts/mobile-shell-test.mjs`, ALL PASS) + desktop regression.
+  Remaining: **MOB-PWA** (phase 4) and **MOB-PUSH** below.
 
 ## Backlog summary
 
 | ID | Item | Priority | Depends on | Source (design) |
 | --- | --- | --- | --- | --- |
-| R4 | Gateway mode (egress-less downstreams) | **P1** | R1–R3 (done) | connectivity-execution-plan.md → R4 |
-| RF-M4 | Pre-M4 daemon refactor bundle (SessionManager split, asmux reconnect-supervisor seam, adopt-path test coverage) | **P1** | — (land immediately before M4) | refactoring-plan.md → RF-M4 |
-| M4 | Holder hardening + exact cold-stitch adopt | **P1** | M1–M3 (done); RF-M4 | durable-sessions.md → M4 |
-| RF-MOB | Client shell prep (`useActiveSession` hook, `showUsage`→store, unify `isLive`) | **P1** | — (do with/before MOB phase 1) | refactoring-plan.md → RF-MOB |
-| MOB | Mobile UI phases 1–3 + verify (adaptive shell, sheet CSS, terminal key bar) | **P1** | RF-MOB (client-only) | mobile-ui.md → Execution plan |
-| MOB-PWA | Mobile UI phase 4: PWA manifest + iOS metas | **P2** | MOB | mobile-ui.md → Packaging path |
-| MOB-PUSH | Web Push for attention states | **P3** | MOB; daemon push plumbing (relay as carrier) | mobile-ui.md → Follow-ups |
+| M4 | Holder hardening + exact cold-stitch adopt (now also absorbs RF-M4 #2: the reconnect-supervisor home + `AsmuxClient` trait) | **P1** | M1–M3 (done); RF-M4 #1/#3/#4 (done) | durable-sessions.md → M4; refactoring-plan.md → RF-M4 #2 |
+| MOB-PWA | Mobile UI phase 4: PWA manifest + iOS metas | **P2** | MOB (done) | mobile-ui.md → Packaging path |
+| MOB-PUSH | Web Push for attention states | **P3** | MOB (done); daemon push plumbing (relay as carrier) | mobile-ui.md → Follow-ups |
 | IMG-2 | Image paste follow-ups: `.asm/pastes/` cleanup policy, per-agent capability hint | **P3** | image paste + 📎 button (done) | image-paste.md → Follow-ups |
 | RF-ERR | Typed daemon error → HTTP status mapping (RelayError-style) | **P2** | — (pair with SEC-2 or RF-M4) | refactoring-plan.md → RF-ERR |
 | SEC-2 | Constrain `/api/fs/list` + workspace roots | **P1** | RF-ERR recommended (403 mapping) | security-followups.md → 2 (HIGH) |
-| SEC-1 | Transport encryption off-loopback (direct mode TLS; relay TLS ops) | **P1/P2** | partially ties to R5 | security-followups.md → 1 (HIGH) |
+| SEC-1 | Transport encryption off-loopback (direct mode TLS; relay TLS — **agent `wss://` (code) + relay rustls/proxy**) | **P1/P2** | partially ties to R5 | security-followups.md → 1 (HIGH) |
 | V0 | Web-editor de-risking spike (scratchpad only) | **P2** | R1–R3 (done) | vscode-over-relay-plan.md → V0 |
 | V1 | Relay cookie auth + daemon editor proxy | **P2** | V0 go decision | vscode-over-relay-plan.md → V1 |
 | V2 | IDE launcher, detection, editor tickets | **P2** | V1 | vscode-over-relay-plan.md → V2 |
@@ -90,36 +135,25 @@ pick it up**.
 | SEC-8 | Terminal-escape policy at capture/replay + fuzzing | **P3** | — | security-followups.md → 8 (LOW) |
 | DEC-1 | Decide: adopt planned client stack (shadcn/Tailwind/Dockview/Electron) or amend the plan | **P2** (decision, cheap) | — | mvp-execution-plan.md → Baseline Technology |
 | RF-VT100 | Terminal emulator dependency review (`vt100` 0.15 unmaintained) | **P3** | — (trigger: M4 cold-stitch work or upstream CVE) | refactoring-plan.md → RF-VT100 |
+| MEAS | Classifier measurement: local-LLM shadow classification of any registered heuristic (attention first), disagreement snapshots + triage (dev-only, default-off) | **P2** | RF-M4 recommended first (shares the `on_output`/`on_idle` seams); needs a local Ollama/llama-server on the dev host | classifier-measurement.md → Milestones |
 | DOC-1 | Doc sync: architecture.md still calls yamux the relay default | **P3** (one-liner) | — | architecture.md → Open Decisions |
 | I18N-2 | Additional locales beyond `en` | **P4** (deferred by user) | — | i18n.md → Adding a locale |
 
 ## Detail
 
-### R4 — Gateway mode (P1)
-
-The next milestone on the product path (relay = the connection model; see the
-locked zero-client-tooling principle). Daemon parses `ASM_RELAY_DOWNSTREAMS`,
-probes downstream `/health` for `node_id`/`label`, advertises them over the
-control stream, and serves `open` frames targeting a downstream by dialing
-that host:port; relay routes downstream node_ids via the owning gateway and
-reports `via`; client renders "D · via C". Plumbing already exists on both
-sides (`downstreams` in the protocol, `via` in `/nodes`). Acceptance: the
-gateway-test script described in the plan (relay + gateway C + downstream D on
-distinct loopback addresses; 5 checks).
-
-### RF-M4 — pre-M4 daemon refactor bundle (P1)
-
-Land immediately before M4: M4's reconnect and mid-flight reconciliation
-otherwise land in the two worst structural spots. Scope (structure only, zero
-behavior change): split `SessionManager` into workspace service / session
-monitor / lifecycle core; create the daemon↔asmux **reconnect-supervisor
-home** (today connection loss is handled in three disconnected layers with no
-owner) with `AsmuxClient` behind a testable seam; make `db`/`registry`
-private; extend `MockBackend` with `holder_list`/`adopt` so the startup adopt
-path — exactly where cold-stitch lands — gets tests **before** the flip.
-Full scope + acceptance: refactoring-plan.md → RF-M4.
-
 ### M4 — Holder hardening (P1)
+
+**RF-M4 #1/#3/#4 landed 2026-07-07** (see "Already done"): the `SessionManager`
+split, the `db`/`registry` encapsulation, and the `MockBackend` holder seams +
+`startup_reconcile` branch tests are in, so M4's reconnect/reconciliation now
+lands in focused modules and the cold-stitch flip is test-guarded. **RF-M4 #2
+was folded into M4** — build the daemon↔asmux **reconnect-supervisor home** (one
+task owning the `AsmuxClient` lifecycle; today `sidecar.rs`'s `Detached` arm just
+logs + breaks) together with the reconnect behavior it hosts, and put
+`AsmuxClient` behind a trait at that point so the backoff/reconciliation logic is
+unit-testable (async `create`/`attach`/`list` ⇒ decide `async-trait` vs
+future-boxing there). Pre-placed seams to reuse: `AsmuxClient::detach`,
+`instance_id`, `head_cursor`, `backend_cursor`.
 
 Orthogonal to the R-track (explicitly: R code must not assume M4 exists).
 Scope: idle watchdog + daemon↔asmux reconnect with backoff,
@@ -132,36 +166,20 @@ marker on `BUFFER_GAP`; everything is scaffolded, ring-replay is currently the
 default). This closes the headline "terminal intact after restart" promise for
 long-lived sessions whose output outgrew the ring.
 
-### RF-MOB — client shell prep (P1, client-only, hours)
+### MOB follow-ups — phases 4–5 remaining (P2/P3)
 
-MOB phase 1's only structural obstacle: `App.tsx` entangles shared data
-wiring with desktop-only layout, so a naive `MobileShell` would duplicate the
-wiring. Extract `useActiveSession()` (daemon poll + active-session derivation
-+ health counts), move `showUsage` into `useUiStore` (the only dialog flag
-not in the store), and unify the three divergent `isLive` definitions —
-note `RightPanel`'s ended-list omits `indeterminate`, a possible bug to
-decide while unifying. Detail: refactoring-plan.md → RF-MOB.
+Phases 1–3 shipped (see "Already done"); the mobile app is usable and the
+terminal genuinely workable on a phone, verified against a live session. What's
+left of the `mobile-ui.md` plan:
 
-### MOB — mobile adaptive shell (P1, client-only)
-
-Newly designed 2026-07-05 (`mobile-ui.md`). One codebase: `useIsPhone()`
-(`PHONE_MQ`) switches between the existing 3-pane `DesktopShell` and a new
-stacked `MobileShell` (Sessions home → full-screen Terminal → Details sheet
-over the live terminal); all panels/dialogs/stores/queries shared, so feature
-parity is structural. Phases: (1) shell split + pushState navigation,
-(2) touch-target + modal→bottom-sheet CSS, (3) terminal key bar
-(Esc/Tab/⇧Tab/Ctrl-latch/^C/arrows/⌨/Paste via a `TerminalView` input handle)
-+ visual-viewport keyboard geometry, (4) PWA manifest/icons (= MOB-PWA row),
-(5) headless-Chrome mobile-viewport verification + desktop regression.
-Phases 1–2 make the app usable on a phone; 1–3 make the terminal genuinely
-workable; each ships independently. No daemon changes; interleaves freely
-with R4/M4 (disjoint code). i18n rule applies to all new strings. This is the
-natural consumer of the R3 milestone ("mobile-ready, zero client tooling").
-Smaller follow-ups noted in the doc (attention-pinned home group, font-size
-control, tap-and-hold tooltips) ride along or slot in later; **MOB-PUSH**
-(Web Push for `approval_needed`/`likely_blocked`) is its own row because it
-needs daemon-side push plumbing with the relay as carrier — design that
-before building.
+- **MOB-PWA** (phase 4): web-app manifest (`display: standalone`, theme/bg
+  `#0b0e14`, icons) + iOS meta tags → "Add to Home Screen" becomes the zero-cost
+  phone app, and future store apps are thin wrappers around the same origin.
+- **MOB-PUSH**: Web Push for `approval_needed`/`likely_blocked` — its own row
+  because it needs daemon-side push plumbing with the relay as carrier; design
+  that before building.
+- Smaller follow-ups noted in the doc (attention-pinned home group, font-size
+  control, tap-and-hold tooltips) slot in later.
 
 ### RF-ERR — typed daemon error mapping (P2, pairs with SEC-2)
 
@@ -178,8 +196,14 @@ Gate exposing ASM beyond a trusted LAN. SEC-2 (fs-list browses the whole host
 filesystem; any client can register any workspace root) is self-contained
 daemon work: server-side allowed-roots config enforced for both browsing and
 registration. SEC-1 (plaintext HTTP/WS off loopback) splits: the **relay path**
-gets TLS via `ASM_RELAY_TLS_CERT/KEY` + deployment guidance (an R5 ops item);
-**direct mode** needs the Phase-8 TLS/mTLS deliverable (self-signed +
+(the product path) is plaintext today and is **not just an ops item** — it needs
+(i) a TLS feature enabled on the daemon agent's `tokio-tungstenite` so it can
+dial `wss://` at all (it is currently compiled without TLS, so a TLS reverse
+proxy in front of the relay is useless until this lands — a code change), plus
+(ii) relay-side rustls (`ASM_RELAY_TLS_CERT/KEY`, described in
+connectivity-execution-plan.md but **not yet implemented** in the relay binary)
+or a TLS-terminating proxy, with a real ACME cert so there is no client UX
+change; **direct mode** needs the Phase-8 TLS/mTLS deliverable (self-signed +
 pinning or ACME). Until then the SSH-tunnel recommendation stays prominent.
 
 ### V0–V3 — browser VS Code over the relay (P2)
@@ -285,6 +309,25 @@ snapshot path, or an upstream CVE. Detail: refactoring-plan.md → RF-VT100.
 default is yamux with dial-out as fallback. R1 locked **dial-out-per-stream**
 (recorded in connectivity-execution-plan.md); fix the architecture.md line.
 
+### MEAS — classifier measurement / shadow classification (P2, dev-only)
+
+A general shadow-classification harness: any classification heuristic in
+the project registers a `TaskSpec` (labels, prompt, projection, replay) and
+calls `observe()`; a local 1–2 B LLM (Ollama / llama-server on the dev
+host, never a cloud API) re-classifies the same snapshotted inputs in
+**shadow**. Agreement is recorded; disagreements persist a replayable
+snapshot + both labels + the LLM's reasoning into `measure_samples`. Triage
+loop turns `heuristic_gap` rows into regression-test fixtures and pattern
+fixes, and `llm_wrong` rows into banked training data for a future
+distilled classifier. Attention is the first registered task;
+`exit_outcome` and remote (client/asmux) submitters follow in MEAS-3.
+Default-off (`ASM_MEASURE=1`), zero effect on live state, rate-capped for
+CPU inference budgets. Full design incl. schema, sampling policy, adoption
+recipe, and the two-pass label/reasoning protocol:
+[`classifier-measurement.md`](classifier-measurement.md). Milestones
+MEAS-1..3 (task-agnostic core + attention → reasoning + triage/export →
+second task + remote observe).
+
 ### I18N-2 — additional locales (P4)
 
 Deferred by explicit user choice. Infrastructure is ready (`check-locales.mjs`
@@ -292,24 +335,33 @@ parity gate, typed keys); adding a locale is the 3-step recipe in `i18n.md`.
 
 ## Suggested order (cross-track)
 
-1. **RF-MOB** (hours) → **MOB** phases 1–3 — freshest design, client-only,
-   immediately usable value on top of the just-shipped relay path; runs in
-   parallel with any daemon work.
-2. **R4** — finishes the connectivity story the product is built around; no
-   refactor needed (relay/agent scaffolding is complete; daemon side is a
-   `Config` field + probe loop).
-3. **RF-M4** → **M4** — durability hardening; the only remaining gap in the
-   headline restart promise. Can interleave with R4 (different subsystems);
-   the cold-stitch flip waits for RF-M4's adopt-path tests.
-4. **SEC-2 + RF-ERR** (together), then **SEC-1(direct)** — before any
+1. ~~**MOB** phases 1–3~~ ✅ landed 2026-07-06 (RF-MOB + phases 1–3). Remaining
+   mobile work: **MOB-PWA** (phase 4) then **MOB-PUSH** (needs daemon push
+   plumbing) — see item 8.
+2. ~~**R4** — gateway mode~~ ✅ landed 2026-07-07 (daemon probe loop feeding the
+   relay agent over a `watch` channel; relay fast-fail; client `via` label).
+   Finishes the connectivity story the product is built around. Proof:
+   `scripts/gateway-test.mjs`.
+3. ~~**RF-M4** #1/#3/#4~~ ✅ landed 2026-07-07 (split, encapsulation, adopt-path
+   tests) → **M4** — durability hardening; the only remaining gap in the
+   headline restart promise. The cold-stitch flip is now guarded by RF-M4 #4's
+   `startup_reconcile` branch tests. M4 also absorbs the reconnect-supervisor
+   home + `AsmuxClient` trait (was RF-M4 #2).
+4. **MEAS-1** — right after RF-M4's SessionManager split settles the
+   `on_output`/`on_idle` seams it hooks (landing it earlier just makes the
+   refactor carry the hooks). Dev-only and parallel-friendly: once enabled
+   on a dev daemon it accrues heuristic-disagreement data passively while
+   every later item proceeds, so earlier = more signal for free. MEAS-2/3
+   ride along opportunistically (item 10 tier).
+5. **SEC-2 + RF-ERR** (together), then **SEC-1(direct)** — before any
    exposure beyond trusted networks.
-5. **DEC-1** (an hour of thought) → **RF-QUERY** → **MVP-RICH**.
-6. **V0** spike → V1–V3 as a block.
-7. **MOB-PWA**, then **MOB-PUSH** (design the push plumbing first).
-8. **R5** items as deployment needs them (TLS/ops first, ACLs next,
+6. **DEC-1** (an hour of thought) → **RF-QUERY** → **MVP-RICH**.
+7. **V0** spike → V1–V3 as a block.
+8. **MOB-PWA**, then **MOB-PUSH** (design the push plumbing first).
+9. **R5** items as deployment needs them (TLS/ops first, ACLs next,
    E2E-crypto decision when V-track ships).
-9. **MVP-HOOKS**, **MVP-CKPT** opportunistically.
-10. **M5** → **MVP-PKG** when cross-platform/packaging becomes the goal.
+10. **MVP-HOOKS**, **MVP-CKPT**, **MEAS-2/3** opportunistically.
+11. **M5** → **MVP-PKG** when cross-platform/packaging becomes the goal.
 
 Constraints to respect when reordering: nothing in R-track may assume M4
 features exist; V1's relay change must not add daemon-API parsing to the

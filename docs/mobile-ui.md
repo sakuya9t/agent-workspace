@@ -1,8 +1,9 @@
 # Mobile UI Design
 
 Goal: the full ASM control center on a phone — same features as the desktop web
-client, laid out for a narrow touch screen. This is a design + execution plan;
-nothing here is implemented yet.
+client, laid out for a narrow touch screen. **Status (2026-07-06): execution
+plan phases 1–3 shipped** (adaptive shell, touch/sheet CSS, terminal key bar);
+phase 4 (PWA packaging) and the follow-ups remain. See the Execution plan below.
 
 ## Constraints
 
@@ -55,7 +56,7 @@ terminal — and its WebSocket — stays mounted underneath).
 
 ```
 ┌─ Sessions (home) ─┐  tap session   ┌─ Terminal ────────┐  ⓘ   ┌─ Details sheet ─┐
-│ health · Daemons  │ ─────────────▶ │ ‹ agent·status ⓘ  │ ───▶ │ VS Code, fields │
+│ health · Daemons  │ ─────────────▶ │ ‹ agent·status ⓘ  │ ───▶ │ fields, cleanup │
 │ host ▸ ws ▸ rows  │ ◀───────────── │  xterm (fills)    │ ◀─── │ SCM, diffs,     │
 │ history (bottom)  │  ‹ back /      │ [Esc Tab ^ ⇧⇥ ↑↓] │ swipe│ pull/rebase,    │
 └───────────────────┘  system back   └───────────────────┘ down └─ commit graph ──┘
@@ -119,13 +120,17 @@ Terminal screen.
 ### Sheet — Details (RightPanel)
 
 Full-height sheet (~94 dvh, drag-handle + swipe-down/× to close) sliding over
-the terminal screen, hosting the unchanged `RightPanel`: Continue-in-VS-Code
-(kept for parity; on phones the deep link typically fails and the existing
-"didn't open" fallback with the copyable CLI command appears), risk banner,
-metadata fields, worktree cleanup, end-of-session summary, and the full source
-control block — branch, changed files → DiffModal, pull/rebase with branch
-picker, commit graph → CommitModal. Rendering it as an overlay (not a pushed
-screen) keeps the terminal mounted and attached underneath.
+the terminal screen, hosting the `RightPanel`: risk banner, metadata fields,
+worktree cleanup, end-of-session summary, and the full source control block —
+branch, changed files → DiffModal, pull/rebase with branch picker, commit graph
+→ CommitModal. Rendering it as an overlay (not a pushed screen) keeps the
+terminal mounted and attached underneath.
+
+**Continue-in-VS-Code is the one deliberate parity break:** the whole affordance
+is hidden on phones (`RightPanel` gates it behind `!useIsPhone()`). A phone has
+no local VS Code for the `vscode://` deep link to reach, so the button and its
+"didn't open"/CLI fallback are dead weight; the browser web editor (V-track)
+will be the mobile editing path.
 
 ### Modals → full-screen sheets
 
@@ -160,7 +165,7 @@ desktop (select session on load).
 | Stop / archive / takeover confirm / attention ack | Identical (row buttons + row tap) |
 | Terminal + status header + View usage | Terminal screen + header buttons |
 | Keyboard input incl. Esc/Ctrl/arrows | Soft keyboard + key bar (new) |
-| Right panel: VS Code, fields, cleanup, summary | Details sheet, same component |
+| Right panel: VS Code, fields, cleanup, summary | Details sheet, same component (VS Code hidden — see below) |
 | SCM: status, changed files, diff, pull, rebase, commit graph, commit detail | Details sheet, same components; modals as sheets |
 | New session / new workspace / directory picker / connection & relay manage / usage | Same dialogs as full-screen sheets |
 | Panel resize | N/A on phone (no panels) — desktop unchanged |
@@ -178,26 +183,29 @@ desktop (select session on load).
 
 ## Execution plan
 
-1. **Shell split** — `useIsPhone()`; extract the current 3-pane JSX from
-   `App.tsx` into `DesktopShell`; add `MobileShell` (home screen + terminal
-   screen + details sheet + navigation state in `useUiStore`:
-   `showDetails`, derived screen from `activeSession`). History/pushState
-   integration. *(new: MobileShell.tsx, useIsPhone.ts; touch: App.tsx,
-   store.ts, main.tsx)*
-2. **Touch & sheet CSS** — `PHONE_MQ` media block in `styles.css`: touch
-   targets, modal→sheet, safe-area, dvh root. *(touch: styles.css,
-   index.html)*
-3. **Terminal on touch** — key bar component + `TerminalView` input handle +
-   `useVisualViewportHeight`. i18n keys for key labels/tooltips. *(new:
-   TermKeyBar.tsx; touch: Terminal.tsx, en.json)*
+1. ✅ **Shell split** (landed 2026-07-06) — `useIsPhone()`; extracted the 3-pane
+   JSX from `App.tsx` into `DesktopShell`; added `MobileShell` (home + terminal
+   + details sheet). Nav state in `useUiStore` (`showDetails`) + browser-history
+   pushState mirroring the layer stack + `#s=` deep-link. *(new: MobileShell.tsx,
+   useIsPhone.ts, agents.ts, DesktopShell.tsx; touch: App.tsx, store.ts)* — note
+   the shared dialogs live in `App.tsx`, not `main.tsx`.
+2. ✅ **Touch & sheet CSS** (landed 2026-07-06) — one `@media PHONE_MQ` block in
+   `styles.css`: touch targets, modal→bottom-sheet, safe-area, 100dvh root;
+   `viewport-fit=cover`. *(touch: styles.css, index.html)*
+3. ✅ **Terminal on touch** (landed 2026-07-06) — `TermKeyBar` +
+   `TerminalView` input handle (write/focus/getSelection) + Ctrl latch +
+   `useVisualViewportHeight` + `interactive-widget=resizes-content`. i18n
+   `keybar.*`. *(new: TermKeyBar.tsx, terminalTypes.ts, useVisualViewportHeight.ts;
+   touch: Terminal.tsx, MobileShell.tsx, clipboard.ts, en.json, index.html)*
 4. **PWA wrapper** — manifest, icons, theme-color, iOS metas. *(touch:
    index.html; new: public/manifest.webmanifest, icons)*
-5. **Verify** — headless-Chrome mobile-viewport pass (390×844 + 844×390)
-   driving: connect → new workspace → new session → type via key bar → diff →
-   pull → archive; plus desktop regression at 1280×800.
+5. ✅ **Verify** (for phases 1–3) — `scripts/mobile-shell-test.mjs`: headless
+   Chrome at 390×844 against a live shell session drives device switch → session
+   tap → key-bar/Ctrl-latch input over the WS → details sheet → back navigation
+   (ALL PASS), plus desktop regression at 1280×800. Re-run after phase 4.
 
 Phases 1–2 make the app usable on a phone; 3 makes the terminal genuinely
-workable; 4 is packaging. Each phase ships independently.
+workable (all shipped); 4 is packaging. Each phase ships independently.
 
 ## Follow-ups (out of scope, noted so they aren't lost)
 

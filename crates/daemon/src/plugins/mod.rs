@@ -97,6 +97,16 @@ pub trait AgentPlugin: Send + Sync {
         false
     }
 
+    /// Called when a *working* session's output goes silent (the idle settle),
+    /// with the rendered visible screen: return a reason if the agent stopped
+    /// **on an error** (e.g. Claude Code's `API Error: …`, printed with no bell
+    /// and no prompt) rather than at a ready prompt. `Some` settles the session
+    /// to [`AttentionState::Error`] instead of `Idle`. The default — providers
+    /// with no known stop-on-error rendering — never flags.
+    fn idle_error(&self, _screen: &str) -> Option<String> {
+        None
+    }
+
     /// Best-effort token/context usage for a running session, read from the
     /// agent's own on-disk transcript (mirrors its `/status` / `/usage`). Agents
     /// that don't persist usage return `None`.

@@ -7,7 +7,11 @@
 #   2. Rust toolchain via rustup — into ~/.cargo / ~/.rustup, NO sudo. Adds the
 #      clippy + rustfmt components used by the dev flow.
 #   3. `cargo build` of the workspace (asm-daemon + asmux + asm-relay).
-#   4. web-client deps (`npm install`) if Node is present — optional.
+#   4. web client (optional): if Node/npm is present, install deps AND build
+#      client/dist so the daemon can serve the UI headlessly (ASM_STATIC_DIR) —
+#      no npm/vite needed on the serving box. Missing Node is a warning, not a
+#      failure: the daemon runs fine without a UI, and a pre-built client/dist
+#      copied in from a build machine is served as-is.
 #
 # Safe to re-run: every step is skipped when it's already satisfied.
 #
@@ -174,28 +178,69 @@ build_rust() {
 }
 
 # ---------------------------------------------------------------------------
-# 4. Web client deps (optional). Node is only needed for the browser UI and the
-#    .mjs test scripts — the daemon itself runs without it, so a missing Node is
-#    a warning, not a failure.
+# 4. Web client (optional). Two ways the browser UI reaches users:
+#      • packaged — the daemon serves a pre-built client/dist itself
+#        (ASM_STATIC_DIR), needing NO Node/npm/vite on the serving box.
+#      • dev       — `npm run dev` runs Vite and proxies to the daemon.
+#    A headless server without npm/vite is fully supported: it just needs a
+#    pre-built client/dist (built here when Node is present, or copied in from a
+#    machine that has one). The daemon also runs fine with no client at all.
 # ---------------------------------------------------------------------------
+CLIENT_DIST=""  # set to a servable client/dist when one is ready (for the banner)
+
 setup_client() {
   if [ "${ASM_NO_CLIENT:-0}" = "1" ]; then
     log "ASM_NO_CLIENT=1 — skipping web client"
     return 0
   fi
+
+  local dist="$ROOT/client/dist"
+
+  # A pre-built bundle (built here earlier, or copied from a build machine) is
+  # all a no-Node server needs — the daemon serves it via ASM_STATIC_DIR.
+  if [ -f "$dist/index.html" ]; then
+    CLIENT_DIST="$dist"
+    log "pre-built web client present at client/dist — daemon can serve it (ASM_STATIC_DIR)"
+  fi
+
+  # No Node toolchain on this box: it can't build the client. That's fine for
+  # serving — point at the packaged path, not the (impossible) Vite dev server.
   if ! have node || ! have npm; then
-    warn "Node.js/npm not found — skipping the web client."
-    warn "install Node 20+ (e.g. https://github.com/nvm-sh/nvm) then run: cd client && npm install"
+    if [ -n "$CLIENT_DIST" ]; then
+      log "Node/npm absent, but the pre-built client/dist is enough to serve the UI."
+    else
+      warn "Node.js/npm not found — can't build the web client on this box."
+      warn "The daemon serves a *pre-built* client with no Node toolchain needed:"
+      warn "  • on a machine with Node 20+:  cd client && npm install && npm run build"
+      warn "  • copy the resulting client/dist/ to this host, then start with"
+      warn "        ASM_STATIC_DIR=$dist scripts/start.sh"
+      warn "  (or install Node 20+ here once to build it — https://github.com/nvm-sh/nvm)"
+    fi
     return 0
   fi
+
   local major
   major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
   if [ "$major" -lt 20 ] 2>/dev/null; then
     warn "Node $(node -v) detected; the client wants Node 20+. Continuing, but the build may fail."
   fi
+
   log "installing web client deps (npm install)..."
   ( cd "$ROOT/client" && npm install )
-  log "client deps installed — run 'cd client && npm run dev' for the UI"
+
+  # Build the static bundle so the daemon can serve the UI headlessly — this is
+  # what lets a server without npm/vite host the client. Skipped under
+  # ASM_NO_BUILD (deps only); a build failure is non-fatal since `npm run dev`
+  # still works for local development.
+  if [ "${ASM_NO_BUILD:-0}" = "1" ]; then
+    log "ASM_NO_BUILD=1 — client deps installed, skipping the client build (client/dist)"
+  elif ( cd "$ROOT/client" && npm run build ); then
+    CLIENT_DIST="$dist"
+    log "client built → client/dist — daemon can serve it (ASM_STATIC_DIR=$dist)"
+  else
+    warn "client build failed — 'npm run dev' still works for local development;"
+    warn "re-run 'cd client && npm run build' to produce a daemon-servable client/dist."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -205,6 +250,22 @@ main() {
   ensure_rust
   build_rust
   setup_client
+
+  # Tailor the Web UI hint to what's actually available: a built (or copied-in)
+  # client/dist can be served headlessly by the daemon with no Node toolchain;
+  # otherwise point at how to produce one.
+  local web_ui
+  if [ -n "$CLIENT_DIST" ]; then
+    web_ui="Web UI is built (client/dist). Serve it straight from the daemon —
+     no Node/npm/vite needed on this box:
+         ASM_STATIC_DIR=$CLIENT_DIST scripts/start.sh
+     …or for live-reload development:  cd client && npm run dev"
+  else
+    web_ui="Web UI: build a servable bundle with 'cd client && npm run build'
+     (needs Node 20+), or copy one in, then serve it headlessly via
+         ASM_STATIC_DIR=$ROOT/client/dist scripts/start.sh
+     …or for development instead:  cd client && npm run dev"
+  fi
 
   cat <<EOF
 
@@ -219,7 +280,7 @@ Next steps:
   3. Check it and grab this host's enrollment token:
          scripts/status.sh
          scripts/token.sh
-  4. Web UI (dev):  cd client && npm run dev
+  4. $web_ui
 EOF
 }
 

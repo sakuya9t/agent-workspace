@@ -51,6 +51,11 @@ start_daemon
 
 backend="$(command -v curl >/dev/null 2>&1 && curl -s "http://$ASM_BIND/health" | sed -n 's/.*"backend":"\([^"]*\)".*/\1/p' || true)"
 log "ready — http://$ASM_BIND (backend=${backend:-?})"
+# The daemon serves the packaged web client itself when ASM_STATIC_DIR points at
+# a build (auto-set from client/dist in _asm_common.sh) — no npm/vite needed.
+if [ -n "${ASM_STATIC_DIR:-}" ] && [ -d "$ASM_STATIC_DIR" ]; then
+  log "web UI — http://$ASM_BIND (served from ${ASM_STATIC_DIR#"$ROOT"/})"
+fi
 relay_enabled && log "relay  — http://$ASM_RELAY_BIND (nodes register here)"
 [ -n "${ASM_RELAY_URL:-}" ] && log "node   — registering to $ASM_RELAY_URL"
 log "logs   — $LOG_DIR/{asmux,asm-daemon$(relay_enabled && echo ',asm-relay')}.log"

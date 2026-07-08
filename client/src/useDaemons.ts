@@ -37,6 +37,13 @@ export function useDaemonStates(): DaemonState[] {
       // A disconnected host stays in the list but is not polled.
       enabled: d.connected,
       refetchInterval: d.connected ? 1500 : (false as const),
+      // Keep polling while the tab is backgrounded — the tab alert (blinking
+      // title + warning favicon, see useTabAlert) exists precisely to flag a
+      // session that gets blocked while the user is browsing something else,
+      // and TanStack's default pauses interval refetches for unfocused tabs.
+      // (Browsers throttle background timers, so the effective rate degrades
+      // gracefully rather than costing a poll every 1.5s forever.)
+      refetchIntervalInBackground: true,
       // Keep the last good data during a refetch (and across token/URL changes)
       // so the panel never blanks between polls.
       placeholderData: keepPreviousData,

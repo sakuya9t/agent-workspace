@@ -5,6 +5,8 @@
     "daemonSummary_other": "{{count}} daemons · {{reachable}} reachable · {{live}} live",
     "manage": "manage",
     "manageTitle": "Connect / manage daemons",
+    "blockedTab_one": "🔴 {{count}} session needs attention",
+    "blockedTab_other": "🔴 {{count}} sessions need attention",
     "terminal": "Terminal",
     "viewUsage": "view usage",
     "viewUsageTitle": "Token & context usage for this session",
@@ -28,6 +30,7 @@
     "idle": "idle",
     "likely_blocked": "blocked",
     "approval_needed": "blocked",
+    "error": "error",
     "failed": "failed"
   },
   "isolation": {
@@ -55,6 +58,7 @@
   "common": {
     "cancel": "Cancel",
     "close": "close",
+    "dismiss": "Dismiss",
     "copy": "Copy",
     "copied": "Copied",
     "browse": "Browse…",
@@ -222,8 +226,14 @@
     "rebaseOnto": "Rebase {{branch}} onto",
     "rebaseSelectPlaceholder": "Select a branch…",
     "rebaseConfirm": "Rebase",
+    "mergeTitle": "Merge this branch into…",
+    "mergeInto": "Merge {{branch}} into",
+    "mergeSelectPlaceholder": "Select a branch…",
+    "mergeConfirm": "Merge",
+    "mergeConflictPrompt": "{{message}}\n\nThe merge was aborted; no conflict files were left behind.",
     "loadingBranches": "Loading branches…",
     "noOtherBranches": "No other branches to rebase onto.",
+    "noMergeBranches": "No other branches to merge into.",
     "scmRunning": "Running…"
   },
   "usage": {
@@ -242,6 +252,9 @@
   },
   "diffModal": {
     "loading": "Loading diff…",
+    "loadingImage": "Loading image…",
+    "before": "Before",
+    "after": "After",
     "noChanges": "No changes to display."
   },
   "commitModal": {
@@ -257,7 +270,28 @@
     "uploadingImage": "Uploading image…",
     "pasteFailed": "Image paste failed: {{message}}",
     "pastedImageRef": "[pasted image {{path}}] ",
-    "attachImage": "Attach image"
+    "attachImage": "Attach image",
+    "copied": "Copied",
+    "copyFailed": "Copy failed"
+  },
+  "mobile": {
+    "back": "Back to sessions",
+    "details": "Details"
+  },
+  "keybar": {
+    "label": "Terminal keys",
+    "esc": "Esc",
+    "tab": "Tab",
+    "shiftTab": "⇧Tab",
+    "ctrl": "Ctrl",
+    "ctrlC": "^C",
+    "up": "Arrow up",
+    "down": "Arrow down",
+    "left": "Arrow left",
+    "right": "Arrow right",
+    "keyboard": "Show keyboard",
+    "paste": "Paste",
+    "copy": "Copy"
   },
   "api": {
     "unreachableAt": "cannot connect — daemon unreachable at {{baseUrl}} (not started?)",
@@ -266,12 +300,15 @@
     "gatewayUnreachable": "cannot connect — daemon unreachable ({{message}})"
   },
   "connection": {
-    "title": "Daemons",
+    "title": "Connections",
+    "navExisting": "Existing",
+    "navAdd": "Add",
+    "addTabDaemon": "Daemon",
+    "addTabRelay": "Relay",
     "sameOrigin": "same-origin (local)",
     "tokenTag": "🔒 token",
     "remove": "remove",
     "enrollTokenLabel": "Enrollment token for other devices:",
-    "addDivider": "— add a remote daemon —",
     "urlLabel": "Daemon URL",
     "urlPlaceholder": "{{lan}}  or  {{tunnel}} (SSH tunnel)",
     "tokenLabel": "Enrollment token",
@@ -286,8 +323,7 @@
   },
   "relay": {
     "sectionTitle": "— relays —",
-    "empty": "No relays yet. Relays don't appear on their own — add one below with its URL and access key. Hosts that dial out to it then show up here, ready to connect.",
-    "addDivider": "— add a relay —",
+    "empty": "No relays yet. Relays don't appear on their own — add one from the Add · Relay tab with its URL and access key. Hosts that dial out to it then show up here, ready to connect.",
     "urlLabel": "Relay URL",
     "urlPlaceholder": "http://relay-host:4700",
     "keyLabel": "Access key",

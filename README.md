@@ -228,6 +228,10 @@ socket path), `ASMUX_MEMORY_LIMIT` (holder ring-memory cap, bytes).
 | GET | `/api/sessions/:id/scm/status` | repo status, branch, changed files |
 | GET | `/api/sessions/:id/scm/diff?path=&untracked=` | unified diff for a file |
 | GET | `/api/sessions/:id/scm/log?limit=` | commit history |
+| GET | `/api/sessions/:id/scm/branches` | local branches + current HEAD |
+| POST | `/api/sessions/:id/scm/pull` | fast-forward-only pull for the session branch |
+| POST | `/api/sessions/:id/scm/rebase` | rebase the session branch onto a target branch |
+| POST | `/api/sessions/:id/scm/merge` | merge the session branch into a target branch |
 
 WebSocket protocol: the server sends binary frames of terminal output (the
 first frame is the snapshot repaint). The client sends terminal input as binary
@@ -380,6 +384,33 @@ at registration; a mismatched client entry reads as unreachable.
 > tracked in [`docs/security-followups.md`](docs/security-followups.md).
 
 ## Running the client
+
+There are two ways to get the browser UI in front of users.
+
+**Packaged (no Node/npm/vite on the serving box).** The daemon serves a
+pre-built client itself. Build the bundle once on any machine that has Node
+20+, then point the daemon at it:
+
+```bash
+cd client && npm install && npm run build   # produces client/dist/
+```
+
+`scripts/setup.sh` runs this build for you when Node is present. `scripts/start.sh`
+then auto-serves `client/dist` if it exists (via `ASM_STATIC_DIR`), so the UI is
+live at the daemon's own address (`http://<host>:4600`) with **no dev server and
+no Node toolchain on the serving host**. On a headless server without Node, copy
+a `client/dist/` built elsewhere and start with:
+
+```bash
+ASM_STATIC_DIR=/path/to/client/dist scripts/start.sh
+```
+
+Set `ASM_STATIC_DIR=` (empty) to disable packaged serving. If you build
+`client/dist` while the daemon is already running, `scripts/restart-daemon.sh`
+picks it up.
+
+**Dev (live reload).** The Vite dev server proxies `/api` and `/health` to the
+daemon — needs Node/npm on your workstation:
 
 ```bash
 cd client

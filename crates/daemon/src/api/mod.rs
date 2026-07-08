@@ -83,11 +83,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/:id/stream", get(ws::stream))
         .route("/api/sessions/:id/scm/status", get(scm::status))
         .route("/api/sessions/:id/scm/diff", get(scm::diff))
+        .route("/api/sessions/:id/scm/file", get(scm::file))
         .route("/api/sessions/:id/scm/log", get(scm::log))
         .route("/api/sessions/:id/scm/commit", get(scm::commit))
         .route("/api/sessions/:id/scm/branches", get(scm::branches))
         .route("/api/sessions/:id/scm/pull", post(scm::pull))
-        .route("/api/sessions/:id/scm/rebase", post(scm::rebase));
+        .route("/api/sessions/:id/scm/rebase", post(scm::rebase))
+        .route("/api/sessions/:id/scm/merge", post(scm::merge));
 
     // Optionally serve a packaged web client.
     if let Some(dir) = static_dir {
@@ -137,7 +139,7 @@ fn hostname() -> String {
 }
 
 async fn list_plugins(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(json!({ "plugins": state.manager.registry.describe() }))
+    Json(json!({ "plugins": state.manager.registry().describe() }))
 }
 
 async fn list_workspaces(
@@ -345,7 +347,7 @@ async fn get_session_usage(
     // the async runtime.
     let manager = state.manager.clone();
     let usage = tokio::task::spawn_blocking(move || {
-        manager.registry.get(&s.agent_plugin_id).and_then(|p| {
+        manager.registry().get(&s.agent_plugin_id).and_then(|p| {
             p.usage(&crate::plugins::usage::UsageContext {
                 cwd: std::path::PathBuf::from(&s.working_directory),
                 started_at_ms: s.created_at,

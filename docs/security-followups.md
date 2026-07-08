@@ -10,17 +10,39 @@ logs can contain secrets, logs live on the daemon host, retention is
 conservative, and encryption-at-rest + production redaction are deferred. The
 items below are additional, tracked here so we don't forget.
 
-## 1. No transport encryption for direct off-loopback access — HIGH
+## 1. No transport encryption off loopback — direct AND relay paths — HIGH
 
-- **What:** direct LAN/remote HTTP + WebSocket is plaintext. Device bearer
-  tokens, terminal input/output, and diffs travel unencrypted over the network.
+- **What:** off-loopback HTTP + WebSocket is plaintext. Device bearer tokens,
+  terminal input/output, and diffs travel unencrypted over the network. This
+  applies to **both** exposure paths: a direct off-loopback bind, and the relay
+  path (the product path) — the browser↔relay and daemon↔relay hops both carry
+  the device token and full terminal I/O.
 - **Current mitigation:** loopback-trust means the recommended remote path is an
   **SSH local port-forward**, which encrypts the channel. Direct off-loopback
   bind is opt-in and documented as untrusted-network-unsafe.
-- **Guidance:** implement the Phase 8 "TLS/mTLS or equivalent" deliverable for
-  direct mode — self-signed cert + client pinning, or an ACME path; consider
-  mTLS so the device token isn't the only credential on the wire. Until then,
-  keep the SSH-tunnel recommendation prominent.
+- **Relay path is plaintext today, with an unbuilt code prerequisite.** The
+  design (`connectivity-execution-plan.md`) has the relay listen on rustls TLS
+  via `ASM_RELAY_TLS_CERT` / `ASM_RELAY_TLS_KEY`, but the relay binary does not
+  read those yet — `RelayConfig` is `bind` + `keys` only and `run()` binds a
+  plain `TcpListener`. Worse, the daemon's relay agent depends on
+  `tokio-tungstenite` with **no TLS feature enabled**, so it can only dial
+  `ws://`; a `wss://` URL fails at runtime. Relay TLS is therefore not merely an
+  ops/cert task: **a TLS-terminating reverse proxy in front of the relay is
+  useless until the agent can speak `wss://`**, because the daemon dials the
+  relay outbound from behind NAT and must itself make the TLS connection.
+- **Guidance:**
+  - Enable a TLS feature (e.g. `rustls-tls-webpki-roots`) on
+    `tokio-tungstenite` and wire the connector so the daemon agent can dial
+    `wss://`. This is the blocker — do it first.
+  - Implement relay-side TLS (`ASM_RELAY_TLS_CERT/KEY`, rustls) or terminate TLS
+    at a reverse proxy in front of the relay.
+  - Use a **real ACME cert** on the relay, not self-signed, so there is **no
+    client-facing UX change** (no browser certificate warning). Because the
+    daemon stays loopback-bound, it needs no cert of its own on the relay path.
+  - For **direct mode**, implement the Phase 8 "TLS/mTLS or equivalent"
+    deliverable — self-signed cert + client pinning, or an ACME path; consider
+    mTLS so the device token isn't the only credential on the wire.
+  - Until all of this lands, keep the SSH-tunnel recommendation prominent.
 
 ## 2. `/api/fs/list` exposes the whole host filesystem — HIGH
 
@@ -32,6 +54,14 @@ items below are additional, tracked here so we don't forget.
   configured set of allowed roots that a client cannot expand without host-side
   approval; treat "browse anywhere" as an explicit, host-granted capability.
   Enforce the workspace allowlist for the picker, not just for raw-cwd sessions.
+- **Related (image preview):** `GET /api/sessions/:id/scm/file` serves a changed
+  file's raw bytes so the diff panel can show image previews. It is deliberately
+  narrow: `guard_path` blocks `..`/absolute paths, the working-tree read is
+  canonicalized and confined to the session `cwd` (a repo symlink pointing
+  outside is refused), and only bytes that magic-sniff as PNG/JPEG/GIF/WebP are
+  returned. The residual exposure is the same as the picker's: `cwd` itself is
+  host-chosen, so the allowed-roots work above also bounds what this endpoint can
+  ever reach.
 
 ## 3. Enrollment token is a static, non-expiring shared secret — MEDIUM
 
@@ -110,3 +140,25 @@ items below are additional, tracked here so we don't forget.
   rate-limit rows.
 - **Guidance:** if a "no outbound network" deployment mode is added, gate this
   fetch behind it.
+
+## 11. Gateway→downstream trust relies on a non-loopback hop — LOW (topology-dependent)
+
+- **What:** a downstream reached through a gateway (R4) is dialed by the gateway
+  at its ordinary listener, so the downstream makes its own loopback-trust
+  decision from the **gateway's** source address. In the intended deployment the
+  gateway reaches the downstream over the private network — a non-loopback hop —
+  so the downstream enforces its device token on relayed traffic and the R2
+  invariant ("relayed traffic never inherits loopback trust") holds by topology.
+  A downstream **co-located on the gateway host** (a loopback hop) would instead
+  grant loopback trust to gatewayed traffic, i.e. tokenless access for any client
+  that can reach the gateway through the relay. (This is also why
+  `scripts/gateway-test.mjs`, which emulates the gateway and downstream on
+  127.0.0.x, cannot assert downstream token enforcement across the hop — it
+  proves the relay-key gate instead, and documents the caveat inline.)
+- **Current mitigation:** the gateway model exists for **egress-less**
+  downstreams (the downstream cannot reach the relay while the gateway can),
+  which implies a network boundary between them; co-location is a degenerate
+  configuration.
+- **Guidance:** ship the item-6 "always require a token" mode and recommend it on
+  any downstream that shares a host (or loopback range) with its gateway; fold
+  into item 1's off-loopback story.

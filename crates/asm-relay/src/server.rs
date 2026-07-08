@@ -109,6 +109,10 @@ struct Route {
     via: String,
     target: String,
     is_downstream: bool,
+    /// The gateway's most recent probe verdict for a downstream target (always
+    /// `true` for a direct node). A `false` here lets the proxy fail fast with
+    /// `downstream_unreachable` instead of minting a stream that will time out.
+    reachable: bool,
 }
 
 pub struct Registry {
@@ -205,15 +209,17 @@ impl Registry {
                 via: node_id.to_string(),
                 target: node_id.to_string(),
                 is_downstream: false,
+                reachable: true,
             });
         }
         // Otherwise it may be an advertised downstream of some gateway.
         for (gw_id, st) in nodes.iter() {
-            if st.downstreams.iter().any(|d| d.node_id == node_id) {
+            if let Some(d) = st.downstreams.iter().find(|d| d.node_id == node_id) {
                 return Some(Route {
                     via: gw_id.clone(),
                     target: node_id.to_string(),
                     is_downstream: true,
+                    reachable: d.reachable,
                 });
             }
         }
@@ -399,6 +405,11 @@ async fn proxy(
     let Some(ctrl_tx) = reg.ctrl_if_online(&route.via) else {
         return err_response(RelayError::NodeOffline);
     };
+    // A downstream the gateway last probed as unreachable fails fast — no point
+    // minting a stream the node will refuse to dial (it would only 502 on timeout).
+    if route.is_downstream && !route.reachable {
+        return err_response(RelayError::DownstreamUnreachable);
+    }
     // The error to surface when the routed node fails to produce a stream.
     let unreachable = if route.is_downstream {
         RelayError::DownstreamUnreachable
@@ -604,4 +615,73 @@ fn ms_string(t: SystemTime) -> String {
     t.duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis().to_string())
         .unwrap_or_else(|_| "0".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A registry holding one gateway that advertises a reachable and an
+    /// unreachable downstream.
+    fn reg_with_gateway() -> Registry {
+        let reg = Registry::new(HashSet::new());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        reg.register(
+            "gw",
+            "gateway".to_string(),
+            vec![
+                DownstreamInfo {
+                    node_id: "d-up".to_string(),
+                    label: "up".to_string(),
+                    reachable: true,
+                },
+                DownstreamInfo {
+                    node_id: "d-down".to_string(),
+                    label: "down".to_string(),
+                    reachable: false,
+                },
+            ],
+            tx,
+        );
+        reg
+    }
+
+    #[test]
+    fn routes_downstream_via_its_gateway() {
+        let reg = reg_with_gateway();
+
+        let up = reg.route("d-up").expect("reachable downstream routes");
+        assert_eq!(up.via, "gw");
+        assert_eq!(up.target, "d-up");
+        assert!(up.is_downstream && up.reachable);
+
+        // An unreachable downstream still resolves (via the gateway), but carries
+        // the false flag so the proxy can fail fast.
+        let down = reg.route("d-down").expect("unreachable downstream still routes");
+        assert!(down.is_downstream && !down.reachable);
+
+        // The gateway itself routes to itself, always reachable.
+        let gw = reg.route("gw").expect("gateway routes to itself");
+        assert!(!gw.is_downstream && gw.reachable);
+
+        assert!(reg.route("nobody").is_none());
+    }
+
+    #[test]
+    fn snapshot_surfaces_downstreams_with_via() {
+        let reg = reg_with_gateway();
+        let snap = reg.snapshot();
+
+        let gw = snap.iter().find(|n| n.node_id == "gw").expect("gateway entry");
+        assert_eq!(gw.kind, NodeKind::Gateway);
+        assert!(gw.via.is_none());
+
+        let up = snap.iter().find(|n| n.node_id == "d-up").expect("downstream entry");
+        assert_eq!(up.via.as_deref(), Some("gw"));
+        assert_eq!(up.kind, NodeKind::Leaf);
+        assert!(up.online, "reachable downstream of an online gateway is online");
+
+        let down = snap.iter().find(|n| n.node_id == "d-down").unwrap();
+        assert!(!down.online, "unreachable downstream shows offline");
+    }
 }

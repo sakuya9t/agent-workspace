@@ -30,6 +30,9 @@ use crate::plugins::{attention, AgentContext, AgentPlugin, PluginRegistry};
 use crate::util::now_millis;
 use crate::workspace;
 
+mod monitor;
+mod workspaces;
+
 /// A destructive operation was refused because it would discard uncommitted or
 /// unmerged work. Carried as a typed error so the API can answer `409 Conflict`
 /// and the client can confirm and retry with `force`.
@@ -93,8 +96,8 @@ struct Interaction {
 /// Owns session lifecycle: plugin resolution, backend spawn, persistence, and
 /// the per-session monitor task that tracks exit, summaries, and attention.
 pub struct SessionManager {
-    pub db: Db,
-    pub registry: Arc<PluginRegistry>,
+    db: Db,
+    registry: Arc<PluginRegistry>,
     backend: Arc<dyn SessionBackend>,
     live: Mutex<HashMap<String, Arc<dyn BackendSession>>>,
     /// Base directory under which per-session Git worktrees are created.
@@ -118,6 +121,19 @@ impl SessionManager {
             worktree_root,
             interactions: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The persistence handle. Crate-internal accessor so auth/ws handlers read
+    /// through one deliberate door instead of a public field (keeping the DB out
+    /// of any external surface). Session logic inside this module uses the field.
+    pub(crate) fn db(&self) -> &Db {
+        &self.db
+    }
+
+    /// The agent plugin registry (read-only, shared). Crate-internal accessor,
+    /// same rationale as [`Self::db`].
+    pub(crate) fn registry(&self) -> &PluginRegistry {
+        &self.registry
     }
 
     pub fn backend_id(&self) -> &'static str {
@@ -239,313 +255,6 @@ impl SessionManager {
         self.db
             .get_session(&id)?
             .ok_or_else(|| anyhow!("session vanished after creation"))
-    }
-
-    /// Decide where a session runs: an isolated worktree for a Git workspace,
-    /// the source root for a direct/plain workspace, or a raw allowlisted path.
-    fn resolve_workspace(
-        &self,
-        session_id: &str,
-        req: &CreateSessionRequest,
-    ) -> Result<(String, Option<WorkspaceInstance>)> {
-        let now = now_millis();
-        match &req.workspace_id {
-            Some(ws_id) => {
-                let ws = self
-                    .db
-                    .get_workspace(ws_id)?
-                    .ok_or_else(|| anyhow!("unknown workspace `{ws_id}`"))?;
-                let root = PathBuf::from(&ws.root_path);
-                if !root.is_dir() {
-                    bail!("workspace root does not exist: {}", ws.root_path);
-                }
-
-                if ws.is_git && !req.direct_checkout {
-                    // Isolated managed worktree. The caller may select an
-                    // existing branch, name a new one, or let us auto-generate.
-                    let instance_path = self.worktree_root.join(session_id);
-                    let auto = format!("asm-session/{}", &session_id[..8.min(session_id.len())]);
-                    let requested = req
-                        .branch
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|b| !b.is_empty());
-                    let base = req
-                        .base_ref
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|b| !b.is_empty())
-                        .unwrap_or("HEAD");
-
-                    // Picking an existing branch that is already checked out
-                    // somewhere: share that working tree rather than fail. Git
-                    // forbids a second checkout of one branch, and sharing is
-                    // exactly what lets two sessions (e.g. plan-with-CC then
-                    // review-with-codex) see the same diffs.
-                    if let Some(name) = requested {
-                        if !req.create_branch {
-                            if let Some((existing_path, is_main)) =
-                                workspace::worktree_for_branch(&root, name)?
-                            {
-                                // The repo's own checkout can't become a second
-                                // worktree; sharing it is a direct checkout,
-                                // which owns no worktree or branch to reclaim.
-                                let (path, branch, isolation) = if is_main {
-                                    (ws.root_path.clone(), None, "direct")
-                                } else {
-                                    (existing_path, Some(name.to_string()), "shared")
-                                };
-                                let inst = WorkspaceInstance {
-                                    id: Uuid::new_v4().to_string(),
-                                    workspace_id: ws.id.clone(),
-                                    session_id: Some(session_id.to_string()),
-                                    path: path.clone(),
-                                    branch,
-                                    isolation: isolation.into(),
-                                    status: "active".into(),
-                                    created_at: now,
-                                };
-                                return Ok((path, Some(inst)));
-                            }
-                        }
-                    }
-
-                    let spec = match requested {
-                        Some(name) if req.create_branch => {
-                            workspace::BranchSpec::New { name, base }
-                        }
-                        Some(name) => workspace::BranchSpec::Existing { name },
-                        None => workspace::BranchSpec::Auto { name: &auto },
-                    };
-                    let branch = workspace::create_worktree(&root, &instance_path, spec)?;
-                    let path = instance_path.to_string_lossy().into_owned();
-                    let inst = WorkspaceInstance {
-                        id: Uuid::new_v4().to_string(),
-                        workspace_id: ws.id.clone(),
-                        session_id: Some(session_id.to_string()),
-                        path: path.clone(),
-                        branch,
-                        isolation: "worktree".into(),
-                        status: "active".into(),
-                        created_at: now,
-                    };
-                    Ok((path, Some(inst)))
-                } else {
-                    // Direct source checkout (git override) or plain folder.
-                    let isolation = if ws.is_git { "direct" } else { "plain" };
-                    let inst = WorkspaceInstance {
-                        id: Uuid::new_v4().to_string(),
-                        workspace_id: ws.id.clone(),
-                        session_id: Some(session_id.to_string()),
-                        path: ws.root_path.clone(),
-                        branch: None,
-                        isolation: isolation.into(),
-                        status: "active".into(),
-                        created_at: now,
-                    };
-                    Ok((ws.root_path, Some(inst)))
-                }
-            }
-            None => {
-                if req.cwd.trim().is_empty() {
-                    bail!("cwd is required when no workspace is selected");
-                }
-                // Raw path: enforce the allowlist once any workspace is registered.
-                let workspaces = self.db.list_workspaces()?;
-                if !workspaces.is_empty() {
-                    let cwd_abs = canonical(&req.cwd);
-                    let allowed = workspaces
-                        .iter()
-                        .any(|w| cwd_abs.starts_with(canonical(&w.root_path)));
-                    if !allowed {
-                        bail!("working directory is outside all registered workspace roots");
-                    }
-                }
-                Ok((req.cwd.clone(), None))
-            }
-        }
-    }
-
-    pub fn register_workspace(&self, name: String, root_path: String) -> Result<Workspace> {
-        let root = PathBuf::from(&root_path);
-        if !root.is_dir() {
-            bail!("root path is not a directory: {root_path}");
-        }
-        let canonical_root = canonical(&root_path).to_string_lossy().into_owned();
-        let is_git = workspace::is_git_repo(&root);
-        let w = Workspace {
-            id: Uuid::new_v4().to_string(),
-            name,
-            root_path: canonical_root,
-            is_git,
-            created_at: now_millis(),
-        };
-        self.db.insert_workspace(&w)?;
-        Ok(w)
-    }
-
-    pub fn list_workspaces(&self) -> Result<Vec<Workspace>> {
-        self.db.list_workspaces()
-    }
-
-    /// Unregister a workspace (removes it from the allowlist). Refuses while it
-    /// still has live sessions. Does not stop sessions or delete worktrees on
-    /// disk — it only drops the registration; existing session records keep
-    /// their (now dangling) `workspace_id`.
-    pub fn remove_workspace(&self, id: &str) -> Result<()> {
-        let ws = self
-            .db
-            .get_workspace(id)?
-            .ok_or_else(|| anyhow!("no such workspace"))?;
-        let has_live = self
-            .db
-            .list_sessions()?
-            .iter()
-            .any(|s| s.workspace_id.as_deref() == Some(id) && !s.status.is_terminal());
-        if has_live {
-            bail!(
-                "workspace `{}` still has live sessions; stop them first",
-                ws.name
-            );
-        }
-        self.db.delete_workspace(id)?;
-        Ok(())
-    }
-
-    /// Local branches and current HEAD for a workspace, for the new-session
-    /// branch picker. Empty for non-Git workspaces.
-    pub fn list_workspace_branches(&self, id: &str) -> Result<(Vec<String>, Option<String>)> {
-        let w = self
-            .db
-            .get_workspace(id)?
-            .ok_or_else(|| anyhow!("no such workspace"))?;
-        if !w.is_git {
-            return Ok((vec![], None));
-        }
-        workspace::list_branches(Path::new(&w.root_path))
-    }
-
-    pub fn init_workspace_git(&self, id: &str) -> Result<Workspace> {
-        let w = self
-            .db
-            .get_workspace(id)?
-            .ok_or_else(|| anyhow!("no such workspace"))?;
-        if w.is_git {
-            return Ok(w);
-        }
-        workspace::init_repo(Path::new(&w.root_path))?;
-        self.db.set_workspace_git(id, true)?;
-        self.db
-            .get_workspace(id)?
-            .ok_or_else(|| anyhow!("workspace vanished"))
-    }
-
-    pub fn get_instance_for_session(&self, session_id: &str) -> Result<Option<WorkspaceInstance>> {
-        self.db.get_instance_for_session(session_id)
-    }
-
-    /// Remove a session's managed worktree. Guards against dirty worktrees and
-    /// live sessions unless `force`.
-    pub fn cleanup_instance(&self, session_id: &str, force: bool) -> Result<()> {
-        let inst = self
-            .db
-            .get_instance_for_session(session_id)?
-            .ok_or_else(|| anyhow!("no workspace instance for session"))?;
-        if inst.status == "released" {
-            return Ok(());
-        }
-        if inst.isolation == "worktree" || inst.isolation == "shared" {
-            if self.live_handle(session_id).is_some() {
-                bail!("stop the session before cleaning up its worktree");
-            }
-            // Only reclaim the worktree once the last session sharing it leaves.
-            if self.db.count_active_instances_at_path(&inst.path, &inst.id)? == 0 {
-                let ws = self
-                    .db
-                    .get_workspace(&inst.workspace_id)?
-                    .ok_or_else(|| anyhow!("workspace record missing"))?;
-                workspace::remove_worktree(Path::new(&ws.root_path), Path::new(&inst.path), force)?;
-            }
-        }
-        self.db.set_instance_status(&inst.id, "released")?;
-        Ok(())
-    }
-
-    /// Find and remove worktrees/branches in a workspace's repo that this daemon
-    /// no longer owns — leftovers from throwaway/other daemons that shared the
-    /// repo (the "branch already checked out" cause). "Orphaned" = an
-    /// `asm-session/*` worktree or branch whose session is unknown to this daemon.
-    /// Guards uncommitted (dirty) worktrees and unmerged branches unless `force`.
-    pub fn cleanup_orphan_worktrees(
-        &self,
-        workspace_id: &str,
-        force: bool,
-    ) -> Result<WorktreeCleanupReport> {
-        let ws = self
-            .db
-            .get_workspace(workspace_id)?
-            .ok_or_else(|| anyhow!("no such workspace"))?;
-        if !ws.is_git {
-            bail!("workspace `{}` is not a git repository", ws.name);
-        }
-        let root = Path::new(&ws.root_path);
-
-        // Auto branches are `asm-session/<first 8 chars of the session uuid>`. A
-        // worktree/branch whose suffix matches a session this daemon knows about
-        // (live or ended) is owned, not orphaned.
-        let known: std::collections::HashSet<String> = self
-            .db
-            .list_sessions()?
-            .iter()
-            .filter_map(|s| s.id.get(..8).map(str::to_string))
-            .collect();
-
-        let mut report = WorktreeCleanupReport::default();
-
-        // 1. Drop registrations whose directories are already gone (always safe).
-        let _ = workspace::prune_worktrees(root);
-
-        // 2. Remove orphaned managed worktrees.
-        let worktrees = workspace::list_worktrees(root)?;
-        for (i, wt) in worktrees.iter().enumerate() {
-            if i == 0 {
-                continue; // the main worktree
-            }
-            let Some(branch) = wt.branch.as_deref() else {
-                continue; // detached / no branch
-            };
-            let Some(suffix) = branch.strip_prefix("asm-session/") else {
-                continue; // only our auto-managed worktrees
-            };
-            if known.contains(suffix) {
-                continue; // owned by a session we know
-            }
-            let path = Path::new(&wt.path);
-            if !force && workspace::worktree_is_dirty(path) {
-                report.skipped_dirty.push(wt.path.clone());
-                continue;
-            }
-            if workspace::remove_worktree(root, path, force).is_ok() {
-                report.removed_worktrees.push(wt.path.clone());
-                delete_orphan_branch(root, branch, force, &mut report);
-            } else {
-                report.skipped_dirty.push(wt.path.clone());
-            }
-        }
-
-        // 3. Orphaned `asm-session/*` branches that have no worktree left.
-        let (branches, _head) = workspace::list_branches(root)?;
-        for b in branches {
-            let Some(suffix) = b.strip_prefix("asm-session/") else {
-                continue;
-            };
-            if known.contains(suffix) || report.deleted_branches.contains(&b) {
-                continue;
-            }
-            delete_orphan_branch(root, &b, force, &mut report);
-        }
-
-        Ok(report)
     }
 
     pub fn stop_session(&self, id: &str) -> Result<Session> {
@@ -701,98 +410,6 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Archive a finished session. Unlike a plain "finished" session (which stays
-    /// in history with its branch kept), archiving is the "throw this away" step:
-    /// it removes the session's managed worktree and deletes its branch, then
-    /// marks the record `archived` (dropped from the history view). Refuses to
-    /// discard uncommitted or unmerged work unless `force` — see `discard_instance`.
-    pub fn archive_session(&self, id: &str, force: bool) -> Result<Session> {
-        let s = self
-            .db
-            .get_session(id)?
-            .ok_or_else(|| anyhow!("no such session"))?;
-        if !s.status.is_terminal() {
-            bail!("cannot archive a live session; stop it first");
-        }
-        self.discard_instance(id, force)?;
-        self.db
-            .update_status(id, SessionStatus::Archived, s.exit_code, now_millis())?;
-        self.db
-            .get_session(id)?
-            .ok_or_else(|| anyhow!("session vanished"))
-    }
-
-    /// Tear down a session's managed worktree and delete its branch, reclaiming
-    /// both. A no-op for ad-hoc sessions and direct/plain instances (which share
-    /// the source checkout and own no branch). Guards against data loss unless
-    /// `force`: a dirty worktree or an unmerged branch raises [`NeedsForce`] so
-    /// the caller can confirm before anything is removed. The unmerged check runs
-    /// before the worktree is touched, so a refusal leaves everything intact.
-    fn discard_instance(&self, session_id: &str, force: bool) -> Result<()> {
-        let Some(inst) = self.db.get_instance_for_session(session_id)? else {
-            return Ok(()); // ad-hoc session: nothing managed to remove
-        };
-        if inst.isolation != "worktree" && inst.isolation != "shared" {
-            return Ok(()); // direct/plain: no owned worktree or branch
-        }
-        let ws = self
-            .db
-            .get_workspace(&inst.workspace_id)?
-            .ok_or_else(|| anyhow!("workspace record missing"))?;
-        let root = Path::new(&ws.root_path);
-        let inst_path = Path::new(&inst.path);
-        let active = inst.status == "active";
-
-        if active && self.live_handle(session_id).is_some() {
-            bail!("stop the session before archiving it");
-        }
-
-        // Another session is still working in this shared worktree: relinquish
-        // our own claim but leave the directory and branch for the remaining
-        // sharer(s). Whoever leaves last (this check returns 0) reclaims both.
-        // No `force` bypass — force discards *our* work, never evicts a sharer.
-        if self.db.count_active_instances_at_path(&inst.path, &inst.id)? > 0 {
-            if active {
-                self.db.set_instance_status(&inst.id, "released")?;
-            }
-            return Ok(());
-        }
-
-        // Refuse to silently discard work unless forced. Both guards surface as
-        // `NeedsForce` (→ HTTP 409) so the client can confirm and retry.
-        if !force {
-            if active && workspace::worktree_is_dirty(inst_path) {
-                return Err(NeedsForce(
-                    "worktree has uncommitted changes; archiving would discard them".into(),
-                )
-                .into());
-            }
-            if let Some(branch) = inst.branch.as_deref() {
-                if workspace::branch_exists(root, branch)
-                    && !workspace::branch_is_merged(root, branch)
-                {
-                    return Err(NeedsForce(format!(
-                        "branch `{branch}` has unmerged commits; archiving would delete them"
-                    ))
-                    .into());
-                }
-            }
-        }
-
-        // Safe (or forced): drop the worktree first (a branch checked out in a
-        // worktree cannot be deleted), then the branch itself.
-        if active {
-            workspace::remove_worktree(root, inst_path, force)?;
-            self.db.set_instance_status(&inst.id, "released")?;
-        }
-        if let Some(branch) = inst.branch.as_deref() {
-            if workspace::branch_exists(root, branch) {
-                workspace::delete_branch(root, branch, force)?;
-            }
-        }
-        Ok(())
-    }
-
     pub fn resize_session(&self, id: &str, rows: u16, cols: u16) -> Result<()> {
         if let Some(h) = self.live_handle(id) {
             h.resize(rows, cols)?;
@@ -831,273 +448,6 @@ impl SessionManager {
         if let Some(sig) = self.interactions.lock().get(id) {
             sig.reset.store(true, Ordering::Relaxed);
         }
-    }
-
-    fn spawn_monitor(
-        self: Arc<Self>,
-        id: String,
-        handle: Arc<dyn BackendSession>,
-        started_at: i64,
-        plugin: Option<Arc<dyn AgentPlugin>>,
-    ) {
-        let sig = Arc::new(Interaction::default());
-        self.interactions.lock().insert(id.clone(), sig.clone());
-        tokio::spawn(async move {
-            let mut status_rx = handle.watch_status();
-            let (_snap, mut out_rx) = handle.attach();
-            let mut tail = String::new();
-            let mut last_activity_write = 0i64;
-            let mut last_attn = AttentionState::None;
-            // Carries OSC-escape state across chunks so a window-title update
-            // split over two reads isn't miscounted as a bell (see `scan_bell`).
-            let mut in_osc = false;
-
-            loop {
-                // Only a *working* session needs the close idle watch; a blocked
-                // session is sticky (stays until viewed/answered) and silence
-                // never demotes it to idle.
-                let idle_delay = if last_attn == AttentionState::Activity {
-                    IDLE_AFTER
-                } else {
-                    Duration::from_secs(60)
-                };
-                let idle_tick = tokio::time::sleep(idle_delay);
-
-                tokio::select! {
-                    changed = status_rx.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                        let st = status_rx.borrow().clone();
-                        if st.is_terminal() {
-                            self.on_exit(&id, &handle, started_at, st).await;
-                            break;
-                        }
-                    }
-                    recv = out_rx.recv() => {
-                        match recv {
-                            Ok(bytes) => {
-                                // If the user viewed/answered since the last chunk,
-                                // drop a sticky *block* so fresh output reclassifies.
-                                // A plain idle prompt is left untouched here — its
-                                // keystroke echo must not read as work, which
-                                // `on_output` handles via the input timing below.
-                                if sig.reset.swap(false, Ordering::Relaxed)
-                                    && matches!(
-                                        last_attn,
-                                        AttentionState::LikelyBlocked
-                                            | AttentionState::ApprovalNeeded
-                                    )
-                                {
-                                    last_attn = AttentionState::None;
-                                }
-                                let last_input_ms = sig.last_input_ms.load(Ordering::Relaxed);
-                                let submitted = sig.submitted.load(Ordering::Relaxed);
-                                self.on_output(&id, &handle, &bytes, plugin.as_ref(), &mut tail, &mut last_activity_write, &mut last_attn, &mut in_osc, last_input_ms, submitted);
-                            }
-                            Err(RecvError::Lagged(_)) => { /* attention is best-effort */ }
-                            Err(RecvError::Closed) => {
-                                // Backend gone; the status watch drives the exit.
-                            }
-                        }
-                    }
-                    _ = idle_tick => {
-                        self.on_idle(&id, &mut last_attn, &sig);
-                    }
-                }
-            }
-            self.interactions.lock().remove(&id);
-        });
-    }
-
-    /// Output has been silent for [`IDLE_AFTER`]: a *working* session is now idle,
-    /// waiting for the next input. A blocked session (bell / prompt) is sticky and
-    /// stays blocked — silence doesn't mean it stopped needing you.
-    fn on_idle(&self, id: &str, last_attn: &mut AttentionState, sig: &Interaction) {
-        if *last_attn == AttentionState::Activity {
-            *last_attn = AttentionState::Idle;
-            // Fresh idle prompt: whatever the user types next is composing again,
-            // so clear the submit latch — their keystroke echo is suppressed until
-            // they submit the next line.
-            sig.submitted.store(false, Ordering::Relaxed);
-            let _ = self.db.set_attention(
-                id,
-                AttentionState::Idle,
-                Some("idle — waiting for input"),
-                now_millis(),
-            );
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn on_output(
-        &self,
-        id: &str,
-        handle: &Arc<dyn BackendSession>,
-        bytes: &[u8],
-        plugin: Option<&Arc<dyn AgentPlugin>>,
-        tail: &mut String,
-        last_write: &mut i64,
-        last_attn: &mut AttentionState,
-        in_osc: &mut bool,
-        last_input_ms: i64,
-        submitted: bool,
-    ) {
-        // Maintain a small decoded tail for the default (tail-based) classifier.
-        tail.push_str(&String::from_utf8_lossy(bytes));
-        trim_tail(tail, 4096);
-        // Only trust the bell as an attention signal for agents that opt in
-        // (a plain shell rings it as UI noise), and only a *real* bell — not the
-        // BEL that terminates an OSC window-title update, which agents like
-        // Claude Code emit constantly while working (`ESC ] 0 ; <title> BEL`).
-        let bell = plugin.is_some_and(|p| p.bell_means_attention()) && scan_bell(bytes, in_osc);
-        // Classification is per-provider. Most agents read the raw output tail;
-        // one whose approval UI the tail can't see (Claude Code's boxed menu)
-        // asks for the rendered screen instead — bounded to the visible grid and
-        // always current, so a prompt buried above a footer / redraw frames is
-        // still seen. An unknown plugin falls back to the default heuristic.
-        let screen;
-        let (raw, reason) = match plugin {
-            Some(p) if p.attention_uses_screen() => {
-                screen = handle.screen_text();
-                p.attention(&screen, bell)
-            }
-            Some(p) => p.attention(tail, bell),
-            None => attention::default_attention(tail, bell),
-        };
-        let now = now_millis();
-
-        // Keystroke echo at an idle prompt: the user is composing their next
-        // command, the agent is not working. Output that lands within
-        // [`ECHO_WINDOW`] of their last input — and that hasn't yet submitted a
-        // line — is that echo, so the prompt stays idle. A submit (CR/LF) hands
-        // off to the agent, so its output *is* real work and falls through. This
-        // only guards the idle state; spontaneous agent output (no recent input)
-        // is outside the window and reads as activity as before.
-        if raw == AttentionState::Activity
-            && *last_attn == AttentionState::Idle
-            && !submitted
-            && last_input_ms != 0
-            && now.saturating_sub(last_input_ms) < ECHO_WINDOW.as_millis() as i64
-        {
-            return;
-        }
-
-        // Sticky "blocked": agents ring the bell / show a prompt when they need
-        // you, then keep redrawing (TUIs) — plain redraw output must NOT demote
-        // that back to "working". It clears when the user views or answers (which
-        // resets `last_attn` in the monitor loop).
-        let was_blocked = matches!(
-            *last_attn,
-            AttentionState::LikelyBlocked | AttentionState::ApprovalNeeded
-        );
-        let attention = if raw == AttentionState::Activity && was_blocked {
-            *last_attn
-        } else {
-            raw
-        };
-        *last_attn = attention;
-
-        // Debounce activity writes, but always flush a blocking/approval signal.
-        if attention != AttentionState::Activity || now - *last_write >= 400 {
-            *last_write = now;
-            let _ = self.db.update_activity(
-                id,
-                handle.last_seq(),
-                now,
-                attention,
-                reason.as_deref(),
-            );
-        }
-    }
-
-    async fn on_exit(
-        &self,
-        id: &str,
-        handle: &Arc<dyn BackendSession>,
-        started_at: i64,
-        status: BackendStatus,
-    ) {
-        let now = now_millis();
-        let last_seq = handle.last_seq();
-
-        // Respect an explicit stop/archive already recorded.
-        let existing = self.db.get_session(id).ok().flatten();
-        let already = existing.as_ref().map(|s| s.status);
-
-        let (final_status, exit_code, attention, reason, exit_label) = match status {
-            BackendStatus::Exited(0) => (
-                SessionStatus::Exited,
-                Some(0),
-                AttentionState::None,
-                None,
-                "exited(0)".to_string(),
-            ),
-            BackendStatus::Exited(code) => (
-                SessionStatus::Exited,
-                Some(code),
-                AttentionState::Failed,
-                Some(format!("exited with code {code}")),
-                format!("exited({code})"),
-            ),
-            BackendStatus::Failed(msg) => (
-                SessionStatus::Failed,
-                None,
-                AttentionState::Failed,
-                Some(msg.clone()),
-                format!("failed: {msg}"),
-            ),
-            BackendStatus::Running => return, // not terminal; ignore
-        };
-
-        // If the user explicitly stopped/archived, preserve that status.
-        let status_to_write = match already {
-            Some(SessionStatus::Stopped) => SessionStatus::Stopped,
-            Some(SessionStatus::Archived) => SessionStatus::Archived,
-            _ => final_status,
-        };
-
-        // A user-ended session is not a failure. Stopping kills the child (a
-        // non-zero/​signalled exit), which would otherwise show as `failed` with a
-        // scary exit code — clear both and label the summary by the user action.
-        let user_ended = matches!(
-            status_to_write,
-            SessionStatus::Stopped | SessionStatus::Archived
-        );
-        let (exit_code, attention, reason, exit_label) = if user_ended {
-            (None, AttentionState::None, None, status_to_write.as_str().to_string())
-        } else {
-            (exit_code, attention, reason, exit_label)
-        };
-
-        let _ = self
-            .db
-            .update_status(id, status_to_write, exit_code, now);
-        let _ = self
-            .db
-            .set_attention(id, attention, reason.as_deref(), now);
-
-        // Structural session summary (deterministic metadata, no LLM).
-        let summary = SessionSummary {
-            id: Uuid::new_v4().to_string(),
-            session_id: id.to_string(),
-            agent_plugin_id: existing
-                .as_ref()
-                .map(|s| s.agent_plugin_id.clone())
-                .unwrap_or_default(),
-            started_at,
-            ended_at: now,
-            duration_ms: (now - started_at).max(0),
-            exit_status: exit_label,
-            terminal_event_start: 1,
-            terminal_event_end: last_seq,
-        };
-        if let Err(e) = self.db.insert_summary(&summary) {
-            tracing::warn!(session = %id, "failed to write session summary: {e:#}");
-        }
-
-        self.live.lock().remove(id);
-        tracing::info!(session = %id, status = %status_to_write.as_str(), "session finalized");
     }
 }
 
@@ -1315,26 +665,68 @@ mod tests {
         }
     }
 
-    struct MockBackend;
+    /// A fresh, running `MockSession` handle — used by both `create` and the
+    /// holder `adopt` path.
+    fn mock_session() -> Arc<dyn BackendSession> {
+        let (tx, _) = broadcast::channel(16);
+        let (status_tx, status_rx) = watch::channel(BackendStatus::Running);
+        Arc::new(MockSession {
+            tx,
+            status_tx,
+            status_rx,
+            seq: AtomicU64::new(0),
+            screen: String::new(),
+        })
+    }
+
+    /// A `SessionBackend` test double. `Default` is native-like — sessions die on
+    /// shutdown and there is no holder. The holder knobs simulate an
+    /// out-of-process asmux holder so the startup adopt/reconcile branches can be
+    /// driven without a real socket.
+    #[derive(Default)]
+    struct MockBackend {
+        /// Simulate a holder that outlives the daemon (asmux): sessions are left
+        /// running on shutdown and offered back through `holder_list`/`adopt`.
+        keep_on_shutdown: bool,
+        /// Canned `holder_list()` result (only consulted when `keep_on_shutdown`).
+        holder: Vec<HolderEntry>,
+        /// Make `holder_list()` fail, exercising the "all live → indeterminate" arm.
+        holder_list_fails: bool,
+        /// Whether `adopt()` yields a live handle (`Some`) or gives up (`None`).
+        adopt_ok: bool,
+    }
 
     impl SessionBackend for MockBackend {
         fn id(&self) -> &'static str {
             "mock"
         }
         fn create(&self, _spec: BackendSpawnSpec) -> Result<Arc<dyn BackendSession>> {
-            let (tx, _) = broadcast::channel(16);
-            let (status_tx, status_rx) = watch::channel(BackendStatus::Running);
-            Ok(Arc::new(MockSession {
-                tx,
-                status_tx,
-                status_rx,
-                seq: AtomicU64::new(0),
-                screen: String::new(),
-            }))
+            Ok(mock_session())
+        }
+        fn keep_sessions_on_shutdown(&self) -> bool {
+            self.keep_on_shutdown
+        }
+        fn holder_list(&self) -> Result<Vec<HolderEntry>> {
+            if self.holder_list_fails {
+                bail!("mock holder_list failure");
+            }
+            Ok(self.holder.clone())
+        }
+        fn adopt(
+            &self,
+            _id: &str,
+            _rows: u16,
+            _cols: u16,
+        ) -> Result<Option<Arc<dyn BackendSession>>> {
+            Ok(self.adopt_ok.then(mock_session))
         }
     }
 
     fn test_manager() -> (Arc<SessionManager>, PathBuf) {
+        test_manager_with(Arc::new(MockBackend::default()))
+    }
+
+    fn test_manager_with(backend: Arc<dyn SessionBackend>) -> (Arc<SessionManager>, PathBuf) {
         let dir = std::env::temp_dir().join(format!("asm-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = Db::open(&dir.join("test.sqlite3")).unwrap();
@@ -1342,10 +734,46 @@ mod tests {
         let manager = Arc::new(SessionManager::new(
             db,
             registry,
-            Arc::new(MockBackend),
+            backend,
             dir.join("worktrees"),
         ));
         (manager, dir)
+    }
+
+    /// Seed a session row already marked `running` (as if a prior daemon left it
+    /// live), so `startup_reconcile` finds it via `live_session_ids()`.
+    fn insert_running(db: &Db, id: &str) {
+        let now = now_millis();
+        db.insert_session(&Session {
+            id: id.to_string(),
+            agent_plugin_id: "shell".into(),
+            command: "sh".into(),
+            args: vec![],
+            env: vec![],
+            working_directory: std::env::temp_dir().to_string_lossy().into_owned(),
+            workspace_id: None,
+            status: SessionStatus::Running,
+            rows: 24,
+            cols: 80,
+            last_event_seq: 0,
+            exit_code: None,
+            attention_state: AttentionState::None,
+            attention_reason: None,
+            created_at: now,
+            updated_at: now,
+            last_activity_at: now,
+            risky: false,
+        })
+        .unwrap();
+    }
+
+    fn holder_entry(id: &str, alive: bool, exit_code: i32, exit_signal: i32) -> HolderEntry {
+        HolderEntry {
+            id: id.to_string(),
+            alive,
+            exit_code,
+            exit_signal,
+        }
     }
 
     fn shell_req() -> CreateSessionRequest {
@@ -1411,6 +839,138 @@ mod tests {
             assert_eq!(s.status, SessionStatus::Stopped);
         }
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- startup_reconcile branches ----
+    //
+    // These pin every arm of the adopt/reconcile decision that runs when the
+    // daemon restarts with sessions still `running` in the DB. They exist so the
+    // planned M4 flip of adopt from ring-replay to exact cold-stitch is guarded
+    // *before* it lands (today that flip is untested — RF-M4 #4).
+
+    #[tokio::test]
+    async fn native_reconcile_marks_live_sessions_failed() {
+        // Default mock is native-like: it does not keep sessions on shutdown, so
+        // any row still `running` after a restart is unrecoverable → `failed`.
+        let (manager, dir) = test_manager();
+        insert_running(&manager.db, "s-native");
+
+        manager.startup_reconcile().await.unwrap();
+
+        let s = manager.get_session("s-native").unwrap().unwrap();
+        assert_eq!(s.status, SessionStatus::Failed);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn holder_alive_and_adoptable_is_adopted_running() {
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            holder: vec![holder_entry("s-adopt", true, 0, 0)],
+            adopt_ok: true,
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_with(backend);
+        insert_running(&manager.db, "s-adopt");
+
+        manager.startup_reconcile().await.unwrap();
+
+        let s = manager.get_session("s-adopt").unwrap().unwrap();
+        assert_eq!(s.status, SessionStatus::Running, "adopted → running");
+        assert!(
+            manager.live_handle("s-adopt").is_some(),
+            "adopted handle re-attached into the live map"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn holder_alive_but_unadoptable_is_indeterminate() {
+        // Alive in the holder, but adopt() cannot recover it → indeterminate.
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            holder: vec![holder_entry("s-noadopt", true, 0, 0)],
+            adopt_ok: false,
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_with(backend);
+        insert_running(&manager.db, "s-noadopt");
+
+        manager.startup_reconcile().await.unwrap();
+
+        let s = manager.get_session("s-noadopt").unwrap().unwrap();
+        assert_eq!(s.status, SessionStatus::Indeterminate);
+        assert!(manager.live_handle("s-noadopt").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn holder_dead_entry_reconciles_to_exit_outcome() {
+        // A real completion record from the holder → exited (clean) or failed
+        // (signalled), never indeterminate.
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            holder: vec![
+                holder_entry("s-exit", false, 7, 0),
+                holder_entry("s-signal", false, 0, 9),
+            ],
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_with(backend);
+        insert_running(&manager.db, "s-exit");
+        insert_running(&manager.db, "s-signal");
+
+        manager.startup_reconcile().await.unwrap();
+
+        let exited = manager.get_session("s-exit").unwrap().unwrap();
+        assert_eq!(exited.status, SessionStatus::Exited);
+        assert_eq!(exited.exit_code, Some(7));
+
+        let signalled = manager.get_session("s-signal").unwrap().unwrap();
+        assert_eq!(signalled.status, SessionStatus::Failed, "signalled → failed");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn holder_absent_entry_is_indeterminate() {
+        // The session is gone from the holder (the holder itself died), so no
+        // completion record exists → indeterminate, flagged for the user.
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_with(backend);
+        insert_running(&manager.db, "s-absent");
+
+        manager.startup_reconcile().await.unwrap();
+
+        let s = manager.get_session("s-absent").unwrap().unwrap();
+        assert_eq!(s.status, SessionStatus::Indeterminate);
+        assert_eq!(s.attention_state, AttentionState::LikelyBlocked);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn holder_list_failure_reconciles_all_indeterminate() {
+        // If the holder cannot even be listed, every live session is unknown.
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            holder_list_fails: true,
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_with(backend);
+        insert_running(&manager.db, "s-a");
+        insert_running(&manager.db, "s-b");
+
+        manager.startup_reconcile().await.unwrap();
+
+        for id in ["s-a", "s-b"] {
+            assert_eq!(
+                manager.get_session(id).unwrap().unwrap().status,
+                SessionStatus::Indeterminate
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1651,6 +1211,71 @@ mod tests {
             &mut last_write, &mut last_attn, &mut false, 0, false,
         );
         assert_eq!(last_attn, AttentionState::ApprovalNeeded);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- stalled-on-error settle (working -> error, not idle) ----
+
+    #[test]
+    fn idle_settle_with_stalled_error_screen_reads_as_error() {
+        // The reported bug: the API died mid-turn, Claude printed "API Error: …"
+        // and froze — no bell, no prompt — and the silence timer settled the
+        // session to a calm "idle". The settle must consult the plugin's screen
+        // check and land on Error instead.
+        let (manager, dir) = test_manager();
+        let claude = manager.registry.get("claude").unwrap();
+        let screen = "\
+\u{25cf} API Error: Server error mid-response. The response above may be incomplete.\n\
+\n\
+✻ Worked for 32m 22s\n\
+\n\
+────────────────────\n\
+\u{276f} \n\
+────────────────────\n\
+  ⏵⏵ bypass permissions on · ← for agents";
+        let handle = mock_handle_with_screen(screen);
+        let sig = Interaction::default();
+        let mut last_attn = AttentionState::Activity;
+        manager.on_idle("sid", &handle, Some(&claude), &mut last_attn, &sig);
+        assert_eq!(last_attn, AttentionState::Error);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn idle_settle_with_clean_screen_reads_as_idle() {
+        let (manager, dir) = test_manager();
+        let claude = manager.registry.get("claude").unwrap();
+        let screen = "\
+\u{25cf} Done. All tests pass.\n\
+\n\
+✻ Worked for 3s\n\
+\n\
+────────────────────\n\
+\u{276f} \n\
+────────────────────\n\
+  ? for shortcuts";
+        let handle = mock_handle_with_screen(screen);
+        let sig = Interaction::default();
+        let mut last_attn = AttentionState::Activity;
+        manager.on_idle("sid", &handle, Some(&claude), &mut last_attn, &sig);
+        assert_eq!(last_attn, AttentionState::Idle);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn background_noise_does_not_clear_error() {
+        // The captured stall had "1 shell still running": a background
+        // command's later output under a dead turn must not demote the error
+        // back to "working" — it is sticky until the user views or types.
+        let (manager, dir) = test_manager();
+        let handle = mock_handle();
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::Error);
+        manager.on_output(
+            "sid", &handle, b"bg command output", None, &mut tail, &mut last_write,
+            &mut last_attn, &mut false, 0, false,
+        );
+        assert_eq!(last_attn, AttentionState::Error);
         let _ = std::fs::remove_dir_all(dir);
     }
 

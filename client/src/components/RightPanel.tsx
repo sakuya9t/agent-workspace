@@ -6,7 +6,10 @@ import { Target } from "../connectionStore";
 import { buildVscodeLaunch, launchVscode, vscodeReachable, VscodeLaunch } from "../vscode";
 import { relTime } from "../i18n/time";
 import { attentionLabel, instanceStatusLabel, isolationLabel, statusLabel } from "../i18n/labels";
+import { isTerminal } from "../status";
+import { useIsPhone } from "../useIsPhone";
 import { shortPath } from "../paths";
+import { copyText } from "../clipboard";
 import { DiffModal } from "./DiffModal";
 import { CommitModal } from "./CommitModal";
 
@@ -38,15 +41,18 @@ const STATUS_COLOR: Record<string, string> = {
  */
 export function RightPanel({ target, session }: Props) {
   const { t } = useTranslation();
+  // On a phone there's no local VS Code for the vscode:// deep link to reach, so
+  // the whole "Continue in VS Code" affordance is hidden (mobile shell only).
+  const isPhone = useIsPhone();
   const qc = useQueryClient();
   const [diffTarget, setDiffTarget] = useState<ChangedFile | null>(null);
   const [commitTarget, setCommitTarget] = useState<string | null>(null);
   const [rebaseOpen, setRebaseOpen] = useState(false);
   const [rebaseOnto, setRebaseOnto] = useState("");
+  const [mergeOpen, setMergeOpen] = useState(false);
+  const [mergeTarget, setMergeTarget] = useState("");
 
-  const terminal =
-    session &&
-    ["exited", "failed", "stopped", "archived"].includes(session.status);
+  const terminal = session && isTerminal(session.status);
   const base = target?.baseUrl ?? "";
 
   const { data: instance } = useQuery({
@@ -72,20 +78,7 @@ export function RightPanel({ target, session }: Props) {
   useEffect(() => setCopied(false), [vscode.phase, session?.id]);
 
   const copyCli = async (text: string) => {
-    try {
-      // clipboard API needs a secure context; plain-http LAN profiles don't
-      // have one, so fall back to the selection-based path.
-      await navigator.clipboard.writeText(text);
-    } catch {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand("copy");
-      ta.remove();
-    }
+    await copyText(text);
     setCopied(true);
   };
 
@@ -130,16 +123,16 @@ export function RightPanel({ target, session }: Props) {
     retry: false,
   });
 
-  // Branch list backing the rebase-target picker; only fetched while the picker
-  // is open so it doesn't poll needlessly.
+  // Branch list backing the rebase/merge target pickers; only fetched while a
+  // picker is open so it doesn't poll needlessly.
   const { data: branchList, error: branchesError } = useQuery({
     queryKey: ["scmbranches", base, session?.id],
     queryFn: () => api.scmBranches(target!, session!.id),
-    enabled: !!session && !!target && !!scm?.is_repo && rebaseOpen,
+    enabled: !!session && !!target && !!scm?.is_repo && (rebaseOpen || mergeOpen),
     retry: false,
   });
 
-  // Refresh status + history after a pull/rebase changes the branch.
+  // Refresh status + history after a source-control operation changes refs.
   const refreshScm = () => {
     qc.invalidateQueries({ queryKey: ["scm", base, session?.id] });
     qc.invalidateQueries({ queryKey: ["scmlog", base, session?.id] });
@@ -159,24 +152,49 @@ export function RightPanel({ target, session }: Props) {
     },
   });
 
-  // A pull and a rebase share one result/error line, so starting one clears the
-  // other's stale output.
+  const merge = useMutation({
+    mutationFn: (targetBranch: string) => api.scmMerge(target!, session!.id, targetBranch),
+    onSuccess: () => {
+      setMergeOpen(false);
+      setMergeTarget("");
+      refreshScm();
+    },
+    onError: (e) => {
+      if ((e as { status?: number }).status === 409) {
+        alert(t("rightPanel.mergeConflictPrompt", { message: (e as Error).message }));
+      }
+    },
+  });
+
+  // Pull/rebase/merge share one result/error area, so starting one clears the
+  // others' stale output.
   const startPull = () => {
     rebase.reset();
+    merge.reset();
     pull.mutate();
   };
   const startRebase = (onto: string) => {
     pull.reset();
+    merge.reset();
     rebase.mutate(onto);
   };
+  const startMerge = (targetBranch: string) => {
+    pull.reset();
+    rebase.reset();
+    merge.mutate(targetBranch);
+  };
+  const scmBusy = pull.isPending || rebase.isPending || merge.isPending;
 
-  // Don't carry an open picker or a previous session's pull/rebase output onto
-  // the next session (this panel is reused, not remounted, across selections).
+  // Don't carry an open picker or a previous session's SCM output onto the next
+  // session (this panel is reused, not remounted, across selections).
   useEffect(() => {
     setRebaseOpen(false);
     setRebaseOnto("");
+    setMergeOpen(false);
+    setMergeTarget("");
     pull.reset();
     rebase.reset();
+    merge.reset();
   }, [session?.id, base]);
 
   if (!session || !target) {
@@ -194,63 +212,67 @@ export function RightPanel({ target, session }: Props) {
     <div className="panel right">
       <div className="panel-header">{t("rightPanel.header")}</div>
       <div className="panel-body details">
-        <button
-          className="btn vscode-btn"
-          disabled={vscode.phase === "launching" || !vscodeCanReach}
-          onClick={continueInVscode}
-          title={
-            vscodeCanReach
-              ? t("rightPanel.vscode.title")
-              : t("rightPanel.vscode.relayUnavailableTitle")
-          }
-        >
-          {vscode.phase === "launching"
-            ? t("rightPanel.vscode.opening")
-            : t("rightPanel.vscode.button")}
-        </button>
-        {!vscodeCanReach && (
-          <div className="dim small">{t("rightPanel.vscode.relayUnavailable")}</div>
-        )}
-        {vscode.phase === "opened" && (
-          <div className="dim small">
-            {vscode.launch.kind === "remote-ssh"
-              ? t("rightPanel.vscode.openingRemote", { dest: vscode.launch.sshDest })
-              : t("rightPanel.vscode.openingLocal")}
-          </div>
-        )}
-        {vscode.phase === "not-installed" && (
-          <div className="vscode-fallback">
-            <div>{t("rightPanel.vscode.didntOpen")}</div>
-            <a
-              className="btn tiny"
-              href="https://code.visualstudio.com/download"
-              target="_blank"
-              rel="noreferrer"
+        {!isPhone && (
+          <>
+            <button
+              className="btn vscode-btn"
+              disabled={vscode.phase === "launching" || !vscodeCanReach}
+              onClick={continueInVscode}
+              title={
+                vscodeCanReach
+                  ? t("rightPanel.vscode.title")
+                  : t("rightPanel.vscode.relayUnavailableTitle")
+              }
             >
-              {t("rightPanel.vscode.download")}
-            </a>
-            {vscode.launch.kind === "remote-ssh" && (
+              {vscode.phase === "launching"
+                ? t("rightPanel.vscode.opening")
+                : t("rightPanel.vscode.button")}
+            </button>
+            {!vscodeCanReach && (
+              <div className="dim small">{t("rightPanel.vscode.relayUnavailable")}</div>
+            )}
+            {vscode.phase === "opened" && (
               <div className="dim small">
-                {t("rightPanel.vscode.remoteSshHint", { dest: vscode.launch.sshDest })}
+                {vscode.launch.kind === "remote-ssh"
+                  ? t("rightPanel.vscode.openingRemote", { dest: vscode.launch.sshDest })
+                  : t("rightPanel.vscode.openingLocal")}
               </div>
             )}
-            {vscode.launch.cliCommand && (
-              <>
-                <div className="dim small">{t("rightPanel.vscode.cliHint")}</div>
-                <div className="cli-row">
-                  <code>{vscode.launch.cliCommand}</code>
-                  <button
-                    className="btn tiny"
-                    onClick={() => copyCli(vscode.launch.cliCommand!)}
-                  >
-                    {copied ? t("common.copied") : t("common.copy")}
-                  </button>
-                </div>
-              </>
+            {vscode.phase === "not-installed" && (
+              <div className="vscode-fallback">
+                <div>{t("rightPanel.vscode.didntOpen")}</div>
+                <a
+                  className="btn tiny"
+                  href="https://code.visualstudio.com/download"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  {t("rightPanel.vscode.download")}
+                </a>
+                {vscode.launch.kind === "remote-ssh" && (
+                  <div className="dim small">
+                    {t("rightPanel.vscode.remoteSshHint", { dest: vscode.launch.sshDest })}
+                  </div>
+                )}
+                {vscode.launch.cliCommand && (
+                  <>
+                    <div className="dim small">{t("rightPanel.vscode.cliHint")}</div>
+                    <div className="cli-row">
+                      <code>{vscode.launch.cliCommand}</code>
+                      <button
+                        className="btn tiny"
+                        onClick={() => copyCli(vscode.launch.cliCommand!)}
+                      >
+                        {copied ? t("common.copied") : t("common.copy")}
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
             )}
-          </div>
+            {vscode.phase === "error" && <div className="error">{vscode.message}</div>}
+          </>
         )}
-        {vscode.phase === "error" && <div className="error">{vscode.message}</div>}
 
         {session.risky && (
           <div className="risk-banner" title={t("rightPanel.riskBannerTitle")}>
@@ -325,8 +347,8 @@ export function RightPanel({ target, session }: Props) {
           </>
         )}
 
-        <div className="section-title">
-          {t("rightPanel.scmHeader")}
+        <div className="section-title with-branch">
+          <span>{t("rightPanel.scmHeader")}</span>
           {scm?.is_repo && (
             <span className="branch-pill mono">
               {scm.detached ? t("rightPanel.detached") : scm.branch}
@@ -370,7 +392,7 @@ export function RightPanel({ target, session }: Props) {
                 <span className="scm-actions">
                   <button
                     className="icon-btn"
-                    disabled={pull.isPending || rebase.isPending}
+                    disabled={scmBusy}
                     onClick={startPull}
                     title={t("rightPanel.pullTitle")}
                     aria-label={t("rightPanel.pullTitle")}
@@ -379,12 +401,27 @@ export function RightPanel({ target, session }: Props) {
                   </button>
                   <button
                     className={"icon-btn" + (rebaseOpen ? " active" : "")}
-                    disabled={pull.isPending || rebase.isPending}
-                    onClick={() => setRebaseOpen((o) => !o)}
+                    disabled={scmBusy}
+                    onClick={() => {
+                      setMergeOpen(false);
+                      setRebaseOpen((o) => !o);
+                    }}
                     title={t("rightPanel.rebaseTitle")}
                     aria-label={t("rightPanel.rebaseTitle")}
                   >
                     ⎇
+                  </button>
+                  <button
+                    className={"icon-btn" + (mergeOpen ? " active" : "")}
+                    disabled={scmBusy}
+                    onClick={() => {
+                      setRebaseOpen(false);
+                      setMergeOpen((o) => !o);
+                    }}
+                    title={t("rightPanel.mergeTitle")}
+                    aria-label={t("rightPanel.mergeTitle")}
+                  >
+                    ⤴
                   </button>
                 </span>
               )}
@@ -413,7 +450,7 @@ export function RightPanel({ target, session }: Props) {
                       <select
                         className="rebase-select mono"
                         value={rebaseOnto}
-                        disabled={rebase.isPending}
+                        disabled={scmBusy}
                         onChange={(e) => setRebaseOnto(e.target.value)}
                       >
                         <option value="" disabled>
@@ -427,7 +464,7 @@ export function RightPanel({ target, session }: Props) {
                       </select>
                       <button
                         className="btn tiny"
-                        disabled={!rebaseOnto || rebase.isPending}
+                        disabled={!rebaseOnto || scmBusy}
                         onClick={() => startRebase(rebaseOnto)}
                       >
                         {rebase.isPending
@@ -440,13 +477,89 @@ export function RightPanel({ target, session }: Props) {
               </div>
             )}
 
-            {(pull.isPending || rebase.isPending) && (
+            {mergeOpen && !scm.detached && (
+              <div className="rebase-picker">
+                <div className="rebase-picker-label">
+                  {t("rightPanel.mergeInto", { branch: scm.branch })}
+                </div>
+                {(() => {
+                  const candidates = branchList
+                    ? branchList.branches.filter((b) => b !== branchList.head)
+                    : [];
+                  if (branchesError) {
+                    return <div className="error">{String(branchesError)}</div>;
+                  }
+                  if (!branchList) {
+                    return <div className="dim small">{t("rightPanel.loadingBranches")}</div>;
+                  }
+                  if (candidates.length === 0) {
+                    return <div className="dim small">{t("rightPanel.noMergeBranches")}</div>;
+                  }
+                  return (
+                    <div className="rebase-picker-row">
+                      <select
+                        className="rebase-select mono"
+                        value={mergeTarget}
+                        disabled={scmBusy}
+                        onChange={(e) => setMergeTarget(e.target.value)}
+                      >
+                        <option value="" disabled>
+                          {t("rightPanel.mergeSelectPlaceholder")}
+                        </option>
+                        {candidates.map((b) => (
+                          <option key={b} value={b}>
+                            {b}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        className="btn tiny"
+                        disabled={!mergeTarget || scmBusy}
+                        onClick={() => startMerge(mergeTarget)}
+                      >
+                        {merge.isPending
+                          ? t("rightPanel.scmRunning")
+                          : t("rightPanel.mergeConfirm")}
+                      </button>
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
+
+            {scmBusy && (
               <div className="dim small">{t("rightPanel.scmRunning")}</div>
             )}
-            {pull.error && <div className="error">{String(pull.error)}</div>}
-            {rebase.error && <div className="error">{String(rebase.error)}</div>}
-            {pull.data && <div className="scm-op-result mono small dim">{pull.data}</div>}
-            {rebase.data && <div className="scm-op-result mono small dim">{rebase.data}</div>}
+            {pull.error && (
+              <ScmOpNotice className="error" text={String(pull.error)} onDismiss={pull.reset} />
+            )}
+            {rebase.error && (
+              <ScmOpNotice className="error" text={String(rebase.error)} onDismiss={rebase.reset} />
+            )}
+            {merge.error && (
+              <ScmOpNotice className="error" text={String(merge.error)} onDismiss={merge.reset} />
+            )}
+            {pull.data && (
+              <ScmOpNotice
+                className="scm-op-result mono small dim"
+                text={pull.data}
+                onDismiss={pull.reset}
+              />
+            )}
+            {rebase.data && (
+              <ScmOpNotice
+                className="scm-op-result mono small dim"
+                text={rebase.data}
+                onDismiss={rebase.reset}
+              />
+            )}
+            {merge.data && (
+              <ScmOpNotice
+                className="scm-op-result mono small dim"
+                text={merge.data}
+                onDismiss={merge.reset}
+              />
+            )}
 
             {commits && commits.length > 0 ? (
               <CommitGraph commits={commits} head={scm.head} onSelect={setCommitTarget} />
@@ -531,6 +644,37 @@ function CommitGraph({
           </div>
         );
       })}
+    </div>
+  );
+}
+
+/**
+ * A source-control op message (pull/rebase/merge result or error) with a dismiss
+ * control. These three share one area and otherwise linger until the next op or a
+ * session switch, so `onDismiss` clears the underlying mutation via its reset(),
+ * which drops the message from the UI.
+ */
+function ScmOpNotice({
+  text,
+  className,
+  onDismiss,
+}: {
+  text: string;
+  className: string;
+  onDismiss: () => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className={`scm-op-notice ${className}`}>
+      <span className="scm-op-text">{text}</span>
+      <button
+        className="scm-op-dismiss"
+        onClick={onDismiss}
+        title={t("common.dismiss")}
+        aria-label={t("common.dismiss")}
+      >
+        ×
+      </button>
     </div>
   );
 }

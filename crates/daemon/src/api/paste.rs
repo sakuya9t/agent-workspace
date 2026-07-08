@@ -34,6 +34,19 @@ fn sniff_image_ext(b: &[u8]) -> Option<&'static str> {
     }
 }
 
+/// MIME type of a supported image, sniffed from the same magic bytes as
+/// [`sniff_image_ext`]. Shared with the diff panel's preview endpoint so both
+/// the paste and preview paths trust the bytes, never the filename.
+pub(crate) fn sniff_image_mime(b: &[u8]) -> Option<&'static str> {
+    Some(match sniff_image_ext(b)? {
+        "png" => "image/png",
+        "jpg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => return None,
+    })
+}
+
 /// Store a pasted/dropped image for a session so its agent can read it, then
 /// hand the client back the path to inject as prompt text.
 ///

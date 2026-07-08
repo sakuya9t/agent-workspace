@@ -82,6 +82,16 @@ asm_configure() {
   # Relay default bind is 0.0.0.0 so both LAN clients and nodes dialing out reach it.
   export ASM_RELAY_BIND="${ASM_RELAY_BIND:-0.0.0.0:4700}"
 
+  # Packaged web client: if a build exists (client/dist), serve it straight from
+  # the daemon so a box without npm/vite still gets a browser UI at ASM_BIND —
+  # no need to pass ASM_STATIC_DIR by hand. An explicit ASM_STATIC_DIR always
+  # wins (set it empty, ASM_STATIC_DIR=, to disable). Only a daemon launched
+  # fresh below reads this; if you build client/dist while the daemon is already
+  # up, run scripts/restart-daemon.sh to pick it up.
+  if [ -z "${ASM_STATIC_DIR+set}" ] && [ -f "$ROOT/client/dist/index.html" ]; then
+    export ASM_STATIC_DIR="$ROOT/client/dist"
+  fi
+
   LOG_DIR="$ASM_DATA_DIR/logs"
   ASMUX_SOCK="$ASM_RUNTIME_DIR/asmux.sock"
   ASMUX_PIDFILE="$ASM_RUNTIME_DIR/asmux.pid"
