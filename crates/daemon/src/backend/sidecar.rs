@@ -24,7 +24,8 @@ use asmux::wire;
 
 use super::asmux_client::{AsmuxClient, AttachError, StreamEvent};
 use super::{
-    BackendSession, BackendSpawnSpec, BackendStatus, HolderEntry, SessionBackend, Snapshot,
+    BackendSession, BackendSpawnSpec, BackendStatus, HistoryRing, HolderEntry, SessionBackend,
+    Snapshot, HISTORY_RING_BYTES,
 };
 use crate::db::{Db, EventMsg, EventSink};
 use crate::util::now_millis;
@@ -153,6 +154,7 @@ struct SidecarSession {
     session_id: String,
     client: Arc<AsmuxClient>,
     parser: Arc<Mutex<vt100::Parser>>,
+    history: Arc<Mutex<HistoryRing>>,
     tx: broadcast::Sender<Arc<[u8]>>,
     status_rx: watch::Receiver<BackendStatus>,
     seq: Arc<AtomicU64>,
@@ -172,6 +174,7 @@ impl SidecarSession {
         seq_start: u64,
     ) -> Arc<dyn BackendSession> {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK)));
+        let history = Arc::new(Mutex::new(HistoryRing::new(HISTORY_RING_BYTES)));
         let (tx, _keep) = broadcast::channel::<Arc<[u8]>>(BROADCAST_CAP);
         let (status_tx, status_rx) = watch::channel(BackendStatus::Running);
         let seq = Arc::new(AtomicU64::new(seq_start));
@@ -180,13 +183,14 @@ impl SidecarSession {
             session_id: session_id.clone(),
             client,
             parser: parser.clone(),
+            history: history.clone(),
             tx: tx.clone(),
             status_rx,
             seq: seq.clone(),
         });
 
         tokio::spawn(drain_loop(
-            session_id, parser, tx, events, db, seq, status_tx, rx, persist_from,
+            session_id, parser, history, tx, events, db, seq, status_tx, rx, persist_from,
         ));
 
         session
@@ -196,7 +200,7 @@ impl SidecarSession {
 
 impl BackendSession for SidecarSession {
     fn attach(&self) -> (Snapshot, broadcast::Receiver<Arc<[u8]>>) {
-        super::attach_with_history(&self.parser, &self.tx, &self.seq)
+        super::attach_with_history(&self.parser, &self.history, &self.tx, &self.seq)
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -238,6 +242,7 @@ impl BackendSession for SidecarSession {
 async fn drain_loop(
     session_id: String,
     parser: Arc<Mutex<vt100::Parser>>,
+    history: Arc<Mutex<HistoryRing>>,
     tx: broadcast::Sender<Arc<[u8]>>,
     events: EventSink,
     db: Db,
@@ -262,8 +267,15 @@ async fn drain_loop(
                         tracing::error!(session = %session_id, "terminal parser panicked; snapshots frozen for this session");
                     }
                 }
+                // Push the ring and broadcast under the ring lock so a
+                // normal-buffer attach (which reads the ring + subscribes under
+                // that lock) sees a single consistent stream.
                 let arc: Arc<[u8]> = Arc::from(data.clone().into_boxed_slice());
-                let _ = tx.send(arc);
+                {
+                    let mut h = history.lock();
+                    h.push(arc.clone());
+                    let _ = tx.send(arc);
+                }
 
                 // Persist only genuinely-new bytes (replay past `persist_from`
                 // is already in cold history). This is also what keeps adopt from
