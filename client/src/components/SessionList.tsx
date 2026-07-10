@@ -79,6 +79,18 @@ export function SessionList() {
     onSuccess: refresh,
     onError: (e) => alert(String(e)),
   });
+  // Save the full conversation to a file the browser downloads. The daemon
+  // returns the raw transcript as a Blob (auth headers ride the fetch), so we
+  // wrap it in an object URL and click a synthetic link. No delta — every save
+  // is the complete transcript. Not offered for archived sessions (discarded).
+  const save = useMutation({
+    mutationFn: async ({ target, s }: { target: Target; s: Session }) => {
+      const blob = await api.sessionTranscript(target, s.id);
+      triggerDownload(blob, transcriptFilename(s));
+    },
+    onError: (e) =>
+      alert(t("sessionList.saveError", { message: e instanceof Error ? e.message : String(e) })),
+  });
   const ack = useMutation({
     mutationFn: ({ target, id }: MutArgs) => api.ackAttention(target, id),
     onSuccess: refresh,
@@ -182,32 +194,50 @@ export function SessionList() {
         <div className="session-actions">
           {isLive(s.status) ? (
             <button
-              className="btn tiny"
+              className="icon-btn"
+              title={t("sessionList.stopTitle")}
+              aria-label={t("sessionList.stopTitle")}
               onClick={(e) => {
                 e.stopPropagation();
                 stop.mutate({ target, id: s.id });
               }}
             >
-              {t("sessionList.stop")}
+              ⏹️
             </button>
           ) : (
-            <>
-              <span className="ended-status" title={statusLabel(s.status)}>
-                {endedLabel(s.status)}
-                {s.exit_code !== null ? ` · ${s.exit_code}` : ""}
-              </span>
-              {s.status !== "archived" && (
-                <button
-                  className="btn tiny"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    archive.mutate({ target, id: s.id });
-                  }}
-                >
-                  {t("sessionList.archive")}
-                </button>
-              )}
-            </>
+            <span className="ended-status" title={statusLabel(s.status)}>
+              {endedLabel(s.status)}
+              {s.exit_code !== null ? ` · ${s.exit_code}` : ""}
+            </span>
+          )}
+          {/* Save works for any non-archived session (live or ended); archived
+              sessions have been discarded, so there's nothing to save. */}
+          {s.status !== "archived" && (
+            <button
+              className="icon-btn"
+              title={t("sessionList.saveTitle")}
+              aria-label={t("sessionList.saveTitle")}
+              disabled={save.isPending && save.variables?.s.id === s.id}
+              onClick={(e) => {
+                e.stopPropagation();
+                save.mutate({ target, s });
+              }}
+            >
+              💾
+            </button>
+          )}
+          {!isLive(s.status) && s.status !== "archived" && (
+            <button
+              className="icon-btn"
+              title={t("sessionList.archiveTitle")}
+              aria-label={t("sessionList.archiveTitle")}
+              onClick={(e) => {
+                e.stopPropagation();
+                archive.mutate({ target, id: s.id });
+              }}
+            >
+              🗄️
+            </button>
           )}
         </div>
       </div>
@@ -439,4 +469,24 @@ export function SessionList() {
 function basename(p: string): string {
   const parts = p.split(/[/\\]/).filter(Boolean);
   return parts.length ? parts[parts.length - 1] : p;
+}
+
+/** Download filename for a session transcript; mirrors the daemon's naming. */
+function transcriptFilename(s: Session): string {
+  const agent = s.agent_plugin_id.replace(/[^A-Za-z0-9._-]/g, "_");
+  return `session-${agent}-${s.id}.log`;
+}
+
+/** Save a Blob to the user's machine via a synthetic download link. */
+function triggerDownload(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Revoke on the next tick — some browsers abort the download if the object
+  // URL is released synchronously during the click.
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }

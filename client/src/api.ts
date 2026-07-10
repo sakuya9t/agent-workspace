@@ -404,6 +404,12 @@ export const api = {
     req<{ sessions: Session[] }>(t, "/api/sessions").then((r) => r.sessions),
   getSummary: (t: Target, id: string) =>
     req<{ summary: SessionSummary }>(t, `/api/sessions/${id}/summary`).then((r) => r.summary),
+  /**
+   * Full conversation as a raw terminal transcript (ANSI included), as a Blob so
+   * the browser can save it. No delta — always the complete recorded stream.
+   */
+  sessionTranscript: (t: Target, id: string) =>
+    getBlob(t, `/api/sessions/${id}/transcript`),
   sessionUsage: (t: Target, id: string) =>
     req<{ usage: SessionUsage }>(t, `/api/sessions/${id}/usage`).then((r) => r.usage),
   createSession: (t: Target, body: CreateSessionBody) =>

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -64,6 +64,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:id", get(get_session))
         .route("/api/sessions/:id/summary", get(get_summary))
+        .route("/api/sessions/:id/transcript", get(get_transcript))
         .route("/api/sessions/:id/usage", get(get_session_usage))
         .route("/api/sessions/:id/workspace", get(get_session_workspace))
         .route("/api/sessions/:id/stop", post(stop_session))
@@ -330,6 +331,54 @@ async fn get_summary(
         Some(s) => Ok(Json(json!({ "summary": s }))),
         None => Err(AppError(StatusCode::NOT_FOUND, "no summary yet".into())),
     }
+}
+
+/// Download a session's full conversation as a raw terminal transcript: the
+/// complete recorded PTY byte stream (ANSI included), the same bytes replayed on
+/// history attach. There is no delta — every call returns everything persisted
+/// so far (for a live session, the transcript up to now). Archived sessions have
+/// been discarded, so their transcript is no longer offered.
+async fn get_transcript(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    let s = state
+        .manager
+        .get_session(&id)?
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "no such session".into()))?;
+    if s.status == crate::domain::SessionStatus::Archived {
+        return Err(AppError(
+            StatusCode::CONFLICT,
+            "transcript unavailable for an archived session".into(),
+        ));
+    }
+    let bytes = state.manager.db().read_events_after(&id, 0)?;
+    let filename = transcript_filename(&s);
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// A safe download filename for a session's transcript. The session id is a
+/// UUID, but the agent plugin id is free-form, so fold anything outside
+/// `[A-Za-z0-9._-]` to `_` — this both tidies the name and keeps stray bytes
+/// out of the `Content-Disposition` header.
+fn transcript_filename(s: &crate::domain::Session) -> String {
+    let agent: String = s
+        .agent_plugin_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .collect();
+    format!("session-{agent}-{}.log", s.id)
 }
 
 /// Best-effort token/context usage for a session, read from the agent's own
