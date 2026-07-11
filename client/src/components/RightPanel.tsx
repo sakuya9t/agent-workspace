@@ -159,11 +159,6 @@ export function RightPanel({ target, session }: Props) {
       setMergeTarget("");
       refreshScm();
     },
-    onError: (e) => {
-      if ((e as { status?: number }).status === 409) {
-        alert(t("rightPanel.mergeConflictPrompt", { message: (e as Error).message }));
-      }
-    },
   });
 
   // Pull/rebase/merge share one result/error area, so starting one clears the
@@ -531,32 +526,81 @@ export function RightPanel({ target, session }: Props) {
               <div className="dim small">{t("rightPanel.scmRunning")}</div>
             )}
             {pull.error && (
-              <ScmOpNotice className="error" text={String(pull.error)} onDismiss={pull.reset} />
+              <ScmOpNotice
+                status="error"
+                title={t("rightPanel.pullFailed")}
+                summary={scmErrorSummary(pull.error)}
+                details={scmErrorDetails(pull.error)}
+                onDismiss={pull.reset}
+              />
             )}
             {rebase.error && (
-              <ScmOpNotice className="error" text={String(rebase.error)} onDismiss={rebase.reset} />
+              <ScmOpNotice
+                status="error"
+                title={t("rightPanel.rebaseFailed")}
+                summary={scmErrorSummary(rebase.error)}
+                details={scmErrorDetails(rebase.error)}
+                onDismiss={rebase.reset}
+              />
             )}
             {merge.error && (
-              <ScmOpNotice className="error" text={String(merge.error)} onDismiss={merge.reset} />
+              <ScmOpNotice
+                status="error"
+                title={t("rightPanel.mergeFailed")}
+                summary={
+                  (merge.error as { status?: number }).status === 409
+                    ? t("rightPanel.mergeConflictSummary")
+                    : scmErrorSummary(merge.error)
+                }
+                details={scmErrorDetails(merge.error)}
+                onDismiss={merge.reset}
+              />
             )}
             {pull.data && (
               <ScmOpNotice
-                className="scm-op-result mono small dim"
-                text={pull.data}
+                status="success"
+                title={t("rightPanel.pullComplete")}
+                summary={
+                  pull.data.toLowerCase().includes("already up to date")
+                    ? t("rightPanel.pullUpToDate", {
+                        branch: scm.branch ?? t("rightPanel.currentBranch"),
+                      })
+                    : t("rightPanel.pullSuccess", {
+                        branch: scm.branch ?? t("rightPanel.currentBranch"),
+                      })
+                }
+                details={pull.data}
                 onDismiss={pull.reset}
               />
             )}
             {rebase.data && (
               <ScmOpNotice
-                className="scm-op-result mono small dim"
-                text={rebase.data}
+                status="success"
+                title={t("rightPanel.rebaseComplete")}
+                summary={
+                  rebase.data.toLowerCase().includes("up to date")
+                    ? t("rightPanel.rebaseUpToDate", {
+                        branch: scm.branch ?? t("rightPanel.currentBranch"),
+                        target: rebase.variables,
+                      })
+                    : t("rightPanel.rebaseSuccess", {
+                        branch: scm.branch ?? t("rightPanel.currentBranch"),
+                        target: rebase.variables,
+                      })
+                }
+                details={rebase.data}
                 onDismiss={rebase.reset}
               />
             )}
             {merge.data && (
               <ScmOpNotice
-                className="scm-op-result mono small dim"
-                text={merge.data}
+                status="success"
+                title={t("rightPanel.mergeComplete")}
+                summary={t("rightPanel.mergeSuccess", {
+                  branch: scm.branch ?? t("rightPanel.currentBranch"),
+                  target: merge.variables,
+                })}
+                details={merge.data}
                 onDismiss={merge.reset}
               />
             )}
@@ -649,24 +693,44 @@ function CommitGraph({
 }
 
 /**
- * A source-control op message (pull/rebase/merge result or error) with a dismiss
- * control. These three share one area and otherwise linger until the next op or a
- * session switch, so `onDismiss` clears the underlying mutation via its reset(),
- * which drops the message from the UI.
+ * Compact source-control outcome with raw Git output available on demand. These
+ * notices linger until the next operation/session or until explicitly dismissed.
  */
 function ScmOpNotice({
-  text,
-  className,
+  status,
+  title,
+  summary,
+  details,
   onDismiss,
 }: {
-  text: string;
-  className: string;
+  status: "success" | "error";
+  title: string;
+  summary: string;
+  details: string;
   onDismiss: () => void;
 }) {
   const { t } = useTranslation();
+  const trimmedDetails = details.trim();
+  const showDetails = trimmedDetails.length > 0 && trimmedDetails !== summary.trim();
   return (
-    <div className={`scm-op-notice ${className}`}>
-      <span className="scm-op-text">{text}</span>
+    <div
+      className={`scm-op-notice scm-op-${status}`}
+      role={status === "error" ? "alert" : "status"}
+      aria-live={status === "error" ? "assertive" : "polite"}
+    >
+      <span className="scm-op-status" aria-hidden="true">
+        {status === "success" ? "✓" : "!"}
+      </span>
+      <div className="scm-op-copy">
+        <div className="scm-op-title">{title}</div>
+        <div className="scm-op-summary">{summary}</div>
+        {showDetails && (
+          <details className="scm-op-details">
+            <summary>{t("rightPanel.showGitDetails")}</summary>
+            <pre>{trimmedDetails}</pre>
+          </details>
+        )}
+      </div>
       <button
         className="scm-op-dismiss"
         onClick={onDismiss}
@@ -677,6 +741,17 @@ function ScmOpNotice({
       </button>
     </div>
   );
+}
+
+function scmErrorDetails(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** Keep the actionable first line visible; the complete command output stays expandable. */
+function scmErrorSummary(error: unknown): string {
+  const details = scmErrorDetails(error).trim();
+  const firstLine = details.split(/\r?\n/, 1)[0] || details;
+  return firstLine.length > 180 ? `${firstLine.slice(0, 177)}…` : firstLine;
 }
 
 function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
