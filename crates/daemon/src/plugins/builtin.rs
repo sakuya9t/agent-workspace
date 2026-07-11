@@ -70,8 +70,15 @@ impl AgentPlugin for CodexPlugin {
     fn detect_binary(&self) -> Option<String> {
         find_in_path("codex")
     }
-    fn bell_means_attention(&self) -> bool {
+    // Codex rings the terminal bell on *turn completion*, not only on approval
+    // prompts, so the bell can't be trusted as a "needs you" signal — a finished
+    // turn would read as blocked and stick there. Attention is driven off the
+    // rendered screen instead (see `codex_attention`), so the bell is left off.
+    fn attention_uses_screen(&self) -> bool {
         true
+    }
+    fn attention(&self, screen: &str, bell: bool) -> (AttentionState, Option<String>) {
+        attention::codex_attention(screen, bell)
     }
     fn usage(&self, cx: &UsageContext) -> Option<AgentUsage> {
         usage::codex_usage(cx)
