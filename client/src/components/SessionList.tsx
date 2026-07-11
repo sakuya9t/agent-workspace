@@ -202,7 +202,7 @@ export function SessionList() {
                 stop.mutate({ target, id: s.id });
               }}
             >
-              ⏹️
+              <span className="action-icon action-icon-stop" aria-hidden="true" />
             </button>
           ) : (
             <span className="ended-status" title={statusLabel(s.status)}>
@@ -223,7 +223,7 @@ export function SessionList() {
                 save.mutate({ target, s });
               }}
             >
-              💾
+              <span className="action-icon action-icon-save-transcript" aria-hidden="true" />
             </button>
           )}
           {!isLive(s.status) && s.status !== "archived" && (
@@ -236,7 +236,7 @@ export function SessionList() {
                 archive.mutate({ target, id: s.id });
               }}
             >
-              🗄️
+              <span className="action-icon action-icon-archive" aria-hidden="true" />
             </button>
           )}
         </div>

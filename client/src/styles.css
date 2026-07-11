@@ -1041,6 +1041,47 @@ body.col-resizing iframe {
   opacity: 0.5;
   cursor: not-allowed;
 }
+.action-icon {
+  display: block;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  background: currentColor;
+  mask-position: center;
+  mask-repeat: no-repeat;
+  mask-size: contain;
+  -webkit-mask-position: center;
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-size: contain;
+}
+.action-icon-stop {
+  mask-image: url("/icons/actions/stop.png");
+  -webkit-mask-image: url("/icons/actions/stop.png");
+}
+.action-icon-archive {
+  mask-image: url("/icons/actions/archive.png");
+  -webkit-mask-image: url("/icons/actions/archive.png");
+}
+.action-icon-save-transcript {
+  mask-image: url("/icons/actions/save-transcript.png");
+  -webkit-mask-image: url("/icons/actions/save-transcript.png");
+}
+.action-icon-git-merge {
+  mask-image: url("/icons/actions/git-merge.png");
+  -webkit-mask-image: url("/icons/actions/git-merge.png");
+}
+.action-icon-git-rebase {
+  mask-image: url("/icons/actions/git-rebase.png");
+  -webkit-mask-image: url("/icons/actions/git-rebase.png");
+}
+.action-icon-git-pull {
+  mask-image: url("/icons/actions/git-pull.png");
+  -webkit-mask-image: url("/icons/actions/git-pull.png");
+}
+.action-icon-git-push {
+  mask-image: url("/icons/actions/git-push.png");
+  -webkit-mask-image: url("/icons/actions/git-push.png");
+}
 .rebase-picker {
   display: flex;
   flex-wrap: wrap;

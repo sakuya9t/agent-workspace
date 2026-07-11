@@ -397,7 +397,7 @@ export function RightPanel({ target, session }: Props) {
                     title={t("rightPanel.pullTitle")}
                     aria-label={t("rightPanel.pullTitle")}
                   >
-                    ⬇️
+                    <span className="action-icon action-icon-git-pull" aria-hidden="true" />
                   </button>
                   <button
                     className={"icon-btn" + (rebaseOpen ? " active" : "")}
@@ -409,7 +409,7 @@ export function RightPanel({ target, session }: Props) {
                     title={t("rightPanel.rebaseTitle")}
                     aria-label={t("rightPanel.rebaseTitle")}
                   >
-                    🔃
+                    <span className="action-icon action-icon-git-rebase" aria-hidden="true" />
                   </button>
                   <button
                     className={"icon-btn" + (mergeOpen ? " active" : "")}
@@ -421,7 +421,7 @@ export function RightPanel({ target, session }: Props) {
                     title={t("rightPanel.mergeTitle")}
                     aria-label={t("rightPanel.mergeTitle")}
                   >
-                    🔀
+                    <span className="action-icon action-icon-git-merge" aria-hidden="true" />
                   </button>
                 </span>
               )}
