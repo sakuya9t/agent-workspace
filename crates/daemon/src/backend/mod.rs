@@ -184,6 +184,143 @@ pub(crate) fn repaint_with_history(parser: &mut vt100::Parser) -> Vec<u8> {
     out
 }
 
+/// Scan a string-type escape sequence (OSC/DCS/APC/PM/SOS) whose body starts at
+/// `from` (the first byte after the `ESC ]`/`ESC P`/… introducer). Returns
+/// `(body_end, seq_end)` — `body_end` is one past the last body byte, `seq_end`
+/// one past the terminator (BEL, or a two-byte ST `ESC \`). `None` if the ring
+/// was truncated before a terminator arrived.
+fn scan_string_seq(input: &[u8], from: usize) -> Option<(usize, usize)> {
+    const ESC: u8 = 0x1b;
+    const BEL: u8 = 0x07;
+    let mut j = from;
+    while j < input.len() {
+        if input[j] == BEL {
+            return Some((j, j + 1));
+        }
+        if input[j] == ESC && j + 1 < input.len() && input[j + 1] == b'\\' {
+            return Some((j, j + 2));
+        }
+        j += 1;
+    }
+    None
+}
+
+/// True for an OSC *color/status query* — `OSC <code> ; … ; ?`, where `<code>`
+/// is a color/clipboard slot and the final `;`-separated parameter is a bare
+/// `?`. That is the only OSC form a terminal answers with a report. Setters
+/// (`OSC 10;#rgb`), window titles (`OSC 0;done?`), and hyperlinks
+/// (`OSC 8;;https://x/?q=1`) are left intact: their `?`, if any, is embedded in
+/// a longer token, and their code is outside the color set.
+fn is_osc_color_query(body: &[u8]) -> bool {
+    // OSC codes whose query form (`… ; ?`) a terminal answers with a report:
+    // fg/bg/cursor/mouse/highlight colors (10–19), the 256-color and special
+    // palettes (4, 5), and the clipboard (52).
+    const COLOR_CODES: [&[u8]; 13] = [
+        b"4", b"5", b"10", b"11", b"12", b"13", b"14", b"15", b"16", b"17", b"18", b"19", b"52",
+    ];
+    let digits = body.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 || digits >= body.len() || body[digits] != b';' {
+        return false;
+    }
+    COLOR_CODES.contains(&&body[..digits])
+        && body.split(|&c| c == b';').last() == Some(b"?".as_slice())
+}
+
+/// Strip the terminal *query* sequences from replayed scrollback so a freshly
+/// attached emulator does not auto-answer them onto the PTY.
+///
+/// On attach we replay a normal-buffer session's raw output verbatim (see
+/// `raw_history_repaint`). That output still contains the queries programs
+/// emitted while running — cursor-position reports (DSR, `CSI … n`), device
+/// attributes (DA, `CSI … c`), and OSC color queries (`OSC 10/11/… ; ?`). A live
+/// terminal answers each by writing the reply onto its input channel, and the
+/// program that asked consumed that reply long ago. Replayed into a new xterm.js
+/// the same queries are answered again — but now the replies land at the bare
+/// shell prompt as literal text (`;1R`, `10;rgb:…`, `2c`). Removing the queries
+/// from the replay leaves nothing to answer. Only this historical snapshot is
+/// filtered; queries a program issues *live* while a client is attached still
+/// flow through untouched and are answered correctly.
+fn strip_terminal_queries(input: &[u8]) -> Vec<u8> {
+    const ESC: u8 = 0x1b;
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] != ESC || i + 1 >= input.len() {
+            out.push(input[i]);
+            i += 1;
+            continue;
+        }
+        match input[i + 1] {
+            b'[' => {
+                // CSI: ESC [ (params 0x30..=0x3F) (intermediates 0x20..=0x2F)
+                // final (0x40..=0x7E). DSR (`… n`) and DA (`… c`) are pure
+                // requests — a terminal only ever replies to them, they never
+                // draw — so drop them; emit every other CSI verbatim.
+                let mut j = i + 2;
+                loop {
+                    if j >= input.len() {
+                        // Ring truncated mid-CSI: emit the remainder as-is.
+                        out.extend_from_slice(&input[i..]);
+                        return out;
+                    }
+                    let c = input[j];
+                    if (0x40..=0x7e).contains(&c) {
+                        if c == b'n' || c == b'c' {
+                            i = j + 1; // drop the whole request
+                        } else {
+                            out.extend_from_slice(&input[i..=j]);
+                            i = j + 1;
+                        }
+                        break;
+                    }
+                    if c == ESC {
+                        // Aborted CSI: emit what we have, reprocess from the ESC.
+                        out.extend_from_slice(&input[i..j]);
+                        i = j;
+                        break;
+                    }
+                    j += 1;
+                }
+            }
+            b']' => match scan_string_seq(input, i + 2) {
+                Some((body_end, seq_end)) => {
+                    if is_osc_color_query(&input[i + 2..body_end]) {
+                        i = seq_end; // drop the whole OSC query
+                    } else {
+                        out.extend_from_slice(&input[i..seq_end]);
+                        i = seq_end;
+                    }
+                }
+                None => {
+                    out.extend_from_slice(&input[i..]);
+                    return out;
+                }
+            },
+            b'P' | b'X' | b'^' | b'_' => {
+                // Other string sequences (DCS/SOS/PM/APC) never carry a query we
+                // answer; consume each as a unit so its body is not rescanned as
+                // CSI, and emit it verbatim.
+                match scan_string_seq(input, i + 2) {
+                    Some((_, seq_end)) => {
+                        out.extend_from_slice(&input[i..seq_end]);
+                        i = seq_end;
+                    }
+                    None => {
+                        out.extend_from_slice(&input[i..]);
+                        return out;
+                    }
+                }
+            }
+            _ => {
+                // Plain two-byte escape (e.g. ESC c = RIS): emit both bytes.
+                out.extend_from_slice(&input[i..i + 2]);
+                i += 2;
+            }
+        }
+    }
+    out
+}
+
 /// Preamble + raw ring, the attach repaint for a **normal-buffer** session.
 /// The preamble parks the client in a known state — normal buffer, no scroll
 /// region, cleared screen + scrollback, default attributes — so a ring that was
@@ -192,10 +329,19 @@ pub(crate) fn repaint_with_history(parser: &mut vt100::Parser) -> Vec<u8> {
 /// next full repaint lands. The ring bytes then reconstruct scrollback AND the
 /// current screen in the client's own emulator (it ends at the live screen, so
 /// no separate screen repaint is appended).
+///
+/// The ring is filtered through `strip_terminal_queries` first: replaying the
+/// raw queries programs emitted would make the client's emulator answer them
+/// into the PTY, dumping report sequences (`;1R`, `10;rgb:…`, `2c`) at the shell
+/// prompt.
 fn raw_history_repaint(history: &HistoryRing) -> Vec<u8> {
-    let mut out = Vec::with_capacity(history.bytes + 16);
+    let mut ring = Vec::with_capacity(history.bytes);
+    history.extend_into(&mut ring);
+    let ring = strip_terminal_queries(&ring);
+
+    let mut out = Vec::with_capacity(ring.len() + 16);
     out.extend_from_slice(b"\x1b[?1049l\x1b[r\x1b[H\x1b[2J\x1b[3J\x1b[m");
-    history.extend_into(&mut out);
+    out.extend_from_slice(&ring);
     out
 }
 
@@ -311,7 +457,8 @@ pub trait BackendSession: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_with_history, repaint_with_history, HistoryRing, HISTORY_RING_BYTES,
+        attach_with_history, raw_history_repaint, repaint_with_history, strip_terminal_queries,
+        HistoryRing, HISTORY_RING_BYTES,
     };
     use parking_lot::Mutex;
     use std::sync::atomic::AtomicU64;
@@ -505,5 +652,52 @@ mod tests {
         let mut client = vt100::Parser::new(5, 20, 1000);
         client.process(&snap.repaint);
         assert!(client.screen().alternate_screen());
+    }
+
+    /// The four query families a shell/agent emits — DSR (`CSI…n`), primary and
+    /// secondary DA (`CSI…c`), and OSC 10/11 color queries in both BEL- and
+    /// ST-terminated form — are removed; surrounding text is untouched.
+    #[test]
+    fn strip_removes_dsr_da_and_osc_color_queries() {
+        let input = b"A\x1b[6nB\x1b[cC\x1b[>0cD\x1b]10;?\x07E\x1b]11;?\x1b\\F";
+        assert_eq!(strip_terminal_queries(input), b"ABCDEF");
+    }
+
+    /// Non-query sequences that merely *look* adjacent must survive verbatim:
+    /// SGR, a cursor-style setter (`CSI 2 q`), window titles and OSC 8 hyperlinks
+    /// (whose `?` is embedded in a URL, not a bare final parameter), and OSC
+    /// color *setters* (`11;rgb:…`, `4;1;#…`).
+    #[test]
+    fn strip_preserves_sgr_titles_hyperlinks_and_setters() {
+        let input: &[u8] = b"\x1b[31mred\x1b[m\x1b[2 q\
+\x1b]0;title?\x07\
+\x1b]8;;https://ex.com/?q=1\x07link\x1b]8;;\x07\
+\x1b]11;rgb:0b0b/0e0e/1414\x07\x1b]4;1;#ff0000\x07";
+        assert_eq!(strip_terminal_queries(input), input);
+    }
+
+    /// A ring truncated mid-sequence (byte-cap eviction can cut anywhere) must be
+    /// emitted as-is, and an aborted CSI (a new ESC before the final byte) is
+    /// preserved rather than swallowing what follows.
+    #[test]
+    fn strip_leaves_truncated_and_aborted_sequences_intact() {
+        assert_eq!(strip_terminal_queries(b"hello\x1b[6"), b"hello\x1b[6");
+        assert_eq!(strip_terminal_queries(b"hi\x1b]11;?"), b"hi\x1b]11;?");
+        assert_eq!(strip_terminal_queries(b"\x1b[6\x1b[m"), b"\x1b[6\x1b[m");
+    }
+
+    /// End to end: a ring holding OSC/DSR/DA queries — including one split across
+    /// chunk boundaries — yields a repaint of preamble + visible text only, with
+    /// no query bytes left for the client's emulator to answer.
+    #[test]
+    fn raw_history_repaint_strips_replayed_queries() {
+        let mut ring = HistoryRing::new(HISTORY_RING_BYTES);
+        ring.push(Arc::from(b"\x1b]11;?\x07hello \x1b[".to_vec().into_boxed_slice()));
+        ring.push(Arc::from(b"6n world\x1b[c!".to_vec().into_boxed_slice()));
+
+        let out = raw_history_repaint(&ring);
+        let mut expected = PREAMBLE.to_vec();
+        expected.extend_from_slice(b"hello  world!");
+        assert_eq!(out, expected);
     }
 }
