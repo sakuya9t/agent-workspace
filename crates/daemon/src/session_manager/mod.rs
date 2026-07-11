@@ -1214,6 +1214,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn codex_turn_complete_bell_reads_as_activity_via_on_output() {
+        // The reported bug, end-to-end: Codex rings the terminal bell when a turn
+        // finishes. The plugin opts out of the bell heuristic and classifies from
+        // the screen, so a finished turn (no approval menu) must read as activity
+        // — settling to idle — even though the byte chunk carried a real bell.
+        let (manager, dir) = test_manager();
+        let codex = manager.registry.get("codex").unwrap();
+        let screen = "\u{25cf} Committed as ee1d352 \u{2014} done.\n\u{2500} Worked for 10m 19s \u{2500}\u{2500}\n\u{203a} ";
+        let handle = mock_handle_with_screen(screen);
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::Activity);
+        manager.on_output(
+            "sid", &handle, b"done.\x07", Some(&codex), &mut tail, &mut last_write,
+            &mut last_attn, &mut false, 0, false,
+        );
+        assert_eq!(last_attn, AttentionState::Activity);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn codex_approval_screen_blocks_via_on_output() {
+        // The other half: a real Codex approval menu on screen must read as a
+        // block, so the session is flagged for the user.
+        let (manager, dir) = test_manager();
+        let codex = manager.registry.get("codex").unwrap();
+        let screen = " Would you like to run the following command?\n \u{203a} 1. Yes, proceed (y)\n   2. No, and tell Codex what to do differently (esc)\n Press enter to confirm or esc to cancel";
+        let handle = mock_handle_with_screen(screen);
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::Activity);
+        manager.on_output(
+            "sid", &handle, b"\x1b[2K", Some(&codex), &mut tail, &mut last_write,
+            &mut last_attn, &mut false, 0, false,
+        );
+        assert_eq!(last_attn, AttentionState::ApprovalNeeded);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     // ---- stalled-on-error settle (working -> error, not idle) ----
 
     #[test]
