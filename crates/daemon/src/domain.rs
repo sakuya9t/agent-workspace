@@ -192,6 +192,16 @@ pub struct WorkspaceInstance {
     /// "active" | "released"
     pub status: String,
     pub created_at: i64,
+    /// Whether we created `path` and may remove it when the last session there
+    /// is archived. False when the session joined a worktree that already
+    /// existed — the user's own checkout is not ours to reclaim.
+    #[serde(default)]
+    pub owns_worktree: bool,
+    /// Whether we created `branch` and may delete it on archive. False when the
+    /// session was handed a branch that already existed (`main`, `release`, a
+    /// feature branch): we only borrowed it, and archiving must leave it intact.
+    #[serde(default)]
+    pub owns_branch: bool,
 }
 
 /// Structural session summary written on exit / segment boundary.
