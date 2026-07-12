@@ -178,11 +178,41 @@ start_relay() {
 
 # Start the holder (idempotent). It runs detached (nohup) so it outlives the
 # daemon — that is what makes sessions durable across a daemon restart.
+# Does a LIVE holder answer on the socket? This is the only check that means
+# anything: a pid can be alive while the socket is gone (an "orphan" — the holder
+# still holds PTYs but nothing can dial it). Gating on pid alone is what let the
+# 2026-07-12 incident wedge the stack; `asmux probe` exits 0 only if someone answers.
+holder_live() {
+  [ -x "$ASMUX_BIN" ] || return 1
+  ASMUX_SOCK="$ASMUX_SOCK" ASM_RUNTIME_DIR="$ASM_RUNTIME_DIR" \
+    "$ASMUX_BIN" probe >/dev/null 2>&1
+}
+
 start_asmux() {
-  if pid_alive "$ASMUX_PIDFILE"; then
-    log "asmux already running (pid $(cat "$ASMUX_PIDFILE"))"
+  if holder_live; then
+    log "asmux already running (pid $(cat "$ASMUX_PIDFILE" 2>/dev/null || echo '?'))"
     return 0
   fi
+
+  # Pid alive but nobody answering = an orphaned holder: its socket was unlinked
+  # out from under it. asmux now rebinds itself within ~5s, so give it a moment
+  # before concluding anything.
+  if pid_alive "$ASMUX_PIDFILE"; then
+    local p i
+    p="$(cat "$ASMUX_PIDFILE")"
+    log "asmux (pid $p) is alive but not answering on $ASMUX_SOCK — waiting for it to rebind..."
+    for i in $(seq 1 20); do
+      sleep 0.5
+      if holder_live; then log "asmux recovered its socket (pid $p) — sessions intact"; return 0; fi
+    done
+    err "asmux (pid $p) is ORPHANED: alive, holding live PTYs, but unreachable — its socket path"
+    err "is owned by something else, or rebinding failed. Its sessions CANNOT be attached, and"
+    err "killing it will lose them. Inspect first:  $LOG_DIR/asmux.log"
+    err "To force a clean holder anyway (THIS KILLS ITS SESSIONS):"
+    err "    kill $p && scripts/start.sh"
+    return 1
+  fi
+
   [ -x "$ASMUX_BIN" ] || { err "missing $ASMUX_BIN — build first (cargo build -p asmux)"; return 1; }
   log "starting asmux holder..."
   ASM_RUNTIME_DIR="$ASM_RUNTIME_DIR" ASMUX_SOCK="$ASMUX_SOCK" \

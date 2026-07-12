@@ -34,8 +34,16 @@ asm_parse_args "$@" || { usage; exit 2; }
 [ "${ASM_SHOW_HELP:-0}" = 1 ] && { usage; exit 0; }
 asm_configure
 
-if ! pid_alive "$ASMUX_PIDFILE"; then
-  err "asmux is not running — start the full stack first: scripts/start.sh"
+# Check the SOCKET, not just the pid: a holder whose socket was unlinked is alive
+# but unreachable, and restarting the daemon into that state just fails the boot
+# (exactly what happened on 2026-07-12). start.sh knows how to diagnose/recover.
+if ! holder_live; then
+  if pid_alive "$ASMUX_PIDFILE"; then
+    err "asmux (pid $(cat "$ASMUX_PIDFILE")) is alive but not answering on $ASMUX_SOCK."
+    err "Restarting the daemon now would just fail to boot. Run: scripts/start.sh"
+  else
+    err "asmux is not running — start the full stack first: scripts/start.sh"
+  fi
   exit 1
 fi
 

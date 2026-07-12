@@ -67,6 +67,86 @@ struct Conn {
     streams: Mutex<HashMap<String, Arc<Notify>>>,
 }
 
+/// How often the watchdog re-checks that our socket path still points at us.
+const SOCKET_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Accept connections, and keep our socket path pointing at us.
+///
+/// A holder that loses its socket path does not notice: its listener fd keeps
+/// working, so it logs nothing and goes on holding PTYs that nobody can reach any
+/// more. Those sessions are then lost at the next daemon restart — that is the
+/// 2026-07-12 incident (see `socket.rs`). The [`socket::ensure_bindable`] guard
+/// stops another asmux from *taking* the path; this watchdog covers the rest (a
+/// stray `rm`, a `/run` sweep) by rebinding so we stay reachable.
+///
+/// Rebinding preserves every PTY — the sessions live in this process, not in the
+/// socket. That is why healing beats restarting: a restart would kill them all.
+pub async fn serve_watched(
+    listener: UnixListener,
+    bound_ino: u64,
+    sock_path: std::path::PathBuf,
+    ctx: Arc<ServerCtx>,
+) {
+    let mut listener = listener;
+    let mut bound_ino = bound_ino;
+    let mut ticker = tokio::time::interval(SOCKET_WATCH_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            res = listener.accept() => match res {
+                Ok((stream, _addr)) => {
+                    let ctx = ctx.clone();
+                    let id = ctx.next_conn_id.fetch_add(1, Ordering::Relaxed);
+                    tokio::spawn(async move {
+                        handle_conn(stream, ctx, id).await;
+                    });
+                }
+                Err(e) => tracing::warn!("accept failed: {e}"),
+            },
+
+            _ = ticker.tick() => {
+                if !crate::socket::was_displaced(&sock_path, bound_ino) {
+                    continue;
+                }
+                // Our path no longer routes to us. Who has it now?
+                match crate::socket::probe(&sock_path).await {
+                    crate::socket::SocketState::Live => {
+                        // Another holder owns it. Stealing it back is exactly the
+                        // move that caused the incident, so we do not. We are an
+                        // orphan: still holding live PTYs nobody can dial.
+                        tracing::error!(
+                            socket = %sock_path.display(),
+                            sessions = ctx.registry.session_count(),
+                            "our socket path was taken over by another asmux; this holder is now \
+                             UNREACHABLE and its sessions cannot be attached. Refusing to steal the \
+                             path back. Stop the other holder, then restart this one to recover."
+                        );
+                        // Back off: complaining every 5s helps nobody.
+                        ticker.reset_after(std::time::Duration::from_secs(60));
+                    }
+                    // Gone, or a dead file left behind: the path is ours to retake.
+                    _ => match crate::socket::bind(&sock_path, false).await {
+                        Ok((l, ino)) => {
+                            tracing::warn!(
+                                socket = %sock_path.display(),
+                                sessions = ctx.registry.session_count(),
+                                "socket path had been unlinked; rebound it. Sessions were NOT lost."
+                            );
+                            listener = l;
+                            bound_ino = ino;
+                        }
+                        Err(e) => tracing::error!(
+                            socket = %sock_path.display(),
+                            "socket path was unlinked and rebinding failed: {e:#}"
+                        ),
+                    },
+                }
+            }
+        }
+    }
+}
+
 /// Accept connections forever, one task per connection.
 pub async fn serve(listener: UnixListener, ctx: Arc<ServerCtx>) {
     loop {

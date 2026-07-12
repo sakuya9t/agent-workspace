@@ -6,16 +6,14 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
-use tokio::net::UnixListener;
+use anyhow::Result;
 
 use asmux::registry::Registry;
-use asmux::server::{serve, ServerCtx};
+use asmux::server::{serve_watched, ServerCtx};
 use asmux::MEMORY_LIMIT_DEFAULT_BYTES;
 
 #[tokio::main]
@@ -29,20 +27,22 @@ async fn main() -> Result<()> {
         .init();
 
     let sock_path = resolve_socket_path()?;
-    if let Some(dir) = sock_path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("create runtime dir {dir:?}"))?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("chmod 0700 {dir:?}"))?;
+
+    // `probe` is a read-only diagnostic for the service scripts: exit 0 iff a live
+    // holder answers on this path. It lets them distinguish "alive" from "the pid
+    // is alive but the socket is gone" — the orphan state that wedged the daemon
+    // on 2026-07-12, which a pid check cannot see.
+    if std::env::args().nth(1).as_deref() == Some("probe") {
+        let state = asmux::socket::probe(&sock_path).await;
+        println!("{state:?}");
+        std::process::exit(if state == asmux::socket::SocketState::Live { 0 } else { 1 });
     }
 
-    // Remove a stale socket. NOTE (M4): before removing we should probe for a
-    // live holder and refuse to clobber it; for M1 single-user dev this is a
-    // plain unlink.
-    let _ = std::fs::remove_file(&sock_path);
-    let listener = UnixListener::bind(&sock_path)
-        .with_context(|| format!("bind UDS at {sock_path:?}"))?;
-    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 0600 {sock_path:?}"))?;
+    // Bind, refusing to displace a live holder (a test with a stale ASMUX_SOCK, a
+    // stray `cargo run`). `bound_ino` lets the watchdog notice if our path is
+    // later unlinked out from under us. See `socket::ensure_bindable`.
+    let takeover = matches!(std::env::var("ASMUX_TAKEOVER").as_deref(), Ok("1"));
+    let (listener, bound_ino) = asmux::socket::bind(&sock_path, takeover).await?;
 
     let memory_limit = std::env::var("ASMUX_MEMORY_LIMIT")
         .ok()
@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
 
     let cleanup_path = sock_path.clone();
     tokio::select! {
-        _ = serve(listener, ctx) => {}
+        _ = serve_watched(listener, bound_ino, sock_path, ctx) => {}
         _ = shutdown_signal() => {
             tracing::info!("shutdown signal received");
         }

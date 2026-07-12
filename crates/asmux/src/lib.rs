@@ -36,6 +36,7 @@ pub mod ring;
 pub mod session;
 pub mod registry;
 pub mod server;
+pub mod socket;
 
 /// Negotiated wire-protocol version implemented by this build. v1 == the frozen
 /// `docs/asmux-protocol.md`.

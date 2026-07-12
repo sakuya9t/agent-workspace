@@ -18,8 +18,14 @@ elif relay_enabled; then
   log "relay   stopped"
 fi
 
-if pid_alive "$ASMUX_PIDFILE"; then
-  log "asmux   RUNNING  pid=$(cat "$ASMUX_PIDFILE")  socket=$ASMUX_SOCK"
+# "RUNNING" must mean *reachable*. A pid-only check reported a healthy holder
+# right through the 2026-07-12 outage, while its socket was gone and the daemon
+# could not boot. ORPHANED is the state worth shouting about.
+if holder_live; then
+  log "asmux   RUNNING  pid=$(cat "$ASMUX_PIDFILE" 2>/dev/null || echo '?')  socket=$ASMUX_SOCK"
+elif pid_alive "$ASMUX_PIDFILE"; then
+  err "asmux   ORPHANED  pid=$(cat "$ASMUX_PIDFILE")  — alive, but NOT answering on $ASMUX_SOCK."
+  err "                  It still holds live PTYs that nothing can attach to. See scripts/start.sh."
 else
   log "asmux   stopped"
 fi
