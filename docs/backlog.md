@@ -184,6 +184,12 @@ pick it up**.
 - **Terminal copy/paste under TUI mouse reporting:** `7e908b7` copy-selection to
   the OS clipboard; `b682d0d` + `1e40c88` keep selection and copy/paste working
   while an app has mouse reporting on.
+- **Terminal text selection on touch:** long-press selects a word, drag extends
+  it (auto-scrolling at the edges), tap dismisses; the gesture drives xterm's own
+  selection model, so the key bar's `Copy` needed no change. Also fixes a drag
+  starting *on text* scrolling only one row — the DOM renderer replaced the span
+  the touch had latched onto, silently starving the listener; the gesture now
+  rides on pointer capture. `scripts/touch-select-test.mjs`, `mobile-ui.md`.
 - **Client polish, uncredited:** `97cfe0d`/`3dad62e` two-level connection dialog
   (Existing/Add × Daemon/Relay); `f7c7640` app icons + blocked-session favicon
   blink and `d291a4e` tab-title blink (`f7c7640` also shipped most of MOB-PWA —

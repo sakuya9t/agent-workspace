@@ -165,11 +165,14 @@ body.col-resizing iframe {
 .terminal-mount {
   width: 100%;
   height: 100%;
-  /* Terminal scrolling is driven from JS (see the touch handler in Terminal.tsx),
-     so keep the browser from starting its own touch gesture — native pan/zoom or
-     a page-level pull-to-refresh/overscroll bounce — on a swipe over the grid. */
+  /* Every touch gesture over the grid is ours (see the pointer handlers in
+     Terminal.tsx: drag scrolls, long-press selects), so keep the browser from
+     starting one of its own — native pan/zoom, a page-level pull-to-refresh or
+     overscroll bounce, or iOS's long-press callout, which would race the
+     long-press-to-select. */
   touch-action: none;
   overscroll-behavior: contain;
+  -webkit-touch-callout: none;
 }
 /* Transient image-paste status, floated over the terminal's top-right. */
 .paste-status {

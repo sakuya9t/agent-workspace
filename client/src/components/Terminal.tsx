@@ -367,6 +367,13 @@ export function TerminalView({
     // read "". Swallow the press in capture phase (xterm's bubble listeners on
     // a descendant never see it); the browser still fires contextmenu.
     const onMouseDownCapture = (e: MouseEvent) => {
+      // A touch selection has just been made: this is the compatibility mousedown
+      // the browser synthesizes from the lift, and xterm would clear on it.
+      if (holdSelection) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
       if (e.button === 2 && term.hasSelection()) e.stopPropagation();
     };
     // Right-click copies on every platform (the "universal" affordance), then
@@ -374,6 +381,12 @@ export function TerminalView({
     // browser menu — whose Paste works even in insecure contexts (xterm parks
     // its hidden textarea under the cursor for exactly that).
     const onContextMenu = (e: MouseEvent) => {
+      // A long-press can raise contextmenu too; that's our selection gesture, not
+      // a right-click, so swallow it rather than copy-and-clear what it just made.
+      if (gesture === "select" || holdSelection) {
+        e.preventDefault();
+        return;
+      }
       if (!term.hasSelection()) return; // nothing selected: leave the default
       void copySelection();
       term.clearSelection();
@@ -415,34 +428,192 @@ export function TerminalView({
         void uploadRef.current(img);
       }
     };
-    // --- Touch scroll ---
-    // xterm's built-in touch handler only nudges its own scrollback viewport, so
-    // on a TUI (an alternate-screen app, or anything with mouse reporting on) a
-    // swipe does nothing: there is no scrollback to move and the gesture is never
-    // forwarded to the app. Desktop avoids this because the *wheel* path forwards
-    // to the app — mouse-wheel reports, or ↑/↓ for a no-scrollback screen. Mirror
-    // that on touch: translate a vertical drag into wheel events aimed at xterm's
-    // element so the identical wheel logic runs (smooth scrollback for a shell,
-    // app-forwarded scroll for a TUI). Registered in the capture phase with
-    // stopPropagation so xterm's own touch handler on `.xterm` never also fires
-    // and double-scrolls.
-    let touchY: number | null = null;
-    let touchScrolling = false;
-    const TOUCH_SLOP = 6; // px of travel before a drag counts as a scroll (not a tap)
-    const onTouchStart = (e: TouchEvent) => {
-      touchScrolling = false;
-      touchY = e.touches.length === 1 ? e.touches[0].clientY : null;
+    // --- Touch: drag scrolls, long-press selects, drag-after-press extends ---
+    //
+    // Scroll: xterm's built-in touch handler only nudges its own scrollback
+    // viewport, so on a TUI (alternate screen, or mouse reporting on) a swipe did
+    // nothing — no scrollback to move, and the gesture never reached the app.
+    // Desktop escapes this because the *wheel* path forwards to the app (wheel
+    // reports, or ↑/↓ for a no-scrollback screen), so translate a vertical drag
+    // into wheel events aimed at xterm's element and the identical wheel logic
+    // runs. xterm's own touch scroll is suppressed (capture-phase
+    // stopPropagation) so it can't double-scroll.
+    //
+    // Selection: xterm has NO touch selection — its selection service is
+    // mouse-only and `.xterm` carries `user-select: none`, so neither xterm nor
+    // the browser would ever select a cell from a fingertip. Synthesize the
+    // gesture and push it through xterm's own selection model via term.select(),
+    // which is what makes the existing copy paths (the key bar's Copy,
+    // getSelection(), the Ctrl-Shift-C/right-click handlers) work unchanged.
+    //
+    // Both ride on POINTER events, not touch events, because the DOM renderer
+    // REPLACES a row's <span>s whenever that row repaints. A touch that started
+    // on one of those spans is retargeted to a node that is no longer in the
+    // tree, so its touchmoves silently stop propagating to any listener — no
+    // touchcancel, just nothing. Scrolling repaints rows, so a drag beginning on
+    // TEXT scrolled exactly one row and then died, while a drag beginning on
+    // blank space (whose target is the row <div> — recycled, not replaced)
+    // scrolled normally. setPointerCapture pins the gesture to the container, so
+    // what happens to the element under the finger stops mattering.
+    const LONG_PRESS_MS = 450;
+    const TOUCH_SLOP = 8; // px of travel before a drag is a scroll, not a press
+    const EDGE = 24; // px from an edge where an extend-drag auto-scrolls
+    /** Word chars stop at these — xterm's own `wordSeparator` default, so a
+     *  long-press grabs the same word a desktop double-click would. */
+    const WORD_SEPARATORS = " ()[]{}'\"`";
+
+    type Gesture = "idle" | "scroll" | "select";
+    let gesture: Gesture = "idle";
+    let pointerId: number | null = null;
+    let startX = 0;
+    let startY = 0;
+    let lastX = 0;
+    let lastY = 0;
+    let pressTimer: number | undefined;
+    let autoScrollTimer: number | undefined;
+    /** The long-pressed word, in absolute buffer cells; a drag extends off it in
+     *  either direction. Half-open: [col,row) → [endCol,endRow). */
+    let anchor: { col: number; row: number; endCol: number; endRow: number } | null = null;
+    /** True while a just-made touch selection is settling, so the compatibility
+     *  mouse events the browser fires after the finger lifts don't reach xterm's
+     *  selection service — which clears the selection on any mousedown. */
+    let holdSelection = false;
+    let holdTimer: number | undefined;
+
+    const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
+    const screenEl = () => term.element?.querySelector(".xterm-screen") as HTMLElement | null;
+
+    /** Client px → absolute buffer cell (scrollback included), clamped to the screen. */
+    const cellAt = (x: number, y: number) => {
+      const el = screenEl();
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return null;
+      const col = clamp(Math.floor(((x - r.left) / r.width) * term.cols), 0, term.cols - 1);
+      const viewRow = clamp(Math.floor(((y - r.top) / r.height) * term.rows), 0, term.rows - 1);
+      return { col, row: term.buffer.active.viewportY + viewRow };
     };
-    const onTouchMove = (e: TouchEvent) => {
-      if (touchY === null || e.touches.length !== 1) return; // ignore taps / pinch
-      const y = e.touches[0].clientY;
-      if (!touchScrolling) {
-        if (Math.abs(y - touchY) < TOUCH_SLOP) return; // still might be a tap
-        touchScrolling = true;
-        touchY = y; // rebase so the first step isn't a jump of the whole slop
+
+    /** The word spanning `col` on buffer line `row`, or that single cell if the
+     *  press landed on whitespace//a separator. */
+    const wordAt = (col: number, row: number) => {
+      const line = term.buffer.active.getLine(row);
+      if (!line) return null;
+      const isWord = (i: number) => {
+        const cell = line.getCell(i);
+        if (!cell) return false;
+        if (cell.getWidth() === 0) return true; // trailing half of a wide (CJK) char
+        const ch = cell.getChars();
+        return ch !== "" && !WORD_SEPARATORS.includes(ch);
+      };
+      if (!isWord(col)) return { col, row, endCol: col + 1, endRow: row };
+      let s = col;
+      let e = col;
+      while (s > 0 && isWord(s - 1)) s--;
+      while (e < term.cols - 1 && isWord(e + 1)) e++;
+      return { col: s, row, endCol: e + 1, endRow: row };
+    };
+
+    // term.select(col, row, length) walks `length` cells rightward from the start,
+    // wrapping by `cols` — so a selection is just a half-open run of absolute cell
+    // offsets, and dragging backward past the anchor simply swaps the two ends.
+    const offOf = (col: number, row: number) => row * term.cols + col;
+    const selectTo = (cur: { col: number; row: number }) => {
+      if (!anchor) return;
+      const aStart = offOf(anchor.col, anchor.row);
+      const aEnd = offOf(anchor.endCol, anchor.endRow); // exclusive
+      const c = offOf(cur.col, cur.row);
+      const [start, end] =
+        c + 1 > aEnd ? [aStart, c + 1] // dragged forward, past the word
+        : c < aStart ? [c, aEnd] // dragged backward, before the word
+        : [aStart, aEnd]; // still inside the word
+      term.select(start % term.cols, Math.floor(start / term.cols), end - start);
+    };
+
+    const beginSelect = () => {
+      const cell = cellAt(startX, startY);
+      const word = cell && wordAt(cell.col, cell.row);
+      if (!cell || !word) return;
+      gesture = "select";
+      anchor = word;
+      // Pin the gesture to the container: from here the finger can wander over
+      // rows that the renderer is busy replacing.
+      if (pointerId !== null) container.setPointerCapture(pointerId);
+      selectTo(cell);
+      navigator.vibrate?.(8); // the only feedback that the press "took"
+    };
+
+    // Extending past the top/bottom edge scrolls, so a selection can run beyond
+    // one screenful. Only armed while a selection drag is live.
+    const autoScrollTick = () => {
+      if (gesture !== "select") return;
+      const el = screenEl();
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      const dir = lastY < r.top + EDGE ? -1 : lastY > r.bottom - EDGE ? 1 : 0;
+      if (dir === 0) return;
+      term.scrollLines(dir);
+      const cell = cellAt(lastX, lastY);
+      if (cell) selectTo(cell);
+    };
+
+    const endGesture = () => {
+      if (pointerId !== null && container.hasPointerCapture(pointerId)) {
+        container.releasePointerCapture(pointerId);
       }
-      const deltaY = touchY - y; // finger down → deltaY<0 → scroll toward older, like a wheel
-      touchY = y;
+      window.clearTimeout(pressTimer);
+      window.clearInterval(autoScrollTimer);
+      autoScrollTimer = undefined;
+      gesture = "idle";
+      pointerId = null;
+      anchor = null;
+    };
+
+    const onPointerDown = (e: PointerEvent) => {
+      if (e.pointerType !== "touch") return; // mouse/pen keep xterm's own path
+      if (pointerId !== null) {
+        endGesture(); // a second finger (pinch/zoom): abandon, own nothing
+        return;
+      }
+      pointerId = e.pointerId;
+      gesture = "idle";
+      startX = lastX = e.clientX;
+      startY = lastY = e.clientY;
+      pressTimer = window.setTimeout(beginSelect, LONG_PRESS_MS);
+    };
+
+    const onPointerMove = (e: PointerEvent) => {
+      if (e.pointerId !== pointerId) return;
+      const x = e.clientX;
+      const y = e.clientY;
+
+      if (gesture === "select") {
+        lastX = x;
+        lastY = y;
+        const cell = cellAt(x, y);
+        if (cell) selectTo(cell);
+        autoScrollTimer ??= window.setInterval(autoScrollTick, 90);
+        e.preventDefault();
+        return;
+      }
+
+      if (gesture === "idle") {
+        if (Math.abs(y - startY) < TOUCH_SLOP && Math.abs(x - startX) < TOUCH_SLOP) {
+          return; // still inside the slop — the long press is still on the table
+        }
+        // It moved before the press landed, so this is a scroll, not a selection.
+        window.clearTimeout(pressTimer);
+        gesture = "scroll";
+        container.setPointerCapture(e.pointerId);
+        lastX = x;
+        lastY = y; // rebase, so the first step isn't a jump of the whole slop
+        e.preventDefault();
+        return;
+      }
+
+      const deltaY = lastY - y; // finger down → deltaY<0 → toward older, like a wheel
+      lastX = x;
+      lastY = y;
       if (deltaY !== 0) {
         term.element?.dispatchEvent(
           new WheelEvent("wheel", {
@@ -453,12 +624,37 @@ export function TerminalView({
           }),
         );
       }
-      e.preventDefault(); // we own this gesture — suppress page bounce/overscroll
-      e.stopPropagation(); // and xterm's built-in touch scroll must not also run
+      e.preventDefault();
     };
-    const onTouchEnd = () => {
-      touchY = null;
-      touchScrolling = false;
+
+    const onPointerUp = (e: PointerEvent) => {
+      if (e.pointerId !== pointerId) return;
+      if (gesture === "select") {
+        // Keep the highlight — the key bar's Copy reads it. Swallow the mouse
+        // events the browser synthesizes from the lift for ~a beat, or xterm's
+        // selection service would clear what we just selected.
+        holdSelection = true;
+        window.clearTimeout(holdTimer);
+        holdTimer = window.setTimeout(() => (holdSelection = false), 700);
+        e.preventDefault();
+      } else if (gesture === "idle" && term.hasSelection()) {
+        term.clearSelection(); // a plain tap dismisses the selection
+      }
+      endGesture();
+    };
+
+    // Only the suppression lives on touch events; the gesture itself is on
+    // pointer events (see above). Once the renderer detaches the touch's target
+    // these stop firing — but xterm's own touch listener is starved by exactly
+    // the same detachment, so nothing is left to double-scroll.
+    const onTouchMove = (e: TouchEvent) => {
+      e.stopPropagation(); // xterm's built-in touch scroll must never run
+      if (gesture !== "idle") e.preventDefault(); // ...nor a page bounce/overscroll
+    };
+    const onTouchEnd = (e: TouchEvent) => {
+      // Suppress the synthetic mousedown/click that would clear a fresh selection.
+      // (Checked both ways because pointerup/touchend ordering isn't worth betting on.)
+      if (gesture === "select" || holdSelection) e.preventDefault();
     };
 
     container.addEventListener("mousedown", onMouseDownCapture, true);
@@ -466,10 +662,12 @@ export function TerminalView({
     container.addEventListener("paste", onPaste, true);
     container.addEventListener("dragover", onDragOver);
     container.addEventListener("drop", onDrop);
-    container.addEventListener("touchstart", onTouchStart, { capture: true, passive: true });
+    container.addEventListener("pointerdown", onPointerDown, true);
+    container.addEventListener("pointermove", onPointerMove, { capture: true, passive: false });
+    container.addEventListener("pointerup", onPointerUp, true);
+    container.addEventListener("pointercancel", onPointerUp, true);
     container.addEventListener("touchmove", onTouchMove, { capture: true, passive: false });
-    container.addEventListener("touchend", onTouchEnd, { capture: true });
-    container.addEventListener("touchcancel", onTouchEnd, { capture: true });
+    container.addEventListener("touchend", onTouchEnd, { capture: true, passive: false });
 
     const ro = new ResizeObserver(() => {
       safeFit(fit);
@@ -496,10 +694,15 @@ export function TerminalView({
       container.removeEventListener("paste", onPaste, true);
       container.removeEventListener("dragover", onDragOver);
       container.removeEventListener("drop", onDrop);
-      container.removeEventListener("touchstart", onTouchStart, { capture: true });
+      container.removeEventListener("pointerdown", onPointerDown, true);
+      container.removeEventListener("pointermove", onPointerMove, { capture: true });
+      container.removeEventListener("pointerup", onPointerUp, true);
+      container.removeEventListener("pointercancel", onPointerUp, true);
       container.removeEventListener("touchmove", onTouchMove, { capture: true });
       container.removeEventListener("touchend", onTouchEnd, { capture: true });
-      container.removeEventListener("touchcancel", onTouchEnd, { capture: true });
+      window.clearTimeout(pressTimer);
+      window.clearTimeout(holdTimer);
+      window.clearInterval(autoScrollTimer);
       ro.disconnect();
       dataSub.dispose();
       wsRef.current = null;
