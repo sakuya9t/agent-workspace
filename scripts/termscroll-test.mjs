@@ -25,6 +25,7 @@ import { mkdtempSync, rmSync, openSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { hermeticChildEnv } from "./lib/testenv.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const DAEMON = join(ROOT, "target", "debug", "asm-daemon");
@@ -103,13 +104,13 @@ function attachBytes(id, ms) {
 
 async function main() {
   daemon = spawn(DAEMON, [], {
-    env: {
-      ...process.env,
+    // Never inherit the dev host's ASM_*/ASMUX_* — they point at the live install.
+    env: hermeticChildEnv({
       ASM_BIND: BASE,
       ASM_DATA_DIR: join(tmp, "data"),
       ASM_CONFIG_DIR: join(tmp, "config"),
       ASM_RUNTIME_DIR: join(tmp, "run"),
-    },
+    }),
     stdio: ["ignore", openSync(join(tmp, "daemon.log"), "a"), openSync(join(tmp, "daemon.log"), "a")],
   });
   await waitHealth(15000);

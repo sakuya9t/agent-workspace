@@ -1,17 +1,58 @@
-import { readFileSync, existsSync } from "node:fs";
+// Per-session git worktree isolation: two sessions on one workspace get
+// distinct worktrees, cannot collide on the same file, and honour the cleanup
+// guards (live / dirty / force).
+//
+//   node scripts/worktree-test.mjs                      # sandboxed (default)
+//   node scripts/worktree-test.mjs 127.0.0.1:4600 /repo # ATTENDED: real daemon + real repo
+//
+// This test CREATES and FORCE-REMOVES git worktrees, so by default it builds a
+// throwaway repo and drives a throwaway daemon. Pointing it at a real daemon and
+// a real repo means it will make and delete worktrees in *that* repo.
 
-const base = process.argv[2];
-const repo = process.argv[3];
-const http = `http://${base}`;
-let fails = 0;
-const check = (n, c, extra) => {
-  console.log(`${c ? "PASS" : "FAIL"}  ${n}${extra ? "  " + extra : ""}`);
-  if (!c) fails++;
-};
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+import { readFileSync, existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { createSandbox, checker, sleep } from "./lib/testenv.mjs";
+
+const attendedBase = process.argv[2] ?? null;
+const { check, report } = checker();
+
+let sb = null;
+let base;
+let repo;
+
+/** A throwaway git repo with one commit — enough for `is_git` and worktrees. */
+function makeRepo(dir) {
+  const env = {
+    ...process.env,
+    GIT_AUTHOR_NAME: "wt",
+    GIT_AUTHOR_EMAIL: "wt@test",
+    GIT_COMMITTER_NAME: "wt",
+    GIT_COMMITTER_EMAIL: "wt@test",
+  };
+  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: dir, env });
+  execFileSync("git", ["commit", "-q", "--allow-empty", "-m", "init"], { cwd: dir, env });
+  return dir;
+}
+
+async function setup() {
+  if (attendedBase) {
+    base = attendedBase;
+    repo = process.argv[3];
+    if (!repo) throw new Error("attended mode needs a repo path: worktree-test.mjs <base> <repo>");
+    console.log(`!! ATTENDED MODE — ${base}, worktrees will be created in ${repo}\n`);
+    return;
+  }
+  sb = await createSandbox("asm-wt");
+  await sb.startDaemon();
+  base = sb.base;
+  repo = makeRepo(sb.cwd);
+  console.log(`sandbox daemon on ${base}  (repo: ${repo})\n`);
+}
+
+const http = () => `http://${base}`;
 
 async function j(path, init) {
-  const res = await fetch(http + path, {
+  const res = await fetch(http() + path, {
     ...init,
     headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
   });
@@ -32,6 +73,8 @@ async function sendCmd(id, cmd) {
 }
 
 async function main() {
+  await setup();
+
   const { workspace } = await j("/api/workspaces", {
     method: "POST",
     body: JSON.stringify({ name: "test-repo", root_path: repo }),
@@ -90,10 +133,16 @@ async function main() {
   check("forced cleanup removed worktree1", !existsSync(i1.path));
   check("worktree2 still intact", existsSync(i2.path));
 
-  console.log(fails === 0 ? "\nALL PASS" : `\n${fails} FAILURE(S)`);
-  process.exit(fails === 0 ? 0 : 1);
+  return report("per-session worktrees isolate and clean up safely");
 }
-main().catch((e) => {
-  console.error(e);
-  process.exit(2);
-});
+
+main()
+  .then((pass) => {
+    sb?.cleanup();
+    process.exit(pass ? 0 : 1);
+  })
+  .catch((e) => {
+    console.error(e);
+    sb?.cleanup();
+    process.exit(2);
+  });

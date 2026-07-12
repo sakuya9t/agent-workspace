@@ -43,6 +43,22 @@ pick it up**.
 
 ## Already done (context, do not re-plan)
 
+- **Holder-theft hardening (2026-07-12 incident).** A test inherited the dev
+  host's ambient `ASMUX_SOCK`, unlinked the live holder's socket, and six live
+  sessions were lost. Fixed on three levels:
+  1. **asmux will not displace a live holder** — it probes before unlinking and
+     exits non-zero if anyone answers (`ASMUX_TAKEOVER=1` to override).
+     `crates/asmux/src/socket.rs`.
+  2. **asmux heals an unlinked socket** — a watchdog notices its path was removed
+     or replaced and rebinds, so the PTYs survive instead of being orphaned.
+     `server::serve_watched`.
+  3. **Tests are sandboxed** — `scripts/lib/testenv.mjs` (`createSandbox()`); all
+     11 e2e scripts spawn their own daemon/holder/Chrome in a tmpdir on a free
+     port. `scripts/holder-theft-test.mjs` replays the incident as a regression.
+  Also: `asmux probe` (Live/Stale/Free), daemon waits for the holder instead of
+  dying on the first refused connect (`ASM_ASMUX_WAIT_MS`) and logs at ERROR, and
+  `start.sh`/`status.sh`/`restart-daemon.sh` check the *socket* rather than the
+  pid — a pid-only check reported a healthy holder right through the outage.
 - MVP core loop end-to-end: sessions, attach/replay, snapshots, attention
   signals, agent plugins (shell/codex/claude/custom), Git SCM panel
   (status/diff/log/pull/rebase), workspaces + per-session worktree isolation,

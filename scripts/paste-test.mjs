@@ -1,6 +1,7 @@
 // End-to-end test for image paste (POST /api/sessions/:id/paste).
 //
-//   node scripts/paste-test.mjs [baseHostPort] [cwd]
+//   node scripts/paste-test.mjs                 # sandboxed: spawns its own daemon (default)
+//   node scripts/paste-test.mjs 127.0.0.1:4600  # ATTENDED: against a running daemon
 //
 // Proves the ASM plumbing behind the "paste a screenshot into a session"
 // feature: the client uploads image bytes, the daemon stores them under the
@@ -9,26 +10,40 @@
 // Claude Code / Codex then load as an image — that agent step is covered
 // separately by the CLI probe in the design doc).
 //
-// Requires a running daemon on loopback (loopback is trusted, so no token).
-// Node 18+ (global fetch + WebSocket).
+// This test WRITES into the session's cwd (.asm/pastes/, .asm/.gitignore), so by
+// default it runs against a throwaway daemon in a throwaway cwd. It used to
+// default to the live daemon with cwd=process.cwd(), which littered the repo.
+//
+// Requires the built binaries (`cargo build`) and Node 18+.
 
 import fs from "node:fs";
+import { createSandbox, checker, sleep } from "./lib/testenv.mjs";
 
-const base = process.argv[2] ?? "127.0.0.1:4600";
-const cwd = process.argv[3] ?? process.cwd();
-const http = `http://${base}`;
+const attendedBase = process.argv[2] ?? null;
+const { check, report } = checker();
 
-let failures = 0;
-function check(name, cond, extra) {
-  const ok = !!cond;
-  console.log(`${ok ? "PASS" : "FAIL"}  ${name}${extra ? "  " + extra : ""}`);
-  if (!ok) failures++;
-  return ok;
+let sb = null;
+let base;
+let cwd;
+
+async function setup() {
+  if (attendedBase) {
+    console.log(`!! ATTENDED MODE — live daemon ${attendedBase}; this test writes into the session cwd.\n`);
+    base = attendedBase;
+    cwd = process.argv[3] ?? process.cwd();
+    return;
+  }
+  sb = await createSandbox("asm-paste");
+  await sb.startDaemon();
+  base = sb.base;
+  cwd = sb.cwd;
+  console.log(`sandbox daemon on ${base}  (cwd: ${cwd})\n`);
 }
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const http = () => `http://${base}`;
 
 async function j(path, init) {
-  const res = await fetch(http + path, {
+  const res = await fetch(http() + path, {
     ...init,
     headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
   });
@@ -43,7 +58,7 @@ const PNG = Buffer.from(
 );
 
 async function post(id, body, contentType) {
-  return fetch(`${http}/api/sessions/${id}/paste`, {
+  return fetch(`${http()}/api/sessions/${id}/paste`, {
     method: "POST",
     headers: { "content-type": contentType },
     body,
@@ -51,6 +66,8 @@ async function post(id, body, contentType) {
 }
 
 async function main() {
+  await setup();
+
   const health = await j("/health");
   check("health ok", health.status === "ok", `v${health.version}`);
 
@@ -119,11 +136,16 @@ async function main() {
     /* ignore */
   }
 
-  console.log(failures ? `\n${failures} FAILURE(S)` : "\nALL PASS");
-  process.exit(failures ? 1 : 0);
+  return report("image paste round-trips into the session cwd");
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+main()
+  .then((pass) => {
+    sb?.cleanup();
+    process.exit(pass ? 0 : 1);
+  })
+  .catch((e) => {
+    console.error(e);
+    sb?.cleanup();
+    process.exit(1);
+  });
