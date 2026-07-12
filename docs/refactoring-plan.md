@@ -196,8 +196,8 @@ closes each.
 
 | Debt / compromise | Recorded in | Untangle via |
 | --- | --- | --- |
-| Adopt reconstructs from holder ring, not exact cold-stitch (seams pre-placed: `get_backend_cursor`, `head_cursor`, `Snapshot` fields, `instance_id`) | durable-sessions.md → M3/M4 | M4 (tests first: RF-M4 #4) |
-| No daemon↔asmux reconnect; `Detached` stops draining until restart | durable-sessions.md → M4; `sidecar.rs` comment | RF-M4 #2 → M4 |
+| ~~Adopt reconstructs from holder ring, not exact cold-stitch~~ **RESOLVED (M4 Stage B, 2026-07-11)**: cold-stitch adopt is the default (`backend_cursor` exact, seed from cold history, `attach FromCursor(consumed)`, gap marker) | durable-sessions.md → M4 Stage B | — |
+| ~~No daemon↔asmux reconnect; `Detached` stops draining until restart~~ **RESOLVED (M4 Stage A, 2026-07-11)**: reconnect supervisor + watchdog; `Detached` backpressure resyncs in place | durable-sessions.md → M4 Stage A | — |
 | Plaintext HTTP/WS off loopback (direct); relay/gateway see stream plaintext | security-followups.md #1; connectivity plan → R5 gate | SEC-1; R5 decision gate |
 | `/api/fs/list` browses whole host; any root registrable | security-followups.md #2 | SEC-2 (+ RF-ERR for 403; reconcile with the workspace-derived allowlist in `resolve_workspace` so there is **one** notion of allowed root) |
 | Tokens plaintext at rest; enrollment token never expires; permissive CORS | security-followups.md #3–5 | SEC-3/4/5 |

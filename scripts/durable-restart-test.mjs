@@ -166,6 +166,22 @@ async function main() {
   c1.ws.close();
   check("live output shows marker (pre-restart)", c1.buf.includes(marker));
 
+  // 3b. Cold-stitch discriminator: emit a marker, then MORE than the 2 MiB
+  // holder ring of filler, so that marker is evicted from the ring. Only the
+  // exact cold-stitch adopt (seed vt100 + history from the daemon's SQLite cold
+  // history) can reconstruct it after restart — plain ring-replay cannot.
+  const coldMarker = "COLD-" + Math.random().toString(36).slice(2, 8).toUpperCase();
+  const cf = wsCollect(id);
+  await new Promise((res) => (cf.ws.onopen = res));
+  await sleep(300);
+  cf.ws.send(JSON.stringify({ t: "i", d: `echo ${coldMarker}\r` }));
+  await sleep(500);
+  // ~2.65 MiB (52000 lines * 51 bytes) — well past the 2 MiB default ring.
+  const filler = "".padEnd(50, ".");
+  cf.ws.send(JSON.stringify({ t: "i", d: `yes ${filler} | head -n 52000\r` }));
+  await sleep(4500); // let it all emit AND flush to cold history
+  cf.ws.close();
+
   // 4. kill daemon #1 — the holder must keep the PTY alive
   stop("daemon1");
   await waitExit("daemon1", 5000);
@@ -186,8 +202,13 @@ async function main() {
 
   const c2 = wsCollect(id);
   await new Promise((res) => (c2.ws.onopen = res));
-  await sleep(700);
+  await sleep(1200);
   check("screen reconstructed after restart (marker present)", c2.buf.includes(marker));
+  check(
+    "cold-stitch preserved history beyond the 2 MiB ring",
+    c2.buf.includes(coldMarker),
+    coldMarker,
+  );
 
   // prove it is genuinely alive, not just a replayed corpse
   const marker2 = "ALIVE-" + Math.random().toString(36).slice(2, 8).toUpperCase();

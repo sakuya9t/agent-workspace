@@ -1,17 +1,21 @@
 # Durable Sessions via an Out-of-Process Session Holder ("asmux")
 
-Status: **M1–M3 landed; M4 Stage A landed (reconnect supervisor); M4 Stage
-B/C + M5 pending.** The standalone holder (`crates/asmux` + `crates/asmux-wire`),
-the daemon-side `SidecarBackend` over an async client, and adopt-on-restart are
-all implemented and tested — sessions survive a daemon restart end-to-end
+Status: **M1–M3 landed; M4 Stage A + B landed; M4 Stage C + M5 pending.** The
+standalone holder (`crates/asmux` + `crates/asmux-wire`), the daemon-side
+`SidecarBackend` over an async client, and adopt-on-restart are all implemented
+and tested — sessions survive a daemon restart end-to-end
 (`scripts/durable-restart-test.mjs`). **M4 Stage A** added the daemon↔asmux
 reconnect supervisor (dial → hello → re-attach → drain, exponential backoff), a
 10 s idle watchdog + heartbeat, in-place backpressure resync, a `list`-reconcile
-after every reconnect, and the `Holder` trait that makes all of it testable (see
-[M4](#incremental-milestones)). Remaining: M4 **Stage B** (exact cold-stitch
-adopt), **Stage C** (soft-reboot, `purge`, metadata RPCs, `readBuffer`, orphan
-UI), and M5 Windows. Adapts the "acmux" design (from the agent-conductor project)
-to this codebase.
+after every reconnect, and the `Holder` trait that makes all of it testable.
+**M4 Stage B** made adopt **exact via cold-stitch**: seed `vt100` + the
+raw-history ring from the daemon's SQLite cold history, then
+`attach FromCursor(consumed)` for the un-drained tail, with a visible gap marker
+when the ring wrapped — so a session whose output outgrew the 2 MiB holder ring is
+reconstructed exactly after a restart (proven: the cold-stitch discriminator in
+`durable-restart-test.mjs`). Remaining: M4 **Stage C** (soft-reboot, `purge`,
+metadata RPCs, `readBuffer`, orphan UI, periodic snapshot store) and M5 Windows.
+Adapts the "acmux" design (from the agent-conductor project) to this codebase.
 
 Locked decisions: sidecar crate/binary named **`asmux`**; wire encoding is
 **FlatBuffers** (schema frozen once shipped); **one holder for all sessions**
@@ -306,13 +310,8 @@ sessions instead of dropping them — see [`deployment.md`](deployment.md).
   completion record). Duplicate `create` is idempotent (holder-side launch
   fingerprint). **Verified end-to-end** by `scripts/durable-restart-test.mjs`:
   create → `SIGTERM` daemon → restart → session still `running`, screen
-  reconstructed (marker present), still accepts input. _Follow-up:_ the current
-  adopt reconstructs from the holder **ring** (exact while the session's output
-  fits the ring; approximate + repaint beyond it). The M3-exact path — seed from
-  cold history and `attach FromCursor(backend_cursor)` with a real **gap marker**
-  when the ring wrapped past `consumed` — is scaffolded (`backend_cursor` is
-  persisted; `get_backend_cursor` + `HolderEntry.head_cursor` are ready) but not
-  yet the default.
+  reconstructed (marker present), still accepts input. _The M3 ring-replay
+  follow-up (exact cold-stitch) landed as M4 Stage B — see below._
 - **M4 — hardening.**
   - **Stage A — _Done._** The daemon↔asmux connection now has a single owner: a
     **supervisor task** in `AsmuxClient` (dial → `hello` → re-attach every routed
@@ -330,9 +329,25 @@ sessions instead of dropping them — see [`deployment.md`](deployment.md).
     unit-testable; a `MockHolder`-free unit suite covers the reconcile branches
     and an in-process-asmux test covers a real forced-drop → reconnect → resume.
     (This absorbed RF-M4 #2 — the reconnect-supervisor home + `Holder` trait.)
-  - **Stage B/C — pending.** Stage B: exact cold-stitch adopt. Stage C:
-    soft-reboot (hash drift + confirm), orphan surfacing/adopt, `purge`, metadata
-    RPCs, `readLog`, and the periodic `(snapshot, cursor)` store.
+  - **Stage B — _Done._** Adopt is now **exact via cold-stitch**. `backend_cursor`
+    is made exact by advancing it in the same transaction as the terminal-event
+    batch (`EventMsg.head_cursor` → `write_batch`), replacing the throttled drain
+    write, so it is the true end of cold history. `adopt` then seeds a fresh
+    `vt100` **and** the raw-history ring from cold history (`read_events_after`),
+    continues the sequence from the exact `max_event_seq` (not the throttled
+    `last_event_seq`, which would collide under `INSERT OR IGNORE`), and
+    `attach FromCursor(consumed)` for the un-drained tail `(consumed..head]`. If
+    the ring wrapped past `consumed` (`BUFFER_GAP`), it renders a visible **gap
+    marker** (`render_gap_marker`) for the lost span and resyncs `FromEarliest`.
+    So a session whose output outgrew the 2 MiB ring is reconstructed exactly —
+    proven by the cold-stitch discriminator in `durable-restart-test.mjs` (emit a
+    marker, then > 2 MiB of filler, restart, assert the marker survives).
+    _Deferred to Stage C:_ the periodic `(snapshot, cursor)` store that would
+    bound cold-history replay cost on adopt (Stage B replays full cold history,
+    correct and fine for realistic session sizes on a one-time adopt).
+  - **Stage C — pending.** Soft-reboot (hash drift + confirm), orphan
+    surfacing/adopt, `purge`, metadata RPCs, `readBuffer`/`readLog`, and the
+    periodic `(snapshot, cursor)` store.
 - **M5 — Windows.** ConPTY + AF_UNIX/named-pipe transport + ACL socket perms.
 
 ## Decisions

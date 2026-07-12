@@ -64,7 +64,6 @@ impl SessionBackend for SidecarBackend {
     fn create(&self, spec: BackendSpawnSpec) -> Result<Arc<dyn BackendSession>> {
         let client = self.client.clone();
         let events = self.events.clone();
-        let db = self.db.clone();
         let session_id = spec.session_id.clone();
         let (cols, rows) = (spec.cols, spec.rows);
 
@@ -83,9 +82,11 @@ impl SessionBackend for SidecarBackend {
                 Err(AttachError::Code(c)) => bail!("asmux attach failed (code {c})"),
                 Err(AttachError::Conn(e)) => return Err(e),
             }
-            // Fresh session: persist everything (persist_from = 0), seq from 0.
+            // Fresh session: empty emulator, persist everything (persist_from = 0),
+            // seq from 0.
+            let (parser, history) = fresh_emulator(rows, cols);
             Ok(SidecarSession::spawn(
-                session_id, cols, rows, client, events, db, rx, 0, 0,
+                session_id, client, events, rx, parser, history, 0, 0,
             ))
         })?;
         Ok(session)
@@ -109,28 +110,44 @@ impl SessionBackend for SidecarBackend {
         let client = self.client.clone();
         let events = self.events.clone();
         let db = self.db.clone();
-        // Continue the persisted event sequence from where the pre-restart daemon
-        // left off, so new live output appends without colliding.
-        let last_seq = db
-            .get_session(session_id)?
-            .map(|s| s.last_event_seq)
-            .unwrap_or(0);
         let sid = session_id.to_string();
 
+        // Cold-stitch adopt: the daemon persisted *every* output chunk, so cold
+        // history covers `0..consumed`; only the un-drained tail `(consumed..head]`
+        // is missing. Seed the emulator from cold history, then attach the ring
+        // from exactly `consumed`.
+        let consumed = db.get_backend_cursor(&sid)?;
+        // Continue the event sequence past the true max persisted seq (not the
+        // throttled `last_event_seq`, which could collide with existing rows).
+        let seq_start = db.max_event_seq(&sid)?;
+        let cold = db.read_events_after(&sid, 0)?;
+
         let session = block_on(async move {
+            // Reconstruct both the screen (vt100) and the normal-buffer raw
+            // scrollback (HistoryRing) from cold history.
+            let (parser, history) = seed_from_cold(rows, cols, &cold);
             let rx = client.route(&sid);
-            // Reconstruct the screen by replaying the holder ring into a fresh
-            // emulator. `head` is the attach boundary: bytes at/under it are
-            // replay (already in cold history — feed the emulator but don't
-            // re-persist); bytes beyond it are genuinely new (persist).
-            let head = match client
-                .attach(&sid, wire::AttachMode::FromEarliest, 0)
+            let persist_from = match client
+                .attach(&sid, wire::AttachMode::FromCursor, consumed)
                 .await
             {
-                Ok(h) => h,
+                // Exact: cold history ends at `consumed`; the ring holds the
+                // un-drained tail `(consumed..head]` (all genuinely new → persist).
+                Ok(_head) => consumed,
                 Err(AttachError::Gap { earliest }) => {
-                    tracing::warn!(session = %sid, earliest, "unexpected gap adopting session");
-                    0
+                    // The ring wrapped past `consumed` while the daemon was down:
+                    // bytes `(consumed..earliest)` are gone from both tiers. Show a
+                    // gap marker, then resync from the current ring tail. The screen
+                    // is approximate (starts mid-stream) until the app repaints.
+                    let lost = earliest.saturating_sub(consumed);
+                    tracing::warn!(session = %sid, consumed, earliest, lost, "adopt ring gap; rendering gap marker");
+                    super::render_gap_marker(&parser, &history, lost);
+                    match client.attach(&sid, wire::AttachMode::FromEarliest, 0).await {
+                        Ok(_) => {}
+                        Err(AttachError::Conn(e)) => return Err(e),
+                        Err(_) => {}
+                    }
+                    consumed
                 }
                 Err(AttachError::Code(c)) => {
                     tracing::warn!(session = %sid, code = c, "cannot adopt session");
@@ -140,7 +157,7 @@ impl SessionBackend for SidecarBackend {
                 Err(AttachError::Conn(e)) => return Err(e),
             };
             let s = SidecarSession::spawn(
-                sid, cols, rows, client, events, db, rx, head, last_seq,
+                sid, client, events, rx, parser, history, persist_from, seq_start,
             );
             Ok(Some(s))
         })?;
@@ -171,20 +188,19 @@ struct SidecarSession {
 }
 
 impl SidecarSession {
+    /// `parser`/`history` are supplied pre-built so `create` can pass fresh ones
+    /// and `adopt` can pass ones already seeded from cold history.
     #[allow(clippy::too_many_arguments)]
     fn spawn(
         session_id: String,
-        cols: u16,
-        rows: u16,
         client: Arc<dyn Holder>,
         events: EventSink,
-        db: Db,
         rx: mpsc::UnboundedReceiver<StreamEvent>,
+        parser: Arc<Mutex<vt100::Parser>>,
+        history: Arc<Mutex<HistoryRing>>,
         persist_from: u64,
         seq_start: u64,
     ) -> Arc<dyn BackendSession> {
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK)));
-        let history = Arc::new(Mutex::new(HistoryRing::new(HISTORY_RING_BYTES)));
         let (tx, _keep) = broadcast::channel::<Arc<[u8]>>(BROADCAST_CAP);
         let (status_tx, status_rx) = watch::channel(BackendStatus::Running);
         let seq = Arc::new(AtomicU64::new(seq_start));
@@ -206,7 +222,6 @@ impl SidecarSession {
             history,
             tx,
             events,
-            db,
             seq,
             status_tx,
             rx,
@@ -215,6 +230,39 @@ impl SidecarSession {
 
         session
     }
+}
+
+/// A fresh, empty emulator + raw-history ring for a new session.
+fn fresh_emulator(rows: u16, cols: u16) -> (Arc<Mutex<vt100::Parser>>, Arc<Mutex<HistoryRing>>) {
+    (
+        Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK))),
+        Arc::new(Mutex::new(HistoryRing::new(HISTORY_RING_BYTES))),
+    )
+}
+
+/// Seed a fresh emulator + raw-history ring from a session's cold history so an
+/// adopt reconstructs the screen exactly (up to `consumed`). The full history
+/// feeds `vt100` (it self-trims to its scrollback); the `HistoryRing` is fed in
+/// bounded chunks so it keeps only its byte-capped tail (for normal-buffer
+/// scrollback replay). Replaying full history is a one-time adopt cost; the
+/// periodic-snapshot optimization that bounds it is a Stage C follow-up.
+fn seed_from_cold(
+    rows: u16,
+    cols: u16,
+    cold: &[u8],
+) -> (Arc<Mutex<vt100::Parser>>, Arc<Mutex<HistoryRing>>) {
+    let (parser, history) = fresh_emulator(rows, cols);
+    if !cold.is_empty() {
+        {
+            let mut p = parser.lock();
+            let _ = std::panic::catch_unwind(AssertUnwindSafe(|| p.process(cold)));
+        }
+        let mut h = history.lock();
+        for chunk in cold.chunks(64 * 1024) {
+            h.push(Arc::from(chunk.to_vec().into_boxed_slice()));
+        }
+    }
+    (parser, history)
 }
 
 impl BackendSession for SidecarSession {
@@ -264,7 +312,6 @@ struct DrainCtx {
     history: Arc<Mutex<HistoryRing>>,
     tx: broadcast::Sender<Arc<[u8]>>,
     events: EventSink,
-    db: Db,
     seq: Arc<AtomicU64>,
     status_tx: watch::Sender<BackendStatus>,
     rx: mpsc::UnboundedReceiver<StreamEvent>,
@@ -282,7 +329,6 @@ async fn drain_loop(ctx: DrainCtx) {
         history,
         tx,
         events,
-        db,
         seq,
         status_tx,
         mut rx,
@@ -290,7 +336,6 @@ async fn drain_loop(ctx: DrainCtx) {
     } = ctx;
     let mut parser_ok = true;
     let mut last_cursor = persist_from;
-    let mut last_cursor_write = 0i64;
 
     while let Some(ev) = rx.recv().await {
         match ev {
@@ -318,7 +363,8 @@ async fn drain_loop(ctx: DrainCtx) {
 
                 // Persist only genuinely-new bytes (replay past `persist_from`
                 // is already in cold history). This is also what keeps adopt from
-                // duplicating history.
+                // duplicating history. The event write also advances the persisted
+                // `backend_cursor` (= exact end of cold history) via `head_cursor`.
                 if cursor > persist_from {
                     let s = seq.fetch_add(1, Ordering::SeqCst) + 1;
                     events.send(EventMsg {
@@ -327,12 +373,8 @@ async fn drain_loop(ctx: DrainCtx) {
                         ts_ms: now_millis(),
                         stream: 0,
                         bytes: data,
+                        head_cursor: cursor,
                     });
-                    let now = now_millis();
-                    if now - last_cursor_write >= 400 {
-                        last_cursor_write = now;
-                        let _ = db.set_backend_cursor(&session_id, cursor);
-                    }
                 }
             }
             StreamEvent::Exited { code, signal } => {
@@ -382,4 +424,56 @@ where
     F: std::future::Future<Output = T>,
 {
     tokio::task::block_in_place(|| Handle::current().block_on(fut))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ring_bytes(history: &Mutex<HistoryRing>) -> Vec<u8> {
+        let mut out = Vec::new();
+        history.lock().extend_into(&mut out);
+        out
+    }
+
+    #[test]
+    fn seed_from_cold_reconstructs_screen_and_scrollback() {
+        // Cold history longer than the screen: the seeded emulator shows the
+        // latest screen, and the raw-history ring still carries the early output
+        // (so a normal-buffer attach replays it as scrollback).
+        let mut cold = Vec::new();
+        for i in 0..50 {
+            cold.extend_from_slice(format!("line {i}\r\n").as_bytes());
+        }
+        cold.extend_from_slice(b"prompt> ");
+        let (parser, history) = seed_from_cold(24, 80, &cold);
+
+        let screen = parser.lock().screen().contents();
+        assert!(screen.contains("prompt>"), "latest screen: {screen:?}");
+        assert!(screen.contains("line 49"), "recent line on screen");
+
+        let ring = String::from_utf8_lossy(&ring_bytes(&history)).into_owned();
+        assert!(ring.contains("line 0"), "early output recoverable from ring");
+        assert!(ring.contains("line 49"));
+    }
+
+    #[test]
+    fn seed_from_cold_empty_history_is_blank() {
+        let (parser, history) = seed_from_cold(24, 80, &[]);
+        assert_eq!(parser.lock().screen().contents().trim(), "");
+        assert!(ring_bytes(&history).is_empty());
+    }
+
+    #[test]
+    fn gap_marker_lands_in_screen_and_ring() {
+        let (parser, history) = fresh_emulator(24, 80);
+        crate::backend::render_gap_marker(&parser, &history, 4096);
+        assert!(parser
+            .lock()
+            .screen()
+            .contents()
+            .contains("not recorded during the restart gap"));
+        let ring = String::from_utf8_lossy(&ring_bytes(&history)).into_owned();
+        assert!(ring.contains("4096 bytes"), "byte count shown: {ring:?}");
+    }
 }

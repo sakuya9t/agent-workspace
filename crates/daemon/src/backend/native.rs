@@ -220,6 +220,8 @@ fn reader_loop(
                         ts_ms: now_millis(),
                         stream: 0,
                         bytes: chunk.to_vec(),
+                        // In-process PTYs never adopt, so no ring cursor to track.
+                        head_cursor: 0,
                     });
                     // Push the ring and broadcast under the ring lock so a
                     // normal-buffer attach (which reads the ring + subscribes

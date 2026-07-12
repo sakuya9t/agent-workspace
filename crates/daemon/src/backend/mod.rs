@@ -400,6 +400,27 @@ pub(crate) fn attach_with_history(
     (Snapshot { rows, cols, repaint, last_seq }, rx)
 }
 
+/// Feed a visible "output lost" advisory into a (seeded) emulator + raw-history
+/// ring so a cold-stitch adopt that hit a ring gap tells the user a span of
+/// output could not be recovered, instead of silently splicing across it. The
+/// marker is static ASCII (cannot panic the parser). No broadcast: at adopt-gap
+/// time no client is attached yet — the marker is baked into the snapshot the
+/// next client sees, and into the raw-history ring for the normal-buffer replay.
+pub(crate) fn render_gap_marker(
+    parser: &Mutex<vt100::Parser>,
+    history: &Mutex<HistoryRing>,
+    lost_bytes: u64,
+) {
+    let marker = format!(
+        "\r\n\x1b[2m[asm: ~{lost_bytes} bytes of output were not recorded during the restart gap]\x1b[m\r\n"
+    )
+    .into_bytes();
+    parser.lock().process(&marker);
+    history
+        .lock()
+        .push(Arc::from(marker.into_boxed_slice()));
+}
+
 /// Shared `BackendSession::snapshot` body: a screen-only repaint (no history
 /// replay) of the current emulator state.
 pub(crate) fn snapshot_screen(parser: &vt100::Parser, seq: &AtomicU64) -> Snapshot {

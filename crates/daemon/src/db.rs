@@ -29,6 +29,10 @@ pub struct EventMsg {
     pub ts_ms: i64,
     pub stream: u8,
     pub bytes: Vec<u8>,
+    /// The asmux ring cursor *after* this chunk. Persisted (per batch) as the
+    /// session's `backend_cursor` so a cold-stitch adopt can re-attach the ring
+    /// tail exactly where cold history ends. 0 for the native backend.
+    pub head_cursor: u64,
 }
 
 /// Cloneable handle used by session backends to enqueue terminal events.
@@ -437,20 +441,25 @@ impl Db {
         Ok(())
     }
 
-    /// Persist the asmux ring cursor the daemon has drained up to, for adopt.
-    pub fn set_backend_cursor(&self, id: &str, cursor: u64) -> Result<()> {
+    /// The highest terminal-event `seq` persisted for a session (0 if none). A
+    /// cold-stitch adopt continues the sequence from here — not the throttled
+    /// `last_event_seq`, which can lag and would make new events collide with
+    /// already-persisted seqs (dropped by `INSERT OR IGNORE`).
+    pub fn max_event_seq(&self, session_id: &str) -> Result<u64> {
         let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE sessions SET backend_cursor = ?2 WHERE id = ?1",
-            rusqlite::params![id, cursor as i64],
-        )?;
-        Ok(())
+        let mut stmt =
+            conn.prepare("SELECT COALESCE(MAX(seq), 0) FROM terminal_events WHERE session_id = ?1")?;
+        let mut rows = stmt.query_map([session_id], |r| r.get::<_, i64>(0))?;
+        match rows.next() {
+            Some(r) => Ok(r?.max(0) as u64),
+            None => Ok(0),
+        }
     }
 
-    /// The persisted `consumed` cursor. Reserved for the M3-exact adopt path
-    /// (cold-stitch + `attach FromCursor(consumed)`); the current adopt replays
-    /// the holder ring `FromEarliest`.
-    #[allow(dead_code)]
+    /// The persisted `consumed` cursor — the exact end of this session's cold
+    /// history (written per batch by the event writer). A cold-stitch adopt seeds
+    /// `vt100` from cold history and re-attaches the holder ring
+    /// `FromCursor(consumed)` for the un-drained tail.
     pub fn get_backend_cursor(&self, id: &str) -> Result<u64> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT backend_cursor FROM sessions WHERE id = ?1")?;
@@ -726,6 +735,104 @@ fn write_batch(conn: &mut Connection, batch: &[EventMsg]) -> Result<()> {
             ])?;
         }
     }
+    // Advance each session's persisted `backend_cursor` to the max ring cursor in
+    // this batch (never regressing), atomically with the events it belongs to.
+    // This is the exact end-of-cold-history anchor a cold-stitch adopt re-attaches
+    // from. Only holder-backed sessions carry a non-zero cursor.
+    {
+        let mut max_cursor: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+        for m in batch {
+            if m.head_cursor > 0 {
+                let e = max_cursor.entry(m.session_id.as_str()).or_insert(0);
+                *e = (*e).max(m.head_cursor);
+            }
+        }
+        if !max_cursor.is_empty() {
+            let mut stmt = tx.prepare_cached(
+                "UPDATE sessions SET backend_cursor = MAX(backend_cursor, ?2) WHERE id = ?1",
+            )?;
+            for (id, cursor) in max_cursor {
+                stmt.execute(rusqlite::params![id, cursor as i64])?;
+            }
+        }
+    }
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{AttentionState, Session, SessionStatus};
+
+    fn temp_db() -> (Db, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("asm-db-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        (Db::open(&dir.join("t.sqlite3")).unwrap(), dir)
+    }
+
+    fn seed_session(db: &Db, id: &str) {
+        db.insert_session(&Session {
+            id: id.into(),
+            agent_plugin_id: "shell".into(),
+            command: "sh".into(),
+            args: vec![],
+            env: vec![],
+            working_directory: "/tmp".into(),
+            workspace_id: None,
+            status: SessionStatus::Running,
+            rows: 24,
+            cols: 80,
+            last_event_seq: 0,
+            exit_code: None,
+            attention_state: AttentionState::None,
+            attention_reason: None,
+            created_at: 1,
+            updated_at: 1,
+            last_activity_at: 1,
+            risky: false,
+        })
+        .unwrap();
+    }
+
+    /// The exact cold-stitch anchor: after a batch flush, `backend_cursor` equals
+    /// the max ring cursor persisted, and `max_event_seq` the max seq — so an
+    /// adopt re-attaches from the true end of cold history and continues the
+    /// sequence without colliding with existing rows.
+    #[test]
+    fn backend_cursor_and_max_seq_track_persisted_events() {
+        let (db, dir) = temp_db();
+        seed_session(&db, "s1");
+        let sink = db.events();
+        for (seq, cursor) in [(1u64, 100u64), (2, 250), (3, 400)] {
+            sink.send(EventMsg {
+                session_id: "s1".into(),
+                seq,
+                ts_ms: 0,
+                stream: 0,
+                bytes: vec![b'x'; 10],
+                head_cursor: cursor,
+            });
+        }
+        // Let the event-writer thread flush the batch.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        assert_eq!(db.get_backend_cursor("s1").unwrap(), 400);
+        assert_eq!(db.max_event_seq("s1").unwrap(), 3);
+        assert_eq!(db.read_events_after("s1", 0).unwrap().len(), 30);
+        // A later batch never regresses the cursor.
+        sink.send(EventMsg {
+            session_id: "s1".into(),
+            seq: 4,
+            ts_ms: 0,
+            stream: 0,
+            bytes: vec![b'y'; 5],
+            head_cursor: 550,
+        });
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert_eq!(db.get_backend_cursor("s1").unwrap(), 550);
+        assert_eq!(db.max_event_seq("s1").unwrap(), 4);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

@@ -12,6 +12,11 @@ folded into **M4**, which is now the next P1 on the durability track. **Update
 2026-07-08:** **TERM-SCROLL** (P1) — a diagnosed user-visible bug where the codex
 attach snapshot carried no scrollback — is **implemented and verified**; moved to
 *Already done*. Design + as-built: [`terminal-scrollback.md`](terminal-scrollback.md).
+**Update 2026-07-11:** **M4 Stage A** (daemon↔asmux reconnect supervisor + `Holder`
+trait, absorbing RF-M4 #2) and **M4 Stage B** (exact cold-stitch adopt + gap
+marker) both landed — moved to *Already done*; the M4 row now tracks only
+**Stage C** (soft-reboot, `purge`, metadata RPCs, `readBuffer`, orphan UI,
+periodic snapshot store), demoted to P2/P3.
 
 This is the single cross-track index of work that is **designed but not yet
 implemented**. The detailed designs stay in their own documents
@@ -95,6 +100,23 @@ pick it up**.
   path unchanged). Design + as-built:
   [`terminal-scrollback.md`](terminal-scrollback.md). Adjacent to M4 cold-stitch
   (history beyond the ring) and RF-VT100 (the concrete defect motivating it).
+- **M4 Stage A + B** — durable-session hardening (2026-07-11, daemon-only).
+  **Stage A:** the daemon↔asmux connection gained a single reconnect owner — a
+  supervisor task in `AsmuxClient` (dial → `hello` → re-attach every routed
+  session `FromCursor(last_cursor)` → drain) with exponential backoff, a 10 s idle
+  watchdog + heartbeat, in-place backpressure resync (`sidecar.rs`'s `Detached`
+  arm no longer breaks), and a `list`-reconcile after every reconnect
+  (`reconcile_after_reconnect` → shared `reconcile_from_holder`). `AsmuxClient`
+  now implements a `Holder` trait so it is unit-testable (reconcile-branch tests +
+  an in-process-asmux forced-drop → reconnect → resume test). Absorbs RF-M4 #2.
+  **Stage B:** adopt is exact via **cold-stitch** — `backend_cursor` made exact in
+  the event-batch transaction (`EventMsg.head_cursor`), `adopt` seeds `vt100` + the
+  raw-history ring from SQLite cold history and `attach FromCursor(consumed)` for
+  the tail, with a visible **gap marker** when the ring wrapped. A session whose
+  output outgrew the 2 MiB ring now reconstructs exactly after restart
+  (`durable-restart-test.mjs` cold-stitch discriminator; 117 daemon tests green).
+  Remaining M4 work is **Stage C** (table row M4-C). Design + as-built:
+  [`durable-sessions.md`](durable-sessions.md) → M4.
 - **RF-MOB** — client shell prep for the MOB phase-1 split (2026-07-06,
   client-only, zero behavior change): `src/status.ts` unifies the three drifted
   `isLive` predicates (+ `isTerminal`; the RightPanel ended-list's omission of
@@ -129,7 +151,7 @@ pick it up**.
 
 | ID | Item | Priority | Depends on | Source (design) |
 | --- | --- | --- | --- | --- |
-| M4 | Holder hardening + exact cold-stitch adopt (now also absorbs RF-M4 #2: the reconnect-supervisor home + `AsmuxClient` trait) | **P1** | M1–M3 (done); RF-M4 #1/#3/#4 (done) | durable-sessions.md → M4; refactoring-plan.md → RF-M4 #2 |
+| M4-C | Holder hardening **Stage C**: soft-reboot (hash drift + confirm), orphan surfacing/adopt UI, `purge`, metadata RPCs, `readBuffer`, periodic `(snapshot, cursor)` store (bounds cold-stitch replay cost) | **P2/P3** | M4 A/B (done) | durable-sessions.md → M4 Stage C |
 | MOB-PWA | Mobile UI phase 4: PWA manifest + iOS metas | **P2** | MOB (done) | mobile-ui.md → Packaging path |
 | MOB-PUSH | Web Push for attention states | **P3** | MOB (done); daemon push plumbing (relay as carrier) | mobile-ui.md → Follow-ups |
 | IMG-2 | Image paste follow-ups: `.asm/pastes/` cleanup policy, per-agent capability hint | **P3** | image paste + 📎 button (done) | image-paste.md → Follow-ups |
@@ -161,30 +183,22 @@ pick it up**.
 
 ## Detail
 
-### M4 — Holder hardening (P1)
+### M4-C — Holder hardening Stage C (P2/P3)
 
-**RF-M4 #1/#3/#4 landed 2026-07-07** (see "Already done"): the `SessionManager`
-split, the `db`/`registry` encapsulation, and the `MockBackend` holder seams +
-`startup_reconcile` branch tests are in, so M4's reconnect/reconciliation now
-lands in focused modules and the cold-stitch flip is test-guarded. **RF-M4 #2
-was folded into M4** — build the daemon↔asmux **reconnect-supervisor home** (one
-task owning the `AsmuxClient` lifecycle; today `sidecar.rs`'s `Detached` arm just
-logs + breaks) together with the reconnect behavior it hosts, and put
-`AsmuxClient` behind a trait at that point so the backoff/reconciliation logic is
-unit-testable (async `create`/`attach`/`list` ⇒ decide `async-trait` vs
-future-boxing there). Pre-placed seams to reuse: `AsmuxClient::detach`,
-`instance_id`, `head_cursor`, `backend_cursor`.
+**Stages A + B landed 2026-07-11** (see "Already done"): the daemon↔asmux
+reconnect supervisor + idle watchdog + `list`-after-reconnect reconciliation +
+`Holder` trait (Stage A, absorbing RF-M4 #2), and the exact cold-stitch adopt +
+gap marker (Stage B). The headline "terminal intact after restart" promise now
+holds for long-lived sessions whose output outgrew the ring.
 
 Orthogonal to the R-track (explicitly: R code must not assume M4 exists).
-Scope: idle watchdog + daemon↔asmux reconnect with backoff,
-`list`-after-reconnect reconciliation, soft-reboot on `binary_sha256` drift
-(warn + confirm), orphan surfacing/adopt UI, `purge`, metadata RPCs,
-`readLog`, slow-attacher drop + resync — **plus the M3 follow-up**: make the
-exact cold-stitch adopt the default (seed vt100 from persisted snapshot,
-stitch from SQLite cold history, `attach FromCursor(backend_cursor)`, real gap
-marker on `BUFFER_GAP`; everything is scaffolded, ring-replay is currently the
-default). This closes the headline "terminal intact after restart" promise for
-long-lived sessions whose output outgrew the ring.
+**Stage C — remaining scope:** soft-reboot on `binary_sha256` drift (warn +
+confirm), orphan surfacing/adopt UI, `purge`, metadata RPCs, `readBuffer`,
+slow-attacher drop + resync (the protocol/eviction plumbing exists; the daemon
+policy does not), and the **periodic `(snapshot, cursor)` store** that would bound
+cold-stitch's full cold-history replay on adopt (Stage B replays all of it —
+correct, and fine for realistic session sizes on a one-time adopt). None are on
+the critical durability path; pick per need.
 
 ### MOB follow-ups — phases 4–5 remaining (P2/P3)
 
@@ -369,11 +383,13 @@ parity gate, typed keys); adding a locale is the 3-step recipe in `i18n.md`.
    relay agent over a `watch` channel; relay fast-fail; client `via` label).
    Finishes the connectivity story the product is built around. Proof:
    `scripts/gateway-test.mjs`.
-3. ~~**RF-M4** #1/#3/#4~~ ✅ landed 2026-07-07 (split, encapsulation, adopt-path
-   tests) → **M4** — durability hardening; the only remaining gap in the
-   headline restart promise. The cold-stitch flip is now guarded by RF-M4 #4's
-   `startup_reconcile` branch tests. M4 also absorbs the reconnect-supervisor
-   home + `AsmuxClient` trait (was RF-M4 #2).
+3. ~~**RF-M4** #1/#3/#4~~ ✅ 2026-07-07 → ~~**M4 Stage A + B**~~ ✅ landed
+   2026-07-11 — durability hardening closed the last gap in the headline restart
+   promise: the reconnect supervisor + idle watchdog + `list`-reconcile + `Holder`
+   trait (Stage A, absorbing RF-M4 #2), and exact cold-stitch adopt + gap marker
+   (Stage B). Proof: `scripts/durable-restart-test.mjs` (cold-stitch discriminator).
+   **M4 Stage C** (M4-C row) — soft-reboot, `purge`, metadata RPCs, `readBuffer`,
+   orphan UI, periodic snapshot store — remains, demoted to P2/P3 (pick per need).
    - ~~**TERM-SCROLL**~~ ✅ landed 2026-07-08 (codex attach scrollback; per-buffer
      -model attach strategy + raw-history ring). Independent of M4; on the same
      snapshot/attach surface. Proof: `scripts/termscroll-test.mjs`.
