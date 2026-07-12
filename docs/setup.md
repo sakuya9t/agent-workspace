@@ -72,9 +72,16 @@ scripts/stop.sh             # stop both (stop.sh daemon|asmux for just one)
 scripts/token.sh            # print this host's device-enrollment token
 ```
 
-Override with env, e.g. `ASM_BIND=0.0.0.0:4600 RELEASE=1 scripts/start.sh`. The
-rest of this section is the manual equivalent, for when you want the processes in
-the foreground or wired into your own supervisor.
+Override with env, e.g. `ASM_BIND=0.0.0.0:4600 RELEASE=1 scripts/start.sh`. Once
+a component has launched, its settings are recorded (`asm-daemon.reg` /
+`asm-relay.reg` in the runtime dir): a **flagless** `start.sh` /
+`restart-daemon.sh` keeps those recorded settings — including a `0.0.0.0` bind, a
+`--register`, and relay-only-ness — rather than reverting to defaults, and the
+recording beats inherited `ASM_*` env (shells inside an asm session inherit the
+daemon's own exports). Pass flags to actually change settings; an explicit
+`stop.sh` clears the component's recording. The rest of this section is the
+manual equivalent, for when you want the processes in the foreground or wired
+into your own supervisor.
 
 Build both binaries first — `cargo run -p asm-daemon` only builds the asmux
 *library*, not the `asmux` holder binary:

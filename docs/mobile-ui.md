@@ -73,10 +73,12 @@ rendered by the same `SessionList` component. Mobile CSS only:
 - Rows ≥ 44 px tall (tree nodes today are ~30 px).
 - `tree-add` +/× buttons 20 px → 36 px square.
 - `btn.tiny` min-height 32 px.
-- Long-press is not required anywhere; every action is already an explicit
-  visible button (stop/archive/connect/+/×), which is why the tree ports
-  cleanly to touch. Hover-only `title` tooltips degrade silently; all critical
-  info (status, attention, path basename, rel-time) is already visible text.
+- Long-press is not required anywhere *in the tree*; every action is already an
+  explicit visible button (stop/archive/connect/+/×), which is why the tree ports
+  cleanly to touch. (The terminal is the one place a long-press carries meaning —
+  it starts a selection; see "Touch gestures" below.) Hover-only `title` tooltips
+  degrade silently; all critical info (status, attention, path basename,
+  rel-time) is already visible text.
 
 Tap a session row → same takeover confirm as desktop → navigates to the
 Terminal screen.
@@ -107,6 +109,37 @@ Terminal screen.
   `TerminalView` grows an optional `onReady(handle)` prop exposing
   `write(data)`/`focus()` so the key bar can inject input through the same
   WS send path as typed keys.
+
+- **Touch gestures** (added 2026-07-12, `scripts/touch-select-test.mjs`):
+
+  | Gesture | Does |
+  |---|---|
+  | Drag | Scrolls — the same from anywhere, over text or over blank space |
+  | Long-press (450 ms) | Selects the word under the finger (short vibrate) |
+  | Drag, still held | Extends the selection cell-by-cell, forward or backward; holding near the top/bottom edge auto-scrolls so a selection can outrun one screenful |
+  | Tap | Dismisses the selection |
+
+  Then `Copy` on the key bar puts it on the clipboard.
+
+  Two things make this more than "listen for `touchmove`":
+
+  1. **xterm has no touch selection at all.** Its selection service is
+     mouse-only and `.xterm` carries `user-select: none`, so neither xterm nor
+     the browser will select a cell from a fingertip. The gesture is synthesized
+     and pushed through xterm's *own* selection model via `term.select()` —
+     which is why every existing copy path (the key bar's `Copy`,
+     `getSelection()`, right-click, Ctrl-Shift-C) works on it unchanged, and why
+     the selection is cell-accurate rather than scraped out of the DOM.
+  2. **The gesture rides on pointer events, not touch events.** The DOM renderer
+     *replaces* a row's `<span>`s when that row repaints. A touch whose
+     `touchstart` landed on one of those spans gets retargeted to a node that is
+     no longer in the tree, so its `touchmove`s silently stop reaching any
+     listener — no `touchcancel`, just nothing. Since scrolling repaints rows,
+     a drag beginning on **text** scrolled exactly one row and then died, while a
+     drag beginning on **blank space** (whose target is the row `<div>` — which
+     xterm recycles rather than replaces) scrolled normally. `setPointerCapture`
+     pins the gesture to the container, so what becomes of the element under the
+     finger stops mattering.
 
 - **Soft-keyboard geometry:** viewport meta gains
   `interactive-widget=resizes-content` (Android); an `useVisualViewportHeight`

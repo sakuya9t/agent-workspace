@@ -9,6 +9,14 @@
 # restart regardless.) Passing --register/--relay-key here re-applies the relay
 # registration: the old daemon is stopped and a fresh one starts with the flags.
 #
+# A FLAGLESS run keeps the daemon's recorded launch config (bind/label/relay
+# registration) — it does not revert a 0.0.0.0 bind or a --register to defaults,
+# and the recording also beats inherited ASM_* env (an asm session leaks the
+# daemon's own exports). Passing any daemon flag re-specifies that config as a
+# whole instead. A bundled relay recorded on this box is left running (its
+# connections survive the daemon reload); if it died, it is rebuilt and revived
+# with its recorded settings.
+#
 # Options (the ASM_* env vars still work as fallbacks):
 #   --bind ADDR          daemon listen address (default 127.0.0.1:4600)
 #   --data-dir DIR       persistent data dir (default ~/.local/share/asm)
@@ -34,6 +42,11 @@ asm_parse_args "$@" || { usage; exit 2; }
 [ "${ASM_SHOW_HELP:-0}" = 1 ] && { usage; exit 0; }
 asm_configure
 
+# A flagless restart keeps what's running: re-load the daemon config recorded at
+# its launch, plus any bundled relay recorded on this box (see _asm_common.sh).
+daemon_load_recorded_config
+relay_load_recorded_config
+
 # Check the SOCKET, not just the pid: a holder whose socket was unlinked is alive
 # but unreachable, and restarting the daemon into that state just fails the boot
 # (exactly what happened on 2026-07-12). start.sh knows how to diagnose/recover.
@@ -47,8 +60,22 @@ if ! holder_live; then
   exit 1
 fi
 
-log "rebuilding asm-daemon ($PROFILE)..."
-cargo_build -p asm-daemon
+# Re-assert a recorded bundled relay, but only if it DIED — restarting a live
+# relay would drop every connected node and client for no reason.
+build_targets=(-p asm-daemon)
+restart_relay=0
+if relay_enabled && ! pid_alive "$RELAY_PIDFILE"; then
+  restart_relay=1
+  build_targets+=(-p asm-relay)
+fi
+
+log "rebuilding asm-daemon$([ "$restart_relay" = 1 ] && echo ' + asm-relay') ($PROFILE)..."
+cargo_build "${build_targets[@]}"
+
+if [ "$restart_relay" = 1 ]; then
+  log "bundled relay is down — reviving it with its recorded settings..."
+  start_relay
+fi
 
 # Stop the daemon: it detaches and leaves the holder's children running.
 stop_one asm-daemon "$DAEMON_PIDFILE"
