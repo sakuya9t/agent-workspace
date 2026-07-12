@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Start the durable stack: the asmux holder + the daemon in sidecar mode, and —
-# with --relay — a bundled rendezvous relay on this host. Sessions survive a
-# daemon restart (see scripts/restart-daemon.sh).
+# with --relay — a bundled rendezvous relay on this host. --relay-only starts
+# JUST the relay (a pure rendezvous box; no sessions run here). Sessions survive
+# a daemon restart (see scripts/restart-daemon.sh).
 #
 # Options are flags (the ASM_* env vars still work as fallbacks). See --help.
 set -euo pipefail
@@ -20,8 +21,13 @@ Usage: scripts/start.sh [options]
   --release            build/run the release profile
   -h, --help           show this help
 
+  A flagless run keeps the settings recorded from the previous launch (bind,
+  label, relay registration, bundled relay) instead of reverting to defaults;
+  recorded settings also beat inherited ASM_* env — pass flags to change them.
+
   Relay host — a reachable box that NAT'd nodes register to:
-  --relay              run a bundled rendezvous relay here
+  --relay              run a bundled rendezvous relay here (alongside the daemon)
+  --relay-only         run ONLY the relay — no holder/daemon, no sessions on this box
   --relay-bind ADDR    relay listen address (default 0.0.0.0:4700; implies --relay)
   --relay-key KEY      shared relay access key
 
@@ -32,6 +38,7 @@ Usage: scripts/start.sh [options]
 Examples:
   scripts/start.sh --bind 0.0.0.0:4600
   scripts/start.sh --relay --relay-key s3cret               # relay host + daemon
+  scripts/start.sh --relay-only --relay-key s3cret          # just the relay, no daemon
   scripts/start.sh --register ws://192.168.122.1:4700 --relay-key s3cret
 USAGE
 }
@@ -39,6 +46,23 @@ USAGE
 asm_parse_args "$@" || { usage; exit 2; }
 [ "${ASM_SHOW_HELP:-0}" = 1 ] && { usage; exit 0; }
 asm_configure
+
+# A flagless run brings the stack up as it was recorded (bind/label/registration,
+# bundled relay, relay-only-ness) rather than reverting to defaults.
+daemon_load_recorded_config
+relay_load_recorded_config
+
+# Relay-only: build and start just the rendezvous relay — no holder, no daemon.
+if [ "${ASM_RELAY_ONLY:-0}" = 1 ]; then
+  relay_enabled || { err "--relay-only needs --relay-key KEY (the access key nodes present)"; exit 2; }
+  log "building asm-relay ($PROFILE)..."
+  cargo_build -p asm-relay
+  start_relay
+  log "ready — relay http://$ASM_RELAY_BIND (nodes register here; no sessions on this box)"
+  log "logs   — $LOG_DIR/asm-relay.log"
+  log "next   — scripts/status.sh · scripts/stop.sh relay"
+  exit 0
+fi
 
 build_targets=(-p asm-daemon -p asmux)
 relay_enabled && build_targets+=(-p asm-relay)
