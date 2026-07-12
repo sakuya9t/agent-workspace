@@ -340,15 +340,57 @@ fn probe_health(url: &str) -> Option<(String, String)> {
     Some((node_id, label))
 }
 
+/// Poll the holder socket until something answers, or `wait` elapses.
+async fn wait_for_asmux(socket: &std::path::Path, wait: Duration) -> bool {
+    use tokio::net::UnixStream;
+
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        if UnixStream::connect(socket).await.is_ok() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Ensure the asmux holder is reachable, auto-spawning it (detached) if the
 /// socket is dead and autospawn is enabled.
+///
+/// This *waits* rather than probing once. A single connect attempt fails the
+/// daemon's whole boot the instant the holder is slow (peer container still
+/// starting) or briefly absent — which is how a missing socket became a hard,
+/// silent boot failure on 2026-07-12 (two dead boots, and not one ERROR line in
+/// the log, because `bail!` from `main` only prints a bare `Error:` to stderr).
 async fn ensure_asmux(config: &Config) -> Result<()> {
     use tokio::net::UnixStream;
 
     if UnixStream::connect(&config.asmux_socket).await.is_ok() {
         return Ok(());
     }
+
     if !config.asmux_autospawn {
+        // The holder is somebody else's job (peer container, service script).
+        // Give it a chance to appear instead of dying on the first refusal.
+        tracing::warn!(
+            socket = %config.asmux_socket.display(),
+            wait_ms = config.asmux_wait.as_millis() as u64,
+            "asmux holder not answering yet (ASM_ASMUX_AUTOSPAWN=0); waiting for it"
+        );
+        if wait_for_asmux(&config.asmux_socket, config.asmux_wait).await {
+            tracing::info!("asmux holder appeared; continuing");
+            return Ok(());
+        }
+        tracing::error!(
+            socket = %config.asmux_socket.display(),
+            "no asmux holder at this socket and ASM_ASMUX_AUTOSPAWN=0, so the daemon cannot start. \
+             Either the holder is not running, or it is running but its socket was unlinked (an \
+             orphan: `asmux probe` says not-Live while its pid is alive). Recover with \
+             `scripts/start.sh`, which detects both, or set ASM_ASMUX_AUTOSPAWN=1 to let the daemon \
+             spawn one."
+        );
         bail!(
             "asmux socket {} is unavailable and ASM_ASMUX_AUTOSPAWN=0",
             config.asmux_socket.display()
@@ -375,13 +417,15 @@ async fn ensure_asmux(config: &Config) -> Result<()> {
     cmd.spawn()
         .with_context(|| format!("spawning asmux binary at {}", bin.display()))?;
 
-    // Wait for the socket to come up.
-    for _ in 0..50 {
-        if UnixStream::connect(&config.asmux_socket).await.is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    if wait_for_asmux(&config.asmux_socket, config.asmux_wait).await {
+        return Ok(());
     }
+    tracing::error!(
+        socket = %config.asmux_socket.display(),
+        bin = %bin.display(),
+        "spawned asmux but it never listened. If a live holder already owns this socket it refuses \
+         to displace it (by design) — check the asmux log."
+    );
     bail!(
         "asmux did not start listening at {}",
         config.asmux_socket.display()

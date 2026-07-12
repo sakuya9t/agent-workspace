@@ -164,6 +164,34 @@ RPC semantics, error codes, cursor/replay rules, backpressure, and the
 never-crash lints are specified in [`asmux-protocol.md`](asmux-protocol.md) —
 that document is the frozen contract; this one is the rationale.
 
+### Socket ownership: the path is a live resource, not a lock file
+
+A holder's socket path is the only way to reach the PTYs it owns, and **unlinking
+it is silently destructive**: the running asmux keeps its listener fd open, so it
+logs nothing and dies none the wiser, but nobody can dial it by path again. Its
+sessions are then lost at the next daemon restart, with no completion record —
+they reconcile to `indeterminate`.
+
+So asmux **probes before it unlinks** (`crates/asmux/src/socket.rs`):
+
+| at the path | meaning | action |
+| --- | --- | --- |
+| nothing | clean start | bind |
+| a file, nobody answers | the owner died without cleanup | unlink, bind |
+| **someone answers** | **a live holder owns it** | **refuse, exit non-zero** |
+
+`ASMUX_TAKEOVER=1` overrides the refusal — displacing a holder must be asked for,
+never inferred.
+
+This is not defensive theatre. On **2026-07-12** an e2e test inherited the dev
+host's ambient `ASMUX_SOCK` (the daemon resolves it *before* `ASM_RUNTIME_DIR`,
+so the test's private runtime dir was ignored), unlinked and rebound the real
+holder's socket, and then removed it on exit. The real holder ran on, orphaned
+and unreachable; the next daemon boot failed with *"asmux socket is unavailable
+and ASM_ASMUX_AUTOSPAWN=0"*, the orphan was killed to recover, and **six live
+sessions died**. The guard above makes that specific failure impossible; the test
+side is fixed in `scripts/lib/testenv.mjs` (see [`setup.md`](setup.md) → Tests).
+
 Key semantics that matter to the daemon:
 
 - **Single-attacher with takeover** — the daemon is the one attacher; a new

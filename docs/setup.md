@@ -384,22 +384,99 @@ The integration tests swap a mock `SessionBackend` for the native PTY backend,
 exercising the manager lifecycle (create → stop → summary, approval gate,
 archive state machine) without spawning real processes.
 
-### End-to-end smoke test
+### The e2e scripts are sandboxed — never point them at your daemon
 
-With a daemon running, exercise the full loop (create → attach → run →
-disconnect → reconnect snapshot resume → scm status → stop → summary):
+Every script in `scripts/*.mjs` spawns **its own** daemon in a fresh tmpdir, on a
+kernel-assigned free port, with its own data dir and its own asmux socket. Just
+run them; nothing needs to be up first:
 
 ```bash
-node scripts/smoke.mjs 127.0.0.1:4600 /path/to/a/git/repo
+cargo build
+node scripts/smoke.mjs                  # core loop: create → attach → run → reconnect → stop
+node scripts/durable-restart-test.mjs   # sessions survive a daemon restart (asmux adopt)
+node scripts/holder-theft-test.mjs      # the 2026-07-12 incident, as a regression test
+node scripts/worktree-test.mjs          # per-session git worktrees + cleanup guards
+node scripts/paste-test.mjs             # image paste into the session cwd
+node scripts/relay-test.mjs             # a NAT'd daemon driven through the relay
+node scripts/gateway-test.mjs           # an egress-less downstream through a gateway
+node scripts/termscroll-test.mjs        # attach scrollback / alt-screen
 ```
 
-### Durable-restart test (asmux)
-
-Proves sessions survive a daemon restart. Self-contained — it starts asmux and
-two daemon generations itself (no running daemon needed), creates a session,
-`SIGTERM`s the daemon, restarts it, and asserts the session was adopted
-(`running`, screen reconstructed, still accepts input):
+The headless-Chrome tests drive the real client bundle, so build it once
+(`cd client && npm run build`); they then spawn their own daemon *and* their own
+Chrome:
 
 ```bash
-cargo build && node scripts/durable-restart-test.mjs
+node scripts/attach-button-test.mjs     # 📎 button → upload → path injected into the PTY
+node scripts/mobile-shell-test.mjs      # mobile adaptive shell at a phone viewport
+node scripts/copy-paste-test.mjs        # copy/paste personas (T1 + T2)
+```
+
+`copy-paste`'s **T3** needs a genuinely insecure origin (a LAN IP), which a
+sandbox cannot fabricate, so it is opt-in and *skips* rather than silently
+passing. It prints the vite command to run, then:
+`node scripts/copy-paste-test.mjs http://<LAN-IP>:5199/`
+
+Isolation comes from `scripts/lib/testenv.mjs` — take a sandbox from
+`createSandbox()`, never hand-roll the child env:
+
+```js
+import { createSandbox, checker, sleep } from "./lib/testenv.mjs";
+const sb = await createSandbox("my-test");
+await sb.startDaemon();            // sb.base, sb.http, sb.api(), sb.ws(id), sb.cwd
+```
+
+**Why this is not optional.** This dev host exports `ASMUX_SOCK`,
+`ASM_RUNTIME_DIR`, `ASM_DATA_DIR` and `ASM_BIND` globally, and the daemon
+resolves `ASMUX_SOCK` *before* falling back to `ASM_RUNTIME_DIR`. A test that
+spreads `...process.env` into the daemon it spawns therefore inherits the **live
+holder's socket** even if it set a private runtime dir — and asmux used to
+`remove_file` + rebind that path unconditionally. On **2026-07-12** exactly that
+happened: an e2e run unlinked the real holder's socket, the holder kept running
+but became unreachable, the next daemon restart could not find it, and **six live
+sessions were lost**. A private TCP port does not protect you; the collision is on
+the socket and the data dir.
+
+Three defences now exist, and you want all of them:
+
+- `createSandbox()` / `hermeticChildEnv()` strip every inherited `ASM_*` / `ASMUX_*`,
+  repoint `XDG_RUNTIME_DIR` into the tmpdir, pin `ASMUX_SOCK` explicitly, and throw
+  if a resolved path ever escapes the sandbox.
+- **asmux refuses to displace a live holder**: it probes the socket before
+  unlinking it and exits non-zero if anyone answers (`ASMUX_TAKEOVER=1` overrides,
+  deliberately). See `crates/asmux/src/socket.rs`.
+- **asmux heals an unlinked socket**: a watchdog notices its path was removed or
+  replaced and rebinds it, so the holder stays reachable and its PTYs survive.
+  `scripts/holder-theft-test.mjs` replays the whole incident and asserts that no
+  sessions are lost.
+
+### Diagnosing the holder
+
+A holder's *pid* being alive means nothing — during the outage asmux was alive
+the whole time while its socket was gone, and `status.sh` cheerfully reported
+"RUNNING". What matters is whether it **answers**:
+
+```bash
+./target/debug/asmux probe   # Live (exit 0) | Stale | Free (exit 1)
+scripts/status.sh            # reports ORPHANED when the pid is alive but nothing answers
+```
+
+An **orphaned** holder is alive, still holding live PTYs, and unreachable. Its
+sessions cannot be attached, and killing it loses them — so `start.sh` waits for
+the self-heal, and only then tells you what it found rather than quietly killing
+anything.
+
+If the daemon starts before the holder (peer containers, service ordering), it
+now **waits** for it — `ASM_ASMUX_WAIT_MS` (default 15000) — instead of dying on
+the first refused connect, and logs at ERROR when it truly gives up.
+
+### Running against a real daemon (attended)
+
+Some scripts accept a `host:port` to smoke an already-running daemon. This is
+opt-in and prints a warning, because every session it creates lands in *that*
+daemon's data dir — and `worktree-test` will create and force-remove worktrees in
+the repo you give it:
+
+```bash
+node scripts/smoke.mjs 127.0.0.1:4600 /path/to/a/git/repo   # ATTENDED
 ```

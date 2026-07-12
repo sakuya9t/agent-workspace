@@ -10,31 +10,35 @@
 //   T3  Linux UA, INSECURE origin (LAN IP via vite --host): execCommand
 //       fallback with focus retention, native paste without clipboard API
 //
-//   node scripts/copy-paste-test.mjs <daemonBase> <insecureUrl> <cwd> <chromePort>
+//   cd client && npm run build         # once, to produce client/dist
+//   node scripts/copy-paste-test.mjs   # sandboxed: runs T1 + T2
 //
-// Full recipe:
-//   (cd client && npm run build)
-//   D=/tmp/asm-cp; mkdir -p $D/{data,cfg,rt,cwd,chrome}
-//   ASM_BIND=127.0.0.1:4671 ASM_DATA_DIR=$D/data ASM_CONFIG_DIR=$D/cfg \
-//     ASM_RUNTIME_DIR=$D/rt ASM_STATIC_DIR=$PWD/client/dist ASM_BACKEND=native \
-//     ASM_ASMUX_AUTOSPAWN=0 ./target/debug/asm-daemon &
-//   # vite bound to the LAN gives an INSECURE origin while its /api+ws proxy
-//   # reaches the daemon from loopback (so no device pairing is needed)
-//   (cd client && ASM_DAEMON=http://127.0.0.1:4671 npx vite --port 5199 --host 0.0.0.0) &
-//   google-chrome --headless=new --disable-gpu --no-sandbox --disable-dev-shm-usage \
-//     --remote-debugging-port=9335 --user-data-dir=$D/chrome about:blank &
-//   node scripts/copy-paste-test.mjs 127.0.0.1:4671 http://<LAN-IP>:5199/ $D/cwd 9335
+// T1/T2 are fully sandboxed: the daemon (serving the bundle), Chrome, and the
+// session are all spawned here in a tmpdir. They used to need a hand-started
+// daemon on :4671 and four argv — see scripts/lib/testenv.mjs.
+//
+// T3 needs a genuinely INSECURE origin, which means a second server on a LAN IP
+// (vite --host) — not something a sandbox can conjure. It is therefore opt-in;
+// pass the URL to run it:
+//
+//   (cd client && ASM_DAEMON=http://127.0.0.1:<port> npx vite --port 5199 --host 0.0.0.0) &
+//   node scripts/copy-paste-test.mjs http://<LAN-IP>:5199/
+//
+// (For T3, point vite's ASM_DAEMON at the sandbox daemon's port, which this
+// script prints on startup.)
 //
 // Chrome-harness gotchas encoded below: Network.setCacheDisabled (a cached
 // index.html silently runs a stale bundle after rebuilds), and auto-accepting
 // Page.javascriptDialogOpening (an unanswered confirm() — e.g. the session
 // take-over prompt — blocks every same-process Runtime.evaluate forever).
 
-const daemonBase = process.argv[2] ?? "127.0.0.1:4671";
-const insecureUrl = process.argv[3] ?? "http://192.168.0.159:5199/";
-const cwd = process.argv[4];
-const chromePort = process.argv[5] ?? "9335";
-const secureUrl = `http://${daemonBase}/`;
+import { createSandbox, sleep } from "./lib/testenv.mjs";
+
+const insecureUrl = process.argv[2] ?? null; // opt-in: T3 needs a LAN/vite origin
+const sb = await createSandbox("asm-cp");
+let daemonBase; // set in main(), once the sandbox daemon is up
+let secureUrl;
+const cwd = sb.cwd;
 
 let failures = 0;
 const check = (name, cond, extra) => {
@@ -42,19 +46,6 @@ const check = (name, cond, extra) => {
   if (!cond) failures++;
   return cond;
 };
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function browserWs() {
-  for (let i = 0; i < 40; i++) {
-    try {
-      const r = await fetch(`http://127.0.0.1:${chromePort}/json/version`);
-      const j = await r.json();
-      if (j.webSocketDebuggerUrl) return j.webSocketDebuggerUrl;
-    } catch {}
-    await sleep(250);
-  }
-  throw new Error("chrome devtools endpoint never came up");
-}
 
 function makeConn(wsUrl) {
   const ws = new WebSocket(wsUrl);
@@ -102,7 +93,21 @@ const MAC_UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
 
 async function main() {
-  const conn = makeConn(await browserWs());
+  // Sandbox: a daemon serving the built bundle, plus its own Chrome. We build our
+  // own CDP client (not sb.startChrome()) because this test needs console-log
+  // capture and dialog auto-accept — see makeConn above.
+  await sb.startAppDaemon();
+  daemonBase = sb.base;
+  secureUrl = `${sb.http}/`;
+  console.log(`sandbox daemon on ${daemonBase}  (cwd: ${cwd})`);
+  if (!insecureUrl) {
+    console.log("T3 skipped: no insecure origin given. To run it, start vite on the LAN with");
+    console.log(`  (cd client && ASM_DAEMON=http://${daemonBase} npx vite --port 5199 --host 0.0.0.0)`);
+    console.log("then re-run with:  node scripts/copy-paste-test.mjs http://<LAN-IP>:5199/");
+  }
+
+  const { wsUrl } = await sb.launchChrome();
+  const conn = makeConn(wsUrl);
   await conn.ready;
 
   // Clipboard read/write permission for the secure "reader" origin.
@@ -290,8 +295,12 @@ async function main() {
   }
 
   // ============ T3: Linux persona, INSECURE origin (LAN IP via vite) ============
-  console.log("\n--- T3: insecure origin (execCommand fallback) ---");
-  {
+  // Opt-in: a real insecure origin needs a second server on a LAN IP, which the
+  // sandbox cannot fabricate. Without it we skip rather than silently "pass".
+  if (!insecureUrl) {
+    console.log("\n--- T3: SKIPPED (no insecure origin given) ---");
+  } else {
+    console.log("\n--- T3: insecure origin (execCommand fallback) ---");
     const t = await openTab(conn, insecureUrl, null);
     await attachTerminal(t, "MARK3LAN");
     check("T3 insecure context (no navigator.clipboard)", await t.eval(`!navigator.clipboard`));
@@ -332,7 +341,7 @@ async function main() {
   await reader.close();
   conn.ws.close();
   console.log(failures ? `\n${failures} FAILURE(S)` : "\nALL PASS");
-  process.exit(failures ? 1 : 0);
+  return failures === 0;
 }
 
 // ---------- helpers ----------
@@ -497,7 +506,13 @@ async function sentHas(tab, needle) {
   return await tab.eval(`window.__sent.some(f => f.includes(${JSON.stringify(needle)}))`);
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+main()
+  .then((pass) => {
+    sb.cleanup();
+    process.exit(pass ? 0 : 1);
+  })
+  .catch((e) => {
+    console.error(e);
+    sb.cleanup();
+    process.exit(1);
+  });

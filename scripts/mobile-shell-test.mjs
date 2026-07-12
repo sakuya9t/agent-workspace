@@ -4,86 +4,38 @@
 // full-screen terminal + key bar → key-bar/​Ctrl-latch input over the WS →
 // details sheet → back navigation.
 //
-//   node scripts/mobile-shell-test.mjs <base host:port> <chromePort> <pngOut>
+//   cd client && npm run build          # once, to produce client/dist
+//   node scripts/mobile-shell-test.mjs  # sandboxed: daemon + chrome + session
 //
-// Recipe (see also docs/mobile-ui.md and build-run-env memory):
-//   (cd client && npm run build)
-//   D=/tmp/asm-mob; mkdir -p $D/{data,cfg,rt,cwd,chrome}; git -C $D/cwd init -q
-//   ASM_BIND=127.0.0.1:4671 ASM_DATA_DIR=$D/data ASM_CONFIG_DIR=$D/cfg \
-//     ASM_RUNTIME_DIR=$D/rt ASM_STATIC_DIR=$PWD/client/dist ASM_BACKEND=native \
-//     ASM_ASMUX_AUTOSPAWN=0 ./target/debug/asm-daemon &
-//   curl -sX POST 127.0.0.1:4671/api/sessions -H 'content-type: application/json' \
-//     -d "{\"agent_plugin_id\":\"shell\",\"cwd\":\"$D/cwd\"}"
-//   google-chrome --headless=new --disable-gpu --no-sandbox --disable-dev-shm-usage \
-//     --remote-debugging-port=9334 --user-data-dir=$D/chrome about:blank &
-//   node scripts/mobile-shell-test.mjs 127.0.0.1:4671 9334 $D/term.png
+// It used to require a hand-rolled recipe (throwaway daemon on :4671 with
+// ASM_STATIC_DIR, a curl to make a session, chrome with a debug port, three
+// argv). That is now `createSandbox()` — see scripts/lib/testenv.mjs. See also
+// docs/mobile-ui.md.
 //
 // Same-origin (default `local` daemon has baseUrl="" so loopback trust = no
 // token). Node 18+ (global fetch/WS).
 
 import fs from "node:fs";
+import { join } from "node:path";
+import { createSandbox, checker, sleep } from "./lib/testenv.mjs";
 
-const [base, chromePort, pngOut] = [
-  process.argv[2] ?? "127.0.0.1:4671",
-  process.argv[3] ?? "9334",
-  process.argv[4] ?? "/tmp/asm-mob/term.png",
-];
-const appUrl = `http://${base}/`;
-
-let failures = 0;
-const check = (name, cond, extra) => {
-  console.log(`${cond ? "PASS" : "FAIL"}  ${name}${extra ? "  " + extra : ""}`);
-  if (!cond) failures++;
-  return cond;
-};
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function browserWs() {
-  for (let i = 0; i < 40; i++) {
-    try {
-      const r = await fetch(`http://127.0.0.1:${chromePort}/json/version`);
-      const j = await r.json();
-      if (j.webSocketDebuggerUrl) return j.webSocketDebuggerUrl;
-    } catch {
-      /* not up yet */
-    }
-    await sleep(250);
-  }
-  throw new Error("chrome devtools endpoint never came up");
-}
-
-function makeConn(wsUrl) {
-  const ws = new WebSocket(wsUrl);
-  const pending = new Map();
-  let idc = 1;
-  ws.onmessage = (ev) => {
-    const m = JSON.parse(ev.data);
-    if (m.id && pending.has(m.id)) {
-      const { resolve, reject } = pending.get(m.id);
-      pending.delete(m.id);
-      m.error ? reject(new Error(JSON.stringify(m.error))) : resolve(m.result);
-    }
-  };
-  const ready = new Promise((res) => (ws.onopen = res));
-  const send = (method, params = {}, sessionId) =>
-    new Promise((resolve, reject) => {
-      const id = idc++;
-      pending.set(id, { resolve, reject });
-      ws.send(JSON.stringify({ id, method, params, sessionId }));
-    });
-  return { ws, ready, send };
-}
+const { check, report } = checker();
+const sb = await createSandbox("asm-mob");
+const pngOut = process.argv[2] ?? null; // optional: where to drop the screenshot
 
 async function main() {
-  const conn = makeConn(await browserWs());
-  await conn.ready;
+  await sb.startAppDaemon();
+  const { session } = await sb.api("/api/sessions", {
+    method: "POST",
+    body: JSON.stringify({ agent_plugin_id: "shell", cwd: sb.cwd }),
+  });
+  check("session created for the UI", session.status === "running", session.id.slice(0, 8));
 
-  const { targetId } = await conn.send("Target.createTarget", { url: "about:blank" });
-  const { sessionId } = await conn.send("Target.attachToTarget", { targetId, flatten: true });
-  const S = (method, params) => conn.send(method, params, sessionId);
-  await S("Runtime.enable");
-  await S("DOM.enable");
-  await S("Page.enable");
+  const appUrl = `${sb.http}/`;
+  const chrome = await sb.startChrome();
+  const page = await chrome.openPage("about:blank");
+  const { S, evalJs, waitFor } = page;
+
   // Emulate a phone: 390×844 triggers the (max-width:599px) clause in PHONE_MQ,
   // and touch emulation makes (pointer: coarse) match too.
   await S("Emulation.setDeviceMetricsOverride", {
@@ -95,23 +47,6 @@ async function main() {
   await S("Emulation.setTouchEmulationEnabled", { enabled: true });
   await S("Page.navigate", { url: appUrl });
 
-  const evalJs = async (expr) => {
-    const { result, exceptionDetails } = await S("Runtime.evaluate", {
-      expression: expr,
-      returnByValue: true,
-      awaitPromise: true,
-    });
-    if (exceptionDetails) throw new Error(exceptionDetails.text + " :: " + expr);
-    return result.value;
-  };
-  const waitFor = async (expr, ms = 12000) => {
-    const t0 = Date.now();
-    while (Date.now() - t0 < ms) {
-      if (await evalJs(expr)) return true;
-      await sleep(250);
-    }
-    return false;
-  };
   const clickKb = (label) =>
     evalJs(
       `(() => { const b=[...document.querySelectorAll('.term-keybar .kb')].find(x=>x.textContent.trim()===${JSON.stringify(
@@ -186,10 +121,12 @@ async function main() {
     ),
   );
 
-  // Screenshot the terminal + key bar for the record.
+  // Screenshot the terminal + key bar for the record. Lands in the sandbox unless
+  // an explicit path was given (the sandbox is deleted on cleanup).
   const shot = await S("Page.captureScreenshot", { format: "png" });
-  fs.writeFileSync(pngOut, Buffer.from(shot.data, "base64"));
-  console.log(`screenshot: ${pngOut}`);
+  const shotPath = pngOut ?? join(sb.tmp, "term.png");
+  fs.writeFileSync(shotPath, Buffer.from(shot.data, "base64"));
+  console.log(`screenshot: ${shotPath}`);
 
   // 7. Details sheet opens over the terminal, back closes it.
   await evalJs("document.querySelector('.mobile-details-btn').click()");
@@ -217,13 +154,18 @@ async function main() {
     await waitFor("!!document.querySelector('.panel.right .vscode-btn')", 6000),
   );
 
-  await conn.send("Target.closeTarget", { targetId }).catch(() => {});
-  conn.ws.close();
-  console.log(failures ? `\n${failures} FAILURE(S)` : "\nALL PASS");
-  process.exit(failures ? 1 : 0);
+  await chrome.send("Target.closeTarget", { targetId: page.targetId }).catch(() => {});
+  chrome.ws.close();
+  return report("the mobile adaptive shell works end-to-end in a real browser");
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+main()
+  .then((pass) => {
+    sb.cleanup();
+    process.exit(pass ? 0 : 1);
+  })
+  .catch((e) => {
+    console.error(e);
+    sb.cleanup();
+    process.exit(1);
+  });
