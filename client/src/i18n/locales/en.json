@@ -224,6 +224,7 @@
     "noCommits": "No commits yet.",
     "loadingHistory": "Loading history…",
     "pullTitle": "Pull latest into this branch (fast-forward only)",
+    "pushTitle": "Push this branch to origin (creates it if it doesn't exist)",
     "rebaseTitle": "Rebase this branch onto…",
     "rebaseOnto": "Rebase {{branch}} onto",
     "rebaseSelectPlaceholder": "Select a branch…",

@@ -119,6 +119,12 @@ pub trait SourceControl: Send + Sync {
     /// Merge the current branch into `target` (a local branch). Failed merges
     /// are aborted so conflict files are not left in either worktree.
     fn merge_to_branch(&self, cwd: &Path, target: &str) -> Result<String>;
+    /// Push the current branch to `origin`, creating the remote branch and
+    /// recording it as the upstream when it doesn't exist yet. Never forces:
+    /// a diverged remote is rejected (non-fast-forward) and that error is
+    /// surfaced. Returns git's combined stdout+stderr for display; auth and
+    /// configuration failures come straight from git.
+    fn push(&self, cwd: &Path) -> Result<String>;
 }
 
 pub struct GitSourceControl;
@@ -463,6 +469,49 @@ impl SourceControl for GitSourceControl {
             output.trim()
         );
     }
+
+    fn push(&self, cwd: &Path) -> Result<String> {
+        if !self.detect(cwd) {
+            bail!("not a git repository");
+        }
+        let branch = git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?
+            .trim()
+            .to_string();
+        if branch.is_empty() || branch == "HEAD" {
+            bail!("cannot push: HEAD is detached");
+        }
+        // The branch name comes from git itself, but it reaches `git push`
+        // positionally after `origin`; guarding is cheap defence in depth.
+        guard_branch(&branch)?;
+
+        // Pre-empt git's cryptic "'origin' does not appear to be a git
+        // repository" with a message that says what to do about it.
+        if !remote_exists(cwd, "origin") {
+            bail!(
+                "no 'origin' remote is configured, so there is nowhere to push. \
+                 Add one with `git remote add origin <url>` first."
+            );
+        }
+
+        // `--set-upstream` creates the remote branch when it doesn't exist yet
+        // and records origin/<branch> as the upstream, so a later Pull has
+        // somewhere to pull from. An existing remote branch is fast-forwarded;
+        // a diverged one is rejected (non-fast-forward) and surfaced rather
+        // than forced. `GIT_TERMINAL_PROMPT=0` makes a missing/expired
+        // credential fail fast with git's own message instead of blocking the
+        // daemon on an interactive username/password prompt that never comes.
+        let out = Command::new("git")
+            .args(["push", "--set-upstream", "origin", &branch])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .current_dir(cwd)
+            .output()
+            .map_err(|e| anyhow!("failed to run git: {e}"))?;
+        if out.status.success() {
+            Ok(combined_output(&out))
+        } else {
+            bail!("git push failed: {}", combined_output(&out).trim());
+        }
+    }
 }
 
 /// Parse the `git show --numstat --format=…\x1e` output into a `CommitDetail`.
@@ -632,6 +681,15 @@ fn remote_tracking_exists(cwd: &Path, remote: &str, branch: &str) -> bool {
     )
     .map(|s| !s.trim().is_empty())
     .unwrap_or(false)
+}
+
+/// Whether a remote by this name is configured. Checked so push can give a
+/// friendly "no origin" message instead of git's raw "does not appear to be a
+/// git repository" when the remote is missing.
+fn remote_exists(cwd: &Path, remote: &str) -> bool {
+    git(cwd, &["remote"])
+        .map(|out| out.lines().any(|l| l.trim() == remote))
+        .unwrap_or(false)
 }
 
 fn ensure_clean_worktree(cwd: &Path, label: &str) -> Result<()> {
@@ -1057,6 +1115,82 @@ mod tests {
             "feature"
         );
         let _ = fs::remove_dir_all(&main_wt);
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    /// A bare repo standing in for `origin`.
+    fn bare_origin(name: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "asm-origin-{name}-{}-{now}.git",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        git_test(&dir, &["init", "-q", "--bare"]);
+        dir
+    }
+
+    #[test]
+    fn push_creates_remote_branch_and_sets_upstream() {
+        let repo = test_repo("push-create");
+        let origin = bare_origin("push-create");
+        git_test(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        write_file(&repo, "a.txt", "hello\n");
+        commit_all(&repo, "initial");
+
+        // The remote has no `main` yet; push must create it and record tracking.
+        let output = GitSourceControl.push(&repo).unwrap();
+        assert!(!output.is_empty());
+
+        // The branch now exists on origin at our HEAD, and @{u} resolves — so a
+        // later Pull has an upstream to pull from.
+        let local_head = git_test(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+        let remote_head = git_test(&origin, &["rev-parse", "main"]).trim().to_string();
+        assert_eq!(local_head, remote_head);
+        assert_eq!(
+            git_test(&repo, &["rev-parse", "--abbrev-ref", "@{u}"]).trim(),
+            "origin/main"
+        );
+
+        // A second push of new work fast-forwards the existing remote branch.
+        write_file(&repo, "b.txt", "more\n");
+        commit_all(&repo, "second");
+        GitSourceControl.push(&repo).unwrap();
+        assert_eq!(
+            git_test(&repo, &["rev-parse", "HEAD"]).trim(),
+            git_test(&origin, &["rev-parse", "main"]).trim()
+        );
+
+        let _ = fs::remove_dir_all(origin);
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn push_without_origin_reports_it() {
+        let repo = test_repo("push-no-origin");
+        write_file(&repo, "a.txt", "hello\n");
+        commit_all(&repo, "initial");
+
+        let err = GitSourceControl.push(&repo).unwrap_err().to_string();
+        assert!(err.contains("origin"), "unexpected message: {err}");
+
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn push_rejects_detached_head() {
+        let repo = test_repo("push-detached");
+        write_file(&repo, "a.txt", "hello\n");
+        commit_all(&repo, "initial");
+        let head = git_test(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+        git_test(&repo, &["checkout", "-q", &head]); // detach
+
+        let err = GitSourceControl.push(&repo).unwrap_err().to_string();
+        assert!(err.contains("detached"), "unexpected message: {err}");
+
         let _ = fs::remove_dir_all(repo);
     }
 }

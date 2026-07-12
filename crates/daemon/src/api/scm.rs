@@ -213,6 +213,18 @@ pub async fn pull(
     Ok(Json(json!({ "output": output })))
 }
 
+/// Push the session's current branch to origin, creating the remote branch when
+/// it doesn't exist yet.
+pub async fn push(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let cwd = session_cwd(&state, &id).await?;
+    let scm = state.scm.clone();
+    let output = run_blocking(move || scm.push(&cwd)).await?;
+    Ok(Json(json!({ "output": output })))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RebaseBody {
     onto: String,

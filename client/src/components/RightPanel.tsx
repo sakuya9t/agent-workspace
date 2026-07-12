@@ -143,6 +143,11 @@ export function RightPanel({ target, session }: Props) {
     onSuccess: refreshScm,
   });
 
+  const push = useMutation({
+    mutationFn: () => api.scmPush(target!, session!.id),
+    onSuccess: refreshScm,
+  });
+
   const rebase = useMutation({
     mutationFn: (onto: string) => api.scmRebase(target!, session!.id, onto),
     onSuccess: () => {
@@ -161,24 +166,33 @@ export function RightPanel({ target, session }: Props) {
     },
   });
 
-  // Pull/rebase/merge share one result/error area, so starting one clears the
-  // others' stale output.
+  // Pull/push/rebase/merge share one result/error area, so starting one clears
+  // the others' stale output.
   const startPull = () => {
+    push.reset();
     rebase.reset();
     merge.reset();
     pull.mutate();
   };
+  const startPush = () => {
+    pull.reset();
+    rebase.reset();
+    merge.reset();
+    push.mutate();
+  };
   const startRebase = (onto: string) => {
     pull.reset();
+    push.reset();
     merge.reset();
     rebase.mutate(onto);
   };
   const startMerge = (targetBranch: string) => {
     pull.reset();
+    push.reset();
     rebase.reset();
     merge.mutate(targetBranch);
   };
-  const scmBusy = pull.isPending || rebase.isPending || merge.isPending;
+  const scmBusy = pull.isPending || push.isPending || rebase.isPending || merge.isPending;
 
   // Don't carry an open picker or a previous session's SCM output onto the next
   // session (this panel is reused, not remounted, across selections).
@@ -188,6 +202,7 @@ export function RightPanel({ target, session }: Props) {
     setMergeOpen(false);
     setMergeTarget("");
     pull.reset();
+    push.reset();
     rebase.reset();
     merge.reset();
   }, [session?.id, base]);
@@ -395,6 +410,15 @@ export function RightPanel({ target, session }: Props) {
                     <span className="action-icon action-icon-git-pull" aria-hidden="true" />
                   </button>
                   <button
+                    className="icon-btn"
+                    disabled={scmBusy}
+                    onClick={startPush}
+                    title={t("rightPanel.pushTitle")}
+                    aria-label={t("rightPanel.pushTitle")}
+                  >
+                    ⬆️
+                  </button>
+                  <button
                     className={"icon-btn" + (rebaseOpen ? " active" : "")}
                     disabled={scmBusy}
                     onClick={() => {
@@ -534,6 +558,9 @@ export function RightPanel({ target, session }: Props) {
                 onDismiss={pull.reset}
               />
             )}
+            {push.error && (
+              <ScmOpNotice className="error" text={String(push.error)} onDismiss={push.reset} />
+            )}
             {rebase.error && (
               <ScmOpNotice
                 status="error"
@@ -571,6 +598,13 @@ export function RightPanel({ target, session }: Props) {
                 }
                 details={pull.data}
                 onDismiss={pull.reset}
+              />
+            )}
+            {push.data && (
+              <ScmOpNotice
+                className="scm-op-result mono small dim"
+                text={push.data}
+                onDismiss={push.reset}
               />
             )}
             {rebase.data && (

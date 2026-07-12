@@ -470,6 +470,10 @@ export const api = {
     req<{ output: string }>(t, `/api/sessions/${id}/scm/pull`, { method: "POST" }).then(
       (r) => r.output,
     ),
+  scmPush: (t: Target, id: string) =>
+    req<{ output: string }>(t, `/api/sessions/${id}/scm/push`, { method: "POST" }).then(
+      (r) => r.output,
+    ),
   scmRebase: (t: Target, id: string, onto: string) =>
     req<{ output: string }>(t, `/api/sessions/${id}/scm/rebase`, {
       method: "POST",
