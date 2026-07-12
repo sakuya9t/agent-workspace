@@ -1,22 +1,35 @@
 # Backlog
 
-Last reconciled: **2026-07-06** (against `release/next` through `655f613`;
-image/screenshot paste + the 📎 button are now merged). This reconcile also
-added the **RF-\*** rows — code-structure refactors from the codebase
-analysis in [`refactoring-plan.md`](refactoring-plan.md), slotted directly
-before the milestones they make cheaper. **Update 2026-07-07:** **R4 (gateway
-mode)** and **RF-M4 #1/#3/#4** (the pre-M4 daemon refactor: `SessionManager`
-split, `db`/`registry` encapsulation, adopt-path test seams) both landed — moved
-to *Already done*. RF-M4 #2 (reconnect-supervisor home + `AsmuxClient` trait) is
-folded into **M4**, which is now the next P1 on the durability track. **Update
-2026-07-08:** **TERM-SCROLL** (P1) — a diagnosed user-visible bug where the codex
-attach snapshot carried no scrollback — is **implemented and verified**; moved to
-*Already done*. Design + as-built: [`terminal-scrollback.md`](terminal-scrollback.md).
-**Update 2026-07-11:** **M4 Stage A** (daemon↔asmux reconnect supervisor + `Holder`
-trait, absorbing RF-M4 #2) and **M4 Stage B** (exact cold-stitch adopt + gap
-marker) both landed — moved to *Already done*; the M4 row now tracks only
-**Stage C** (soft-reboot, `purge`, metadata RPCs, `readBuffer`, orphan UI,
-periodic snapshot store), demoted to P2/P3.
+Last reconciled: **2026-07-11**, row by row against the code (not against this
+table's own claims). Every pending row below was re-verified; the three that had
+drifted are corrected here rather than carried forward.
+
+**What this reconcile changed:**
+
+- **New row REC — session recovery** (P1, designed not implemented):
+  [`session-recovery.md`](session-recovery.md). Slotted **next** in the
+  suggested order — it is the only pending P1 that adds user-visible capability
+  with no decision gate in front of it.
+- **M4 Stage A + B landed** (2026-07-11); the M4 row now tracks only **Stage C**,
+  demoted to P2/P3. Correction: Stage C's *slow-attacher drop + resync* is
+  **already done** — it landed with Stage A (`sidecar.rs:389-404` re-attaches
+  `FromCursor` on `DETACH_BACKPRESSURE`). Removed from the row; the old text
+  claiming "the daemon policy does not [exist]" was stale.
+- **MOB-PWA is mostly shipped** — `f7c7640` (app icons) incidentally added
+  `client/public/site.webmanifest` (`display: standalone`, theme/bg, maskable
+  icons) and the apple-touch-icon/theme-color links. The row now covers only the
+  genuinely missing part: the iOS `apple-mobile-web-app-*` meta tags.
+- **A batch of landed work was never credited** in *Already done* — the attention
+  classifier fixes (including the new `error` state), git **merge + push**,
+  save-conversation download, terminal copy/paste under TUI mouse reporting, the
+  two-level connection dialog, and the daemon-served client. Added below, because
+  an index that understates what exists invites re-planning it.
+
+Everything else in the table was confirmed **still pending**, with evidence.
+
+Earlier reconciles (context): 2026-07-06 added the **RF-\*** rows from
+[`refactoring-plan.md`](refactoring-plan.md); 2026-07-07 landed **R4** (gateway
+mode) and **RF-M4 #1/#3/#4**; 2026-07-08 landed **TERM-SCROLL**.
 
 This is the single cross-track index of work that is **designed but not yet
 implemented**. The detailed designs stay in their own documents
@@ -44,10 +57,10 @@ pick it up**.
 ## Already done (context, do not re-plan)
 
 - MVP core loop end-to-end: sessions, attach/replay, snapshots, attention
-  signals, agent plugins (shell/codex/claude/custom), Git SCM panel
-  (status/diff/log/pull/rebase), workspaces + per-session worktree isolation,
-  device enrollment + bearer auth, multi-daemon client, i18n infrastructure
-  (en-only), usage endpoint.
+  signals, agent plugins (shell/codex/claude/**opencode**/custom), Git SCM panel
+  (status/diff/log/pull/rebase/**merge**/**push**), workspaces + per-session
+  worktree isolation, device enrollment + bearer auth, multi-daemon client, i18n
+  infrastructure (en-only), usage endpoint.
 - Durable sessions **M1–M3**: `asmux` holder, `SidecarBackend`, adopt-on-restart
   (ring-replay), `indeterminate` state incl. client badge
   (`scripts/durable-restart-test.mjs` proves it).
@@ -130,6 +143,42 @@ pick it up**.
   was dropped and the shared util kept. `MobileShell` can now mount with no
   copied wiring. Full build gate (tsc + eslint + check-locales + vite build) and
   proxy tests green.
+- **Attention classifier — per-provider split + the `error` state** (uncredited
+  until the 2026-07-11 reconcile). `f4e81af` added `AttentionState::Error` for a
+  turn that died mid-response (an API failure aborts the turn; the process lives,
+  so it must not read as a calm `Idle` — `domain.rs:93,104`). `057d986` split
+  classification per provider and stopped misreading codex's turn-complete as
+  blocked; `2b8119f` (AskUserQuestion) and `2a31905` (Claude's plan-approval
+  prompt) classify as **blocked**, not idle. The old "attention signals" bullet
+  above predates all four.
+- **SCM growth beyond the original panel:** `fddd528` **git push** (creates the
+  remote branch when absent — `source_control.rs:127,473`) + `27e2a83` its icon;
+  `a8f872e` **merge**; `13a6d93` + `2de284a` git-op feedback and dismissable
+  status.
+- **Save conversation** (`b7f071b`): `GET /api/sessions/:id/transcript` serves a
+  session's complete recorded PTY byte stream (ANSI included) as a `text/plain`
+  attachment via `read_events_after` — no delta, every save is the whole
+  transcript; 409 on archived, 404 on unknown. Client downloads it as an auth'd
+  Blob from a per-row button. **This is the byte log REC's fallback brief reads
+  from** — note it is *raw terminal output*, not a rendered conversation.
+- **Replay hygiene** (`1ee08a3`): `strip_terminal_queries()` removes DSR/DA/
+  OSC-color *queries* from replayed scrollback (`backend/mod.rs:241-352`) so a
+  reattach doesn't make the terminal answer questions the app never asked. A
+  follow-on to TERM-SCROLL; **not** the SEC-8 escape policy (which stays pending).
+- **Terminal copy/paste under TUI mouse reporting:** `7e908b7` copy-selection to
+  the OS clipboard; `b682d0d` + `1e40c88` keep selection and copy/paste working
+  while an app has mouse reporting on.
+- **Client polish, uncredited:** `97cfe0d`/`3dad62e` two-level connection dialog
+  (Existing/Add × Daemon/Relay); `f7c7640` app icons + blocked-session favicon
+  blink and `d291a4e` tab-title blink (`f7c7640` also shipped most of MOB-PWA —
+  see that row); `7e11381` image before/after previews in the diff panel;
+  `8cb9e08` swipe-scrollable mobile terminal; `3b08874` hide "Continue in VS Code"
+  on phones; `ee1d352` action icons.
+- **`c6ad936` daemon-served client** (works on hosts with no npm/vite) and
+  **`dda8354`** frontend bound to `0.0.0.0`. Flagged here because they *widen the
+  exposure surface* the SEC track is about: the daemon now serves a UI to any
+  reachable host, which raises the stakes on **SEC-1** (no TLS off-loopback),
+  **SEC-5** (permissive CORS), and **SEC-6** (unconditional loopback trust).
 - **MOB phases 1–3** — mobile adaptive shell (2026-07-06, client-only, no daemon
   changes). Phase 1: `useIsPhone()` (PHONE_MQ) switches the root between the
   extracted `DesktopShell` and a new stacked `MobileShell` (Sessions home →
@@ -151,8 +200,9 @@ pick it up**.
 
 | ID | Item | Priority | Depends on | Source (design) |
 | --- | --- | --- | --- | --- |
-| M4-C | Holder hardening **Stage C**: soft-reboot (hash drift + confirm), orphan surfacing/adopt UI, `purge`, metadata RPCs, `readBuffer`, periodic `(snapshot, cursor)` store (bounds cold-stitch replay cost) | **P2/P3** | M4 A/B (done) | durable-sessions.md → M4 Stage C |
-| MOB-PWA | Mobile UI phase 4: PWA manifest + iOS metas | **P2** | MOB (done) | mobile-ui.md → Packaging path |
+| REC | **Session recovery** — continue a terminated session (any status but `archived`) in a new session on the same branch, reusing its worktree, seeded with its conversation. **Stage A** = `AgentPlugin` resume seam + `SCHEMA_V6` (`agent_session_id`, `recovered_from`) + native-id capture while live + `POST /api/sessions/:id/recover` + UI; native resume for claude (`--resume … --fork-session`) and codex (`codex fork`). **Stage B** = fallback brief (file + pointer prompt) for shell/custom/misses. **Stage C** = opencode native resume (id lives in `opencode.db`). | **P1** | — (worktree reuse + argv passthrough already exist) | session-recovery.md |
+| M4-C | Holder hardening **Stage C**: soft-reboot (hash drift + confirm), orphan surfacing/adopt UI, `purge`, metadata RPCs, `readBuffer`, periodic `(snapshot, cursor)` store (bounds cold-stitch replay cost). *(Slow-attacher drop + resync — previously listed here — landed with Stage A.)* | **P2/P3** | M4 A/B (done) | durable-sessions.md → M4 Stage C |
+| MOB-PWA | Mobile UI phase 4: **iOS `apple-mobile-web-app-*` meta tags only** — the web manifest, maskable icons, apple-touch-icon and theme-color already shipped in `f7c7640` | **P3** (was P2; mostly done) | MOB (done) | mobile-ui.md → Packaging path |
 | MOB-PUSH | Web Push for attention states | **P3** | MOB (done); daemon push plumbing (relay as carrier) | mobile-ui.md → Follow-ups |
 | IMG-2 | Image paste follow-ups: `.asm/pastes/` cleanup policy, per-agent capability hint | **P3** | image paste + 📎 button (done) | image-paste.md → Follow-ups |
 | RF-ERR | Typed daemon error → HTTP status mapping (RelayError-style) | **P2** | — (pair with SEC-2 or RF-M4) | refactoring-plan.md → RF-ERR |
@@ -183,6 +233,50 @@ pick it up**.
 
 ## Detail
 
+### REC — Session recovery (P1)
+
+Full design: [`session-recovery.md`](session-recovery.md).
+
+A terminated session strands three things worth keeping: a branch, a worktree
+with the work checked out, and a conversation in which an agent learned the
+problem. Recovery continues all three in a **new** session — it is not
+resurrection (the PTY is gone and we never pretend otherwise). Rule: **every
+status but `archived`** is recoverable (`stopped`/`exited`/`failed`/
+`indeterminate`); archive already deletes the worktree *and* the branch, so
+there is no place to recover into.
+
+Most of the plumbing exists. Worktree reuse is the `shared`-isolation
+short-circuit in `resolve_workspace` (`workspaces.rs:54-80`) — post the origin's
+branch with `create_branch: false` and it reuses the directory in place, refcounted
+by `count_active_instances_at_path`. Extra argv already flows end-to-end
+(`CreateSessionBody.args` → `AgentContext.extra_args` → `cli_launch` →
+`BackendSpawnSpec` → PTY argv); the client just never sends it.
+
+The genuinely new work: an `AgentPlugin` resume seam (`native_session_id` +
+`build_resume`, both defaulting to "no capability" like `usage`/`idle_error`),
+because the providers' shapes differ structurally — **codex's resume is a
+subcommand that must lead argv**, claude's and opencode's are flags. All three
+can **fork**, and we always fork: *recovery never mutates the origin's history.*
+
+Native ids must be **captured while the session is alive and persisted**
+(`SCHEMA_V6`: `agent_session_id`, `recovered_from`), not re-derived at recovery
+time — `usage.rs`'s `(cwd, mtime)` match has no identity check (claude's is
+literally "newest `*.jsonl` in the dir"; codex falls back to *any* newest rollout
+on the box). Wrong token count is survivable; resuming the **wrong conversation**
+is not.
+
+Fallback brief (Stage B) takes the **best source available**: the agent's own
+JSONL where one exists but native resume can't be used, else the PTY byte log
+from `terminal_events` (ANSI-stripped via `seed_from_cold`). Either way it is
+written to `.asm/recovered-<id>.txt` in the worktree and pointed at by a small
+opening prompt — never pasted into the agent's TUI (bracketed-paste/input caps
+make a big paste fail exactly on the long sessions that need it). Known weakness,
+stated in the design: alt-screen agents expose zero scrollback to vt100, so their
+*byte log* is redraw frames rather than a conversation — which is why native
+resume leads for those agents, and why the JSONL outranks the PTY as a source.
+Note `GET /api/sessions/:id/transcript` ("Save conversation") serves **raw PTY
+bytes**, not a rendered conversation, despite the button's name.
+
 ### M4-C — Holder hardening Stage C (P2/P3)
 
 **Stages A + B landed 2026-07-11** (see "Already done"): the daemon↔asmux
@@ -193,12 +287,21 @@ holds for long-lived sessions whose output outgrew the ring.
 
 Orthogonal to the R-track (explicitly: R code must not assume M4 exists).
 **Stage C — remaining scope:** soft-reboot on `binary_sha256` drift (warn +
-confirm), orphan surfacing/adopt UI, `purge`, metadata RPCs, `readBuffer`,
-slow-attacher drop + resync (the protocol/eviction plumbing exists; the daemon
-policy does not), and the **periodic `(snapshot, cursor)` store** that would bound
-cold-stitch's full cold-history replay on adopt (Stage B replays all of it —
-correct, and fine for realistic session sizes on a one-time adopt). None are on
-the critical durability path; pick per need.
+confirm — the holder's hash field is still "empty for now", `asmux/src/server.rs:42`),
+orphan surfacing/adopt UI (the client has only the `indeterminate` badge today),
+`purge` / metadata / `readBuffer` RPCs (**holder-side already implemented** —
+`asmux/src/server.rs:380,464`, `registry.rs:133` — but the daemon never issues
+them: its `Holder` trait encodes only CREATE/LIST/RESIZE/KILL/HELLO/ATTACH, so
+this is daemon-side wiring, not protocol work), and the **periodic
+`(snapshot, cursor)` store** that would bound cold-stitch's full cold-history
+replay on adopt (Stage B replays all of it — correct, and fine for realistic
+session sizes on a one-time adopt). None are on the critical durability path;
+pick per need.
+
+**Corrected 2026-07-11:** *slow-attacher drop + resync* used to be listed here as
+"the protocol/eviction plumbing exists; the daemon policy does not". That is no
+longer true — it landed with Stage A: `sidecar.rs:389-404` handles
+`DETACH_BACKPRESSURE` by re-attaching `FromCursor(last_cursor)`.
 
 ### MOB follow-ups — phases 4–5 remaining (P2/P3)
 
@@ -206,9 +309,13 @@ Phases 1–3 shipped (see "Already done"); the mobile app is usable and the
 terminal genuinely workable on a phone, verified against a live session. What's
 left of the `mobile-ui.md` plan:
 
-- **MOB-PWA** (phase 4): web-app manifest (`display: standalone`, theme/bg
-  `#0b0e14`, icons) + iOS meta tags → "Add to Home Screen" becomes the zero-cost
-  phone app, and future store apps are thin wrappers around the same origin.
+- **MOB-PWA** (phase 4): **mostly already shipped, unnoticed.** `f7c7640` (app
+  icons) added `client/public/site.webmanifest` — `display: standalone`, theme/bg
+  `#07111f`, 192/512/1024 maskable icons — plus the `<link rel="manifest">`,
+  apple-touch-icon and theme-color tags (`client/index.html:9,26,27`). What is
+  genuinely missing is only the iOS meta tags (`apple-mobile-web-app-capable`,
+  `-status-bar-style`, `-title`; no match anywhere in `client/`). Demoted to P3:
+  "Add to Home Screen" already largely works.
 - **MOB-PUSH**: Web Push for `approval_needed`/`likely_blocked` — its own row
   because it needs daemon-side push plumbing with the relay as carrier; design
   that before building.
@@ -393,21 +500,32 @@ parity gate, typed keys); adding a locale is the 3-step recipe in `i18n.md`.
    - ~~**TERM-SCROLL**~~ ✅ landed 2026-07-08 (codex attach scrollback; per-buffer
      -model attach strategy + raw-history ring). Independent of M4; on the same
      snapshot/attach surface. Proof: `scripts/termscroll-test.mjs`.
-4. **MEAS-1** — right after RF-M4's SessionManager split settles the
+4. **REC** — session recovery (**next**). The only pending P1 that adds
+   user-visible capability with no decision gate ahead of it, and the cheapest
+   large win on the board: worktree reuse (`shared` isolation) and argv
+   passthrough already exist, so **Stage A** is a plugin seam + `SCHEMA_V6` +
+   id capture + one endpoint + UI. Sequenced *after* M4 deliberately — M4 is what
+   makes an `indeterminate` session's history trustworthy enough to recover from,
+   and M4-C's orphan reconciliation is the real fix for the one open hazard
+   (recovering an `indeterminate` session whose process is secretly still alive).
+   **Stage B** (fallback brief) and **Stage C** (opencode) can trail.
+5. **MEAS-1** — right after RF-M4's SessionManager split settles the
    `on_output`/`on_idle` seams it hooks (landing it earlier just makes the
    refactor carry the hooks). Dev-only and parallel-friendly: once enabled
    on a dev daemon it accrues heuristic-disagreement data passively while
    every later item proceeds, so earlier = more signal for free. MEAS-2/3
-   ride along opportunistically (item 10 tier).
-5. **SEC-2 + RF-ERR** (together), then **SEC-1(direct)** — before any
-   exposure beyond trusted networks.
-6. **DEC-1** (an hour of thought) → **RF-QUERY** → **MVP-RICH**.
-7. **V0** spike → V1–V3 as a block.
-8. **MOB-PWA**, then **MOB-PUSH** (design the push plumbing first).
-9. **R5** items as deployment needs them (TLS/ops first, ACLs next,
-   E2E-crypto decision when V-track ships).
-10. **MVP-HOOKS**, **MVP-CKPT**, **MEAS-2/3** opportunistically.
-11. **M5** → **MVP-PKG** when cross-platform/packaging becomes the goal.
+   ride along opportunistically (item 11 tier).
+6. **SEC-2 + RF-ERR** (together), then **SEC-1(direct)** — before any
+   exposure beyond trusted networks. Note this got *more* urgent, not less:
+   the daemon now serves the client itself (`c6ad936`) on `0.0.0.0` (`dda8354`).
+7. **DEC-1** (an hour of thought) → **RF-QUERY** → **MVP-RICH**.
+8. **V0** spike → V1–V3 as a block.
+9. **MOB-PWA** (now just the iOS metas), then **MOB-PUSH** (design the push
+   plumbing first).
+10. **R5** items as deployment needs them (TLS/ops first, ACLs next,
+    E2E-crypto decision when V-track ships).
+11. **MVP-HOOKS**, **MVP-CKPT**, **MEAS-2/3** opportunistically.
+12. **M5** → **MVP-PKG** when cross-platform/packaging becomes the goal.
 
 Constraints to respect when reordering: nothing in R-track may assume M4
 features exist; V1's relay change must not add daemon-API parsing to the
