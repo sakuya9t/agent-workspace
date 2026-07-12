@@ -80,13 +80,14 @@ export function SessionList() {
     onError: (e) => alert(String(e)),
   });
   // Save the full conversation to a file the browser downloads. The daemon
-  // returns the raw transcript as a Blob (auth headers ride the fetch), so we
-  // wrap it in an object URL and click a synthetic link. No delta — every save
-  // is the complete transcript. Not offered for archived sessions (discarded).
+  // renders the agent's own transcript to Markdown and names the file (auth
+  // headers ride the fetch), so we wrap the Blob in an object URL and click a
+  // synthetic link. No delta — every save is the complete conversation. Not
+  // offered for archived sessions (discarded).
   const save = useMutation({
     mutationFn: async ({ target, s }: { target: Target; s: Session }) => {
-      const blob = await api.sessionTranscript(target, s.id);
-      triggerDownload(blob, transcriptFilename(s));
+      const { blob, filename } = await api.sessionTranscript(target, s.id);
+      triggerDownload(blob, filename ?? transcriptFilename(s));
     },
     onError: (e) =>
       alert(t("sessionList.saveError", { message: e instanceof Error ? e.message : String(e) })),
@@ -471,10 +472,13 @@ function basename(p: string): string {
   return parts.length ? parts[parts.length - 1] : p;
 }
 
-/** Download filename for a session transcript; mirrors the daemon's naming. */
+/**
+ * Fallback download filename, for a daemon that sent no `Content-Disposition`
+ * (an older one). `.md` matches what current daemons serve.
+ */
 function transcriptFilename(s: Session): string {
   const agent = s.agent_plugin_id.replace(/[^A-Za-z0-9._-]/g, "_");
-  return `session-${agent}-${s.id}.log`;
+  return `session-${agent}-${s.id}.md`;
 }
 
 /** Save a Blob to the user's machine via a synthetic download link. */

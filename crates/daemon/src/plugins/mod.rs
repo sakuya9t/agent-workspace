@@ -6,10 +6,11 @@ use serde::Serialize;
 
 pub(crate) mod attention;
 pub mod builtin;
+pub mod conversation;
 pub mod usage;
 
 use crate::domain::AttentionState;
-use usage::{AgentUsage, UsageContext};
+use usage::{AgentUsage, TranscriptContext};
 
 /// User-supplied launch inputs for an agent. The working directory is resolved
 /// separately by the session manager and passed to the backend spawn spec.
@@ -110,7 +111,15 @@ pub trait AgentPlugin: Send + Sync {
     /// Best-effort token/context usage for a running session, read from the
     /// agent's own on-disk transcript (mirrors its `/status` / `/usage`). Agents
     /// that don't persist usage return `None`.
-    fn usage(&self, _cx: &UsageContext) -> Option<AgentUsage> {
+    fn usage(&self, _cx: &TranscriptContext) -> Option<AgentUsage> {
+        None
+    }
+
+    /// The session's conversation, rendered as Markdown from the agent's own
+    /// on-disk transcript. `None` for agents that keep no transcript (a plain
+    /// shell) or when none can be matched to this session — the transcript
+    /// endpoint then serves the raw PTY stream instead.
+    fn conversation(&self, _cx: &TranscriptContext) -> Option<String> {
         None
     }
 }

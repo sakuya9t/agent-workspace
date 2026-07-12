@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 
-use super::usage::{self, AgentUsage, UsageContext};
+use super::conversation;
+use super::usage::{self, AgentUsage, TranscriptContext};
 use super::{attention, find_in_path, AgentContext, AgentOption, AgentPlugin, LaunchSpec};
 use crate::domain::AttentionState;
 
@@ -80,8 +81,11 @@ impl AgentPlugin for CodexPlugin {
     fn attention(&self, screen: &str, bell: bool) -> (AttentionState, Option<String>) {
         attention::codex_attention(screen, bell)
     }
-    fn usage(&self, cx: &UsageContext) -> Option<AgentUsage> {
+    fn usage(&self, cx: &TranscriptContext) -> Option<AgentUsage> {
         usage::codex_usage(cx)
+    }
+    fn conversation(&self, cx: &TranscriptContext) -> Option<String> {
+        conversation::codex_conversation(cx)
     }
     fn options(&self) -> Vec<AgentOption> {
         vec![AgentOption {
@@ -127,8 +131,11 @@ impl AgentPlugin for ClaudePlugin {
     fn idle_error(&self, screen: &str) -> Option<String> {
         attention::claude_idle_error(screen)
     }
-    fn usage(&self, cx: &UsageContext) -> Option<AgentUsage> {
+    fn usage(&self, cx: &TranscriptContext) -> Option<AgentUsage> {
         usage::claude_usage(cx)
+    }
+    fn conversation(&self, cx: &TranscriptContext) -> Option<String> {
+        conversation::claude_conversation(cx)
     }
     fn options(&self) -> Vec<AgentOption> {
         vec![AgentOption {

@@ -22,8 +22,9 @@ use serde_json::Value;
 /// (clock skew / launch lag) before we consider it too stale to be ours.
 const SLACK_MS: i64 = 120_000;
 
-/// Inputs a plugin needs to locate its on-disk session transcript.
-pub struct UsageContext {
+/// Inputs a plugin needs to locate its on-disk session transcript. Shared with
+/// [`super::conversation`], which renders the same file as Markdown.
+pub struct TranscriptContext {
     /// Working directory the session was launched in.
     pub cwd: PathBuf,
     /// Session `created_at` in unix milliseconds.
@@ -79,7 +80,7 @@ pub struct RateLimitWindow {
 /// OAuth usage endpoint (the same data `/usage` shows). Rate limits are still
 /// returned when the transcript is missing, so a session whose agent hasn't
 /// written one yet isn't a blank modal.
-pub fn claude_usage(cx: &UsageContext) -> Option<AgentUsage> {
+pub fn claude_usage(cx: &TranscriptContext) -> Option<AgentUsage> {
     let limits = claude_rate_limits();
     match claude_transcript_usage(cx) {
         Some(mut u) => {
@@ -106,8 +107,11 @@ pub fn claude_usage(cx: &UsageContext) -> Option<AgentUsage> {
     }
 }
 
-/// Read per-session token usage from `~/.claude/projects/<cwd>/*.jsonl`.
-fn claude_transcript_usage(cx: &UsageContext) -> Option<AgentUsage> {
+/// The Claude Code session file this asm session most likely owns:
+/// `~/.claude/projects/<encoded cwd>/<uuid>.jsonl`. Subagent transcripts sit in
+/// a nested `<uuid>/subagents/` directory, and the scan here is flat, so it
+/// always lands on a main-thread file.
+pub fn claude_transcript_path(cx: &TranscriptContext) -> Option<PathBuf> {
     let dir = home_dir()?
         .join(".claude")
         .join("projects")
@@ -115,7 +119,12 @@ fn claude_transcript_usage(cx: &UsageContext) -> Option<AgentUsage> {
     if !dir.is_dir() {
         return None;
     }
-    let file = newest_jsonl_in(&dir, cx.started_at_ms - SLACK_MS)?;
+    newest_jsonl_in(&dir, cx.started_at_ms - SLACK_MS)
+}
+
+/// Read per-session token usage from `~/.claude/projects/<cwd>/*.jsonl`.
+fn claude_transcript_usage(cx: &TranscriptContext) -> Option<AgentUsage> {
+    let file = claude_transcript_path(cx)?;
     let text = fs::read_to_string(&file).ok()?;
     let mut u = parse_claude_text(&text)?;
     u.source = Some(format!("Claude transcript {}", file.display()));
@@ -400,8 +409,9 @@ fn iso8601_to_unix_secs(s: &str) -> Option<i64> {
 
 // ---------- Codex ----------
 
-/// Read usage for a Codex session from `~/.codex/sessions/**/rollout-*.jsonl`.
-pub fn codex_usage(cx: &UsageContext) -> Option<AgentUsage> {
+/// The Codex rollout file this asm session most likely owns, from
+/// `~/.codex/sessions/**/rollout-*.jsonl`.
+pub fn codex_rollout_path(cx: &TranscriptContext) -> Option<PathBuf> {
     let root = home_dir()?.join(".codex").join("sessions");
     if !root.is_dir() {
         return None;
@@ -415,13 +425,17 @@ pub fn codex_usage(cx: &UsageContext) -> Option<AgentUsage> {
     // Prefer the rollout whose recorded cwd matches this session; otherwise take
     // the most recently written candidate.
     let want = cx.cwd.to_string_lossy().to_string();
-    let chosen = files
+    files
         .iter()
         .take(20)
         .find(|(_, p)| read_head(p, 64 * 1024).and_then(|h| codex_file_cwd(&h)).as_deref() == Some(want.as_str()))
         .or_else(|| files.first())
-        .map(|(_, p)| p.clone())?;
+        .map(|(_, p)| p.clone())
+}
 
+/// Read usage for a Codex session from its rollout file.
+pub fn codex_usage(cx: &TranscriptContext) -> Option<AgentUsage> {
+    let chosen = codex_rollout_path(cx)?;
     let text = fs::read_to_string(&chosen).ok()?;
     let mut u = parse_codex_text(&text)?;
     u.source = Some(format!("Codex rollout {}", chosen.display()));
