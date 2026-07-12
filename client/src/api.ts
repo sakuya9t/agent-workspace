@@ -341,6 +341,43 @@ async function getBlob(t: Target, path: string): Promise<Blob> {
   return res.blob();
 }
 
+/** A file the daemon offers for download, with the name it chose for it. */
+export interface Download {
+  blob: Blob;
+  /** From `Content-Disposition`; null if the daemon didn't name the file. */
+  filename: string | null;
+}
+
+/**
+ * GET a file to save. Like `getBlob`, but keeps the daemon's filename: the
+ * transcript endpoint picks the extension (`.md` for a rendered conversation,
+ * `.log` when it can only serve the raw stream), so the client can't derive it.
+ */
+async function getDownload(t: Target, path: string): Promise<Download> {
+  const headers: Record<string, string> = {};
+  if (t.token) headers["Authorization"] = `Bearer ${t.token}`;
+  if (t.relayKey) headers["X-ASM-Relay-Key"] = t.relayKey;
+
+  let res: Response;
+  try {
+    res = await fetch(baseOf(t.baseUrl) + path, { headers });
+  } catch {
+    throw unreachableError(t.baseUrl);
+  }
+  if (!res.ok) {
+    const { msg } = await errorMessage(res);
+    throw Object.assign(new Error(msg), { status: res.status });
+  }
+  return { blob: await res.blob(), filename: contentDispositionName(res) };
+}
+
+/** The `filename="…"` of a `Content-Disposition` header, if it carries one. */
+export function contentDispositionName(res: Response): string | null {
+  const cd = res.headers.get("Content-Disposition");
+  const m = cd?.match(/filename="([^"]+)"/);
+  return m ? m[1] : null;
+}
+
 /** Where a stored paste landed on the daemon host. */
 export interface PastedImage {
   path: string;
@@ -409,7 +446,7 @@ export const api = {
    * the browser can save it. No delta — always the complete recorded stream.
    */
   sessionTranscript: (t: Target, id: string) =>
-    getBlob(t, `/api/sessions/${id}/transcript`),
+    getDownload(t, `/api/sessions/${id}/transcript`),
   sessionUsage: (t: Target, id: string) =>
     req<{ usage: SessionUsage }>(t, `/api/sessions/${id}/usage`).then((r) => r.usage),
   createSession: (t: Target, body: CreateSessionBody) =>

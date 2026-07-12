@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -334,14 +334,30 @@ async fn get_summary(
     }
 }
 
-/// Download a session's full conversation as a raw terminal transcript: the
-/// complete recorded PTY byte stream (ANSI included), the same bytes replayed on
-/// history attach. There is no delta — every call returns everything persisted
-/// so far (for a live session, the transcript up to now). Archived sessions have
-/// been discarded, so their transcript is no longer offered.
+/// `?format=raw` opts out of the rendered conversation.
+#[derive(Debug, Default, Deserialize)]
+struct TranscriptQuery {
+    format: Option<String>,
+}
+
+/// Download a session's conversation as Markdown, rendered from the agent's own
+/// on-disk transcript (see [`crate::plugins::conversation`]).
+///
+/// This deliberately does *not* serve the recorded PTY stream by default: those
+/// bytes are what a TUI sent a terminal — escape sequences and repainted frames,
+/// tens of MB of them, which no editor renders and no human can read.
+/// `?format=raw` still returns them, because they're the exact bytes replayed on
+/// history attach and that's what you want when debugging replay. Raw is also
+/// the fallback for agents that keep no transcript of their own (a plain shell),
+/// where the PTY bytes *are* the record.
+///
+/// There is no delta — every call returns everything recorded so far (for a live
+/// session, the conversation up to now). Archived sessions have had their bytes
+/// discarded, so nothing is offered for them.
 async fn get_transcript(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<TranscriptQuery>,
 ) -> Result<Response, AppError> {
     let s = state
         .manager
@@ -353,33 +369,66 @@ async fn get_transcript(
             "transcript unavailable for an archived session".into(),
         ));
     }
+
+    if q.format.as_deref() != Some("raw") {
+        // Reads and parses an agent file that can run to hundreds of MB — keep
+        // it off the async runtime.
+        let manager = state.manager.clone();
+        let sess = s.clone();
+        let rendered = tokio::task::spawn_blocking(move || {
+            manager.registry().get(&sess.agent_plugin_id).and_then(|p| {
+                p.conversation(&crate::plugins::usage::TranscriptContext {
+                    cwd: std::path::PathBuf::from(&sess.working_directory),
+                    started_at_ms: sess.created_at,
+                })
+            })
+        })
+        .await
+        .map_err(|e| {
+            AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("transcript task: {e}"))
+        })?;
+
+        if let Some(markdown) = rendered {
+            return Ok(attachment(
+                markdown.into_bytes(),
+                "text/markdown; charset=utf-8",
+                &transcript_filename(&s, "md"),
+            ));
+        }
+    }
+
     let bytes = state.manager.db().read_events_after(&id, 0)?;
-    let filename = transcript_filename(&s);
-    Ok((
+    Ok(attachment(bytes, "text/plain; charset=utf-8", &transcript_filename(&s, "log")))
+}
+
+/// A file-download response. `no-store` because a live session's transcript
+/// grows under the same URL.
+fn attachment(body: Vec<u8>, content_type: &str, filename: &str) -> Response {
+    (
         [
-            (header::CONTENT_TYPE, "text/plain; charset=utf-8".to_string()),
+            (header::CONTENT_TYPE, content_type.to_string()),
             (
                 header::CONTENT_DISPOSITION,
                 format!("attachment; filename=\"{filename}\""),
             ),
             (header::CACHE_CONTROL, "no-store".to_string()),
         ],
-        bytes,
+        body,
     )
-        .into_response())
+        .into_response()
 }
 
 /// A safe download filename for a session's transcript. The session id is a
 /// UUID, but the agent plugin id is free-form, so fold anything outside
 /// `[A-Za-z0-9._-]` to `_` — this both tidies the name and keeps stray bytes
 /// out of the `Content-Disposition` header.
-fn transcript_filename(s: &crate::domain::Session) -> String {
+fn transcript_filename(s: &crate::domain::Session, ext: &str) -> String {
     let agent: String = s
         .agent_plugin_id
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
         .collect();
-    format!("session-{agent}-{}.log", s.id)
+    format!("session-{agent}-{}.{ext}", s.id)
 }
 
 /// Best-effort token/context usage for a session, read from the agent's own
@@ -398,7 +447,7 @@ async fn get_session_usage(
     let manager = state.manager.clone();
     let usage = tokio::task::spawn_blocking(move || {
         manager.registry().get(&s.agent_plugin_id).and_then(|p| {
-            p.usage(&crate::plugins::usage::UsageContext {
+            p.usage(&crate::plugins::usage::TranscriptContext {
                 cwd: std::path::PathBuf::from(&s.working_directory),
                 started_at_ms: s.created_at,
             })
