@@ -22,15 +22,15 @@ worktree) and the *context* (conversation) — into a new session with a new id.
 | `exited` | **yes** | agent quit on its own; worktree + branch intact |
 | `failed` | **yes** | the context leading up to a failure is worth the most, not the least |
 | `indeterminate` | **yes** | holder died; worktree + branch intact, outcome unknown (see [durable-sessions.md](durable-sessions.md) → Reconciliation states) |
-| `archived` | **no** | `discard_instance` deleted the worktree **and** the branch (`workspaces.rs:398-408`). There is no place to recover *into*. |
+| `archived` | **no** | explicit policy boundary; managed worktree/branch assets may already be deleted by `discard_instance` (`workspaces.rs:381-451`) |
 | `starting` / `running` | n/a | not terminal; attach to it instead |
 
-The rule is one sentence: **everything but `archived`.** Archive is the act of
-saying "I am done with this work" — it is the only irreversible state, and it is
-already irreversible in the code.
+The recoverable set is **`stopped`, `exited`, `failed`, and (with the orphan
+hazard below) `indeterminate`**. `starting`/`running` must be attached or stopped,
+not forked while live; `archived` is the explicit irreversible state.
 
 > **Note.** Archiving does *not* delete `terminal_events`; the byte log survives
-> and `read_events_after` would still return it. The 409 at `api/mod.rs:350` is
+> and `read_events_after` would still return it. The 409 at `api/mod.rs:367` is
 > a deliberate policy guard, not a consequence of data loss. We keep that policy:
 > archived means gone. But be aware the refusal is a choice we could revisit
 > without recovering any data — the data is still there.
@@ -180,10 +180,12 @@ not a filesystem race.
    only source for a shell or a `custom_command`, and for those it is a *good*
    one (see the alt-screen caveat below for why it is not, for the TUI agents).
 
-The distinction matters and is easy to get wrong: `GET /api/sessions/:id/transcript`
-("Save conversation", `b7f071b`) serves the **raw PTY byte stream, ANSI and all**
-— it is terminal output, not a conversation. Do not mistake it for a rendered
-transcript just because the button says "conversation".
+The distinction matters and is easy to get wrong:
+`GET /api/sessions/:id/transcript` serves rendered provider Markdown by default
+since `78437a9`. The **raw PTY byte stream, ANSI and all**, is available via
+`?format=raw` and is the fallback for plugins without structured transcripts.
+Recovery must select the source deliberately rather than infer it from the
+user-facing endpoint name.
 
 **Do not type the transcript into the new agent's TUI.** A large paste into a TUI
 input box is fragile (bracketed-paste limits, chunking, per-agent input caps) —
@@ -219,7 +221,8 @@ for a TUI agent whose native id we failed to capture.
 
 ## Schema
 
-`sessions` has no column for either fact. **SCHEMA_V6**:
+`sessions` has no column for either fact. **SCHEMA_V7** (V6 is already the
+workspace-instance ownership migration):
 
 ```sql
 ALTER TABLE sessions ADD COLUMN agent_session_id TEXT;    -- native conversation id, captured while live
@@ -244,7 +247,7 @@ if a recovery is itself recovered) and costs one nullable column.
 
 ## Staging
 
-- **Stage A — native resume for Claude + Codex.** The trait seam, `SCHEMA_V6`,
+- **Stage A — native resume for Claude + Codex.** The trait seam, `SCHEMA_V7`,
   id capture in the monitor, `POST /api/sessions/:id/recover`, and the client
   affordance on a terminal session. Both providers' ids are already discoverable
   by code that exists.

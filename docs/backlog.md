@@ -27,6 +27,22 @@ drifted are corrected here rather than carried forward.
 
 Everything else in the table was confirmed **still pending**, with evidence.
 
+**2026-07-12 addition (rows added, not a full reconcile):** a five-subsystem
+tech-debt review ([`refactoring-plan.md`](refactoring-plan.md) → §6; every
+finding carries file:line evidence, the defect bundle hand-verified) added
+rows **FIX** (verified latent defects, P1), **RF-REC** (pre-REC refactor
+bundle, P1), **RF-GATE** (build gate & test safety net, P1/P2),
+**RF-WSPROTO** (client↔daemon WS contract, P2) and **RF-HYG** (hygiene
+bundle, P3), and annotated the REC / M4-C / SEC-2 / R5 / M5 / MEAS /
+MOB-PUSH / MVP-RICH rows with its findings.
+
+**Independent 2026-07-12 review:** added **RF-FLOW** (bounded terminal flow +
+durable persistence, P1), **RF-LIFE** (explicit lifecycle state machine + units
+of work, P1) and **RF-OPS** (truthful health, deadlines and task supervision,
+P2); expanded FIX with the server/client `indeterminate` contradiction and the
+backend-config fail-open; and corrected stale transcript prose. See
+`refactoring-plan.md` → §7.
+
 Earlier reconciles (context): 2026-07-06 added the **RF-\*** rows from
 [`refactoring-plan.md`](refactoring-plan.md); 2026-07-07 landed **R4** (gateway
 mode) and **RF-M4 #1/#3/#4**; 2026-07-08 landed **TERM-SCROLL**.
@@ -171,12 +187,13 @@ pick it up**.
   remote branch when absent — `source_control.rs:127,473`) + `27e2a83` its icon;
   `a8f872e` **merge**; `13a6d93` + `2de284a` git-op feedback and dismissable
   status.
-- **Save conversation** (`b7f071b`): `GET /api/sessions/:id/transcript` serves a
-  session's complete recorded PTY byte stream (ANSI included) as a `text/plain`
-  attachment via `read_events_after` — no delta, every save is the whole
-  transcript; 409 on archived, 404 on unknown. Client downloads it as an auth'd
-  Blob from a per-row button. **This is the byte log REC's fallback brief reads
-  from** — note it is *raw terminal output*, not a rendered conversation.
+- **Save conversation** (`b7f071b`, upgraded by `78437a9`):
+  `GET /api/sessions/:id/transcript` serves rendered provider Markdown by
+  default; `?format=raw` serves the complete PTY byte stream (ANSI included),
+  and raw is the automatic fallback for plugins with no structured transcript.
+  There is no delta; 409 on archived, 404 on unknown. REC's byte-log fallback
+  must explicitly select the raw source rather than assuming the user-facing
+  download is raw.
 - **Replay hygiene** (`1ee08a3`): `strip_terminal_queries()` removes DSR/DA/
   OSC-color *queries* from replayed scrollback (`backend/mod.rs:241-352`) so a
   reattach doesn't make the terminal answer questions the app never asked. A
@@ -226,12 +243,18 @@ pick it up**.
 
 | ID | Item | Priority | Depends on | Source (design) |
 | --- | --- | --- | --- | --- |
-| REC | **Session recovery** — continue a terminated session (any status but `archived`) in a new session on the same branch, reusing its worktree, seeded with its conversation. **Stage A** = `AgentPlugin` resume seam + `SCHEMA_V6` (`agent_session_id`, `recovered_from`) + native-id capture while live + `POST /api/sessions/:id/recover` + UI; native resume for claude (`--resume … --fork-session`) and codex (`codex fork`). **Stage B** = fallback brief (file + pointer prompt) for shell/custom/misses. **Stage C** = opencode native resume (id lives in `opencode.db`). | **P1** | — (worktree reuse + argv passthrough already exist) | session-recovery.md |
+| REC | **Session recovery** — continue a recoverable non-live session in a new session on the same branch, reusing its worktree, seeded with its conversation. **Stage A** = `AgentPlugin` resume seam + schema fields (`agent_session_id`, `recovered_from`) + native-id capture while live + `POST /api/sessions/:id/recover` + UI; native resume for claude and codex. **Stage B** = fallback brief for shell/custom/misses. **Stage C** = opencode native resume. | **P1** | FIX + RF-FLOW + RF-LIFE + RF-REC; worktree reuse + argv passthrough already exist | session-recovery.md |
+| FIX | **Verified latent defects** (2026-07-12 review, all hand-verified): `pull` credential-prompt hang; adopt→reconnect cursor-0 rewind; worktree created before create-validation, no rollback; asmux silent ring-alloc output drop; `exit_signal` never populated; fabricated adopt defaults; server/client disagreement over whether `indeterminate` is terminal; invalid `ASM_BACKEND` silently selects non-durable native mode | **P1** | — (~2–3 days incl. regression tests) | refactoring-plan.md → §6.1 |
+| RF-FLOW | **Bounded terminal flow + durable persistence:** byte-budget output/command queues with explicit overload semantics; writer health + retry/degraded state + shutdown flush; acknowledged input/kill semantics; streaming history/transcripts; retention/compaction; disk-full/slow-consumer fault tests | **P1** | FIX + minimal RF-GATE harness | refactoring-plan.md → §7.1 |
+| RF-LIFE | **Explicit lifecycle state machine + units of work:** named status capabilities, conditional transitions/per-session serialization, atomic metadata/migrations, create+teardown sagas, central `go_live`/`finish`, concurrency/failure-step tests | **P1** | FIX + minimal RF-GATE harness; before REC | refactoring-plan.md → §7.2 |
+| RF-REC | Recovery-specific pre-REC bundle: one deadline/output-bounded `GitRunner`; `require_session` + typed `run_blocking`; client `ScmPanel` split out of `RightPanel`. Generic `go_live`, transaction and teardown work moved to RF-LIFE. | **P1** | RF-LIFE; pairs with RF-ERR on API helpers | refactoring-plan.md → §6.2 |
 | M4-C | Holder hardening **Stage C**: soft-reboot (hash drift + confirm), orphan surfacing/adopt UI, `purge`, metadata RPCs, `readBuffer`, periodic `(snapshot, cursor)` store (bounds cold-stitch replay cost). *(Slow-attacher drop + resync — previously listed here — landed with Stage A.)* | **P2/P3** | M4 A/B (done) | durable-sessions.md → M4 Stage C |
 | MOB-PWA | Mobile UI phase 4: **iOS `apple-mobile-web-app-*` meta tags only** — the web manifest, maskable icons, apple-touch-icon and theme-color already shipped in `f7c7640` | **P3** (was P2; mostly done) | MOB (done) | mobile-ui.md → Packaging path |
-| MOB-PUSH | Web Push for attention states | **P3** | MOB (done); daemon push plumbing (relay as carrier) | mobile-ui.md → Follow-ups |
+| MOB-PUSH | Web Push for attention states | **P3** | MOB (done); RF-WSPROTO (server→client frame type); daemon push plumbing (relay as carrier) | mobile-ui.md → Follow-ups |
 | IMG-2 | Image paste follow-ups: `.asm/pastes/` cleanup policy, per-agent capability hint | **P3** | image paste + 📎 button (done) | image-paste.md → Follow-ups |
-| RF-ERR | Typed daemon error → HTTP status mapping (RelayError-style) | **P2** | — (pair with SEC-2 or RF-M4) | refactoring-plan.md → RF-ERR |
+| RF-ERR | Typed daemon error → HTTP status mapping (RelayError-style) | **P2** | — (pair with SEC-2 or RF-REC) | refactoring-plan.md → RF-ERR |
+| RF-GATE | Build gate & test safety net: react-hooks + recommended eslint, minimal CI, HTTP-router test harness, `MockHolder`, asmux e2e for readBuffer/detach/backpressure/takeover, `generated.rs` drift check, migration-ladder test + `user_version` guard | **P1/P2** | — (before REC ideally; before M4-C wiring definitely) | refactoring-plan.md → §6.4 |
+| RF-OPS | **Truthful health, deadlines and task supervision:** liveness/readiness probes for DB writer + holder; cancellation tree for background tasks; blocking-work boundary; child/client request deadlines; jittered reconnect; structured reliability metrics | **P2** | minimal RF-GATE; Git deadline implementation shares RF-REC | refactoring-plan.md → §7.3 |
 | SEC-2 | Constrain `/api/fs/list` + workspace roots | **P1** | RF-ERR recommended (403 mapping) | security-followups.md → 2 (HIGH) |
 | SEC-1 | Transport encryption off-loopback (direct mode TLS; relay TLS — **agent `wss://` (code) + relay rustls/proxy**) | **P1/P2** | partially ties to R5 | security-followups.md → 1 (HIGH) |
 | V0 | Web-editor de-risking spike (scratchpad only) | **P2** | R1–R3 (done) | vscode-over-relay-plan.md → V0 |
@@ -243,8 +266,9 @@ pick it up**.
 | SEC-4 | Hash device tokens at rest | **P2** | — | security-followups.md → 4 (MEDIUM) |
 | SEC-5 | Restrict CORS origins | **P2** | check against V1 cookie design first | security-followups.md → 5 (MEDIUM) |
 | SEC-6 | Optional "always require token" (no loopback trust) mode | **P2** | — | security-followups.md → 6 (MEDIUM) |
+| RF-WSPROTO | Client↔daemon WS contract: written spec (mirroring asmux-protocol.md) + shared `terminalProtocol.ts` (frame union, server-frame demux with reserved control branch, hello/version) — while there are exactly two frame types | **P2** | — ; before whichever of MOB-PUSH / MVP-RICH / V3 comes first | refactoring-plan.md → §6.3 |
 | RF-QUERY | Client data-layer consolidation (query-key factory, `useDaemonMutation`, api.ts split) | **P2** | DEC-1; before MVP-RICH | refactoring-plan.md → RF-QUERY |
-| MVP-RICH | Rich output pipeline (viewer/diff/markdown/transcripts) | **P2** | client-stack decision DEC-1; RF-QUERY | mvp-execution-plan.md → Workstream 4 |
+| MVP-RICH | Rich output pipeline (viewer/diff/markdown/transcripts) | **P2** | client-stack decision DEC-1; RF-QUERY; RF-WSPROTO (server→client frame type) | mvp-execution-plan.md → Workstream 4 |
 | MVP-HOOKS | Workspace setup hooks (copy/symlink/bootstrap) | **P3** | — | mvp-execution-plan.md → Workstream 6 |
 | MVP-CKPT | Checkpoints + "New segment" | **P3** | — | mvp-execution-plan.md → Workstream 7 |
 | M5 | Windows support (ConPTY, transport, ACLs) | **P3** | M4 (sequenced) | durable-sessions.md → M5 |
@@ -252,8 +276,9 @@ pick it up**.
 | SEC-7 | Auth rate limiting + lifecycle audit log | **P3** | overlaps R5 | security-followups.md → 7 (LOW) |
 | SEC-8 | Terminal-escape policy at capture/replay + fuzzing | **P3** | — | security-followups.md → 8 (LOW) |
 | DEC-1 | Decide: adopt planned client stack (shadcn/Tailwind/Dockview/Electron) or amend the plan | **P2** (decision, cheap) | — | mvp-execution-plan.md → Baseline Technology |
+| RF-HYG | Hygiene bundle (hours-each, pick per need): backend constants hoist, `AttentionState::is_sticky()`, classifier parser dedup, **`MonitorState` extraction (before MEAS)**, write-loop + attach-resync dedup, asmux consistency items, `theme.ts` + dead-CSS sweep, `TerminalHeader`, **Terminal.tsx split** (before next terminal feature / xterm bump), `createTopology()` e2e helper | **P3** | — (two named items have ordering triggers) | refactoring-plan.md → §6.5 |
 | RF-VT100 | Terminal emulator dependency review (`vt100` 0.15 unmaintained) | **P3** | — (trigger: M4 cold-stitch work or upstream CVE) | refactoring-plan.md → RF-VT100 |
-| MEAS | Classifier measurement: local-LLM shadow classification of any registered heuristic (attention first), disagreement snapshots + triage (dev-only, default-off) | **P2** | RF-M4 recommended first (shares the `on_output`/`on_idle` seams); needs a local Ollama/llama-server on the dev host | classifier-measurement.md → Milestones |
+| MEAS | Classifier measurement: local-LLM shadow classification of any registered heuristic (attention first), disagreement snapshots + triage (dev-only, default-off) | **P2** | RF-HYG's `MonitorState` extraction first (RF-M4 landed; the hooks observe its `Classification` output); needs a local Ollama/llama-server on the dev host | classifier-measurement.md → Milestones |
 | DOC-1 | Doc sync: architecture.md still calls yamux the relay default | **P3** (one-liner) | — | architecture.md → Open Decisions |
 | I18N-2 | Additional locales beyond `en` | **P4** (deferred by user) | — | i18n.md → Adding a locale |
 
@@ -266,10 +291,10 @@ Full design: [`session-recovery.md`](session-recovery.md).
 A terminated session strands three things worth keeping: a branch, a worktree
 with the work checked out, and a conversation in which an agent learned the
 problem. Recovery continues all three in a **new** session — it is not
-resurrection (the PTY is gone and we never pretend otherwise). Rule: **every
-status but `archived`** is recoverable (`stopped`/`exited`/`failed`/
-`indeterminate`); archive already deletes the worktree *and* the branch, so
-there is no place to recover into.
+resurrection (the PTY is gone and we never pretend otherwise). Recoverable
+states are `stopped`/`exited`/`failed`/`indeterminate`; live states must be
+attached or stopped, and archive already deletes the worktree *and* the branch,
+so there is no place to recover into.
 
 Most of the plumbing exists. Worktree reuse is the `shared`-isolation
 short-circuit in `resolve_workspace` (`workspaces.rs:54-80`) — post the origin's
@@ -285,8 +310,8 @@ subcommand that must lead argv**, claude's and opencode's are flags. All three
 can **fork**, and we always fork: *recovery never mutates the origin's history.*
 
 Native ids must be **captured while the session is alive and persisted**
-(`SCHEMA_V6`: `agent_session_id`, `recovered_from`), not re-derived at recovery
-time — `usage.rs`'s `(cwd, mtime)` match has no identity check (claude's is
+(`SCHEMA_V7`: `agent_session_id`, `recovered_from`; V6 is already used), not
+re-derived at recovery time — `usage.rs`'s `(cwd, mtime)` match has no identity check (claude's is
 literally "newest `*.jsonl` in the dir"; codex falls back to *any* newest rollout
 on the box). Wrong token count is survivable; resuming the **wrong conversation**
 is not.
@@ -300,8 +325,75 @@ make a big paste fail exactly on the long sessions that need it). Known weakness
 stated in the design: alt-screen agents expose zero scrollback to vt100, so their
 *byte log* is redraw frames rather than a conversation — which is why native
 resume leads for those agents, and why the JSONL outranks the PTY as a source.
-Note `GET /api/sessions/:id/transcript` ("Save conversation") serves **raw PTY
-bytes**, not a rendered conversation, despite the button's name.
+Note `GET /api/sessions/:id/transcript` ("Save conversation") now serves the
+provider's rendered Markdown by default (`78437a9`). The raw PTY byte log remains
+available via `?format=raw` and is the fallback when a provider has no structured
+transcript; REC must request/read that source explicitly when it needs it.
+
+### FIX — verified latent defects (P1)
+
+Eight defects found and hand-verified by the 2026-07-12 reviews; small
+individually (~2–3 days total including regression tests), and several sit
+directly under REC:
+
+1. `pull` lacks the `GIT_TERMINAL_PROMPT=0` guard `fetch`/`push` deliberately
+   set — a missing/expired credential wedges a `spawn_blocking` worker on an
+   interactive prompt that never gets answered.
+2. Adopt→reconnect rewinds to cursor 0: `Route.last_cursor` is seeded 0 and
+   only advanced by live output, so a socket drop before the first
+   post-adopt chunk re-attaches `FromCursor(0)` and renders duplicated
+   scrollback on the exact path M4 Stage B made exact (the drain loop keeps
+   a second, correctly-seeded tracker — collapse them).
+3. `create_session` physically creates the worktree **before** the
+   launch/approval/cwd validation and never rolls back — every rejected
+   create leaks a worktree + branch with no DB row (the orphan class
+   `cleanup_orphan_worktrees` exists to sweep); the spawn-failure arm also
+   leaves the instance `active`.
+4. asmux silently drops PTY output on ring-alloc failure; `ALLOC_FAILED` is
+   defined but never emitted — the never-crash invariants promise the
+   opposite.
+5. `exit_signal` is never populated: `kill -9` reads as a normal exit 137.
+   Decide (populate on Unix, or mark the field reserved) **before** REC
+   reads exit status.
+6. `reconcile_from_holder` fabricates 24×80 geometry + `created_at = now`
+   when a session row vanishes mid-reconcile — silent corruption; log +
+   skip instead.
+7. The client defines `indeterminate` as unresolved (neither live nor
+   definitively terminal), while the daemon's broad `is_terminal()` includes it.
+   Direct API calls can therefore archive/delete its worktree or unregister its
+   workspace even though the UI intentionally withholds those actions.
+8. Any explicit `ASM_BACKEND` value other than exact `sidecar` silently selects
+   the in-process native backend, so a typo boots successfully without durable
+   sessions. Unknown explicit values must fail config validation.
+
+Evidence, line refs, and fixes: refactoring-plan.md → §6.1.
+
+### RF-FLOW / RF-LIFE — reliability prerequisites (P1)
+
+RF-FLOW closes the missing end-to-end durability contract: byte-budgeted
+queues, explicit overload behavior, persistence writer health/retry/flush,
+acknowledged input/kill, streamed history and a retention policy. RF-LIFE
+replaces overloaded status predicates and best-effort multi-resource updates
+with a checked transition table, conditional writes/per-session serialization,
+atomic metadata/migrations, retryable create/teardown sagas and central
+`go_live`/`finish` seams. Both include fault/concurrency tests. Full evidence and
+acceptance criteria: refactoring-plan.md → §7.1–§7.2.
+
+### RF-REC — recovery-specific pre-REC refactor bundle (P1)
+
+After RF-LIFE owns generic lifecycle structure, RF-REC is ~2 days: one
+deadline/output-bounded **`GitRunner`** (also closes FIX #1 structurally),
+**`require_session` + typed `run_blocking`** for the repeated API spine, and a
+client **`ScmPanel`** split out of the 943-line `RightPanel`. Detail:
+refactoring-plan.md → §6.2.
+
+### RF-OPS — operability and bounded waits (P2)
+
+Make `/health` truthful about DB writer/holder readiness; supervise and cancel
+long-lived tasks; isolate synchronous DB/Git/filesystem work from async workers;
+apply deadlines/kill/output caps to children and requests; pass TanStack abort
+signals through the client; use capped jittered WS reconnect; expose reliability
+metrics. Detail and acceptance criteria: refactoring-plan.md → §7.3.
 
 ### M4-C — Holder hardening Stage C (P2/P3)
 
@@ -329,6 +421,16 @@ pick per need.
 longer true — it landed with Stage A: `sidecar.rs:389-404` handles
 `DETACH_BACKPRESSURE` by re-attaching `FromCursor(last_cursor)`.
 
+**2026-07-12 review notes:** the daemon demux already pre-wires the
+purge/updateMetadata/readBuffer/detach **response** arms
+(`asmux_client.rs:682-688`) that nothing can trigger — don't mistake them
+for a request path — and `HolderSessionInfo.head_cursor`'s "reserved for
+exact cold-stitch" comment is stale (Stage B landed without it; correct it
+to "unused; M4-C readBuffer/orphan surfacing"). The holder-side
+`handle_read_buffer`/`handle_detach` have **no test and no caller**; land
+RF-GATE's asmux e2e for them *before* wiring the daemon side. Detail:
+refactoring-plan.md → §6.6.
+
 ### MOB follow-ups — phases 4–5 remaining (P2/P3)
 
 Phases 1–3 shipped (see "Already done"); the mobile app is usable and the
@@ -355,7 +457,43 @@ A `DaemonError` enum with one `IntoResponse` (modeled on the relay's
 hand-builds, and the one-off `NeedsForce → 409` downcast. Gives SEC-2 its
 403 and M4 `purge` its conflict codes for free. One deliberate behavior
 decision inside (aligning the two cleanup endpoints' `NeedsForce` to 409) —
-see refactoring-plan.md → RF-ERR.
+see refactoring-plan.md → RF-ERR. 2026-07-12: pair with RF-REC #3
+(`require_session` + typed `run_blocking`) — same files, same migration.
+
+### RF-GATE — build gate & test safety net (P1/P2)
+
+The net everything else in this table relies on, and it is much thinner than
+it looks: client eslint enforces a **single** i18n rule (no
+`react-hooks/exhaustive-deps`, no recommended set — in a codebase leaning on
+the ref-to-dodge-a-dep pattern); there is **no CI at all** (`npm test` runs
+only the proxy test; the 11 e2e scripts run when a human remembers); **zero
+Rust tests** construct the `api/` router or cover `ws.rs`'s takeover logic
+(which needs no I/O to test); the `Holder` trait has **no mock**, so the
+drain-loop / adopt / backpressure branches are unit-untested (the one
+integration test would not catch FIX #2); asmux's
+readBuffer/detach/backpressure-eviction/takeover paths have **no e2e** (the
+first two also have no caller — land these tests before M4-C wires the
+daemon side); the committed `generated.rs` has **no schema-drift check**
+(and `asmux-protocol.md` claims a `build.rs` that does not exist); the DB
+migration ladder is untested and a forward-rolled `user_version` is silently
+accepted. ~2–3 days. Detail: refactoring-plan.md → §6.4.
+
+### RF-WSPROTO — client↔daemon WS contract (P2; before MOB-PUSH / MVP-RICH / V3)
+
+The one protocol in the system with no written contract, no version field,
+and no room for a new frame type: close codes and `{"t":"i"|"r"}` frame
+shapes are hand-mirrored between `api/ws.rs` and `Terminal.tsx` (plus ~16
+literal sites across the e2e scripts), and the client treats **every**
+server→client message as terminal bytes — a control frame has nowhere to
+land; it would be written into the screen as garbage. Deliverables: a
+contract doc mirroring `asmux-protocol.md` (close codes, control frames,
+snapshot/history/sentinel semantics, reserved tag space, hello/version) and
+a shared `client/src/terminalProtocol.ts` (a `ClientFrame` union +
+`encode()`, and a `ServerFrame` demux with a reserved control branch)
+consumed by the client **and** the e2e scripts. ~1 day now, while there are
+exactly two frame types; MOB-PUSH, MVP-RICH and V3 each need a
+server→client frame and would otherwise each invent one. Detail:
+refactoring-plan.md → §6.3.
 
 ### SEC-1 / SEC-2 — the two HIGH security items (P1)
 
@@ -372,6 +510,15 @@ connectivity-execution-plan.md but **not yet implemented** in the relay binary)
 or a TLS-terminating proxy, with a real ACME cert so there is no client UX
 change; **direct mode** needs the Phase-8 TLS/mTLS deliverable (self-signed +
 pinning or ACME). Until then the SSH-tunnel recommendation stays prominent.
+
+SEC-2 code-level substrate (2026-07-12 review): there are today **three**
+divergent notions of allowed root — `fs::list` enforces none;
+`register_workspace` self-widens the set; and `resolve_workspace`'s inline
+check is **skipped entirely when no workspace is registered** and rides on
+`canonical()`'s fall-back-to-raw-path on error, so `..` segments survive
+into a textual `starts_with`. Plan SEC-2 as one new `allowed_roots` module
+consumed by all three call sites, not a patch. Detail:
+refactoring-plan.md → §6.6.
 
 ### V0–V3 — browser VS Code over the relay (P2)
 
@@ -397,7 +544,10 @@ needed sooner — they don't conflict.
 - Pairing-code enrollment brokered through the relay (replaces token paste;
   also listed as an architecture.md open decision).
 - Ops: deployment.md relay section (systemd, TLS, 443), metrics/log surface,
-  `--version`/health endpoint.
+  `--version`/health endpoint. Also (2026-07-12 review): the relay's `nodes`
+  map never evicts offline entries (`snapshot()` lists them forever), and a
+  per-connection heartbeat thread + writer task linger after a
+  protocol-error return until the peer closes — fold both into this item.
 - Client polish: relay health row, per-node latency hint, reconnect toasts.
 
 ### RF-QUERY — client data-layer consolidation (P2, before MVP-RICH)
@@ -435,7 +585,11 @@ exists in the daemon today.
 ConPTY via portable_pty, AF_UNIX-or-named-pipe transport (tokio has no AF_UNIX
 on Windows), `0600` → owner-only ACL. Note the R-track deliberately added no
 new UDS surface, so M5 scope did not grow. Prerequisite for the MVP gate's
-"works on Windows" and for MVP-PKG's Windows packaging.
+"works on Windows" and for MVP-PKG's Windows packaging. 2026-07-12 note:
+AF_UNIX is hard-typed on the daemon side with no transport seam
+(`main.rs:344-433` probe/spawn; `asmux_client.rs` read/write halves) —
+budget a small `HolderTransport` (probe/connect) abstraction into the
+estimate; not worth pre-building at P3. refactoring-plan.md → §6.6.
 
 ### MVP-PKG — Electron + packaging (P3)
 
@@ -461,6 +615,37 @@ xterm.js and has gone quite far on that footing. Decide: adopt the planned
 stack incrementally (starting with MVP-RICH's CodeMirror), or amend
 `mvp-execution-plan.md` to match reality. Blocks MVP-RICH and MVP-PKG from
 starting with confidence.
+
+### RF-HYG — hygiene bundle (P3, opportunistic; two items have ordering triggers)
+
+Hours-each items from the 2026-07-12 review, pick per need. Daemon/backend:
+backend constants hoist (`BROADCAST_CAP`/`SCROLLBACK` duplicated verbatim
+between the two backends, bare RPC-timeout literals, a hardcoded wire-enum
+value); `AttentionState::is_sticky()` (the sticky-state set is a
+copy-pasted `matches!` at two hot sites); attention-classifier parser dedup
+(three near-identical "selected option" parsers — the module doc's drop-in
+provider promise currently means a third copy-paste); **`MonitorState`
+extraction — do before MEAS** (`on_output` is an 11-argument function whose
+classifier inputs are ephemeral locals; the extraction returns the
+`Classification` MEAS observes); write-side `feed_and_broadcast` dedup
+(native vs sidecar forked copies of the emulator-feed/ring/broadcast loop);
+`attach_or_resync` consolidation (the Ok/Gap/Conn/Code dance hand-rolled at
+four subtly different sites — REC/M4-C would clone a fifth). asmux/relay
+consistency: answer malformed RPC bodies with `Error` instead of 10 silent
+drops; narrow `Registry::create`'s lock (held across `openpty`/fork —
+spawning stalls keystrokes to live sessions); `WATCHDOG_IDLE_MS`
+implement-or-delete; `Superseded.last_cursor` semantics; the stale `yamux`
+comment; the "TEMPORARY diagnostic" test label. Client/scripts: `theme.ts`
+(palette tri-defined: CSS vars + ~40 raw hexes + three TS color maps) +
+dead-CSS sweep (structural CSS split gated on DEC-1); `TerminalHeader`
+extraction (the header/UsageModal block is pasted into both shells);
+**Terminal.tsx split — before the next terminal feature or xterm bump**
+(~1.5 d: one ~640-line effect mixing five subsystems, plus three private
+`_core` monkeypatches that silently no-op if an xterm upgrade moves the
+internals — wrap in one typed shim with a dev-time assertion);
+`createTopology()` e2e helper (the three multi-node tests hand-roll ~120
+lines of process lifecycle each — the exact code class the holder-theft
+incident hardened). Detail: refactoring-plan.md → §6.5.
 
 ### RF-VT100 — terminal emulator dependency review (P3, trigger-based)
 
@@ -500,7 +685,10 @@ CPU inference budgets. Full design incl. schema, sampling policy, adoption
 recipe, and the two-pass label/reasoning protocol:
 [`classifier-measurement.md`](classifier-measurement.md). Milestones
 MEAS-1..3 (task-agnostic core + attention → reasoning + triage/export →
-second task + remote observe).
+second task + remote observe). 2026-07-12: do RF-HYG's `MonitorState`
+extraction first — today `on_output`'s classifier inputs are ephemeral
+`&mut` locals with no observable seam; the extraction returns the
+`Classification` that `observe()` hooks.
 
 ### I18N-2 — additional locales (P4)
 
@@ -526,31 +714,40 @@ parity gate, typed keys); adding a locale is the 3-step recipe in `i18n.md`.
    - ~~**TERM-SCROLL**~~ ✅ landed 2026-07-08 (codex attach scrollback; per-buffer
      -model attach strategy + raw-history ring). Independent of M4; on the same
      snapshot/attach surface. Proof: `scripts/termscroll-test.mjs`.
-4. **REC** — session recovery (**next**). The only pending P1 that adds
-   user-visible capability with no decision gate ahead of it, and the cheapest
-   large win on the board: worktree reuse (`shared` isolation) and argv
-   passthrough already exist, so **Stage A** is a plugin seam + `SCHEMA_V6` +
-   id capture + one endpoint + UI. Sequenced *after* M4 deliberately — M4 is what
-   makes an `indeterminate` session's history trustworthy enough to recover from,
-   and M4-C's orphan reconciliation is the real fix for the one open hazard
-   (recovering an `indeterminate` session whose process is secretly still alive).
-   **Stage B** (fallback brief) and **Stage C** (opencode) can trail.
-5. **MEAS-1** — right after RF-M4's SessionManager split settles the
-   `on_output`/`on_idle` seams it hooks (landing it earlier just makes the
-   refactor carry the hooks). Dev-only and parallel-friendly: once enabled
-   on a dev daemon it accrues heuristic-disagreement data passively while
-   every later item proceeds, so earlier = more signal for free. MEAS-2/3
-   ride along opportunistically (item 11 tier).
+4. **FIX** → **RF-GATE** (at minimum the router harness + `MockHolder` + asmux
+   e2e halves) → **RF-FLOW** → **RF-LIFE** + **RF-REC** → **REC**. FIX repairs
+   the concrete defects; RF-FLOW makes the cold-history/input promises real
+   under overload and disk failure; RF-LIFE owns transitions, atomicity and
+   compensation; RF-REC then adds only recovery-specific Git/API/UI seams.
+   Worktree reuse and argv passthrough already exist, so REC remains the next
+   user-visible capability after these P1 foundations. M4-C's orphan surfacing
+   is still the full fix for recovering an `indeterminate` session whose process
+   is secretly alive. Stage B/C can trail.
+5. **MEAS-1** — right after RF-HYG's `MonitorState` extraction settles the
+   `on_output`/`on_idle` seams it hooks (RF-M4's split already landed;
+   landing MEAS earlier just makes the refactor carry the hooks). Dev-only
+   and parallel-friendly: once enabled on a dev daemon it accrues
+   heuristic-disagreement data passively while every later item proceeds, so
+   earlier = more signal for free. MEAS-2/3 ride along opportunistically
+   (item 11 tier).
 6. **SEC-2 + RF-ERR** (together), then **SEC-1(direct)** — before any
    exposure beyond trusted networks. Note this got *more* urgent, not less:
    the daemon now serves the client itself (`c6ad936`) on `0.0.0.0` (`dda8354`).
-7. **DEC-1** (an hour of thought) → **RF-QUERY** → **MVP-RICH**.
+7. **DEC-1** (an hour of thought) → **RF-QUERY** + **RF-WSPROTO** →
+   **MVP-RICH**. RF-WSPROTO slots before *whichever* of MOB-PUSH / MVP-RICH /
+   V3 comes first — it is ~1 day while there are exactly two WS frame types
+   and each of those items needs a server→client frame.
 8. **V0** spike → V1–V3 as a block.
-9. **MOB-PWA** (now just the iOS metas), then **MOB-PUSH** (design the push
-   plumbing first).
-10. **R5** items as deployment needs them (TLS/ops first, ACLs next,
-    E2E-crypto decision when V-track ships).
-11. **MVP-HOOKS**, **MVP-CKPT**, **MEAS-2/3** opportunistically.
+9. **MOB-PWA** (now just the iOS metas), then **MOB-PUSH** (RF-WSPROTO first
+   if it hasn't landed; design the push plumbing first).
+10. **RF-OPS** can run after the minimal gate or alongside feature work; land
+    truthful readiness before deployment/packaging and client deadlines before
+    adding more polling endpoints. Then take **R5** items as deployment needs
+    them (TLS/ops first, ACLs next, E2E-crypto decision when V-track ships).
+11. **MVP-HOOKS**, **MVP-CKPT**, **MEAS-2/3**, and **RF-HYG** items
+    opportunistically — except RF-HYG's `MonitorState` (precedes MEAS-1,
+    item 5) and its Terminal.tsx split (precedes the next significant
+    terminal feature or xterm bump).
 12. **M5** → **MVP-PKG** when cross-platform/packaging becomes the goal.
 
 Constraints to respect when reordering: nothing in R-track may assume M4
