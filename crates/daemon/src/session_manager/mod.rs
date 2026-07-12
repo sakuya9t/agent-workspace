@@ -1269,6 +1269,133 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Archiving a session that ran on a branch the *user* already had must
+    /// reclaim the worktree we made for it and leave the branch standing. This
+    /// regressed once: teardown inferred "we own this branch" from the isolation
+    /// mode, so a session started on `main` deleted `main` on archive.
+    #[tokio::test]
+    async fn archive_keeps_a_preexisting_branch_it_only_borrowed() {
+        let (manager, dir) = test_manager();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+
+        // `main` exists but is not the repo's checked-out branch, so the session
+        // gets a managed worktree with `main` checked out inside it (rather than
+        // sharing the source checkout).
+        git_in(&repo, &["branch", "main"]);
+        git_in(&repo, &["checkout", "-q", "-b", "other"]);
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+
+        let mut req = ws_req(&ws.id);
+        req.branch = Some("main".into());
+        req.create_branch = false;
+        let s = manager.create_session(req).unwrap();
+        let inst = manager.get_instance_for_session(&s.id).unwrap().unwrap();
+        assert_eq!(inst.branch.as_deref(), Some("main"));
+        assert_eq!(inst.isolation, "worktree");
+        assert!(inst.owns_worktree, "we created this worktree");
+        assert!(!inst.owns_branch, "`main` was the user's, not ours");
+
+        manager.stop_session(&s.id).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Archive succeeds and takes the worktree — but `main` survives.
+        let archived = manager.archive_session(&s.id, false).unwrap();
+        assert_eq!(archived.status, SessionStatus::Archived);
+        assert!(!Path::new(&inst.path).exists(), "worktree reclaimed");
+        assert!(
+            workspace::branch_exists(&repo, "main"),
+            "archiving a session must never delete a branch it did not create"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `force` widens what we may *discard*, never what we *own*. Forcing the
+    /// archive of a session on a borrowed branch — even one carrying unmerged
+    /// commits, which is what the `-D` path would silently drop — still keeps it.
+    #[tokio::test]
+    async fn forced_archive_still_keeps_a_borrowed_branch() {
+        let (manager, dir) = test_manager();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+        git_in(&repo, &["branch", "release"]);
+        git_in(&repo, &["checkout", "-q", "-b", "other"]);
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+
+        let mut req = ws_req(&ws.id);
+        req.branch = Some("release".into());
+        req.create_branch = false;
+        let s = manager.create_session(req).unwrap();
+        let inst = manager.get_instance_for_session(&s.id).unwrap().unwrap();
+        let wt = Path::new(&inst.path);
+
+        // Unmerged commit + uncommitted change: both `force` triggers at once.
+        git_in(wt, &["commit", "-q", "--allow-empty", "-m", "shipped"]);
+        std::fs::write(wt.join("dirty.txt"), "wip").unwrap();
+
+        manager.stop_session(&s.id).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let archived = manager.archive_session(&s.id, true).unwrap();
+        assert_eq!(archived.status, SessionStatus::Archived);
+        assert!(!wt.exists(), "forced archive reclaims our worktree");
+        assert!(
+            workspace::branch_exists(&repo, "release"),
+            "force discards our work, it must not delete the user's branch"
+        );
+        // The commit made on `release` is still there.
+        let log = git_in(&repo, &["log", "-1", "--format=%s", "release"]);
+        assert_eq!(log.trim(), "shipped");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A session dropped into a worktree the user created themselves owns
+    /// nothing: archiving releases the claim and leaves the directory and its
+    /// branch untouched.
+    #[tokio::test]
+    async fn archive_leaves_a_worktree_the_user_made() {
+        let (manager, dir) = test_manager();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+
+        // The user's own worktree, on their own branch — nothing to do with us.
+        let theirs = dir.join("their-worktree");
+        git_in(
+            &repo,
+            &["worktree", "add", "-q", "-b", "release", theirs.to_str().unwrap()],
+        );
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+
+        let mut req = ws_req(&ws.id);
+        req.branch = Some("release".into());
+        req.create_branch = false;
+        let s = manager.create_session(req).unwrap();
+        let inst = manager.get_instance_for_session(&s.id).unwrap().unwrap();
+        assert_eq!(inst.isolation, "shared");
+        assert_eq!(Path::new(&inst.path), theirs.as_path());
+        assert!(!inst.owns_worktree && !inst.owns_branch);
+
+        manager.stop_session(&s.id).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        manager.archive_session(&s.id, true).unwrap();
+        assert!(theirs.is_dir(), "the user's worktree is not ours to remove");
+        assert!(workspace::branch_exists(&repo, "release"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     // ---- keystroke echo vs. real work (idle-prompt accuracy) ----
 
     fn mock_handle() -> Arc<dyn BackendSession> {

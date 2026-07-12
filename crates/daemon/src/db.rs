@@ -312,8 +312,9 @@ impl Db {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO workspace_instances
-                (id, workspace_id, session_id, path, branch, isolation, status, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                (id, workspace_id, session_id, path, branch, isolation, status, created_at,
+                 owns_worktree, owns_branch)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             rusqlite::params![
                 i.id,
                 i.workspace_id,
@@ -323,6 +324,8 @@ impl Db {
                 i.isolation,
                 i.status,
                 i.created_at,
+                i.owns_worktree as i64,
+                i.owns_branch as i64,
             ],
         )?;
         Ok(())
@@ -331,10 +334,29 @@ impl Db {
     pub fn get_instance_for_session(&self, session_id: &str) -> Result<Option<WorkspaceInstance>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, workspace_id, session_id, path, branch, isolation, status, created_at
+            "SELECT id, workspace_id, session_id, path, branch, isolation, status, created_at,
+                    owns_worktree, owns_branch
              FROM workspace_instances WHERE session_id = ?1 ORDER BY created_at DESC LIMIT 1",
         )?;
         let mut rows = stmt.query_map([session_id], row_to_instance)?;
+        rows.next().transpose().map_err(Into::into)
+    }
+
+    /// The `(owns_worktree, owns_branch)` flags recorded for the newest instance
+    /// at `path`, or `None` if no session has ever run there. Ownership belongs
+    /// to the resource rather than to whoever is currently sharing it, so a
+    /// session joining an existing worktree inherits the flags of the instance
+    /// that created it — and inherits nothing (`None`) for a worktree we never
+    /// made, which is what keeps a user's own checkout safe from archive.
+    pub fn instance_ownership_at_path(&self, path: &str) -> Result<Option<(bool, bool)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT owns_worktree, owns_branch FROM workspace_instances
+             WHERE path = ?1 ORDER BY created_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map([path], |r| {
+            Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)? != 0))
+        })?;
         rows.next().transpose().map_err(Into::into)
     }
 
@@ -562,6 +584,8 @@ fn row_to_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceInstanc
         isolation: row.get(5)?,
         status: row.get(6)?,
         created_at: row.get(7)?,
+        owns_worktree: row.get::<_, i64>(8)? != 0,
+        owns_branch: row.get::<_, i64>(9)? != 0,
     })
 }
 
@@ -599,6 +623,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA_V5)?;
         conn.pragma_update(None, "user_version", 5)?;
         tracing::info!("applied schema migration v5");
+    }
+    if version < 6 {
+        conn.execute_batch(SCHEMA_V6)?;
+        conn.pragma_update(None, "user_version", 6)?;
+        tracing::info!("applied schema migration v6");
     }
     Ok(())
 }
@@ -698,6 +727,26 @@ ALTER TABLE sessions ADD COLUMN risky INTEGER NOT NULL DEFAULT 0;
 // drained yet (also the value for native/in-process sessions, which never adopt).
 const SCHEMA_V5: &str = r#"
 ALTER TABLE sessions ADD COLUMN backend_cursor INTEGER NOT NULL DEFAULT 0;
+"#;
+
+// Records what a session's instance actually *created*, so archiving can only
+// reclaim what we made. Before this, teardown inferred ownership from
+// `isolation` and deleted `branch` for any managed worktree — so a session
+// started on an existing branch (`main`, `release`) took that branch down with
+// it on archive.
+//
+// The backfill for pre-existing rows errs toward keeping things: a leaked
+// worktree or branch is recoverable (and the orphan sweep collects `asm-session/*`
+// leftovers anyway), a deleted `main` is not. So only `asm-session/*` branches —
+// the ones only we ever create — are backfilled as owned; a branch the user
+// named themselves is left unowned even if we did create it.
+const SCHEMA_V6: &str = r#"
+ALTER TABLE workspace_instances ADD COLUMN owns_worktree INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE workspace_instances ADD COLUMN owns_branch INTEGER NOT NULL DEFAULT 0;
+
+UPDATE workspace_instances SET owns_worktree = 1 WHERE isolation = 'worktree';
+UPDATE workspace_instances SET owns_branch = 1
+    WHERE isolation = 'worktree' AND branch LIKE 'asm-session/%';
 "#;
 
 /// Batches terminal events into transactions to keep write amplification low.
