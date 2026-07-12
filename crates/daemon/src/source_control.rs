@@ -155,6 +155,10 @@ pub trait SourceControl: Send + Sync {
     fn show(&self, cwd: &Path, hash: &str) -> Result<CommitDetail>;
     /// Local branch names and the current branch (`None` when detached).
     fn branches(&self, cwd: &Path) -> Result<(Vec<String>, Option<String>)>;
+    /// Refresh every remote's tracking refs — the ones `status` reports, which
+    /// are otherwise only as fresh as the last fetch. Touches no branch and no
+    /// working tree: this only updates what we know the remotes hold.
+    fn fetch(&self, cwd: &Path) -> Result<String>;
     /// Fast-forward-only pull of the current branch from its upstream. Never
     /// creates a merge commit or leaves the worktree in a conflicted state; if
     /// the branch has diverged it fails cleanly (the user can rebase instead).
@@ -382,6 +386,38 @@ impl SourceControl for GitSourceControl {
             .filter(|l| !l.is_empty())
             .collect();
         Ok((branches, current_branch(cwd)))
+    }
+
+    fn fetch(&self, cwd: &Path) -> Result<String> {
+        if !self.detect(cwd) {
+            bail!("not a git repository");
+        }
+        // Pre-empt a silently successful no-op: `git fetch` with no remotes
+        // exits zero having done nothing, which would report as a fetch that
+        // worked when there was never anywhere to fetch from.
+        if git(cwd, &["remote"])?.trim().is_empty() {
+            bail!(
+                "no remotes are configured, so there is nothing to fetch. \
+                 Add one with `git remote add origin <url>` first."
+            );
+        }
+        // `--prune` drops tracking refs whose branch is gone upstream, so a
+        // branch deleted on the remote stops being reported as living there.
+        // Only refs under refs/remotes/ are touched — no local branch, and no
+        // working tree. `GIT_TERMINAL_PROMPT=0` makes a missing or expired
+        // credential fail fast with git's own message rather than blocking the
+        // daemon on an interactive prompt that never gets answered.
+        let out = Command::new("git")
+            .args(["fetch", "--all", "--prune"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .current_dir(cwd)
+            .output()
+            .map_err(|e| anyhow!("failed to run git: {e}"))?;
+        if out.status.success() {
+            Ok(combined_output(&out))
+        } else {
+            bail!("git fetch failed: {}", combined_output(&out).trim());
+        }
     }
 
     fn pull(&self, cwd: &Path) -> Result<String> {
@@ -1563,6 +1599,66 @@ mod tests {
 
         let _ = fs::remove_dir_all(one);
         let _ = fs::remove_dir_all(two);
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn fetch_refreshes_a_stale_remote_row() {
+        // The remote commits the panel shows come from the tracking refs, so they
+        // are only ever as fresh as the last fetch. This is the button that makes
+        // them current: a remote that has moved on behind our back must show up.
+        let repo = test_repo("fetch-stale");
+        let origin = bare_origin("fetch-stale");
+        git_test(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        write_file(&repo, "a.txt", "a\n");
+        commit_all(&repo, "c1");
+        git_test(&repo, &["push", "-q", "-u", "origin", "main"]);
+
+        // Someone else pushes to the same remote. We haven't fetched, so our view
+        // of it is stale: still their old tip, and we look perfectly in sync.
+        let other = test_repo("fetch-stale-other");
+        git_test(&other, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git_test(&other, &["fetch", "-q", "origin"]);
+        git_test(&other, &["checkout", "-q", "-B", "main", "origin/main"]);
+        write_file(&other, "b.txt", "b\n");
+        commit_all(&other, "c2 from elsewhere");
+        git_test(&other, &["push", "-q", "origin", "main"]);
+        let moved_to = git_test(&other, &["rev-parse", "--short", "HEAD"]).trim().to_string();
+
+        let stale = GitSourceControl.status(&repo).unwrap().remotes;
+        assert_eq!(stale.len(), 1);
+        assert_ne!(stale[0].head, moved_to);
+        assert_eq!((stale[0].ahead, stale[0].behind), (0, 0));
+
+        // After the fetch the row is current, and we can see we're a commit behind.
+        GitSourceControl.fetch(&repo).unwrap();
+        let fresh = GitSourceControl.status(&repo).unwrap().remotes;
+        assert_eq!(fresh[0].head, moved_to);
+        assert_eq!((fresh[0].ahead, fresh[0].behind), (0, 1));
+
+        // Fetching touches remotes only: our branch and working tree are untouched.
+        assert_eq!(
+            git_test(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "main"
+        );
+        assert_eq!(git_test(&repo, &["status", "--porcelain"]), "");
+
+        let _ = fs::remove_dir_all(other);
+        let _ = fs::remove_dir_all(origin);
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn fetch_without_remotes_reports_it() {
+        // `git fetch` with nothing configured exits zero having done nothing, which
+        // would otherwise report as a fetch that worked.
+        let repo = test_repo("fetch-no-remote");
+        write_file(&repo, "a.txt", "a\n");
+        commit_all(&repo, "c1");
+
+        let err = GitSourceControl.fetch(&repo).unwrap_err().to_string();
+        assert!(err.contains("nothing to fetch"), "unexpected message: {err}");
+
         let _ = fs::remove_dir_all(repo);
     }
 

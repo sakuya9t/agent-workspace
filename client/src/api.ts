@@ -525,6 +525,10 @@ export const api = {
     ).then((r) => r.commit),
   scmBranches: (t: Target, id: string) =>
     req<BranchList>(t, `/api/sessions/${id}/scm/branches`),
+  scmFetch: (t: Target, id: string) =>
+    req<{ output: string }>(t, `/api/sessions/${id}/scm/fetch`, { method: "POST" }).then(
+      (r) => r.output,
+    ),
   scmPull: (t: Target, id: string) =>
     req<{ output: string }>(t, `/api/sessions/${id}/scm/pull`, { method: "POST" }).then(
       (r) => r.output,

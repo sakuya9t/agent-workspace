@@ -202,6 +202,18 @@ pub async fn branches(
     Ok(Json(json!({ "branches": branches, "head": head })))
 }
 
+/// Refresh every remote's tracking refs, so the remote commits the panel shows
+/// are current rather than as-of-the-last-fetch. Changes no branch.
+pub async fn fetch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let cwd = session_cwd(&state, &id).await?;
+    let scm = state.scm.clone();
+    let output = run_blocking(move || scm.fetch(&cwd)).await?;
+    Ok(Json(json!({ "output": output })))
+}
+
 /// Fast-forward-only pull of the session's current branch.
 pub async fn pull(
     State(state): State<AppState>,

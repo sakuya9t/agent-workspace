@@ -138,6 +138,12 @@ export function RightPanel({ target, session }: Props) {
     qc.invalidateQueries({ queryKey: ["scmlog", base, session?.id] });
   };
 
+  // Named `fetchRemotes`, not `fetch`, so it can't shadow the global.
+  const fetchRemotes = useMutation({
+    mutationFn: () => api.scmFetch(target!, session!.id),
+    onSuccess: refreshScm,
+  });
+
   const pull = useMutation({
     mutationFn: () => api.scmPull(target!, session!.id),
     onSuccess: refreshScm,
@@ -166,33 +172,31 @@ export function RightPanel({ target, session }: Props) {
     },
   });
 
-  // Pull/push/rebase/merge share one result/error area, so starting one clears
-  // the others' stale output.
+  // Every source-control operation shares one result/error area, so starting any
+  // one of them clears the others' stale output.
+  const scmOps = [fetchRemotes, pull, push, rebase, merge];
+  const resetScmOps = () => scmOps.forEach((op) => op.reset());
+  const startFetch = () => {
+    resetScmOps();
+    fetchRemotes.mutate();
+  };
   const startPull = () => {
-    push.reset();
-    rebase.reset();
-    merge.reset();
+    resetScmOps();
     pull.mutate();
   };
   const startPush = () => {
-    pull.reset();
-    rebase.reset();
-    merge.reset();
+    resetScmOps();
     push.mutate();
   };
   const startRebase = (onto: string) => {
-    pull.reset();
-    push.reset();
-    merge.reset();
+    resetScmOps();
     rebase.mutate(onto);
   };
   const startMerge = (targetBranch: string) => {
-    pull.reset();
-    push.reset();
-    rebase.reset();
+    resetScmOps();
     merge.mutate(targetBranch);
   };
-  const scmBusy = pull.isPending || push.isPending || rebase.isPending || merge.isPending;
+  const scmBusy = scmOps.some((op) => op.isPending);
 
   // Don't carry an open picker or a previous session's SCM output onto the next
   // session (this panel is reused, not remounted, across selections).
@@ -201,10 +205,7 @@ export function RightPanel({ target, session }: Props) {
     setRebaseOnto("");
     setMergeOpen(false);
     setMergeTarget("");
-    pull.reset();
-    push.reset();
-    rebase.reset();
-    merge.reset();
+    resetScmOps();
   }, [session?.id, base]);
 
   if (!session || !target) {
@@ -479,52 +480,65 @@ export function RightPanel({ target, session }: Props) {
           <>
             <div className="section-title with-actions">
               <span>{t("rightPanel.historyHeader")}</span>
-              {!scm.detached && (
-                <span className="scm-actions">
-                  <button
-                    className="icon-btn"
-                    disabled={scmBusy}
-                    onClick={startPull}
-                    title={t("rightPanel.pullTitle")}
-                    aria-label={t("rightPanel.pullTitle")}
-                  >
-                    <span className="action-icon action-icon-git-pull" aria-hidden="true" />
-                  </button>
-                  <button
-                    className="icon-btn"
-                    disabled={scmBusy}
-                    onClick={startPush}
-                    title={t("rightPanel.pushTitle")}
-                    aria-label={t("rightPanel.pushTitle")}
-                  >
-                    <span className="action-icon action-icon-git-push" aria-hidden="true" />
-                  </button>
-                  <button
-                    className={"icon-btn" + (rebaseOpen ? " active" : "")}
-                    disabled={scmBusy}
-                    onClick={() => {
-                      setMergeOpen(false);
-                      setRebaseOpen((o) => !o);
-                    }}
-                    title={t("rightPanel.rebaseTitle")}
-                    aria-label={t("rightPanel.rebaseTitle")}
-                  >
-                    <span className="action-icon action-icon-git-rebase" aria-hidden="true" />
-                  </button>
-                  <button
-                    className={"icon-btn" + (mergeOpen ? " active" : "")}
-                    disabled={scmBusy}
-                    onClick={() => {
-                      setRebaseOpen(false);
-                      setMergeOpen((o) => !o);
-                    }}
-                    title={t("rightPanel.mergeTitle")}
-                    aria-label={t("rightPanel.mergeTitle")}
-                  >
-                    <span className="action-icon action-icon-git-merge" aria-hidden="true" />
-                  </button>
-                </span>
-              )}
+              <span className="scm-actions">
+                {/* Fetch only reads the remotes, so unlike the rest it is just as
+                    valid on a detached HEAD as on a branch. */}
+                <button
+                  className="icon-btn"
+                  disabled={scmBusy}
+                  onClick={startFetch}
+                  title={t("rightPanel.fetchTitle")}
+                  aria-label={t("rightPanel.fetchTitle")}
+                >
+                  <span className="action-icon action-icon-git-fetch" aria-hidden="true" />
+                </button>
+                {!scm.detached && (
+                  <>
+                    <button
+                      className="icon-btn"
+                      disabled={scmBusy}
+                      onClick={startPull}
+                      title={t("rightPanel.pullTitle")}
+                      aria-label={t("rightPanel.pullTitle")}
+                    >
+                      <span className="action-icon action-icon-git-pull" aria-hidden="true" />
+                    </button>
+                    <button
+                      className="icon-btn"
+                      disabled={scmBusy}
+                      onClick={startPush}
+                      title={t("rightPanel.pushTitle")}
+                      aria-label={t("rightPanel.pushTitle")}
+                    >
+                      <span className="action-icon action-icon-git-push" aria-hidden="true" />
+                    </button>
+                    <button
+                      className={"icon-btn" + (rebaseOpen ? " active" : "")}
+                      disabled={scmBusy}
+                      onClick={() => {
+                        setMergeOpen(false);
+                        setRebaseOpen((o) => !o);
+                      }}
+                      title={t("rightPanel.rebaseTitle")}
+                      aria-label={t("rightPanel.rebaseTitle")}
+                    >
+                      <span className="action-icon action-icon-git-rebase" aria-hidden="true" />
+                    </button>
+                    <button
+                      className={"icon-btn" + (mergeOpen ? " active" : "")}
+                      disabled={scmBusy}
+                      onClick={() => {
+                        setRebaseOpen(false);
+                        setMergeOpen((o) => !o);
+                      }}
+                      title={t("rightPanel.mergeTitle")}
+                      aria-label={t("rightPanel.mergeTitle")}
+                    >
+                      <span className="action-icon action-icon-git-merge" aria-hidden="true" />
+                    </button>
+                  </>
+                )}
+              </span>
             </div>
 
             {rebaseOpen && !scm.detached && (
@@ -630,6 +644,15 @@ export function RightPanel({ target, session }: Props) {
             {scmBusy && (
               <div className="dim small">{t("rightPanel.scmRunning")}</div>
             )}
+            {fetchRemotes.error && (
+              <ScmOpNotice
+                status="error"
+                title={t("rightPanel.fetchFailed")}
+                summary={scmErrorSummary(fetchRemotes.error)}
+                details={scmErrorDetails(fetchRemotes.error)}
+                onDismiss={fetchRemotes.reset}
+              />
+            )}
             {pull.error && (
               <ScmOpNotice
                 status="error"
@@ -668,6 +691,21 @@ export function RightPanel({ target, session }: Props) {
                 }
                 details={scmErrorDetails(merge.error)}
                 onDismiss={merge.reset}
+              />
+            )}
+            {/* A fetch that found nothing new succeeds with *empty* output, so the
+                truthiness check the other ops use would swallow the result. */}
+            {fetchRemotes.data !== undefined && (
+              <ScmOpNotice
+                status="success"
+                title={t("rightPanel.fetchComplete")}
+                summary={
+                  fetchRemotes.data.trim()
+                    ? t("rightPanel.fetchSuccess")
+                    : t("rightPanel.fetchUpToDate")
+                }
+                details={fetchRemotes.data}
+                onDismiss={fetchRemotes.reset}
               />
             )}
             {pull.data && (

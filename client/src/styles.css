@@ -1074,6 +1074,10 @@ body.col-resizing iframe {
   mask-image: url("/icons/actions/git-rebase.png");
   -webkit-mask-image: url("/icons/actions/git-rebase.png");
 }
+.action-icon-git-fetch {
+  mask-image: url("/icons/actions/git-fetch.png");
+  -webkit-mask-image: url("/icons/actions/git-fetch.png");
+}
 .action-icon-git-pull {
   mask-image: url("/icons/actions/git-pull.png");
   -webkit-mask-image: url("/icons/actions/git-pull.png");
