@@ -47,6 +47,10 @@ asm_configure
 daemon_load_recorded_config
 relay_load_recorded_config
 
+# Same transport check start.sh makes, before we stop a working daemon: a config
+# the daemon would refuse must not be allowed to take down the running one.
+daemon_transport_preflight || exit 2
+
 # Check the SOCKET, not just the pid: a holder whose socket was unlinked is alive
 # but unreachable, and restarting the daemon into that state just fails the boot
 # (exactly what happened on 2026-07-12). start.sh knows how to diagnose/recover.

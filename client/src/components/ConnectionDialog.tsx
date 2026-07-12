@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Trans, useTranslation } from "react-i18next";
 import { api, enrollDevice, listRelayNodes, probeHealth } from "../api";
 import { daemonLabel, localTarget, RelayConn, useConnStore } from "../connectionStore";
+import { checkTargetUrl } from "../secureUrl";
 import { useUiStore } from "../store";
 
 type ConnectionMode = "existing" | "add";
@@ -40,6 +41,15 @@ export function ConnectionDialog() {
   const [mode, setMode] = useState<ConnectionMode>("add");
   const [addKind, setAddKind] = useState<AddKind>("daemon");
 
+  // Live, so the warning appears as the URL is typed rather than on submit. A
+  // plaintext URL is flagged, never blocked: a LAN daemon has no TLS to offer,
+  // so refusing it would just make the product unusable on a trusted network.
+  // Only an unparseable URL stops the add.
+  const urlProblem = url.trim() ? checkTargetUrl(url.trim().replace(/\/$/, "")) : null;
+  const relayUrlProblem = relayUrl.trim()
+    ? checkTargetUrl(relayUrl.trim().replace(/\/$/, ""))
+    : null;
+
   const { data: localEnrollToken } = useQuery({
     queryKey: ["enrollment-token"],
     queryFn: () => api.enrollmentToken(localTarget()),
@@ -53,6 +63,14 @@ export function ConnectionDialog() {
     const targetUrl = url.trim().replace(/\/$/, "");
     if (!targetUrl) {
       setErr(t("connection.errNoUrl"));
+      return;
+    }
+    if (urlProblem === "invalid") {
+      setErr(t("connection.errBadUrl"));
+      return;
+    }
+    if (urlProblem === "websocket") {
+      setErr(t("connection.errWsScheme"));
       return;
     }
     setBusy(true);
@@ -91,15 +109,15 @@ export function ConnectionDialog() {
       setRelayErr(t("relay.errNoKey"));
       return;
     }
-    let label = relayLabel.trim();
-    if (!label) {
-      try {
-        label = new URL(u).host;
-      } catch {
-        setRelayErr(t("relay.errBadUrl"));
-        return;
-      }
+    if (relayUrlProblem === "invalid") {
+      setRelayErr(t("relay.errBadUrl"));
+      return;
     }
+    if (relayUrlProblem === "websocket") {
+      setRelayErr(t("relay.errWsScheme"));
+      return;
+    }
+    const label = relayLabel.trim() || new URL(u).host;
     setRelayErr(null);
     addRelay({ url: u, accessKey: relayKey.trim(), label });
     setRelayUrl("");
@@ -252,6 +270,9 @@ export function ConnectionDialog() {
                   />
                   <label className="form-label">{t("relay.labelLabel")}</label>
                   <input className="input" value={relayLabel} onChange={(e) => setRelayLabel(e.target.value)} />
+                  {relayUrlProblem === "insecure" && (
+                    <div className="conn-insecure-warn small">{t("relay.insecureWarn")}</div>
+                  )}
                   {relayErr && <div className="error conn-form-error">{relayErr}</div>}
                   <div className="conn-hint dim small">{t("relay.tip")}</div>
                   <div className="conn-form-actions">
@@ -269,7 +290,7 @@ export function ConnectionDialog() {
                   <input
                     className="input mono"
                     placeholder={t("connection.urlPlaceholder", {
-                      lan: "http://192.168.0.5:4600",
+                      lan: "https://asm.example.com",
                       tunnel: "http://localhost:4600",
                     })}
                     value={url}
@@ -289,6 +310,10 @@ export function ConnectionDialog() {
 
                   <label className="form-label">{t("connection.nameLabel")}</label>
                   <input className="input" value={name} onChange={(e) => setName(e.target.value)} />
+
+                  {urlProblem === "insecure" && (
+                    <div className="conn-insecure-warn small">{t("connection.insecureWarn")}</div>
+                  )}
 
                   {err && <div className="error conn-form-error">{err}</div>}
 

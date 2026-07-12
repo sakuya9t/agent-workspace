@@ -18,7 +18,7 @@ daemon_load_recorded_config
 relay_load_recorded_config
 
 if pid_alive "$RELAY_PIDFILE"; then
-  log "relay   RUNNING  pid=$(cat "$RELAY_PIDFILE")  http://$ASM_RELAY_BIND"
+  log "relay   RUNNING  pid=$(cat "$RELAY_PIDFILE")  $(relay_scheme)://$ASM_RELAY_BIND"
 elif relay_enabled; then
   log "relay   stopped"
 fi
@@ -36,9 +36,9 @@ else
 fi
 
 if pid_alive "$DAEMON_PIDFILE"; then
-  log "daemon  RUNNING  pid=$(cat "$DAEMON_PIDFILE")  http://$ASM_BIND"
+  log "daemon  RUNNING  pid=$(cat "$DAEMON_PIDFILE")  $(daemon_scheme)://$ASM_BIND"
   if command -v curl >/dev/null 2>&1; then
-    curl -s "http://$ASM_BIND/health" 2>/dev/null | sed 's/^/        /' || true
+    curl -sk "$(daemon_scheme)://$ASM_BIND/health" 2>/dev/null | sed 's/^/        /' || true
     echo
   fi
 else

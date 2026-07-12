@@ -256,7 +256,7 @@ pick it up**.
 | RF-GATE | Build gate & test safety net: react-hooks + recommended eslint, minimal CI, HTTP-router test harness, `MockHolder`, asmux e2e for readBuffer/detach/backpressure/takeover, `generated.rs` drift check, migration-ladder test + `user_version` guard | **P1/P2** | — (before REC ideally; before M4-C wiring definitely) | refactoring-plan.md → §6.4 |
 | RF-OPS | **Truthful health, deadlines and task supervision:** liveness/readiness probes for DB writer + holder; cancellation tree for background tasks; blocking-work boundary; child/client request deadlines; jittered reconnect; structured reliability metrics | **P2** | minimal RF-GATE; Git deadline implementation shares RF-REC | refactoring-plan.md → §7.3 |
 | SEC-2 | Constrain `/api/fs/list` + workspace roots | **P1** | RF-ERR recommended (403 mapping) | security-followups.md → 2 (HIGH) |
-| SEC-1 | Transport encryption off-loopback (direct mode TLS; relay TLS — **agent `wss://` (code) + relay rustls/proxy**) | **P1/P2** | partially ties to R5 | security-followups.md → 1 (HIGH) |
+| SEC-1 | Transport encryption off-loopback. **DONE (2026-07-12)**: agent dials `wss://`, relay serves rustls, daemon serves https/wss (`ASM_TLS_CERT/KEY`), plaintext relay refused, `ASM_TRUST_LOOPBACK=0` closes the reverse-proxy auth hole. Remaining: **mTLS** only | **P3** (was P1/P2) | — | security-followups.md → 1 (LOW) |
 | V0 | Web-editor de-risking spike (scratchpad only) | **P2** | R1–R3 (done) | vscode-over-relay-plan.md → V0 |
 | V1 | Relay cookie auth + daemon editor proxy | **P2** | V0 go decision | vscode-over-relay-plan.md → V1 |
 | V2 | IDE launcher, detection, editor tickets | **P2** | V1 | vscode-over-relay-plan.md → V2 |
@@ -495,21 +495,34 @@ exactly two frame types; MOB-PUSH, MVP-RICH and V3 each need a
 server→client frame and would otherwise each invent one. Detail:
 refactoring-plan.md → §6.3.
 
-### SEC-1 / SEC-2 — the two HIGH security items (P1)
+### SEC-2 — fs-list / workspace roots (P1, the remaining HIGH)
 
-Gate exposing ASM beyond a trusted LAN. SEC-2 (fs-list browses the whole host
-filesystem; any client can register any workspace root) is self-contained
-daemon work: server-side allowed-roots config enforced for both browsing and
-registration. SEC-1 (plaintext HTTP/WS off loopback) splits: the **relay path**
-(the product path) is plaintext today and is **not just an ops item** — it needs
-(i) a TLS feature enabled on the daemon agent's `tokio-tungstenite` so it can
-dial `wss://` at all (it is currently compiled without TLS, so a TLS reverse
-proxy in front of the relay is useless until this lands — a code change), plus
-(ii) relay-side rustls (`ASM_RELAY_TLS_CERT/KEY`, described in
-connectivity-execution-plan.md but **not yet implemented** in the relay binary)
-or a TLS-terminating proxy, with a real ACME cert so there is no client UX
-change; **direct mode** needs the Phase-8 TLS/mTLS deliverable (self-signed +
-pinning or ACME). Until then the SSH-tunnel recommendation stays prominent.
+Gates exposing ASM beyond a trusted LAN. `fs-list` browses the whole host
+filesystem and any client can register any workspace root. Self-contained daemon
+work: a server-side allowed-roots config, enforced for both browsing and
+registration.
+
+### SEC-1 — transport encryption (relay path done; direct mode open, P2)
+
+**The relay path — the product path — is encrypted as of 2026-07-12.** The agent
+dials `wss://` (a `tokio-tungstenite` TLS feature plus an explicit rustls
+connector, which was the *code* blocker: the daemon dials the relay outbound, so
+a TLS proxy in front of the relay was useless until the agent could speak TLS
+itself), and the relay serves rustls behind `ASM_RELAY_TLS_CERT/KEY`. A plaintext
+`ws://` relay on a remote host is **refused** by the daemon at boot
+(`--insecure-relay` overrides). See `crates/asm-relay/tests/tls.rs`.
+
+**Direct mode landed too**: `ASM_TLS_CERT` / `ASM_TLS_KEY` make the daemon serve
+https/wss on its own bind, so a LAN client reaches it at `https://host:4600` —
+Phase 8's "TLS or equivalent". An off-loopback bind *without* a certificate stays
+allowed (warned at startup, flagged in the client): it is a deliberate choice,
+and refusing it only broke the LAN and container deployments that had made it.
+Also landed: `ASM_TRUST_LOOPBACK=0`, without which a same-host reverse proxy in
+front of the daemon silently disables auth (its requests arrive from 127.0.0.1
+and are loopback-trusted).
+
+What is left is **mTLS** — the device token is still the only credential on the
+wire — plus the residual plaintext-by-choice path above.
 
 SEC-2 code-level substrate (2026-07-12 review): there are today **three**
 divergent notions of allowed root — `fs::list` enforces none;
