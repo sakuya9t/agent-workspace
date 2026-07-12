@@ -5,6 +5,7 @@ import { streamUrl, api } from "../api";
 import { Target } from "../connectionStore";
 import { useUiStore } from "../store";
 import { copyText } from "../clipboard";
+import { glog } from "../gestureLog";
 import { CtrlLatch, TerminalHandle } from "../terminalTypes";
 import i18n from "../i18n";
 
@@ -542,17 +543,38 @@ export function TerminalView({
       term.select(start % term.cols, Math.floor(start / term.cols), end - start);
     };
 
+    /** Pin the gesture to the container: from here the finger can wander over rows
+     *  the renderer is busy replacing, and what becomes of the element under it
+     *  stops mattering.
+     *
+     *  Best-effort, and deliberately NOT on the critical path. Capture is the part
+     *  of this gesture an engine is most likely to refuse — it is only defined for
+     *  an *active* pointer, and the long-press timer fires outside any pointer
+     *  event handler. Blink allows a capture from there (which is all Chrome's
+     *  device emulation can ever prove), other engines need not, and the throw used
+     *  to escape beginSelect() BEFORE it selected anything: a "long press does
+     *  nothing" of exactly the kind iOS reports. So select the word first, attempt
+     *  the capture in a try/catch, and retry it from the next pointermove — a
+     *  handler no engine objects to. */
+    const grabPointer = () => {
+      if (pointerId === null || container.hasPointerCapture(pointerId)) return;
+      try {
+        container.setPointerCapture(pointerId);
+      } catch (e) {
+        glog("capture-failed", (e as Error).name);
+      }
+    };
+
     const beginSelect = () => {
       const cell = cellAt(startX, startY);
       const word = cell && wordAt(cell.col, cell.row);
       if (!cell || !word) return;
       gesture = "select";
       anchor = word;
-      // Pin the gesture to the container: from here the finger can wander over
-      // rows that the renderer is busy replacing.
-      if (pointerId !== null) container.setPointerCapture(pointerId);
-      selectTo(cell);
-      navigator.vibrate?.(8); // the only feedback that the press "took"
+      selectTo(cell); // first: a refused capture must not cost us the word
+      grabPointer();
+      navigator.vibrate?.(8); // the only feedback that the press "took" (iOS has none)
+      glog("select", `${word.col},${word.row} "${term.getSelection().slice(0, 24)}"`);
     };
 
     // Extending past the top/bottom edge scrolls, so a selection can run beyond
@@ -600,6 +622,7 @@ export function TerminalView({
       const y = e.clientY;
 
       if (gesture === "select") {
+        grabPointer(); // if the timer's capture was refused, this handler's won't be
         lastX = x;
         lastY = y;
         const cell = cellAt(x, y);
@@ -616,9 +639,10 @@ export function TerminalView({
         // It moved before the press landed, so this is a scroll, not a selection.
         window.clearTimeout(pressTimer);
         gesture = "scroll";
-        container.setPointerCapture(e.pointerId);
+        grabPointer();
         lastX = x;
         lastY = y; // rebase, so the first step isn't a jump of the whole slop
+        glog("scroll");
         e.preventDefault();
         return;
       }
@@ -641,6 +665,9 @@ export function TerminalView({
 
     const onPointerUp = (e: PointerEvent) => {
       if (e.pointerId !== pointerId) return;
+      // A `pointercancel` landing here with gesture=idle is the engine claiming the
+      // touch for a gesture of its own, before our long press could land.
+      glog(e.type === "pointercancel" ? "cancel" : "up", `gesture=${gesture}`);
       if (gesture === "select") {
         // Keep the highlight — the key bar's Copy reads it. Swallow the mouse
         // events the browser synthesizes from the lift for ~a beat, or xterm's

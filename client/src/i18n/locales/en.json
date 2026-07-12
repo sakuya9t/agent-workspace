@@ -330,6 +330,11 @@
     "paste": "Paste",
     "copy": "Copy"
   },
+  "pasteSheet": {
+    "title": "Paste into the terminal",
+    "hint": "Long-press here, choose Paste, and it goes straight to the terminal.",
+    "send": "Send"
+  },
   "api": {
     "unreachableAt": "cannot connect — daemon unreachable at {{baseUrl}} (not started?)",
     "unreachable": "cannot connect — daemon unreachable (not started?)",
