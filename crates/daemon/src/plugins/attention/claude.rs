@@ -32,6 +32,10 @@ pub(crate) fn claude_attention(screen: &str, bell: bool) -> (AttentionState, Opt
     const APPROVAL_PHRASES: &[&str] = &[
         // "Do you want to proceed?" / "…make this edit to X?" / "…create X?".
         "do you want to",
+        // Plan mode's exit prompt phrases the same question differently: "Claude
+        // has written up a plan and is ready to execute. Would you like to
+        // proceed?".
+        "would you like to",
         "this command requires approval",
     ];
     if screen.lines().any(is_selected_option) {
@@ -198,6 +202,30 @@ mod tests {
         let screen = " Do you want to make this edit to session_manager.rs?\n \u{276f} 1. Yes\n   2. No";
         let (a, _) = claude_attention(screen, false);
         assert_eq!(a, AttentionState::ApprovalNeeded);
+    }
+
+    /// The captured real-world plan-approval screen from the reported bug: the
+    /// tail of the plan is still on screen above a `❯`-selected option menu, but
+    /// the question is "Would you like to proceed?" — not the "Do you want to …"
+    /// wording every other permission prompt uses — so the phrase scan missed it
+    /// and the blocked session read as idle.
+    #[test]
+    fn claude_plan_approval_screen_is_approval() {
+        let screen = "\
+   so a supervisor task owns the socket lifecycle:                              \u{2193}\n\
+  \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+   Claude has written up a plan and is ready to execute. Would you like to proceed?\n\
+\n\
+   \u{276f} 1. Yes, and bypass permissions\n\
+     2. Yes, manually approve edits\n\
+     3. No, refine with Ultraplan on Claude Code on the web\n\
+     4. Tell Claude what to change\n\
+        shift+tab to approve with this feedback\n\
+\n\
+   ctrl+g to edit in  VS Code  \u{b7} ~/.claude/plans/glittery-honking-lighthouse.md";
+        let (a, reason) = claude_attention(screen, false);
+        assert_eq!(a, AttentionState::ApprovalNeeded);
+        assert!(reason.unwrap().starts_with("prompt detected: "));
     }
 
     #[test]
