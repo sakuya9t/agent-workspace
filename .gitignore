@@ -20,3 +20,8 @@ client/.vite/
 *.swp
 .idea/
 .vscode/
+
+# TLS material (ASM_TLS_CERT/KEY, ASM_RELAY_TLS_CERT/KEY). Certificates are
+# host-specific and the key is a secret — never commit either.
+*.pem
+*.key

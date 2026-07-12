@@ -109,6 +109,24 @@ pick it up**.
   token-enforcement caveat: [`security-followups.md`](security-followups.md) → 11.
 - VS Code correctness fix: relayed hosts get a disabled button + honest hint
   instead of a misdirected Remote-SSH deep link.
+- **LAN self-enrollment** (2026-07-12, client-only; fallout from SEC-1's TLS).
+  The daemon serves the client, so opening `https://<host>:4600` on a phone *is*
+  the app — same-origin, nothing to add. But the client conflated **same-origin**
+  with **loopback**: `connectionStore` pinned the local entry to `token: null`
+  and dropped it on rehydrate, while the daemon waives the token only for
+  loopback *peers*. A LAN device therefore sat at "unauthorized" with no
+  affordance to fix it, and the only way in was to add the daemon a second time
+  as a cross-origin host — which then failed its own way, because a background
+  fetch to an untrusted self-signed cert throws the same opaque `TypeError` as a
+  dead host and never shows the interstitial that would let the user accept it.
+  Fix: the local entry carries and persists a device token; the connections
+  dialog offers **Enroll this device** when the page is same-origin but
+  off-loopback (and opens on that tab); `api.unreachableAtTls` stops blaming a
+  stopped daemon for what is usually a rejected certificate. Proof:
+  `scripts/lan-enroll-test.mjs` (TLS daemon on `0.0.0.0`, LAN-IP origin, real
+  Chrome: 401 → enroll → 200 → survives reload). Interstitial-on-first-open is
+  inherent to self-signed certs; a publicly-trusted relay cert (**R5**) is the
+  path that removes it.
 - Image/screenshot paste: paste, drag-drop, or the 📎 button feed an image into
   a live terminal → daemon stores it under `<cwd>/.asm/pastes/`
   (`POST /api/sessions/:id/paste`, magic-byte + size validated) → client injects

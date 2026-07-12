@@ -2,7 +2,13 @@ import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Trans, useTranslation } from "react-i18next";
 import { api, enrollDevice, listRelayNodes, probeHealth } from "../api";
-import { daemonLabel, localTarget, RelayConn, useConnStore } from "../connectionStore";
+import {
+  daemonLabel,
+  isLoopbackOrigin,
+  localTarget,
+  RelayConn,
+  useConnStore,
+} from "../connectionStore";
 import { checkTargetUrl } from "../secureUrl";
 import { useUiStore } from "../store";
 
@@ -23,6 +29,7 @@ export function ConnectionDialog() {
   const setShow = useUiStore((s) => s.setShowConnection);
   const daemons = useConnStore((s) => s.daemons);
   const addDaemon = useConnStore((s) => s.addDaemon);
+  const updateDaemon = useConnStore((s) => s.updateDaemon);
   const removeDaemon = useConnStore((s) => s.removeDaemon);
   const relays = useConnStore((s) => s.relays);
   const addRelay = useConnStore((s) => s.addRelay);
@@ -38,8 +45,21 @@ export function ConnectionDialog() {
   const [relayKey, setRelayKey] = useState("");
   const [relayLabel, setRelayLabel] = useState("");
   const [relayErr, setRelayErr] = useState<string | null>(null);
-  const [mode, setMode] = useState<ConnectionMode>("add");
   const [addKind, setAddKind] = useState<AddKind>("daemon");
+
+  const [localToken, setLocalToken] = useState("");
+  const [localBusy, setLocalBusy] = useState(false);
+  const [localErr, setLocalErr] = useState<string | null>(null);
+
+  const local = daemons.find((d) => d.id === "local");
+  // The daemon serves this bundle, so a phone on the LAN lands here same-origin
+  // — but it is not a loopback peer, so it must enroll like any other device.
+  // Without this the local row would sit at "unauthorized" with nothing to do.
+  const localNeedsEnroll = Boolean(local) && !local?.token && !isLoopbackOrigin();
+
+  // Enrolling this device is the one thing a phone MUST do here, and it lives on
+  // the Existing tab — so open there rather than on "add another host".
+  const [mode, setMode] = useState<ConnectionMode>(localNeedsEnroll ? "existing" : "add");
 
   // Live, so the warning appears as the URL is typed rather than on submit. A
   // plaintext URL is flagged, never blocked: a LAN daemon has no TLS to offer,
@@ -58,6 +78,33 @@ export function ConnectionDialog() {
   });
 
   if (!show) return null;
+
+  /**
+   * Enroll this device against the daemon that served the page. Same-origin, so
+   * there is no URL to type and no certificate to trust beyond the one the
+   * browser already accepted to load this page — just the enrollment token.
+   */
+  const enrollLocal = async () => {
+    const tok = localToken.trim();
+    if (!tok) {
+      setLocalErr(t("connection.errNoToken"));
+      return;
+    }
+    setLocalBusy(true);
+    setLocalErr(null);
+    try {
+      const res = await enrollDevice("", tok, name.trim() || navigator.platform || "device");
+      await probeHealth("", res.device_token);
+      updateDaemon("local", { token: res.device_token, connected: true });
+      qc.invalidateQueries({ queryKey: ["daemon"] });
+      qc.invalidateQueries({ queryKey: ["enrollment-token"] });
+      setLocalToken("");
+    } catch (e) {
+      setLocalErr(String(e instanceof Error ? e.message : e));
+    } finally {
+      setLocalBusy(false);
+    }
+  };
 
   const addRemote = async () => {
     const targetUrl = url.trim().replace(/\/$/, "");
@@ -195,6 +242,33 @@ export function ConnectionDialog() {
                   </div>
                 ))}
               </div>
+
+              {localNeedsEnroll && (
+                <div className="conn-callout">
+                  <div className="conn-callout-title">{t("connection.enrollLocalTitle")}</div>
+                  <div className="dim small">
+                    {t("connection.enrollLocalHint", { cmd: "asm-daemon token" })}
+                  </div>
+                  <div className="conn-node-connect">
+                    <input
+                      className="input mono small"
+                      placeholder={t("connection.tokenPlaceholder", { cmd: "asm-daemon token" })}
+                      value={localToken}
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      spellCheck={false}
+                      onChange={(e) => setLocalToken(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && !localBusy) enrollLocal();
+                      }}
+                    />
+                    <button className="btn tiny" disabled={localBusy} onClick={enrollLocal}>
+                      {localBusy ? t("connection.enrolling") : t("connection.enroll")}
+                    </button>
+                  </div>
+                  {localErr && <div className="conn-node-error error-line small">{localErr}</div>}
+                </div>
+              )}
 
               {localEnrollToken && (
                 <div className="conn-callout">

@@ -337,6 +337,7 @@
   },
   "api": {
     "unreachableAt": "cannot connect — daemon unreachable at {{baseUrl}} (not started?)",
+    "unreachableAtTls": "cannot connect to {{baseUrl}} — the daemon is either not started, or its TLS certificate isn't trusted by this browser. Open {{baseUrl}} in a tab to see which, and accept the certificate if prompted.",
     "unreachable": "cannot connect — daemon unreachable (not started?)",
     "unauthorized": "unauthorized — enroll or reconnect ({{message}})",
     "gatewayUnreachable": "cannot connect — daemon unreachable ({{message}})"
@@ -376,6 +377,11 @@
     "tokenLabel": "Enrollment token",
     "tokenHint": "(blank for SSH-tunnelled / loopback)",
     "tokenPlaceholder": "from `{{cmd}}` on that host",
+    "enrollLocalTitle": "Enroll this device",
+    "enrollLocalHint": "This page came from the daemon, but this device isn't on its loopback interface, so it needs a token once. Run `{{cmd}}` on the daemon host and paste it here.",
+    "enroll": "Enroll",
+    "enrolling": "Enrolling…",
+    "errNoToken": "Enter the enrollment token.",
     "nameLabel": "Label (optional)",
     "errNoUrl": "Enter a daemon URL.",
     "sshTip": "Tip: for a private host, run <cmd>{{ssh}}</cmd> and add <cmd>{{url}}</cmd> with no token.",
