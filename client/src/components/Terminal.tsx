@@ -27,7 +27,10 @@ function toCtrl(s: string): string {
  * (Windows/Linux) so plain Ctrl-C stays SIGINT to the agent. macOS ⌘-C is
  * served natively by xterm's own `copy`-event listener; elsewhere the native
  * copy gesture *is* Ctrl-C, so we claim the Ctrl-Shift-C chord instead —
- * hence the platform split.
+ * hence the platform split. Paste is the mirror image: ⌘-V is already native on
+ * macOS, while on Windows/Linux we take Ctrl-V away from xterm (it would send
+ * ^V) so the browser's own paste runs — the only paste that carries an image.
+ * See the key handler below.
  */
 const isMac = /Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent);
 
@@ -336,27 +339,36 @@ export function TerminalView({
       errorTimerRef.current = window.setTimeout(() => setPasteStatus(null), ok ? 1500 : 4000);
     };
 
-    // On Windows/Linux we claim Ctrl-Shift-C here and leave Ctrl-C to xterm so
-    // it still forwards \x03 (SIGINT). macOS ⌘-C needs nothing from us: xterm
-    // doesn't cancel the ⌘-C keydown, so the browser fires a native `copy`
-    // event that xterm's own listener serves from the selection — synchronously,
-    // which also covers insecure contexts. (Paste is native too: ⌘-V and
-    // Ctrl-Shift-V keydowns pass through xterm uncancelled, and the browser's
-    // paste event lands on xterm's textarea. Plain Ctrl-V stays ^V to the app.)
+    // Copy: on Windows/Linux we claim Ctrl-Shift-C here and leave Ctrl-C to xterm
+    // so it still forwards \x03 (SIGINT). macOS ⌘-C needs nothing from us: xterm
+    // doesn't cancel the ⌘-C keydown, so the browser fires a native `copy` event
+    // that xterm's own listener serves from the selection — synchronously, which
+    // also covers insecure contexts.
+    //
+    // Paste: only the browser's *native* paste carries an image — the image lives
+    // in the `paste` event's clipboardData, which `onPaste` below uploads. So a
+    // paste gesture is useful to us only if it reaches the browser uncancelled.
+    // macOS ⌘-V does, which is why image paste worked there and nowhere else:
+    //   - plain Ctrl-V: xterm maps it to ^V and preventDefault()s, so Chrome
+    //     skips its paste command and NO paste event ever fires;
+    //   - Ctrl-Shift-V: Chrome's *paste-as-plain-text*, whose clipboardData is
+    //     stripped to text — an image-only clipboard arrives empty.
+    // Windows was therefore left with no way to paste an image at all. So claim
+    // Ctrl-V and hand it straight back to the browser. This spends ^V (readline's
+    // quoted-insert, vim's visual-block) on Windows/Linux, the same trade Windows
+    // Terminal and VS Code's terminal make — vim's own Ctrl-Q is the way back.
     term.attachCustomKeyEventHandler((e) => {
-      if (
-        e.type === "keydown" &&
-        !isMac &&
-        e.ctrlKey &&
-        e.shiftKey &&
-        !e.altKey &&
-        !e.metaKey &&
-        (e.key === "c" || e.key === "C") &&
-        term.hasSelection()
-      ) {
+      if (e.type !== "keydown" || isMac || !e.ctrlKey || e.altKey || e.metaKey) return true;
+      if (e.shiftKey && (e.key === "c" || e.key === "C") && term.hasSelection()) {
         void copySelection();
         e.preventDefault();
         return false; // swallow: don't let xterm forward it as input
+      }
+      if (!e.shiftKey && (e.key === "v" || e.key === "V")) {
+        // Deliberately no preventDefault: xterm must not send ^V, but the
+        // browser MUST still run its paste command — that is what fires the
+        // `paste` event (image → onPaste; text → xterm's own paste listener).
+        return false;
       }
       return true;
     });

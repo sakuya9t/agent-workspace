@@ -184,6 +184,10 @@ pick it up**.
 - **Terminal copy/paste under TUI mouse reporting:** `7e908b7` copy-selection to
   the OS clipboard; `b682d0d` + `1e40c88` keep selection and copy/paste working
   while an app has mouse reporting on.
+- **Clipboard image paste on Windows/Linux:** Ctrl-V now runs the browser's own
+  paste instead of being swallowed as `^V` — until then only macOS (⌘-V) could
+  paste an image at all, since Ctrl-Shift-V is paste-as-plain-text and arrives
+  with the image stripped. See [`image-paste.md`](image-paste.md).
 - **Client polish, uncredited:** `97cfe0d`/`3dad62e` two-level connection dialog
   (Existing/Add × Daemon/Relay); `f7c7640` app icons + blocked-session favicon
   blink and `d291a4e` tab-title blink (`f7c7640` also shipped most of MOB-PWA —

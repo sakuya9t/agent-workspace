@@ -5,6 +5,11 @@ Status: **implemented** (daemon endpoint + web client incl. 📎 button),
 headless-Chrome click-through of the 📎 button against the real bundle (upload +
 placeholder echo), and a CLI probe of the agent side (below).
 
+2026-07-12: clipboard-image paste was **macOS-only** until now — no key on
+Windows/Linux could deliver an image to the page. Fixed by taking Ctrl-V from
+xterm (see *Which key actually pastes*, below), and covered by the personas in
+`scripts/copy-paste-test.mjs` so it can't silently regress again.
+
 ## Goal
 
 Let a user paste (or drag-drop) a screenshot straight into a live session and
@@ -52,6 +57,25 @@ fallback.
   where clipboard-image paste is unreliable). On an `image/*` item paste/drop
   `preventDefault()`s (so xterm never sees binary garbage); a plain-text paste
   falls through to xterm untouched.
+- **Which key actually pastes** — only the browser's **native** paste carries the
+  image (the file item lives in the `paste` event's `clipboardData`), so a paste
+  gesture is useful to us only if it reaches the browser *uncancelled*. That is
+  why image paste originally worked on macOS and **nowhere else** — on Windows /
+  Linux both gestures dead-ended, and the terminal has no ⌘ key to fall back on:
+
+  | gesture | `paste` event | `clipboardData` | why |
+  | --- | --- | --- | --- |
+  | ⌘-V (macOS) | fires | `file:image/png` | xterm doesn't touch ⌘-V |
+  | Ctrl-V (was) | **never fires** | — | xterm maps it to `^V` and `preventDefault()`s, so Chrome skips its paste command |
+  | Ctrl-Shift-V | fires | **empty** | it is Chrome's *paste-as-plain-text*; the image is stripped by the browser |
+
+  So `Terminal.tsx`'s key handler now claims **Ctrl-V on Windows/Linux and hands
+  it straight back to the browser** (returns `false` to xterm, *without* a
+  `preventDefault` — xterm must not send `^V`, but Chrome must still run its
+  paste command). The cost is `^V` (readline quoted-insert, vim visual-block) on
+  those platforms — the same trade Windows Terminal and VS Code's terminal make;
+  vim's own `Ctrl-Q` is the way back. macOS is untouched: ⌘-V still does it, and
+  `^V` still reaches the app there.
 - **Upload then inject (in that order)** — `api.pasteImage` POSTs the raw Blob;
   only after the upload resolves does the client send the placeholder over the
   **existing** WS input frame (`{t:"i", d:"[pasted image <relpath>] "}`). Because
@@ -105,6 +129,15 @@ Two committed proofs, plus a one-off agent check:
    bundle in headless Chrome (button → picker → upload → placeholder echoes into
    the terminal). Its header has the full recipe. General CDP technique: the
    `ui-repro-headless-chrome` note.
+2b. **Browser (clipboard image)** — `scripts/copy-paste-test.mjs` seeds a real
+   PNG onto Chrome's clipboard and presses the actual paste keys: T1 (Linux UA,
+   which is also Windows' key model) Ctrl-V and T2 (Mac UA) ⌘-V both have to
+   upload it. Two harness details make this faithful rather than decorative: the
+   edit command rides on the keydown (`commands: ["paste"]`) exactly as a real
+   browser delivers it, so a `preventDefault` from xterm suppresses the paste
+   just like in the wild; and the image is painted on a canvas, because Chrome
+   sanitizes clipboard images by decoding + re-encoding them (a hand-rolled byte
+   blob like testenv's `TINY_PNG` is rejected by `clipboard.write`).
 3. **Agent ingest** — the load-bearing claim (agent loads a path in the prompt)
    was proven with `claude -p "… /tmp/x.png …"` against a solid-colour PNG.
 

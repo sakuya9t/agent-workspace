@@ -2,13 +2,15 @@
 // real built client in headless Chrome via raw CDP (no puppeteer installed).
 // Companion to attach-button-test.mjs. Three personas, all against a shell
 // session with SGR mouse reporting enabled (i.e. behaving like an agent TUI):
-//   T1  Linux UA, secure origin (daemon-served bundle on 127.0.0.1):
-//       shift+drag select, Ctrl-Shift-C chord (+"Copied" receipt, no SIGINT
-//       leak), native paste, plain Ctrl-V stays ^V, right-click copy+clear
+//   T1  Linux UA, secure origin (daemon-served bundle on 127.0.0.1) — stands in
+//       for Windows too, which shares its key model (no ⌘): shift+drag select,
+//       Ctrl-Shift-C chord (+"Copied" receipt, no SIGINT leak), Ctrl-V pastes
+//       text AND an image (and no longer forwards ^V), Ctrl-Shift-V pastes text,
+//       right-click copy+clear
 //   T2  Mac UA emulation, secure origin: shift+drag AND option+drag select
-//       under mouse reporting, native ⌘-C copy event, ⌘-V paste
+//       under mouse reporting, native ⌘-C copy event, ⌘-V pastes text + image
 //   T3  Linux UA, INSECURE origin (LAN IP via vite --host): execCommand
-//       fallback with focus retention, native paste without clipboard API
+//       fallback with focus retention, Ctrl-V paste without the clipboard API
 //
 //   cd client && npm run build         # once, to produce client/dist
 //   node scripts/copy-paste-test.mjs   # sandboxed: runs T1 + T2
@@ -31,6 +33,9 @@
 // index.html silently runs a stale bundle after rebuilds), and auto-accepting
 // Page.javascriptDialogOpening (an unanswered confirm() — e.g. the session
 // take-over prompt — blocks every same-process Runtime.evaluate forever).
+
+import { existsSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 
 import { createSandbox, sleep } from "./lib/testenv.mjs";
 
@@ -126,6 +131,21 @@ async function main() {
     await reader.S("Page.bringToFront");
     await reader.eval(`navigator.clipboard.writeText(${JSON.stringify(text)})`);
   };
+  // An image on the clipboard, as "Copy image" in a browser leaves one. Painted
+  // on a canvas because Chrome sanitizes clipboard images by decoding and
+  // re-encoding them — a hand-rolled byte blob (testenv's TINY_PNG) is rejected.
+  const clipSeedImage = async () => {
+    await reader.S("Page.bringToFront");
+    await reader.eval(`(async () => {
+      const c = document.createElement('canvas');
+      c.width = c.height = 32;
+      const g = c.getContext('2d');
+      g.fillStyle = 'magenta';
+      g.fillRect(0, 0, 32, 32);
+      const blob = await new Promise((res) => c.toBlob(res, 'image/png'));
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+    })()`);
+  };
 
   // one live shell session, reused by every tab (attach supersedes cleanly)
   const create = await fetch(`http://${daemonBase}/api/sessions`, {
@@ -168,20 +188,37 @@ async function main() {
     const clip1 = await clipRead();
     check("T1 Ctrl-Shift-C copied selection", /MARK1SEC/.test(clip1), clip1);
 
-    // paste: native paste command lands in the pty stream
+    // paste: Ctrl-V is THE paste gesture here (no ⌘ key on Windows/Linux), so it
+    // must reach the browser uncancelled — and must not also send ^V.
     await clipSeed("PASTE1-ZZ9");
     await t.S("Page.bringToFront");
     await focusTerm(t);
-    await key(t, { type: "keyDown", modifiers: 4, key: "v", code: "KeyV", windowsVirtualKeyCode: 86, commands: ["paste"] });
-    await key(t, { type: "keyUp", modifiers: 4, key: "v", code: "KeyV", windowsVirtualKeyCode: 86 });
+    await ctrlV(t);
     await sleep(400);
-    check("T1 native paste reached the session input", await sentHas(t, "PASTE1-ZZ9"));
+    check("T1 Ctrl-V pasted text into the session input", await sentHas(t, "PASTE1-ZZ9"));
+    check("T1 Ctrl-V no longer forwards ^V to the app", !(await sentHas(t, "\\u0016")));
 
-    // plain Ctrl+V stays ^V (0x16) to the app
-    await key(t, { type: "keyDown", modifiers: 2, key: "v", code: "KeyV", windowsVirtualKeyCode: 86 });
-    await key(t, { type: "keyUp", modifiers: 2, key: "v", code: "KeyV", windowsVirtualKeyCode: 86 });
-    await sleep(200);
-    check("T1 plain Ctrl+V forwards ^V to app", await sentHas(t, "\\u0016"));
+    // Ctrl-Shift-V keeps working for text (Chrome's paste-as-plain-text).
+    await clipSeed("PASTE1-SHIFT");
+    await t.S("Page.bringToFront");
+    await focusTerm(t);
+    await ctrlShiftV(t);
+    await sleep(400);
+    check("T1 Ctrl-Shift-V still pastes text", await sentHas(t, "PASTE1-SHIFT"));
+
+    // The regression that shipped: an IMAGE on the clipboard. Only a native
+    // browser paste carries the file item, and on Windows/Linux Ctrl-V is the
+    // only gesture that can produce one — xterm used to eat it (no paste event
+    // at all), and Ctrl-Shift-V is paste-as-plain-text, which strips the image.
+    const before = pastesOnDisk().length;
+    await clipSeedImage();
+    await t.S("Page.bringToFront");
+    await focusTerm(t);
+    await ctrlV(t);
+    await sleep(1000); // upload → inject round-trip
+    check("T1 Ctrl-V uploaded the clipboard image", pastesOnDisk().length === before + 1, pastesOnDisk().join());
+    check("T1 Ctrl-V injected the [pasted image …] path", await sentHas(t, "pasted image .asm/pastes/"));
+    await killLine(t); // drop the injected placeholder before the right-click checks
 
     // right-click: copies, clears selection (so next right-click = browser menu).
     // The mouse travels to the click point first, like a real hand does.
@@ -283,14 +320,23 @@ async function main() {
       clipRC,
     );
 
-    // ⌘-V paste
+    // ⌘-V paste — text, then an image (the macOS path that always worked; it is
+    // the reference behaviour Ctrl-V now matches, so it must not regress)
     await clipSeed("PASTE2-QQ7");
     await t.S("Page.bringToFront");
     await focusTerm(t);
-    await key(t, { type: "keyDown", modifiers: 4, key: "v", code: "KeyV", windowsVirtualKeyCode: 86, commands: ["paste"] });
-    await key(t, { type: "keyUp", modifiers: 4, key: "v", code: "KeyV", windowsVirtualKeyCode: 86 });
+    await cmdV(t);
     await sleep(400);
     check("T2 ⌘-V paste reached the session input", await sentHas(t, "PASTE2-QQ7"));
+
+    const before2 = pastesOnDisk().length;
+    await clipSeedImage();
+    await t.S("Page.bringToFront");
+    await focusTerm(t);
+    await cmdV(t);
+    await sleep(1000);
+    check("T2 ⌘-V uploaded the clipboard image", pastesOnDisk().length === before2 + 1, pastesOnDisk().join());
+    check("T2 ⌘-V injected the [pasted image …] path", await sentHas(t, "pasted image .asm/pastes/"));
     await t.close();
   }
 
@@ -325,10 +371,9 @@ async function main() {
     await clipSeed("PASTE3-KK5");
     await t.S("Page.bringToFront");
     await focusTerm(t);
-    await key(t, { type: "keyDown", modifiers: 4, key: "v", code: "KeyV", windowsVirtualKeyCode: 86, commands: ["paste"] });
-    await key(t, { type: "keyUp", modifiers: 4, key: "v", code: "KeyV", windowsVirtualKeyCode: 86 });
+    await ctrlV(t);
     await sleep(400);
-    check("T3 native paste works on insecure origin", await sentHas(t, "PASTE3-KK5"));
+    check("T3 Ctrl-V paste works on insecure origin", await sentHas(t, "PASTE3-KK5"));
     await t.close();
   }
 
@@ -388,6 +433,34 @@ async function waitFor(tab, expr, ms = 12000) {
 
 async function key(tab, params) {
   await tab.S("Input.dispatchKeyEvent", params);
+}
+
+// The paste gestures, as a real browser delivers them: the edit command rides on
+// the keydown, and Chrome runs it only if nothing preventDefault()s that keydown
+// — which is exactly how xterm used to swallow Ctrl-V. Sending the same
+// `commands` here is what makes these tests faithful rather than decorative.
+// Ctrl-Shift-V is "paste and match style": Chrome hands the page a plain-text-
+// only clipboardData, so an image on the clipboard arrives stripped — the reason
+// it cannot be the image-paste gesture. (modifiers: 2 Ctrl, 4 Meta, 8 Shift)
+const ctrlV = (tab) => pasteKey(tab, 2, ["paste"]);
+const cmdV = (tab) => pasteKey(tab, 4, ["paste"]);
+const ctrlShiftV = (tab) => pasteKey(tab, 10, ["pasteAndMatchStyle"]);
+
+async function pasteKey(tab, modifiers, commands) {
+  await key(tab, { type: "keyDown", modifiers, key: "v", code: "KeyV", windowsVirtualKeyCode: 86, commands });
+  await key(tab, { type: "keyUp", modifiers, key: "v", code: "KeyV", windowsVirtualKeyCode: 86 });
+}
+
+/** ^U — kill whatever a test left on the prompt line (e.g. an injected path). */
+async function killLine(tab) {
+  await key(tab, { type: "keyDown", modifiers: 2, key: "u", code: "KeyU", windowsVirtualKeyCode: 85 });
+  await key(tab, { type: "keyUp", modifiers: 2, key: "u", code: "KeyU", windowsVirtualKeyCode: 85 });
+}
+
+/** Images the client has uploaded into the session's cwd so far. */
+function pastesOnDisk() {
+  const dir = join(cwd, ".asm", "pastes");
+  return existsSync(dir) ? readdirSync(dir) : [];
 }
 
 async function typeText(tab, s) {
