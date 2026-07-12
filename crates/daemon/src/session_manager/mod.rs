@@ -21,7 +21,9 @@ const IDLE_AFTER: Duration = Duration::from_secs(4);
 /// the agent (see [`Interaction::submitted`]).
 const ECHO_WINDOW: Duration = Duration::from_millis(1000);
 
-use crate::backend::{BackendSession, BackendSpawnSpec, BackendStatus, HolderEntry, SessionBackend};
+use crate::backend::{
+    BackendSession, BackendSpawnSpec, BackendStatus, HolderEntry, SessionBackend, StreamEnd,
+};
 use crate::db::Db;
 use crate::domain::{
     AttentionState, Session, SessionStatus, SessionSummary, Workspace, WorkspaceInstance,
@@ -347,52 +349,111 @@ impl SessionManager {
                 return Ok(());
             }
         };
+        self.reconcile_from_holder(holder)
+    }
+
+    /// Re-run reconciliation after the daemon↔asmux connection dropped and came
+    /// back (the supervisor has already re-attached the live sessions). A `list`
+    /// after any reconnect catches exits missed while detached
+    /// (`asmux-protocol.md` → Liveness). A transient `list` failure here is
+    /// *not* treated as "the holder is gone" (unlike startup): the sessions are
+    /// almost certainly fine, so we log and wait for the next reconnect.
+    pub fn reconcile_after_reconnect(self: &Arc<Self>) -> Result<()> {
+        match self.backend.holder_list() {
+            Ok(holder) => self.reconcile_from_holder(holder),
+            Err(e) => {
+                tracing::warn!("post-reconnect holder list failed ({e:#}); skipping reconcile");
+                Ok(())
+            }
+        }
+    }
+
+    /// The shared adopt-or-reconcile decision, run at startup and after every
+    /// reconnect. For each session the DB still has live:
+    ///
+    /// - **alive in the holder, already in `live`** → nothing to do (the
+    ///   supervisor re-attached it on reconnect).
+    /// - **alive in the holder, not in `live`** → adopt (the startup case).
+    /// - **a real exit record** → `exited`/`failed`; if the session was still
+    ///   live in `live` (it exited while we were detached), drive the normal exit
+    ///   path so the monitor writes its summary and clears it.
+    /// - **absent from the holder** → `indeterminate` (no completion record); a
+    ///   still-live one has its stream closed so its monitor stops.
+    fn reconcile_from_holder(self: &Arc<Self>, holder: Vec<HolderEntry>) -> Result<()> {
         let by_id: HashMap<String, HolderEntry> =
             holder.into_iter().map(|h| (h.id.clone(), h)).collect();
 
         let mut adopted = 0usize;
         let mut reconciled = 0usize;
         for id in self.db.live_session_ids()? {
-            let sess = self.db.get_session(&id)?;
-            let (rows, cols) = sess.as_ref().map(|s| (s.rows, s.cols)).unwrap_or((24, 80));
-            let created_at = sess.as_ref().map(|s| s.created_at).unwrap_or_else(now_millis);
-            let plugin = sess
-                .as_ref()
-                .and_then(|s| self.registry.get(&s.agent_plugin_id));
-
+            let in_live = self.live.lock().contains_key(&id);
             match by_id.get(&id) {
-                Some(entry) if entry.alive => match self.backend.adopt(&id, rows, cols) {
-                    Ok(Some(handle)) => {
-                        self.live.lock().insert(id.clone(), handle.clone());
-                        self.db
-                            .update_status(&id, SessionStatus::Running, None, now_millis())?;
-                        self.clone().spawn_monitor(id.clone(), handle, created_at, plugin.clone());
-                        adopted += 1;
-                        tracing::info!(session = %id, "adopted live holder session");
+                Some(entry) if entry.alive => {
+                    if in_live {
+                        continue; // already running; the supervisor re-attached it
                     }
-                    Ok(None) | Err(_) => {
-                        self.reconcile_indeterminate(&id)?;
-                        reconciled += 1;
+                    let sess = self.db.get_session(&id)?;
+                    let (rows, cols) = sess.as_ref().map(|s| (s.rows, s.cols)).unwrap_or((24, 80));
+                    let created_at =
+                        sess.as_ref().map(|s| s.created_at).unwrap_or_else(now_millis);
+                    let plugin = sess
+                        .as_ref()
+                        .and_then(|s| self.registry.get(&s.agent_plugin_id));
+                    match self.backend.adopt(&id, rows, cols) {
+                        Ok(Some(handle)) => {
+                            self.live.lock().insert(id.clone(), handle.clone());
+                            self.db
+                                .update_status(&id, SessionStatus::Running, None, now_millis())?;
+                            self.clone().spawn_monitor(
+                                id.clone(),
+                                handle,
+                                created_at,
+                                plugin.clone(),
+                            );
+                            adopted += 1;
+                            tracing::info!(session = %id, "adopted live holder session");
+                        }
+                        Ok(None) | Err(_) => {
+                            self.reconcile_indeterminate(&id)?;
+                            reconciled += 1;
+                        }
                     }
-                },
+                }
                 Some(entry) => {
                     // The holder has a real completion record.
-                    let (status, code) = if entry.exit_signal != 0 {
-                        (SessionStatus::Failed, None)
+                    if in_live {
+                        // Exited while we were detached: drive the normal exit
+                        // path so the monitor finalizes (summary + `live` removal).
+                        self.backend.end_session_stream(
+                            &id,
+                            StreamEnd::Exited {
+                                code: entry.exit_code,
+                                signal: entry.exit_signal,
+                            },
+                        );
                     } else {
-                        (SessionStatus::Exited, Some(entry.exit_code))
-                    };
-                    self.db.update_status(&id, status, code, now_millis())?;
+                        let (status, code) = if entry.exit_signal != 0 {
+                            (SessionStatus::Failed, None)
+                        } else {
+                            (SessionStatus::Exited, Some(entry.exit_code))
+                        };
+                        self.db.update_status(&id, status, code, now_millis())?;
+                    }
                     reconciled += 1;
                 }
                 None => {
-                    // Absent from the holder: the holder died → outcome unknown.
+                    // Absent from the holder: it died → outcome unknown. Close a
+                    // still-live stream so its monitor stops, then mark the row.
+                    if in_live {
+                        self.backend.end_session_stream(&id, StreamEnd::Vanished);
+                        self.live.lock().remove(&id);
+                    }
                     self.reconcile_indeterminate(&id)?;
                     reconciled += 1;
                 }
             }
         }
-        tracing::info!("startup reconcile: adopted {adopted}, reconciled {reconciled} session(s)");
+        tracing::info!("reconcile: adopted {adopted}, reconciled {reconciled} session(s)");
         Ok(())
     }
 
@@ -694,6 +755,9 @@ mod tests {
         holder_list_fails: bool,
         /// Whether `adopt()` yields a live handle (`Some`) or gives up (`None`).
         adopt_ok: bool,
+        /// Records `end_session_stream` calls as `(id, "exited"|"vanished")` so the
+        /// reconnect-reconcile branches can be asserted without a real holder.
+        end_calls: Arc<Mutex<Vec<(String, String)>>>,
     }
 
     impl SessionBackend for MockBackend {
@@ -719,6 +783,15 @@ mod tests {
             _cols: u16,
         ) -> Result<Option<Arc<dyn BackendSession>>> {
             Ok(self.adopt_ok.then(mock_session))
+        }
+        fn end_session_stream(&self, id: &str, outcome: StreamEnd) {
+            let kind = match outcome {
+                StreamEnd::Exited { .. } => "exited",
+                StreamEnd::Vanished => "vanished",
+            };
+            self.end_calls
+                .lock()
+                .push((id.to_string(), kind.to_string()));
         }
     }
 
@@ -971,6 +1044,96 @@ mod tests {
                 SessionStatus::Indeterminate
             );
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- reconcile-after-reconnect branches ----
+    //
+    // Unlike startup, on a reconnect the live sessions are already in `self.live`
+    // (the supervisor re-attached them). `reconcile_from_holder` must leave the
+    // survivors alone and only finalize the ones a fresh `list` shows gone.
+
+    /// Put a still-live session into `self.live` (as the supervisor's re-attach
+    /// leaves it) and seed a matching running DB row.
+    fn insert_live(manager: &Arc<SessionManager>, id: &str) {
+        insert_running(&manager.db, id);
+        manager.live.lock().insert(id.to_string(), mock_session());
+    }
+
+    #[tokio::test]
+    async fn reconnect_leaves_live_survivor_running() {
+        // Holder still reports it alive AND it's already live → no-op.
+        let end_calls = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            adopt_ok: false, // adopt must NOT be called for an already-live session
+            end_calls: end_calls.clone(),
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_with(backend);
+        insert_live(&manager, "s-live");
+
+        manager
+            .reconcile_from_holder(vec![holder_entry("s-live", true, 0, 0)])
+            .unwrap();
+
+        assert_eq!(
+            manager.get_session("s-live").unwrap().unwrap().status,
+            SessionStatus::Running
+        );
+        assert!(manager.live_handle("s-live").is_some());
+        assert!(end_calls.lock().is_empty(), "survivor is not finalized");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn reconnect_dead_entry_in_live_drives_exit_path() {
+        // Exited while detached: reconcile drives the normal exit path (the
+        // monitor writes the summary), so it must call end_session_stream(Exited).
+        let end_calls = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            end_calls: end_calls.clone(),
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_with(backend);
+        insert_live(&manager, "s-exit");
+
+        manager
+            .reconcile_from_holder(vec![holder_entry("s-exit", false, 7, 0)])
+            .unwrap();
+
+        assert_eq!(
+            *end_calls.lock(),
+            vec![("s-exit".to_string(), "exited".to_string())]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn reconnect_absent_in_live_is_vanished_indeterminate() {
+        // The holder no longer knows it (crash/replace): close the stream and
+        // mark the row indeterminate, removing it from the live map.
+        let end_calls = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            end_calls: end_calls.clone(),
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_with(backend);
+        insert_live(&manager, "s-gone");
+
+        manager.reconcile_from_holder(vec![]).unwrap();
+
+        assert_eq!(
+            *end_calls.lock(),
+            vec![("s-gone".to_string(), "vanished".to_string())]
+        );
+        assert!(manager.live_handle("s-gone").is_none(), "removed from live");
+        assert_eq!(
+            manager.get_session("s-gone").unwrap().unwrap().status,
+            SessionStatus::Indeterminate
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

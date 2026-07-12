@@ -111,19 +111,14 @@ with no copied wiring.
 
 ### RF-M4 — pre-M4 daemon refactor bundle (P1; land immediately before M4)
 
-**Status (2026-07-07): items 1, 3, 4 landed; item 2 folded into M4.** The three
-behavior-free refactors that de-risk M4 are done — the `SessionManager` split
-(#1), the `db`/`registry` encapsulation (#3), and the `MockBackend` holder seams
-+ `startup_reconcile` branch tests that guard the cold-stitch flip (#4). Item 2
-(reconnect-supervisor home + `AsmuxClient` trait) is **deliberately deferred into
-M4**: it is not meaningful zero-behavior-change structure on its own — the
-"home (dial → hello → re-attach → drain)" *is* M4's reconnect machinery and must
-be shaped with the logic it hosts, and the `AsmuxClient` trait exists only to
-unit-test that not-yet-written logic (and, because `create`/`attach`/`list` are
-async, needs `async-trait`/future-boxing best decided with its consumer). The
-seams M4 actually reuses are already pre-placed (`AsmuxClient::detach`,
-`instance_id`, `head_cursor`, `backend_cursor`), so nothing is lost by co-landing
-#2 with M4's reconnect work.
+**Status (2026-07-11): all four items landed.** Items 1, 3, 4 landed 2026-07-07
+(the `SessionManager` split, the `db`/`registry` encapsulation, and the
+`MockBackend` holder seams + `startup_reconcile` branch tests). **Item 2 landed
+with M4 Stage A** (2026-07-11): the reconnect-supervisor home *is* M4's reconnect
+machinery (dial → hello → re-attach → drain + backoff + idle watchdog), so it was
+shaped together with the logic it hosts, and `AsmuxClient` now implements a
+`Holder` trait (`#[async_trait]`) so the reconnect/reconcile paths are
+unit-testable. See durable-sessions.md → M4 Stage A.
 
 M4's features land in the two worst structural spots; restructure first so M4
 is additive.

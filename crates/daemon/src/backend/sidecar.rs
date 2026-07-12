@@ -6,6 +6,9 @@
 //! The `vt100` emulator stays in the daemon (never in asmux): a per-session
 //! **drain task** pulls raw `SessionOutput` off the asmux client, feeds the
 //! emulator, broadcasts to attached clients, and persists to the cold event log.
+//! The drain task lives as long as the *session*, not the connection: a socket
+//! drop is invisible to it (the supervisor re-attaches the route), and a
+//! per-session backpressure eviction is recovered in place by re-attaching.
 //!
 //! Sync trait methods that need an RPC bridge to the async client via
 //! `block_in_place` + the current runtime handle (the daemon runs a multi-thread
@@ -22,34 +25,30 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use asmux::wire;
 
-use super::asmux_client::{AsmuxClient, AttachError, StreamEvent};
+use super::asmux_client::{AttachError, Holder, StreamEvent};
 use super::{
     BackendSession, BackendSpawnSpec, BackendStatus, HistoryRing, HolderEntry, SessionBackend,
-    Snapshot, HISTORY_RING_BYTES,
+    Snapshot, StreamEnd, HISTORY_RING_BYTES,
 };
 use crate::db::{Db, EventMsg, EventSink};
 use crate::util::now_millis;
 
 const BROADCAST_CAP: usize = 2048;
 const SCROLLBACK: usize = 2000;
+/// `DetachReason::Backpressure` — the only detach reason we recover from in
+/// place (resync via `attach FromCursor`); the rest are terminal.
+const DETACH_BACKPRESSURE: i8 = 2;
 
 /// A backend whose sessions are held by an out-of-process `asmux`.
 pub struct SidecarBackend {
-    client: Arc<AsmuxClient>,
+    client: Arc<dyn Holder>,
     events: EventSink,
     db: Db,
 }
 
 impl SidecarBackend {
-    pub fn new(client: Arc<AsmuxClient>, events: EventSink, db: Db) -> Self {
+    pub fn new(client: Arc<dyn Holder>, events: EventSink, db: Db) -> Self {
         Self { client, events, db }
-    }
-
-    /// The holder instance identity (proves "same holder I adopted before").
-    /// Reserved for M4 soft-reboot / holder-drift detection.
-    #[allow(dead_code)]
-    pub fn instance_id(&self) -> &str {
-        &self.client.instance_id
     }
 }
 
@@ -147,12 +146,23 @@ impl SessionBackend for SidecarBackend {
         })?;
         Ok(session.map(|s| s as Arc<dyn BackendSession>))
     }
+
+    fn end_session_stream(&self, id: &str, outcome: StreamEnd) {
+        match outcome {
+            // Drive the normal exit path through the drain (the monitor writes
+            // the summary and removes it from `live`).
+            StreamEnd::Exited { code, signal } => self.client.inject_exit(id, code, signal),
+            // No completion record: close the drain so its monitor stops; the
+            // manager then marks the row `indeterminate`.
+            StreamEnd::Vanished => self.client.unroute(id),
+        }
+    }
 }
 
 /// One holder-backed session; the daemon-side view (emulator + broadcast).
 struct SidecarSession {
     session_id: String,
-    client: Arc<AsmuxClient>,
+    client: Arc<dyn Holder>,
     parser: Arc<Mutex<vt100::Parser>>,
     history: Arc<Mutex<HistoryRing>>,
     tx: broadcast::Sender<Arc<[u8]>>,
@@ -166,7 +176,7 @@ impl SidecarSession {
         session_id: String,
         cols: u16,
         rows: u16,
-        client: Arc<AsmuxClient>,
+        client: Arc<dyn Holder>,
         events: EventSink,
         db: Db,
         rx: mpsc::UnboundedReceiver<StreamEvent>,
@@ -181,7 +191,7 @@ impl SidecarSession {
 
         let session = Arc::new(SidecarSession {
             session_id: session_id.clone(),
-            client,
+            client: client.clone(),
             parser: parser.clone(),
             history: history.clone(),
             tx: tx.clone(),
@@ -189,13 +199,22 @@ impl SidecarSession {
             seq: seq.clone(),
         });
 
-        tokio::spawn(drain_loop(
-            session_id, parser, history, tx, events, db, seq, status_tx, rx, persist_from,
-        ));
+        tokio::spawn(drain_loop(DrainCtx {
+            session_id,
+            client,
+            parser,
+            history,
+            tx,
+            events,
+            db,
+            seq,
+            status_tx,
+            rx,
+            persist_from,
+        }));
 
         session
     }
-
 }
 
 impl BackendSession for SidecarSession {
@@ -237,10 +256,10 @@ impl BackendSession for SidecarSession {
     }
 }
 
-/// Pull raw output off the asmux client; feed the emulator, broadcast, persist.
-#[allow(clippy::too_many_arguments)]
-async fn drain_loop(
+/// Inputs to the per-session drain task, grouped to keep the spawn call legible.
+struct DrainCtx {
     session_id: String,
+    client: Arc<dyn Holder>,
     parser: Arc<Mutex<vt100::Parser>>,
     history: Arc<Mutex<HistoryRing>>,
     tx: broadcast::Sender<Arc<[u8]>>,
@@ -248,15 +267,35 @@ async fn drain_loop(
     db: Db,
     seq: Arc<AtomicU64>,
     status_tx: watch::Sender<BackendStatus>,
-    mut rx: mpsc::UnboundedReceiver<StreamEvent>,
+    rx: mpsc::UnboundedReceiver<StreamEvent>,
     persist_from: u64,
-) {
+}
+
+/// Pull raw output off the asmux client; feed the emulator, broadcast, persist.
+/// Lives for the session's lifetime: it ends only on a real exit, a terminal
+/// detach (superseded/shutdown/purged), or the route closing (`unroute`).
+async fn drain_loop(ctx: DrainCtx) {
+    let DrainCtx {
+        session_id,
+        client,
+        parser,
+        history,
+        tx,
+        events,
+        db,
+        seq,
+        status_tx,
+        mut rx,
+        persist_from,
+    } = ctx;
     let mut parser_ok = true;
+    let mut last_cursor = persist_from;
     let mut last_cursor_write = 0i64;
 
     while let Some(ev) = rx.recv().await {
         match ev {
             StreamEvent::Output { data, cursor } => {
+                last_cursor = cursor;
                 // Feed the emulator (isolate a parser panic to this session).
                 {
                     let mut p = parser.lock();
@@ -306,8 +345,29 @@ async fn drain_loop(
                 break;
             }
             StreamEvent::Detached { reason } => {
-                // Superseded / backpressure / server-shutdown. Robust re-attach
-                // with backoff is M4; for now stop draining this stream.
+                if reason == DETACH_BACKPRESSURE {
+                    // This session's stream fell behind and was evicted. Resync
+                    // in place from the last cursor we saw; a socket drop during
+                    // this is fine — the supervisor re-attaches on reconnect.
+                    tracing::warn!(session = %session_id, "asmux backpressure eviction; resyncing");
+                    match client
+                        .attach(&session_id, wire::AttachMode::FromCursor, last_cursor)
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(AttachError::Gap { earliest }) => {
+                            tracing::warn!(session = %session_id, earliest, "backpressure resync gap; FromEarliest");
+                            let _ = client
+                                .attach(&session_id, wire::AttachMode::FromEarliest, 0)
+                                .await;
+                        }
+                        // A connection error here is recovered by the supervisor's
+                        // reconnect + reattach; keep draining the same route.
+                        Err(_) => {}
+                    }
+                    continue;
+                }
+                // Superseded / server shutdown / purged: nothing to resync.
                 tracing::warn!(session = %session_id, reason, "asmux detached this session's stream");
                 break;
             }

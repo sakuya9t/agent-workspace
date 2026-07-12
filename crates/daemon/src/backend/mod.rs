@@ -69,6 +69,18 @@ pub struct HolderEntry {
     pub exit_signal: i32,
 }
 
+/// How to end a live session's daemon-side stream during reconnect
+/// reconciliation, when a fresh `list` shows the holder no longer running it.
+pub enum StreamEnd {
+    /// The holder has a real exit record: drive the normal exit path so the
+    /// monitor finalizes (`exited`/`failed` + summary).
+    Exited { code: i32, signal: i32 },
+    /// The holder no longer knows the session (crash / reboot / replaced), so no
+    /// completion record exists: close the stream; the manager marks the row
+    /// `indeterminate`.
+    Vanished,
+}
+
 /// Everything a backend needs to spawn one live session.
 #[derive(Debug, Clone)]
 pub struct BackendSpawnSpec {
@@ -223,7 +235,7 @@ fn is_osc_color_query(body: &[u8]) -> bool {
         return false;
     }
     COLOR_CODES.contains(&&body[..digits])
-        && body.split(|&c| c == b';').last() == Some(b"?".as_slice())
+        && body.split(|&c| c == b';').next_back() == Some(b"?".as_slice())
 }
 
 /// Strip the terminal *query* sequences from replayed scrollback so a freshly
@@ -429,6 +441,11 @@ pub trait SessionBackend: Send + Sync {
     fn adopt(&self, _session_id: &str, _rows: u16, _cols: u16) -> Result<Option<Arc<dyn BackendSession>>> {
         Ok(None)
     }
+
+    /// End a live session's daemon-side stream after a reconnect `list` reveals
+    /// the holder is no longer running it (an exit missed while detached, or the
+    /// holder was lost). No-op for backends that don't outlive the daemon.
+    fn end_session_stream(&self, _id: &str, _outcome: StreamEnd) {}
 }
 
 /// A single live session owned by a backend.

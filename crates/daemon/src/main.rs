@@ -20,7 +20,7 @@ use anyhow::{bail, Context, Result};
 use asm_relay::agent::ResolvedDownstream;
 
 use api::AppState;
-use backend::asmux_client::AsmuxClient;
+use backend::asmux_client::{AsmuxClient, ReconnectEvent};
 use backend::native::NativePtyBackend;
 use backend::sidecar::SidecarBackend;
 use backend::SessionBackend;
@@ -81,6 +81,9 @@ async fn main() -> Result<()> {
 
     // Select the session backend. The out-of-process holder (asmux) is what makes
     // sessions survive a daemon restart; the native in-process backend does not.
+    // For the holder backend, the client's reconnect stream drives a `list`
+    // reconcile after every reconnect (catches exits missed while detached).
+    let mut reconnect_rx: Option<tokio::sync::broadcast::Receiver<ReconnectEvent>> = None;
     let backend: Arc<dyn SessionBackend> = match config.backend {
         BackendKind::Native => {
             tracing::info!("session backend: native (in-process PTYs; do not survive restart)");
@@ -97,6 +100,9 @@ async fn main() -> Result<()> {
                 holder_pid = client.server_pid,
                 "session backend: asmux holder (sessions survive daemon restart)"
             );
+            // Subscribe before the reconcile consumer spawns so a reconnect
+            // during startup is buffered, not lost.
+            reconnect_rx = Some(client.reconnect_events());
             Arc::new(SidecarBackend::new(client, db.events(), db.clone()))
         }
     };
@@ -107,6 +113,25 @@ async fn main() -> Result<()> {
     // holder, or mark them failed/indeterminate. (Native marks them `failed`.)
     if let Err(e) = manager.startup_reconcile().await {
         tracing::error!("startup reconcile failed: {e:#}");
+    }
+
+    // Re-reconcile after each daemon↔asmux reconnect (the supervisor has already
+    // re-attached the live sessions; this catches exits missed while detached).
+    if let Some(mut rx) = reconnect_rx {
+        let mgr = manager.clone();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ReconnectEvent::Connected) => {
+                        if let Err(e) = mgr.reconcile_after_reconnect() {
+                            tracing::warn!("post-reconnect reconcile failed: {e:#}");
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
     }
 
     let state = AppState {

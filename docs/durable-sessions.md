@@ -1,11 +1,17 @@
 # Durable Sessions via an Out-of-Process Session Holder ("asmux")
 
-Status: **M1–M3 landed; M4–M5 pending.** The standalone holder (`crates/asmux` +
-`crates/asmux-wire`), the daemon-side `SidecarBackend` over an async client, and
-adopt-on-restart are all implemented and tested — sessions survive a daemon
-restart end-to-end (`scripts/durable-restart-test.mjs`). Remaining: M4 hardening
-(watchdog/reconnect, soft-reboot, exact cold-stitch adopt) and M5 Windows.
-Adapts the "acmux" design (from the agent-conductor project) to this codebase.
+Status: **M1–M3 landed; M4 Stage A landed (reconnect supervisor); M4 Stage
+B/C + M5 pending.** The standalone holder (`crates/asmux` + `crates/asmux-wire`),
+the daemon-side `SidecarBackend` over an async client, and adopt-on-restart are
+all implemented and tested — sessions survive a daemon restart end-to-end
+(`scripts/durable-restart-test.mjs`). **M4 Stage A** added the daemon↔asmux
+reconnect supervisor (dial → hello → re-attach → drain, exponential backoff), a
+10 s idle watchdog + heartbeat, in-place backpressure resync, a `list`-reconcile
+after every reconnect, and the `Holder` trait that makes all of it testable (see
+[M4](#incremental-milestones)). Remaining: M4 **Stage B** (exact cold-stitch
+adopt), **Stage C** (soft-reboot, `purge`, metadata RPCs, `readBuffer`, orphan
+UI), and M5 Windows. Adapts the "acmux" design (from the agent-conductor project)
+to this codebase.
 
 Locked decisions: sidecar crate/binary named **`asmux`**; wire encoding is
 **FlatBuffers** (schema frozen once shipped); **one holder for all sessions**
@@ -307,9 +313,26 @@ sessions instead of dropping them — see [`deployment.md`](deployment.md).
   when the ring wrapped past `consumed` — is scaffolded (`backend_cursor` is
   persisted; `get_backend_cursor` + `HolderEntry.head_cursor` are ready) but not
   yet the default.
-- **M4 — hardening.** Soft-reboot (hash drift + confirm), orphan surfacing/adopt,
-  `purge`, metadata RPCs, `readLog`, heartbeat/watchdog reconnect with backoff,
-  slow-attacher drop + resync, `list`-after-reconnect reconciliation.
+- **M4 — hardening.**
+  - **Stage A — _Done._** The daemon↔asmux connection now has a single owner: a
+    **supervisor task** in `AsmuxClient` (dial → `hello` → re-attach every routed
+    session `FromCursor(last_cursor)` → drain the command channel) that reconnects
+    with exponential backoff (100 ms→5 s) on any drop, plus a **10 s idle
+    watchdog** (asmux's 1 Hz heartbeat keeps it fed; ten seconds of silence tears
+    the wedged socket down) and an outbound heartbeat. The public handle
+    (`cmd_tx`, `routes`, `pending`) is stable across reconnects, so drain tasks
+    keep their route and resume seamlessly. `sidecar.rs`'s `Detached` arm now
+    **resyncs in place** on a backpressure eviction (`attach FromCursor`) instead
+    of ending the stream. A `list`-reconcile runs after **every** reconnect
+    (`SessionManager::reconcile_after_reconnect` → the shared
+    `reconcile_from_holder`), catching exits missed while detached. `AsmuxClient`
+    now implements a `Holder` trait so the reconnect/reconcile paths are
+    unit-testable; a `MockHolder`-free unit suite covers the reconcile branches
+    and an in-process-asmux test covers a real forced-drop → reconnect → resume.
+    (This absorbed RF-M4 #2 — the reconnect-supervisor home + `Holder` trait.)
+  - **Stage B/C — pending.** Stage B: exact cold-stitch adopt. Stage C:
+    soft-reboot (hash drift + confirm), orphan surfacing/adopt, `purge`, metadata
+    RPCs, `readLog`, and the periodic `(snapshot, cursor)` store.
 - **M5 — Windows.** ConPTY + AF_UNIX/named-pipe transport + ACL socket perms.
 
 ## Decisions
