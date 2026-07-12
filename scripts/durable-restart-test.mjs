@@ -44,8 +44,19 @@ const procs = [];
 
 function startProc(name, bin, env) {
   const log = openSync(join(tmp, `${name}.log`), "a");
+  // Hermetic env: strip any inherited ASM_/ASMUX_ config so the test's own
+  // settings win. This dev host exports ASMUX_SOCK / ASM_RUNTIME_DIR globally,
+  // and both asmux and the daemon resolve ASMUX_SOCK *first* — inherited, they
+  // redirect the holder socket to a shared path, which breaks the private-socket
+  // checks below AND risks colliding with a real running asmux. Passing the
+  // socket path explicitly (ASMUX_SOCK) makes each run fully self-contained.
+  const cleanEnv = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([k]) => !k.startsWith("ASM_") && !k.startsWith("ASMUX_"),
+    ),
+  );
   const child = spawn(bin, [], {
-    env: { ...process.env, ...env },
+    env: { ...cleanEnv, ...env },
     stdio: ["ignore", log, log],
     detached: name === "asmux", // holder gets its own group; it must outlive the daemon
   });
@@ -92,6 +103,7 @@ function daemonEnv() {
     ASM_BIND: BASE,
     ASM_DATA_DIR: dataDir,
     ASM_RUNTIME_DIR: runDir,
+    ASMUX_SOCK: sock, // explicit: don't depend on runtime-dir resolution
     ASM_BACKEND: "sidecar",
     ASM_ASMUX_AUTOSPAWN: "0", // we manage the holder ourselves for determinism
     ASM_LOG: "info,asm_daemon=debug",
@@ -140,7 +152,7 @@ async function main() {
   }
 
   // 1. the holder
-  startProc("asmux", ASMUX, { ASM_RUNTIME_DIR: runDir, ASM_LOG: "info" });
+  startProc("asmux", ASMUX, { ASM_RUNTIME_DIR: runDir, ASMUX_SOCK: sock, ASM_LOG: "info" });
   for (let i = 0; i < 40 && !existsSync(sock); i++) await sleep(100);
   check("holder (asmux) socket up", existsSync(sock), sock);
 
