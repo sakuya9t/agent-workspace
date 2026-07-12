@@ -416,7 +416,7 @@ export function RightPanel({ target, session }: Props) {
                     title={t("rightPanel.pushTitle")}
                     aria-label={t("rightPanel.pushTitle")}
                   >
-                    ⬆️
+                    <span className="action-icon action-icon-git-push" aria-hidden="true" />
                   </button>
                   <button
                     className={"icon-btn" + (rebaseOpen ? " active" : "")}
@@ -559,7 +559,13 @@ export function RightPanel({ target, session }: Props) {
               />
             )}
             {push.error && (
-              <ScmOpNotice className="error" text={String(push.error)} onDismiss={push.reset} />
+              <ScmOpNotice
+                status="error"
+                title={t("rightPanel.pushFailed")}
+                summary={scmErrorSummary(push.error)}
+                details={scmErrorDetails(push.error)}
+                onDismiss={push.reset}
+              />
             )}
             {rebase.error && (
               <ScmOpNotice
@@ -602,8 +608,19 @@ export function RightPanel({ target, session }: Props) {
             )}
             {push.data && (
               <ScmOpNotice
-                className="scm-op-result mono small dim"
-                text={push.data}
+                status="success"
+                title={t("rightPanel.pushComplete")}
+                summary={
+                  push.data.toLowerCase().includes("up-to-date") ||
+                  push.data.toLowerCase().includes("up to date")
+                    ? t("rightPanel.pushUpToDate", {
+                        branch: scm.branch ?? t("rightPanel.currentBranch"),
+                      })
+                    : t("rightPanel.pushSuccess", {
+                        branch: scm.branch ?? t("rightPanel.currentBranch"),
+                      })
+                }
+                details={push.data}
                 onDismiss={push.reset}
               />
             )}
