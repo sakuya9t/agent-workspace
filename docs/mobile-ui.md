@@ -104,11 +104,36 @@ Terminal screen.
   | `^C` | `\x03` | dedicated because it's the most common chord |
   | `↑ ↓ ← →` | `\x1b[A/B/C/D` | history, TUI menus |
   | `⌨` | focus xterm textarea | summon/dismiss keyboard (iOS needs a gesture) |
-  | `Paste` | `clipboard.readText()` → input | long-press paste is flaky in xterm; needs secure context, which the relay path has |
+  | `Paste` | `clipboard.readText()` → input, else the paste sheet | long-press paste is flaky in xterm; the read needs a secure context, which a phone does **not** have (below) |
 
   `TerminalView` grows an optional `onReady(handle)` prop exposing
   `write(data)`/`focus()` so the key bar can inject input through the same
   WS send path as typed keys.
+
+- **Paste without a clipboard read** (fixed 2026-07-12,
+  `scripts/mobile-paste-test.mjs`). `navigator.clipboard.readText()` exists only
+  in a **secure context**, and the daemon and the relay both serve plain HTTP
+  (relay TLS is still open — see `docs/security-followups.md`). So on a phone
+  there was no clipboard to read and `Paste` did nothing at all, in silence.
+
+  Two things kept this hidden. A dev machine reaches the client on **localhost,
+  which _is_ a secure context** — so the identical code works in Chrome's device
+  emulation and fails on the device. And `Copy` went on working next to it,
+  because copying falls back to `execCommand("copy")`; only *reading* has no
+  fallback (`document.execCommand("paste")` is denied to web content in every
+  browser).
+
+  The fix is the one clipboard path that needs neither a secure context nor a
+  permission: a **`paste` event** carries its own `clipboardData`, since the OS
+  hands the text over precisely because the user chose to paste. So when
+  `canReadClipboard()` is false, `Paste` opens `PasteSheet` — a focused textarea
+  to paste *into* — and forwards what lands there to the pty. The gesture stays
+  the platform's own (iOS: long-press → Paste). The check must be **synchronous**
+  inside the click handler: `await` first and the user gesture is spent, and iOS
+  will not raise the keyboard for the sheet.
+
+  When the relay does get TLS, the read path lights up on its own and the sheet
+  becomes the fallback it was written to be.
 
 - **Touch gestures** (added 2026-07-12, `scripts/touch-select-test.mjs`):
 
@@ -140,6 +165,35 @@ Terminal screen.
      xterm recycles rather than replaces) scrolled normally. `setPointerCapture`
      pins the gesture to the container, so what becomes of the element under the
      finger stops mattering.
+
+  **Capture is best-effort, and the selection never depends on it.** It is only
+  defined for an *active* pointer, and the long-press timer fires outside any
+  pointer event handler — Blink allows a capture from there, other engines need
+  not, and an exception used to escape `beginSelect()` **before** it selected
+  anything. So the word is selected first, the capture is attempted in a
+  `try`/`catch`, and the next `pointermove` retries it from a handler no engine
+  objects to.
+
+  **Debugging this on a real phone.** `scripts/touch-select-test.mjs` drives
+  headless Chrome, and Chrome's device-emulation mode is not a phone: it
+  synthesizes pointer events from a mouse and runs none of a real device's
+  gesture recognizers, so it will pass a gesture that iOS kills. An iPhone is
+  also the one browser we cannot instrument from Linux (Safari's Web Inspector
+  needs a Mac). So load the client with **`?gesturelog=1`** (`gestureLog.ts`) and
+  the raw event stream plus the gesture layer's own decisions paint onto an
+  overlay you can read — and copy — on the device:
+
+  ```
+     0 pointerdown touch#2 37,99 span conn=1     ← do pointer events arrive at all?
+   452 ▸select 0,2 "SELECTME"                    ← did the long press land (450 ms)?
+   716 ▸up gesture=select
+  ```
+
+  What to look for: a `pointercancel` **before** 450 ms is the engine claiming
+  the touch for a gesture of its own; `conn=0` is the renderer detaching the
+  target out from under the finger; `▸capture-failed` names a refused
+  `setPointerCapture`; no overlay at all means the phone is running a stale
+  bundle.
 
 - **Soft-keyboard geometry:** viewport meta gains
   `interactive-widget=resizes-content` (Android); an `useVisualViewportHeight`
