@@ -109,8 +109,10 @@ pub async fn serve_watched(
                 if !crate::socket::was_displaced(&sock_path, bound_ino) {
                     continue;
                 }
-                // Our path no longer routes to us. Who has it now?
-                match crate::socket::probe(&sock_path).await {
+                // Our path no longer routes to us. Who has it now? Confirmed probe:
+                // we fork PTY children constantly, so a raw probe can see a fork-
+                // window phantom `Live` and misread a reclaimable path as stolen.
+                match crate::socket::probe_confirmed(&sock_path).await {
                     crate::socket::SocketState::Live => {
                         // Another holder owns it. Stealing it back is exactly the
                         // move that caused the incident, so we do not. We are an

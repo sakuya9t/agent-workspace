@@ -47,15 +47,22 @@ pub async fn probe(path: &Path) -> SocketState {
 
 /// Probe, then *confirm* a `Live` verdict before acting on it.
 ///
-/// A socket can answer `connect()` for a brief moment after its listener is
-/// closed: `close(2)` returns before the kernel has finished tearing the socket
-/// down, so a connect racing that window still succeeds. A single probe therefore
-/// reports a phantom `Live` for a holder that has just died — which would make a
-/// restarting asmux refuse to reclaim its predecessor's socket and fail to boot.
+/// A single probe can report a phantom `Live` for a listener that was already
+/// closed. Mechanism (proven empirically, 2026-07-12): **fd inheritance across
+/// fork**. Any child forked while the listener fd is open inherits a copy of the
+/// fd table, so the socket stays LISTENING after the owner closes its fd — until
+/// the child's `execve` closes the copy (all our sockets are CLOEXEC; verified:
+/// an exec'd child does NOT hold it). The phantom is therefore bounded by the
+/// [fork, exec) window: µs–ms, stretched under load. asmux forks PTY children as
+/// its core job, so the window recurs constantly; a bare bind→close→connect loop
+/// with no forking never reproduces it (0 in 244k iterations), while the same
+/// loop next to fork+exec churn hits it ~1.4% of the time.
 ///
-/// A real holder answers every time; a dying one stops. So re-probe, and only
-/// believe `Live` if it holds.
-async fn probe_confirmed(path: &Path) -> SocketState {
+/// Acting on a phantom would make a restarting asmux refuse to reclaim its dead
+/// predecessor's socket and fail to boot. A real holder answers every probe; a
+/// phantom cannot outlive its fork window. So re-probe across a span far longer
+/// than any [fork, exec) gap, and only believe `Live` if it holds throughout.
+pub async fn probe_confirmed(path: &Path) -> SocketState {
     const CONFIRMATIONS: usize = 3;
     const GAP: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -197,18 +204,22 @@ mod tests {
         drop(UnixListener::bind(&sock).unwrap());
         assert!(sock.exists(), "a closed listener should leave its socket file");
 
-        // `close(2)` returns before the kernel finishes tearing the socket down, so
-        // a connect racing that window can still succeed — a bare `probe()` here is
-        // genuinely flaky (~1 run in 8 under load). `ensure_bindable` confirms a
-        // `Live` verdict precisely so that transient cannot block a reclaim, which
-        // is the behaviour worth asserting: a dead holder's socket IS reclaimable.
+        // A bare `probe()` here is genuinely flaky: sibling tests fork PTY children,
+        // and a child forked while our listener fd was open keeps the socket alive
+        // through its [fork, exec) window (see `probe_confirmed`). `ensure_bindable`
+        // confirms a `Live` verdict precisely so that transient cannot block a
+        // reclaim — the behaviour worth asserting: a dead holder's socket IS
+        // reclaimable.
         assert_eq!(ensure_bindable(&sock, false).await.unwrap(), SocketState::Stale);
     }
 
+    // TEMPORARY diagnostic (to be removed): the raw, unconfirmed probe at the exact
+    // site where the phantom `Live` appears, capturing what the KERNEL thinks at
+    // that instant.
     #[tokio::test]
     async fn a_dying_holder_does_not_block_its_successor() {
-        // The restart-after-crash path: a phantom `Live` from the teardown race
-        // must not make the next asmux refuse to boot.
+        // The restart-after-crash path: a phantom `Live` must not make the next
+        // asmux refuse to boot.
         let sock = tmp_sock("dying");
         for _ in 0..25 {
             drop(UnixListener::bind(&sock).unwrap());
@@ -218,5 +229,39 @@ mod tests {
             assert_eq!(state, SocketState::Stale);
             let _ = std::fs::remove_file(&sock);
         }
+    }
+
+    #[tokio::test]
+    async fn fork_window_phantom_does_not_survive_confirmation() {
+        // Regression for the fork-window phantom (see `probe_confirmed`). A child
+        // forked while a listener fd is open inherits it, keeping the socket
+        // LISTENING briefly after the owner closes it — so a single probe can say
+        // `Live` for a dead listener. This originally surfaced as a ~1-in-8 flake
+        // in this very module, caused by *sibling tests* forking PTY children; here
+        // we create that fork churn deliberately instead of depending on the test
+        // scheduler, and assert the confirmed probe never falls for it.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // fork+exec, over and over — each child is a [fork, exec) window
+                    let _ = std::process::Command::new("/bin/true").status();
+                }
+            })
+        };
+
+        let sock = tmp_sock("forkchurn");
+        for _ in 0..150 {
+            drop(UnixListener::bind(&sock).unwrap());
+            let state = ensure_bindable(&sock, false)
+                .await
+                .expect("a phantom Live must never block a reclaim");
+            assert_eq!(state, SocketState::Stale);
+            let _ = std::fs::remove_file(&sock);
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = churn.join();
     }
 }

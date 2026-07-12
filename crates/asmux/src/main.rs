@@ -31,9 +31,11 @@ async fn main() -> Result<()> {
     // `probe` is a read-only diagnostic for the service scripts: exit 0 iff a live
     // holder answers on this path. It lets them distinguish "alive" from "the pid
     // is alive but the socket is gone" — the orphan state that wedged the daemon
-    // on 2026-07-12, which a pid check cannot see.
+    // on 2026-07-12, which a pid check cannot see. Confirmed, not raw: scripts act
+    // on this verdict (start.sh skips starting the holder on `Live`), so a fork-
+    // window phantom here would wedge a boot. See `socket::probe_confirmed`.
     if std::env::args().nth(1).as_deref() == Some("probe") {
-        let state = asmux::socket::probe(&sock_path).await;
+        let state = asmux::socket::probe_confirmed(&sock_path).await;
         println!("{state:?}");
         std::process::exit(if state == asmux::socket::SocketState::Live { 0 } else { 1 });
     }
