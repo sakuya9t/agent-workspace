@@ -1411,6 +1411,16 @@ body.col-resizing iframe {
   padding: 0 4px;
   vertical-align: 1px;
 }
+.base-pill {
+  margin-left: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--dim);
+  border: 1px dashed var(--dim);
+  border-radius: 4px;
+  padding: 0 4px;
+  vertical-align: 1px;
+}
 .commit-meta {
   font-size: 11px;
   margin-top: 1px;

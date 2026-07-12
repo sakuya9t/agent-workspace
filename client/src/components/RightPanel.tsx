@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
-import { api, ChangedFile, Commit, Session } from "../api";
+import { api, BaseCommit, ChangedFile, Commit, Session } from "../api";
 import { Target } from "../connectionStore";
 import { buildVscodeLaunch, launchVscode, vscodeReachable, VscodeLaunch } from "../vscode";
 import { relTime } from "../i18n/time";
@@ -776,7 +776,12 @@ export function RightPanel({ target, session }: Props) {
             )}
 
             {commits && commits.length > 0 ? (
-              <CommitGraph commits={commits} head={scm.head} onSelect={setCommitTarget} />
+              <CommitGraph
+                commits={commits}
+                head={scm.head}
+                base={scm.base}
+                onSelect={setCommitTarget}
+              />
             ) : (
               <div className="dim small">
                 {commits ? t("rightPanel.noCommits") : t("rightPanel.loadingHistory")}
@@ -812,15 +817,17 @@ export function RightPanel({ target, session }: Props) {
  * Simplified single-lane commit graph for the MVP (per the architecture doc's
  * "closest history model"): a vertical rail with one dot per commit, newest at
  * the top. Merge commits (>1 parent) get a hollow dot; the HEAD commit is
- * highlighted.
+ * highlighted and the branch's base commit is tagged.
  */
 function CommitGraph({
   commits,
   head,
+  base,
   onSelect,
 }: {
   commits: Commit[];
   head: string | null;
+  base: BaseCommit | null;
   onSelect: (hash: string) => void;
 }) {
   const { t } = useTranslation();
@@ -829,6 +836,7 @@ function CommitGraph({
       {commits.map((c, i) => {
         const merge = c.parents.length > 1;
         const isHead = !!head && c.short === head;
+        const isBase = !!base && c.hash === base.hash;
         return (
           <div
             className="commit-row"
@@ -849,6 +857,7 @@ function CommitGraph({
               <div className="commit-subject">
                 {c.subject || t("rightPanel.noMessage")}
                 {isHead && <span className="head-pill">HEAD</span>}
+                {isBase && <span className="base-pill">{t("rightPanel.baseTag")}</span>}
               </div>
               <div className="commit-meta">
                 <span className="mono">{c.short}</span>
