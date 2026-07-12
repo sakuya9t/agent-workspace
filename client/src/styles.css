@@ -1235,6 +1235,66 @@ body.col-resizing iframe {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* where the branch sits: each remote's tip for it, and the commit it is based on */
+.scm-refs {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 2px 0 8px;
+}
+.scm-ref {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+}
+.ref-tag {
+  flex: none;
+  max-width: 90px;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--panel-2);
+  color: var(--dim);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ref-tag.upstream {
+  border-color: var(--accent-2);
+  color: var(--accent);
+}
+.ref-tag.base {
+  border-style: dashed;
+}
+.ref-hash {
+  flex: none;
+  font-size: 11px;
+}
+.ref-note {
+  min-width: 0;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ref-counts {
+  display: flex;
+  flex: none;
+  gap: 5px;
+  margin-left: auto;
+  padding-left: 4px;
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+}
+.ref-count.ahead {
+  color: #9ece6a;
+}
+.ref-count.behind {
+  color: #e0af68;
+}
 .changed-file {
   display: flex;
   align-items: center;

@@ -24,6 +24,50 @@ pub struct ChangedFile {
     pub orig_path: Option<String>,
 }
 
+/// One remote's tip for the current branch, read from the remote-tracking ref —
+/// i.e. as of the last fetch, never the network. A remote that doesn't have the
+/// branch produces no entry at all: it has no commit to report.
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoteBranch {
+    /// Remote name (`origin`, `upstream`, …) — the tag the panel shows.
+    pub remote: String,
+    /// The branch's name *on that remote*. Usually the local name, but an
+    /// upstream may be configured to a differently-named branch.
+    pub branch: String,
+    pub head: String,
+    /// Commits the local branch has that this remote doesn't, and vice versa.
+    pub ahead: u32,
+    pub behind: u32,
+    /// Whether this remote holds the branch's configured upstream.
+    pub upstream: bool,
+}
+
+/// How a branch came to sit where it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BaseKind {
+    /// The branch was created at this commit.
+    Spawned,
+    /// The branch was most recently rebased onto this commit.
+    Rebased,
+}
+
+/// The commit the current branch is built on top of: where it was spawned, or —
+/// once it has been rebased — where it was replayed onto.
+#[derive(Debug, Clone, Serialize)]
+pub struct BaseCommit {
+    pub hash: String,
+    pub short: String,
+    pub subject: String,
+    pub kind: BaseKind,
+    /// Refs that still point at the base, e.g. `master`, `origin/master`. Empty
+    /// once they have moved on, which is itself the signal that the branch is
+    /// built on a stale base.
+    pub refs: Vec<String>,
+    /// Commits the branch has added on top of the base.
+    pub ahead: u32,
+}
+
 /// Provider-neutral repository status for the right-side panel.
 #[derive(Debug, Clone, Serialize)]
 pub struct ScmStatus {
@@ -33,6 +77,10 @@ pub struct ScmStatus {
     pub head: Option<String>,
     pub detached: bool,
     pub changed_files: Vec<ChangedFile>,
+    /// Every configured remote that has this branch, newest known tip each.
+    pub remotes: Vec<RemoteBranch>,
+    /// Where this branch is based, when git recorded it.
+    pub base: Option<BaseCommit>,
 }
 
 /// A commit in the history graph (simplified single-lane model for MVP).
@@ -146,6 +194,8 @@ impl SourceControl for GitSourceControl {
                 head: None,
                 detached: false,
                 changed_files: vec![],
+                remotes: vec![],
+                base: None,
             });
         }
 
@@ -159,6 +209,13 @@ impl SourceControl for GitSourceControl {
         let porcelain = git(cwd, &["status", "--porcelain", "--untracked-files=all"])?;
         let changed_files = parse_porcelain(&porcelain);
 
+        // Both only mean something relative to a branch: a detached HEAD tracks
+        // no remote and has no reflog of its own to have recorded a base.
+        let (remotes, base) = match branch.as_deref() {
+            Some(b) => (remote_branches(cwd, b), base_commit(cwd, b)),
+            None => (vec![], None),
+        };
+
         Ok(ScmStatus {
             is_repo: true,
             provider: "git".into(),
@@ -166,6 +223,8 @@ impl SourceControl for GitSourceControl {
             head,
             detached,
             changed_files,
+            remotes,
+            base,
         })
     }
 
@@ -637,6 +696,196 @@ pub(crate) fn current_branch(cwd: &Path) -> Option<String> {
     } else {
         Some(raw)
     }
+}
+
+/// Each configured remote's tip for `branch`. Read from the remote-tracking
+/// refs, so this is the remote as of the last fetch and costs no network — the
+/// panel polls this every couple of seconds and must stay cheap. A remote that
+/// doesn't have the branch is skipped rather than listed as empty: there is no
+/// commit of its to show.
+fn remote_branches(cwd: &Path, branch: &str) -> Vec<RemoteBranch> {
+    if guard_branch(branch).is_err() {
+        return vec![];
+    }
+    let Ok(configured) = git(cwd, &["remote"]) else {
+        return vec![];
+    };
+    let remotes: Vec<&str> = configured
+        .lines()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .collect();
+
+    // The upstream decides which ref we report for *its* remote, because it may
+    // name a different branch there (a local `fix` tracking `origin/main`). The
+    // other remotes have nothing configured, so the same-named branch is the
+    // only sensible counterpart to look for.
+    let upstream = upstream_branch(cwd, &remotes);
+
+    let mut out = Vec::new();
+    for remote in remotes {
+        let remote_branch = match &upstream {
+            Some((r, b)) if r == remote => b.clone(),
+            _ => branch.to_string(),
+        };
+        let refname = format!("refs/remotes/{remote}/{remote_branch}");
+        let Some(head) = short_hash(cwd, &refname) else {
+            continue;
+        };
+        let (behind, ahead) = ahead_behind(cwd, &refname).unwrap_or((0, 0));
+        out.push(RemoteBranch {
+            remote: remote.to_string(),
+            branch: remote_branch,
+            head,
+            ahead,
+            behind,
+            upstream: matches!(&upstream, Some((r, _)) if r == remote),
+        });
+    }
+    out
+}
+
+/// The current branch's upstream split into (remote, branch): `origin/main` →
+/// `("origin", "main")`. Split against the configured remote names rather than
+/// on the first `/`, since a branch name may itself contain slashes.
+fn upstream_branch(cwd: &Path, remotes: &[&str]) -> Option<(String, String)> {
+    let full = git(
+        cwd,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    .ok()?;
+    let full = full.trim();
+    remotes.iter().find_map(|remote| {
+        full.strip_prefix(&format!("{remote}/"))
+            .map(|branch| (remote.to_string(), branch.to_string()))
+    })
+}
+
+/// Short hash of a ref, or `None` when it doesn't exist locally.
+fn short_hash(cwd: &Path, refname: &str) -> Option<String> {
+    git(cwd, &["rev-parse", "--short", "--verify", "--quiet", refname])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// How far HEAD sits from `refname`: `(behind, ahead)` — commits the ref has
+/// that HEAD doesn't, then commits HEAD has that it doesn't.
+fn ahead_behind(cwd: &Path, refname: &str) -> Option<(u32, u32)> {
+    let out = git(
+        cwd,
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{refname}...HEAD"),
+        ],
+    )
+    .ok()?;
+    let mut counts = out.split_whitespace();
+    let behind = counts.next()?.parse().ok()?;
+    let ahead = counts.next()?.parse().ok()?;
+    Some((behind, ahead))
+}
+
+/// Where `branch` is based — the commit it was created at, or the one it was
+/// most recently rebased onto.
+///
+/// The branch's reflog is the only place git records either event, so that is
+/// what we read. Entries come newest-first and the first match wins, which is
+/// exactly why a rebase supersedes the spawn point: the branch is no longer
+/// based where it started.
+fn base_commit(cwd: &Path, branch: &str) -> Option<BaseCommit> {
+    if guard_branch(branch).is_err() {
+        return None;
+    }
+    // `%H` is the value the ref took *after* the entry — for a "Created from"
+    // entry that is the commit the branch started at. A rebase names its new
+    // base in the message instead, since `%H` there is the replayed tip.
+    let reflog = git(
+        cwd,
+        &[
+            "reflog",
+            "show",
+            "--format=%H%x1f%gs",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .ok()?;
+    let (hash, kind) = reflog.lines().find_map(|line| {
+        let (value, message) = line.split_once('\u{1f}')?;
+        if let Some(onto) = rebase_onto(message) {
+            Some((onto.to_string(), BaseKind::Rebased))
+        } else if message.starts_with("branch: Created from") && is_commit_hash(value) {
+            Some((value.to_string(), BaseKind::Spawned))
+        } else {
+            None
+        }
+    })?;
+
+    // A `git reset` moves a branch without writing a base-establishing entry, so
+    // the one we just found can describe history the branch no longer sits on.
+    // Report a base only when the branch is genuinely built on top of it.
+    if !git_ok(cwd, &["merge-base", "--is-ancestor", &hash, "HEAD"]) {
+        return None;
+    }
+
+    let meta = git(cwd, &["show", "-s", "--format=%h%x1f%s", &hash]).ok()?;
+    let (short, subject) = meta.trim_end().split_once('\u{1f}')?;
+    let ahead = git(cwd, &["rev-list", "--count", &format!("{hash}..HEAD")])
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    // What the base *is* today, when a ref still names it: "master" reads far
+    // better than a bare hash. The branch itself is excluded — a session that
+    // hasn't committed yet sits exactly on its base, and naming itself there
+    // says nothing.
+    let refs = git(
+        cwd,
+        &[
+            "for-each-ref",
+            "--points-at",
+            &hash,
+            "--format=%(refname:short)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )
+    .map(|out| {
+        out.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|r| !r.is_empty() && r != branch)
+            .collect()
+    })
+    .unwrap_or_default();
+
+    Some(BaseCommit {
+        hash,
+        short: short.to_string(),
+        subject: subject.to_string(),
+        kind,
+        refs,
+        ahead,
+    })
+}
+
+/// The commit a rebase reflog entry landed the branch on. Covers the plain,
+/// interactive and `--onto` forms, which differ only in the message's prefix:
+/// `rebase (finish): refs/heads/x onto <hash>`.
+fn rebase_onto(message: &str) -> Option<&str> {
+    if !message.starts_with("rebase") {
+        return None;
+    }
+    let onto = message.rsplit_once(" onto ")?.1.trim();
+    is_commit_hash(onto).then_some(onto)
+}
+
+/// Whether git exits zero — for the predicate subcommands (`--is-ancestor`),
+/// where a non-zero exit is an answer rather than a failure.
+fn git_ok(cwd: &Path, args: &[&str]) -> bool {
+    git_output(cwd, args)
+        .map(|out| out.status.success())
+        .unwrap_or(false)
 }
 
 pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String> {
@@ -1165,6 +1414,155 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(origin);
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn rebase_onto_reads_the_new_base_from_the_reflog_message() {
+        let h = "df4ef7cea9d40feb866a3f7b8fbe634af0b22cf2";
+        // The plain, interactive and older spellings differ only in the prefix.
+        assert_eq!(
+            rebase_onto(&format!("rebase (finish): refs/heads/feature onto {h}")),
+            Some(h)
+        );
+        assert_eq!(
+            rebase_onto(&format!("rebase -i (finish): refs/heads/feature onto {h}")),
+            Some(h)
+        );
+        assert_eq!(
+            rebase_onto(&format!("rebase finished: refs/heads/feature onto {h}")),
+            Some(h)
+        );
+        // Everything else in a branch reflog leaves the base where it was.
+        assert_eq!(rebase_onto("commit: add a thing"), None);
+        assert_eq!(rebase_onto("branch: Created from HEAD"), None);
+        assert_eq!(rebase_onto("pull: Fast-forward"), None);
+        // A message that names a ref rather than a hash isn't one we can resolve.
+        assert_eq!(rebase_onto("rebase (finish): refs/heads/feature onto main"), None);
+    }
+
+    #[test]
+    fn base_tracks_the_spawn_point_then_the_rebase_target() {
+        let repo = test_repo("base-commit");
+        write_file(&repo, "a.txt", "a\n");
+        commit_all(&repo, "c1");
+        write_file(&repo, "b.txt", "b\n");
+        commit_all(&repo, "c2 on main");
+        let spawn = git_test(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+
+        git_test(&repo, &["checkout", "-q", "-b", "feature"]);
+        write_file(&repo, "f.txt", "f\n");
+        commit_all(&repo, "feature work");
+
+        // Spawned: the base is main's tip at the moment the branch was cut, and
+        // main still names it, so the panel can say "main" instead of a hash.
+        let base = GitSourceControl.status(&repo).unwrap().base.expect("spawn base");
+        assert_eq!(base.hash, spawn);
+        assert_eq!(base.kind, BaseKind::Spawned);
+        assert_eq!(base.subject, "c2 on main");
+        assert_eq!(base.ahead, 1);
+        assert_eq!(base.refs, vec!["main".to_string()]);
+
+        // main moves on and feature is replayed onto it: the base follows the
+        // rebase rather than staying at the now-irrelevant spawn point.
+        git_test(&repo, &["checkout", "-q", "main"]);
+        write_file(&repo, "c.txt", "c\n");
+        commit_all(&repo, "c3 on main");
+        let onto = git_test(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+        git_test(&repo, &["checkout", "-q", "feature"]);
+        GitSourceControl.rebase(&repo, "main").unwrap();
+
+        let base = GitSourceControl.status(&repo).unwrap().base.expect("rebase base");
+        assert_eq!(base.hash, onto);
+        assert_eq!(base.kind, BaseKind::Rebased);
+        assert_eq!(base.subject, "c3 on main");
+        assert_eq!(base.ahead, 1);
+        assert_eq!(base.refs, vec!["main".to_string()]);
+
+        // A detached HEAD is on no branch, so it has neither a base nor a remote.
+        git_test(&repo, &["checkout", "-q", &onto]);
+        let status = GitSourceControl.status(&repo).unwrap();
+        assert!(status.detached);
+        assert!(status.base.is_none());
+        assert!(status.remotes.is_empty());
+
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn base_is_dropped_when_the_branch_no_longer_sits_on_it() {
+        // `git reset --hard` to an unrelated commit moves the branch without
+        // writing a base-establishing reflog entry, so the newest one we find
+        // still describes history the branch has left. Better to report nothing
+        // than a base the branch isn't built on.
+        let repo = test_repo("base-reset");
+        write_file(&repo, "a.txt", "a\n");
+        commit_all(&repo, "c1");
+        let root = git_test(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+        write_file(&repo, "b.txt", "b\n");
+        commit_all(&repo, "c2 on main");
+
+        git_test(&repo, &["checkout", "-q", "-b", "feature"]);
+        write_file(&repo, "f.txt", "f\n");
+        commit_all(&repo, "feature work");
+        assert!(GitSourceControl.status(&repo).unwrap().base.is_some());
+
+        // Rewound behind its own spawn point: that commit is no longer an
+        // ancestor, so it is no longer this branch's base.
+        git_test(&repo, &["reset", "-q", "--hard", &root]);
+        assert!(GitSourceControl.status(&repo).unwrap().base.is_none());
+
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn remotes_report_every_remote_that_has_the_branch() {
+        let repo = test_repo("remotes");
+        let one = bare_origin("remotes-1");
+        let two = bare_origin("remotes-2");
+        git_test(&repo, &["remote", "add", "origin1", one.to_str().unwrap()]);
+        git_test(&repo, &["remote", "add", "origin2", two.to_str().unwrap()]);
+        write_file(&repo, "a.txt", "a\n");
+        commit_all(&repo, "c1");
+
+        // Only origin1 has `main`. origin2 is left out entirely — it has no
+        // commit for this branch, so there is nothing to report it as being on.
+        git_test(&repo, &["push", "-q", "-u", "origin1", "main"]);
+        let remotes = GitSourceControl.status(&repo).unwrap().remotes;
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].remote, "origin1");
+        assert_eq!(remotes[0].branch, "main");
+        assert!(remotes[0].upstream);
+        assert_eq!((remotes[0].ahead, remotes[0].behind), (0, 0));
+
+        // A local commit the remote hasn't seen: it stays on the pushed tip and
+        // we are one ahead of it.
+        let pushed = git_test(&repo, &["rev-parse", "--short", "HEAD"]).trim().to_string();
+        write_file(&repo, "b.txt", "b\n");
+        commit_all(&repo, "c2");
+        let remotes = GitSourceControl.status(&repo).unwrap().remotes;
+        assert_eq!(remotes[0].head, pushed);
+        assert_eq!((remotes[0].ahead, remotes[0].behind), (1, 0));
+
+        // Both remotes now carry the branch: two entries, and only the one the
+        // branch actually tracks is tagged as the upstream.
+        git_test(&repo, &["push", "-q", "origin1", "main"]);
+        git_test(&repo, &["push", "-q", "origin2", "main"]);
+        let remotes = GitSourceControl.status(&repo).unwrap().remotes;
+        assert_eq!(remotes.len(), 2);
+        assert_eq!(remotes[0].remote, "origin1");
+        assert!(remotes[0].upstream);
+        assert_eq!(remotes[1].remote, "origin2");
+        assert!(!remotes[1].upstream);
+
+        // Rewinding the local branch leaves both remotes ahead of it.
+        git_test(&repo, &["reset", "-q", "--hard", "HEAD~1"]);
+        let remotes = GitSourceControl.status(&repo).unwrap().remotes;
+        assert_eq!((remotes[0].ahead, remotes[0].behind), (0, 1));
+        assert_eq!((remotes[1].ahead, remotes[1].behind), (0, 1));
+
+        let _ = fs::remove_dir_all(one);
+        let _ = fs::remove_dir_all(two);
         let _ = fs::remove_dir_all(repo);
     }
 

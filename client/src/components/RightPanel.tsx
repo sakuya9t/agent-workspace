@@ -367,6 +367,87 @@ export function RightPanel({ target, session }: Props) {
           )}
         </div>
 
+        {scm?.is_repo && (scm.remotes.length > 0 || scm.base) && (
+          <div className="scm-refs">
+            {scm.remotes.map((r) => {
+              const ref = `${r.remote}/${r.branch}`;
+              return (
+                <div className="scm-ref" key={r.remote}>
+                  <span
+                    className={"ref-tag" + (r.upstream ? " upstream" : "")}
+                    title={t("rightPanel.remoteTitle", { ref })}
+                  >
+                    {r.remote}
+                  </span>
+                  <span className="mono ref-hash">{r.head}</span>
+                  {/* The remote-side name, but only when it isn't the local one —
+                      an upstream may track a differently-named branch. */}
+                  <span className="ref-note dim">{r.branch === scm.branch ? "" : r.branch}</span>
+                  <span className="ref-counts">
+                    {r.ahead > 0 && (
+                      <span
+                        className="ref-count ahead"
+                        title={t("rightPanel.remoteAhead", { count: r.ahead, ref })}
+                      >
+                        ↑{r.ahead}
+                      </span>
+                    )}
+                    {r.behind > 0 && (
+                      <span
+                        className="ref-count behind"
+                        title={t("rightPanel.remoteBehind", { count: r.behind, ref })}
+                      >
+                        ↓{r.behind}
+                      </span>
+                    )}
+                  </span>
+                </div>
+              );
+            })}
+
+            {scm.base && (
+              <div className="scm-ref">
+                <span
+                  className="ref-tag base"
+                  title={t(
+                    scm.base.kind === "spawned"
+                      ? "rightPanel.baseSpawnedTitle"
+                      : "rightPanel.baseRebasedTitle",
+                    { branch: scm.branch },
+                  )}
+                >
+                  {t("rightPanel.baseTag")}
+                </span>
+                <span className="mono ref-hash">{scm.base.short}</span>
+                {/* Name the base by a ref that still points at it — "master" says
+                    far more than a hash. Once they've all moved on, the commit's
+                    own subject is what's left to identify it by. */}
+                <span
+                  className="ref-note dim"
+                  title={scm.base.refs.join(", ") || scm.base.subject}
+                >
+                  {t(
+                    scm.base.kind === "spawned"
+                      ? "rightPanel.baseSpawnedFrom"
+                      : "rightPanel.baseRebasedOnto",
+                    { ref: scm.base.refs[0] || scm.base.subject },
+                  )}
+                </span>
+                {scm.base.ahead > 0 && (
+                  <span className="ref-counts">
+                    <span
+                      className="ref-count ahead"
+                      title={t("rightPanel.baseAhead", { count: scm.base.ahead })}
+                    >
+                      +{scm.base.ahead}
+                    </span>
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
         {!scm?.is_repo && (
           <div className="dim small">{t("rightPanel.notRepo", { cmd: "git init" })}</div>
         )}

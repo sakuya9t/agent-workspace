@@ -104,6 +104,26 @@ export interface ChangedFile {
   orig_path: string | null;
 }
 
+/** One remote's tip for the current branch, as of the last fetch. */
+export interface RemoteBranch {
+  remote: string;
+  branch: string;
+  head: string;
+  ahead: number;
+  behind: number;
+  upstream: boolean;
+}
+
+/** The commit the current branch was spawned at, or last rebased onto. */
+export interface BaseCommit {
+  hash: string;
+  short: string;
+  subject: string;
+  kind: "spawned" | "rebased";
+  refs: string[];
+  ahead: number;
+}
+
 export interface ScmStatus {
   is_repo: boolean;
   provider: string;
@@ -111,6 +131,8 @@ export interface ScmStatus {
   head: string | null;
   detached: boolean;
   changed_files: ChangedFile[];
+  remotes: RemoteBranch[];
+  base: BaseCommit | null;
 }
 
 export interface Commit {
