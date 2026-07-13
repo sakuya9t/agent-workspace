@@ -220,8 +220,9 @@ pick it up**.
 - **`c6ad936` daemon-served client** (works on hosts with no npm/vite) and
   **`dda8354`** frontend bound to `0.0.0.0`. Flagged here because they *widen the
   exposure surface* the SEC track is about: the daemon now serves a UI to any
-  reachable host, which raises the stakes on **SEC-1** (no TLS off-loopback),
-  **SEC-5** (permissive CORS), and **SEC-6** (unconditional loopback trust).
+  reachable host, which raises the stakes on **SEC-1** (plaintext off-loopback;
+  since decided as by-design — see its row), **SEC-5** (permissive CORS), and
+  **SEC-6** (unconditional loopback trust).
 - **MOB phases 1–3** — mobile adaptive shell (2026-07-06, client-only, no daemon
   changes). Phase 1: `useIsPhone()` (PHONE_MQ) switches the root between the
   extracted `DesktopShell` and a new stacked `MobileShell` (Sessions home →
@@ -256,7 +257,7 @@ pick it up**.
 | RF-GATE | Build gate & test safety net: react-hooks + recommended eslint, minimal CI, HTTP-router test harness, `MockHolder`, asmux e2e for readBuffer/detach/backpressure/takeover, `generated.rs` drift check, migration-ladder test + `user_version` guard | **P1/P2** | — (before REC ideally; before M4-C wiring definitely) | refactoring-plan.md → §6.4 |
 | RF-OPS | **Truthful health, deadlines and task supervision:** liveness/readiness probes for DB writer + holder; cancellation tree for background tasks; blocking-work boundary; child/client request deadlines; jittered reconnect; structured reliability metrics | **P2** | minimal RF-GATE; Git deadline implementation shares RF-REC | refactoring-plan.md → §7.3 |
 | SEC-2 | Constrain `/api/fs/list` + workspace roots | **P1** | RF-ERR recommended (403 mapping) | security-followups.md → 2 (HIGH) |
-| SEC-1 | Transport encryption off-loopback (direct mode TLS; relay TLS — **agent `wss://` (code) + relay rustls/proxy**) | **P1/P2** | partially ties to R5 | security-followups.md → 1 (HIGH) |
+| SEC-1 | Transport encryption off-loopback. **DECIDED 2026-07-12: the LAN direct path is plaintext by design.** TLS was built end to end (`1dcb15e`: agent `wss://`, relay rustls, daemon HTTPS) and **reverted** (`a36fdfa`): a self-signed daemon cert is refused by the browser on the client's cross-origin `fetch` (no interstitial, no API) — unreachable by construction — and both escapes (a public name + ACME; a private CA installed per device) violate the product constraints: no external dependencies, no per-device setup, journey immutable. Encryption returns at the **relay** when R5 gives it a real name + ACME cert (resurrect the relay half of `1dcb15e`); SSH port-forward is the encrypted path meanwhile | **folded into R5** (was P1/P2) | R5 | security-followups.md → 1 |
 | V0 | Web-editor de-risking spike (scratchpad only) | **P2** | R1–R3 (done) | vscode-over-relay-plan.md → V0 |
 | V1 | Relay cookie auth + daemon editor proxy | **P2** | V0 go decision | vscode-over-relay-plan.md → V1 |
 | V2 | IDE launcher, detection, editor tickets | **P2** | V1 | vscode-over-relay-plan.md → V2 |
@@ -495,21 +496,26 @@ exactly two frame types; MOB-PUSH, MVP-RICH and V3 each need a
 server→client frame and would otherwise each invent one. Detail:
 refactoring-plan.md → §6.3.
 
-### SEC-1 / SEC-2 — the two HIGH security items (P1)
+### SEC-1 (decided) / SEC-2 — the security items
 
 Gate exposing ASM beyond a trusted LAN. SEC-2 (fs-list browses the whole host
 filesystem; any client can register any workspace root) is self-contained
 daemon work: server-side allowed-roots config enforced for both browsing and
-registration. SEC-1 (plaintext HTTP/WS off loopback) splits: the **relay path**
-(the product path) is plaintext today and is **not just an ops item** — it needs
-(i) a TLS feature enabled on the daemon agent's `tokio-tungstenite` so it can
-dial `wss://` at all (it is currently compiled without TLS, so a TLS reverse
-proxy in front of the relay is useless until this lands — a code change), plus
-(ii) relay-side rustls (`ASM_RELAY_TLS_CERT/KEY`, described in
-connectivity-execution-plan.md but **not yet implemented** in the relay binary)
-or a TLS-terminating proxy, with a real ACME cert so there is no client UX
-change; **direct mode** needs the Phase-8 TLS/mTLS deliverable (self-signed +
-pinning or ACME). Until then the SSH-tunnel recommendation stays prominent.
+registration — **now the only HIGH item**.
+
+SEC-1 is **decided, not open** (2026-07-12): the LAN direct path is plaintext
+by design. The full TLS implementation (agent `wss://`, relay rustls,
+daemon-terminated HTTPS — `1dcb15e`) was built, found to make the daemon
+*unreachable* in the product's own journey (browsers refuse a self-signed cert
+on the client's cross-origin `fetch`, with no interstitial and no API), and
+reverted (`a36fdfa`) after both escapes — a public name + ACME cert, or a
+private CA installed on every device — were rejected as violating the product
+constraints (no external dependencies; no per-device setup; the connect
+journey is immutable). Full reasoning: security-followups.md → 1. Encryption
+returns at the **relay**, which can hold a real ACME cert for a real hostname
+with zero journey change — that is an R5 work item, and the relay half of
+`1dcb15e` should be resurrected from history for it, not rebuilt. Until then
+the SSH-tunnel recommendation stays prominent.
 
 SEC-2 code-level substrate (2026-07-12 review): there are today **three**
 divergent notions of allowed root — `fs::list` enforces none;
@@ -730,9 +736,11 @@ parity gate, typed keys); adding a locale is the 3-step recipe in `i18n.md`.
    heuristic-disagreement data passively while every later item proceeds, so
    earlier = more signal for free. MEAS-2/3 ride along opportunistically
    (item 11 tier).
-6. **SEC-2 + RF-ERR** (together), then **SEC-1(direct)** — before any
-   exposure beyond trusted networks. Note this got *more* urgent, not less:
-   the daemon now serves the client itself (`c6ad936`) on `0.0.0.0` (`dda8354`).
+6. **SEC-2 + RF-ERR** (together) — before any exposure beyond trusted
+   networks. Note this got *more* urgent, not less: the daemon now serves the
+   client itself (`c6ad936`) on `0.0.0.0` (`dda8354`). SEC-1(direct) is
+   **decided, not pending** — the LAN is plaintext by design (2026-07-12,
+   security-followups.md → 1); the relay-side encryption work rides with R5.
 7. **DEC-1** (an hour of thought) → **RF-QUERY** + **RF-WSPROTO** →
    **MVP-RICH**. RF-WSPROTO slots before *whichever* of MOB-PUSH / MVP-RICH /
    V3 comes first — it is ~1 day while there are exactly two WS frame types
