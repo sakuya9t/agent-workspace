@@ -91,6 +91,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/:id/scm/fetch", post(scm::fetch))
         .route("/api/sessions/:id/scm/pull", post(scm::pull))
         .route("/api/sessions/:id/scm/push", post(scm::push))
+        .route("/api/sessions/:id/scm/detach-branch", post(scm::detach_branch))
+        .route("/api/sessions/:id/scm/attach-branch", post(scm::attach_branch))
         .route("/api/sessions/:id/scm/rebase", post(scm::rebase))
         .route("/api/sessions/:id/scm/merge", post(scm::merge));
 

@@ -537,6 +537,14 @@ export const api = {
     req<{ output: string }>(t, `/api/sessions/${id}/scm/push`, { method: "POST" }).then(
       (r) => r.output,
     ),
+  scmDetachBranch: (t: Target, id: string) =>
+    req<{ branch: string; attached: false }>(t, `/api/sessions/${id}/scm/detach-branch`, {
+      method: "POST",
+    }).then((r) => r.branch),
+  scmAttachBranch: (t: Target, id: string) =>
+    req<{ branch: string; attached: true }>(t, `/api/sessions/${id}/scm/attach-branch`, {
+      method: "POST",
+    }).then((r) => r.branch),
   scmRebase: (t: Target, id: string, onto: string) =>
     req<{ output: string }>(t, `/api/sessions/${id}/scm/rebase`, {
       method: "POST",

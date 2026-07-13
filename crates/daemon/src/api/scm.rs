@@ -237,6 +237,33 @@ pub async fn push(
     Ok(Json(json!({ "output": output })))
 }
 
+async fn set_branch_attached(
+    state: AppState,
+    id: String,
+    attached: bool,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let manager = state.manager.clone();
+    let branch = run_blocking(move || manager.set_instance_branch_attached(&id, attached)).await?;
+    Ok(Json(json!({ "branch": branch, "attached": attached })))
+}
+
+/// Release the session worktree's branch so another worktree can check it out.
+/// The session stays at the exact same commit with all local changes intact.
+pub async fn detach_branch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    set_branch_attached(state, id, false).await
+}
+
+/// Reclaim the session's recorded branch after the other checkout releases it.
+pub async fn attach_branch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    set_branch_attached(state, id, true).await
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RebaseBody {
     onto: String,

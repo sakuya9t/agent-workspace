@@ -236,6 +236,34 @@ impl SessionManager {
         self.db.get_instance_for_session(session_id)
     }
 
+    /// Toggle whether an isolated session worktree holds its recorded branch.
+    /// The branch name remains in the instance record while detached so the UI
+    /// can safely attach the same branch again after external verification.
+    pub fn set_instance_branch_attached(&self, session_id: &str, attached: bool) -> Result<String> {
+        let inst = self
+            .db
+            .get_instance_for_session(session_id)?
+            .ok_or_else(|| anyhow!("no workspace instance for session"))?;
+        if inst.status != "active" {
+            bail!("workspace instance is no longer active");
+        }
+        if inst.isolation != "worktree" && inst.isolation != "shared" {
+            bail!("only isolated Git worktrees can detach from a branch");
+        }
+        let branch = inst
+            .branch
+            .as_deref()
+            .ok_or_else(|| anyhow!("this worktree has no recorded branch to reattach"))?;
+        let path = Path::new(&inst.path);
+
+        if attached {
+            workspace::attach_branch(path, branch)?;
+        } else {
+            workspace::detach_branch(path, branch)?;
+        }
+        Ok(branch.to_string())
+    }
+
     /// Remove a session's managed worktree. Guards against dirty worktrees and
     /// live sessions unless `force`.
     pub fn cleanup_instance(&self, session_id: &str, force: bool) -> Result<()> {

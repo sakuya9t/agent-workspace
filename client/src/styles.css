@@ -831,6 +831,16 @@ body.col-resizing iframe {
 .section-title.with-branch > span:first-child {
   flex: none;
 }
+.branch-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+}
+.branch-attachment-btn {
+  flex: none;
+}
 
 /* misc */
 .empty {
@@ -1089,6 +1099,14 @@ body.col-resizing iframe {
   mask-image: url("/icons/actions/git-push.png");
   -webkit-mask-image: url("/icons/actions/git-push.png");
 }
+.action-icon-git-attach {
+  mask-image: url("/icons/actions/git-attach.png");
+  -webkit-mask-image: url("/icons/actions/git-attach.png");
+}
+.action-icon-git-detach {
+  mask-image: url("/icons/actions/git-detach.png");
+  -webkit-mask-image: url("/icons/actions/git-detach.png");
+}
 .rebase-picker {
   display: flex;
   flex-wrap: wrap;
@@ -1241,6 +1259,9 @@ body.col-resizing iframe {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.branch-controls .branch-pill {
+  flex: 1;
 }
 /* where the branch sits: each remote's tip for it, and the commit it is based on */
 .scm-refs {

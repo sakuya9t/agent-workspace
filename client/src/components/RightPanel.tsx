@@ -172,9 +172,20 @@ export function RightPanel({ target, session }: Props) {
     },
   });
 
+  // `attached` here means the managed worktree currently holds its recorded
+  // branch. Detaching leaves the files and HEAD in place, but releases Git's
+  // branch lock so the source checkout can temporarily deploy/verify it.
+  const branchAttachment = useMutation({
+    mutationFn: (attached: boolean) =>
+      attached
+        ? api.scmAttachBranch(target!, session!.id)
+        : api.scmDetachBranch(target!, session!.id),
+    onSuccess: refreshScm,
+  });
+
   // Every source-control operation shares one result/error area, so starting any
   // one of them clears the others' stale output.
-  const scmOps = [fetchRemotes, pull, push, rebase, merge];
+  const scmOps = [fetchRemotes, pull, push, rebase, merge, branchAttachment];
   const resetScmOps = () => scmOps.forEach((op) => op.reset());
   const startFetch = () => {
     resetScmOps();
@@ -196,7 +207,18 @@ export function RightPanel({ target, session }: Props) {
     resetScmOps();
     merge.mutate(targetBranch);
   };
+  const startBranchAttachment = (attached: boolean) => {
+    resetScmOps();
+    branchAttachment.mutate(attached);
+  };
   const scmBusy = scmOps.some((op) => op.isPending);
+
+  const recordedBranch = instance?.branch ?? null;
+  const canToggleBranchAttachment =
+    !!recordedBranch &&
+    (instance?.isolation === "worktree" || instance?.isolation === "shared") &&
+    (!!scm?.detached || scm?.branch === recordedBranch);
+  const branchIsAttached = !!recordedBranch && scm?.branch === recordedBranch;
 
   // Don't carry an open picker or a previous session's SCM output onto the next
   // session (this panel is reused, not remounted, across selections).
@@ -361,9 +383,41 @@ export function RightPanel({ target, session }: Props) {
         <div className="section-title with-branch">
           <span>{t("rightPanel.scmHeader")}</span>
           {scm?.is_repo && (
-            <span className="branch-pill mono">
-              {scm.detached ? t("rightPanel.detached") : scm.branch}
-              {scm.head ? ` · ${scm.head}` : ""}
+            <span className="branch-controls">
+              <span className="branch-pill mono">
+                {scm.detached && recordedBranch
+                  ? t("rightPanel.detachedFrom", { branch: recordedBranch })
+                  : scm.detached
+                    ? t("rightPanel.detached")
+                    : scm.branch}
+                {scm.head ? ` · ${scm.head}` : ""}
+              </span>
+              {canToggleBranchAttachment && (
+                <button
+                  className="icon-btn branch-attachment-btn"
+                  disabled={scmBusy}
+                  onClick={() => startBranchAttachment(!branchIsAttached)}
+                  title={t(
+                    branchIsAttached
+                      ? "rightPanel.detachBranchTitle"
+                      : "rightPanel.attachBranchTitle",
+                    { branch: recordedBranch },
+                  )}
+                  aria-label={t(
+                    branchIsAttached
+                      ? "rightPanel.detachBranchTitle"
+                      : "rightPanel.attachBranchTitle",
+                    { branch: recordedBranch },
+                  )}
+                >
+                  <span
+                    className={`action-icon action-icon-git-${
+                      branchIsAttached ? "detach" : "attach"
+                    }`}
+                    aria-hidden="true"
+                  />
+                </button>
+              )}
             </span>
           )}
         </div>
@@ -693,6 +747,19 @@ export function RightPanel({ target, session }: Props) {
                 onDismiss={merge.reset}
               />
             )}
+            {branchAttachment.error && (
+              <ScmOpNotice
+                status="error"
+                title={t(
+                  branchAttachment.variables
+                    ? "rightPanel.attachBranchFailed"
+                    : "rightPanel.detachBranchFailed",
+                )}
+                summary={scmErrorSummary(branchAttachment.error)}
+                details={scmErrorDetails(branchAttachment.error)}
+                onDismiss={branchAttachment.reset}
+              />
+            )}
             {/* A fetch that found nothing new succeeds with *empty* output, so the
                 truthiness check the other ops use would swallow the result. */}
             {fetchRemotes.data !== undefined && (
@@ -772,6 +839,24 @@ export function RightPanel({ target, session }: Props) {
                 })}
                 details={merge.data}
                 onDismiss={merge.reset}
+              />
+            )}
+            {branchAttachment.data && (
+              <ScmOpNotice
+                status="success"
+                title={t(
+                  branchAttachment.variables
+                    ? "rightPanel.attachBranchComplete"
+                    : "rightPanel.detachBranchComplete",
+                )}
+                summary={t(
+                  branchAttachment.variables
+                    ? "rightPanel.attachBranchSuccess"
+                    : "rightPanel.detachBranchSuccess",
+                  { branch: branchAttachment.data },
+                )}
+                details=""
+                onDismiss={branchAttachment.reset}
               />
             )}
 
