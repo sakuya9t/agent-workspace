@@ -314,9 +314,12 @@
   "terminal": {
     "takenOver": "This session was taken over by another client.",
     "uploadingImage": "Uploading image…",
-    "pasteFailed": "Image paste failed: {{message}}",
+    "uploadingNamed": "Uploading {{name}}…",
+    "pasteFailed": "Upload failed: {{message}}",
+    "attachTooLarge": "File is too large: {{size}} (max {{max}})",
     "pastedImageRef": "[pasted image {{path}}] ",
-    "attachImage": "Attach image",
+    "attachedFileRef": "[attached file {{path}}] ",
+    "attachFile": "Attach file",
     "copied": "Copied",
     "copyFailed": "Copy failed"
   },
