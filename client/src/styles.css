@@ -526,6 +526,17 @@ body.col-resizing iframe {
 .conn-form-error {
   padding-left: 0;
 }
+/* Shown when the typed URL is plaintext to a remote host. Informational — it
+   never blocks the add; a LAN daemon has no TLS to offer. */
+.conn-insecure-warn {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--warn-border, #a8741a);
+  background: var(--warn-bg, rgba(168, 116, 26, 0.12));
+  color: var(--warn-fg, #d8a038);
+  line-height: 1.4;
+}
 .conn-form-actions {
   display: flex;
   justify-content: flex-end;

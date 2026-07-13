@@ -7,6 +7,7 @@ mod domain;
 mod plugins;
 mod session_manager;
 mod source_control;
+mod tls;
 mod util;
 mod workspace;
 
@@ -35,6 +36,19 @@ async fn main() -> Result<()> {
     // Subcommands run without the tracing subscriber so stdout stays clean.
     match std::env::args().nth(1).as_deref() {
         Some("token") | Some("enrollment-token") => return print_enrollment_token(),
+        // Validate TLS material and exit. The service scripts call this before
+        // stopping a healthy daemon to apply a new certificate: readable is not
+        // the same as valid, and a mismatched key would otherwise turn a config
+        // typo into an outage.
+        Some("check-tls") => {
+            let mut args = std::env::args().skip(2);
+            let (cert, key) = match (args.next(), args.next()) {
+                (Some(c), Some(k)) => (PathBuf::from(c), PathBuf::from(k)),
+                _ => bail!("usage: asm-daemon check-tls <cert.pem> <key.pem>"),
+            };
+            tls::server_config(&cert, &key)?;
+            return Ok(());
+        }
         Some("help") | Some("--help") | Some("-h") => {
             print_help();
             return Ok(());
@@ -64,16 +78,28 @@ async fn main() -> Result<()> {
         now_millis(),
     )?;
     let loopback_only = config.bind.ip().is_loopback();
+    let tls_on = config.tls_cert.is_some();
     tracing::info!(server_id = %server_id, "server identity ready");
     tracing::info!("enrollment token for new devices: {enrollment_token}");
     tracing::info!("retrieve it anytime with `asm-daemon token`");
     if loopback_only {
         tracing::info!("bound to loopback: local clients are trusted; remote access via SSH port-forward needs no token");
-    } else {
-        tracing::warn!(
-            "bound off-loopback ({}). Remote devices must enroll with the token above.",
+    } else if tls_on {
+        tracing::info!(
+            "bound off-loopback ({}) over HTTPS. Remote devices must enroll with the token above.",
             config.bind
         );
+    } else {
+        tracing::warn!(
+            "bound off-loopback ({}) and serving PLAIN HTTP — the device token and all terminal \
+             traffic are readable by anyone on this network. Remote devices must enroll with the \
+             token above. To encrypt this listener, set ASM_TLS_CERT + ASM_TLS_KEY; otherwise \
+             prefer the relay (ASM_RELAY_URL) or an SSH port-forward.",
+            config.bind
+        );
+    }
+    if !config.trust_loopback {
+        tracing::info!("loopback trust disabled: every request needs a device token");
     }
 
     let registry = Arc::new(PluginRegistry::with_builtins());
@@ -153,23 +179,35 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("binding {}", config.bind))?;
-    tracing::info!("listening on http://{}", config.bind);
+    let scheme = if tls_on { "https" } else { "http" };
+    tracing::info!("listening on {scheme}://{}", config.bind);
 
     // Connect-info exposes the peer address so auth can trust loopback. The
     // primary listener stamps `Primary`, so genuine loopback here is trusted.
     let primary_app = app.layer(axum::Extension(auth::ListenerKind::Primary));
-    let server = axum::serve(
-        listener,
-        primary_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    );
 
     // Race the server against a shutdown signal. We do NOT wait for open
     // connections to drain — a live terminal WebSocket would block that
     // indefinitely. Instead, on signal we kill every live child so no PTY (and,
     // for a future out-of-process/tmux backend, no sidecar) is ever leaked, then
     // exit; open sockets die with the process.
+    let serve = async {
+        match (&config.tls_cert, &config.tls_key) {
+            (Some(cert), Some(key)) => {
+                let tls_config = tls::server_config(cert, key)?;
+                tls::serve_https(listener, tls_config, primary_app).await
+            }
+            _ => axum::serve(
+                listener,
+                primary_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .context("http server error"),
+        }
+    };
+
     tokio::select! {
-        res = server => res.context("http server error")?,
+        res = serve => res?,
         _ = shutdown_signal() => {
             let killed = manager.shutdown_all_live();
             tracing::info!("shutdown signal received; stopped {killed} live session(s)");
@@ -193,7 +231,9 @@ async fn start_relay_if_configured(
 ) -> Result<Option<tokio::task::JoinHandle<()>>> {
     let (Some(url), Some(key)) = (config.relay_url.clone(), config.relay_key.clone()) else {
         if config.relay_url.is_some() != config.relay_key.is_some() {
-            tracing::warn!("set BOTH ASM_RELAY_URL and ASM_RELAY_KEY to enable the relay; disabled");
+            tracing::warn!(
+                "set BOTH ASM_RELAY_URL and ASM_RELAY_KEY to enable the relay; disabled"
+            );
         }
         return Ok(None);
     };
@@ -224,13 +264,25 @@ async fn start_relay_if_configured(
     let (ds_tx, ds_rx) = tokio::sync::watch::channel(Vec::<ResolvedDownstream>::new());
     let targets = parse_downstream_targets(&config.relay_downstreams);
     if !targets.is_empty() {
-        tracing::info!(count = targets.len(), "relay gateway mode: probing downstreams");
+        tracing::info!(
+            count = targets.len(),
+            "relay gateway mode: probing downstreams"
+        );
         tokio::spawn(probe_downstreams_loop(
             targets,
             config.relay_probe_interval,
             ds_tx,
         ));
     }
+
+    // Read the CA bundle here rather than in the agent: a missing or unreadable
+    // file is a boot-time misconfiguration, and should fail the boot, not
+    // disappear into the agent's reconnect loop.
+    let relay_ca = config
+        .relay_ca
+        .as_ref()
+        .map(|p| std::fs::read(p).with_context(|| format!("reading ASM_RELAY_CA {}", p.display())))
+        .transpose()?;
 
     let agent_cfg = asm_relay::agent::AgentConfig {
         relay_url: url.clone(),
@@ -239,6 +291,7 @@ async fn start_relay_if_configured(
         label: config.node_label.clone(),
         local_target: tunnel_addr,
         downstreams: ds_rx,
+        relay_ca,
     };
     tracing::info!(relay = %url, node = %server_id, tunnel = %tunnel_addr, "registering with relay");
     Ok(Some(tokio::spawn(asm_relay::agent::run(agent_cfg))))

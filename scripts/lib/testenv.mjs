@@ -246,8 +246,13 @@ export async function createSandbox(name = "asm-test") {
      * Launch headless Chrome (profile inside the sandbox) and return its DevTools
      * endpoint. Use this when you need to build your own CDP client — e.g. one
      * that taps console logs or auto-accepts dialogs. Killed by cleanup().
+     *
+     * `extraArgs` are appended to the command line — e.g.
+     * `--ignore-certificate-errors` to stand in for a user who has accepted a
+     * self-signed daemon cert (a background fetch to an untrusted cert fails the
+     * same opaque way as a dead host, and never offers an interstitial).
      */
-    async launchChrome() {
+    async launchChrome(extraArgs = []) {
       const bin = findChrome();
       const cdpPort = await freePort();
       const profile = join(tmp, "chrome");
@@ -262,6 +267,7 @@ export async function createSandbox(name = "asm-test") {
           "--disable-dev-shm-usage",
           "--no-first-run",
           "--noerrdialogs",
+          ...extraArgs,
           `--remote-debugging-port=${cdpPort}`,
           `--user-data-dir=${profile}`,
           "about:blank",
@@ -288,8 +294,8 @@ export async function createSandbox(name = "asm-test") {
      * Headless Chrome plus a connected CDP client and page helpers. The common
      * case; reach for launchChrome() only if you need a custom client.
      */
-    async startChrome() {
-      const { port: cdpPort, wsUrl } = await sb.launchChrome();
+    async startChrome(extraArgs = []) {
+      const { port: cdpPort, wsUrl } = await sb.launchChrome(extraArgs);
       const conn = cdpConnect(wsUrl);
       await conn.ready;
 

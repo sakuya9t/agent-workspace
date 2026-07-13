@@ -33,3 +33,9 @@ directories.workspace = true
 parking_lot.workspace = true
 async-trait.workspace = true
 ureq.workspace = true
+# HTTPS on the daemon's own listener (ASM_TLS_CERT/KEY). Certificate parsing is
+# reused from asm-relay::tls; these drive the accept loop.
+rustls.workspace = true
+tokio-rustls.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true

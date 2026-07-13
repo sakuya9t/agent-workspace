@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -24,8 +25,11 @@ use axum::{Json, Router};
 use futures::{SinkExt, StreamExt};
 use hyper_util::rt::TokioIo;
 use parking_lot::Mutex;
+use rustls::ServerConfig;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
+use tokio_rustls::TlsAcceptor;
+use tower::Service;
 use tower_http::cors::CorsLayer;
 
 use crate::protocol::{
@@ -38,25 +42,160 @@ use crate::transport::WsByteStream;
 /// before the relay gives up with a 502.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long an unauthenticated peer may take to complete a TLS handshake. Beyond
+/// this the connection is dropped: a peer that connects and then goes silent must
+/// not be able to hold a task and an fd open indefinitely.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many TLS handshakes may be in flight at once. Bounds the fds and tasks a
+/// flood of half-open connections can pin, while leaving established connections
+/// (which have released their permit) unaffected.
+const MAX_PENDING_HANDSHAKES: usize = 256;
+
 /// A dial-back data stream, presented to the proxy as a byte duplex.
 type DataConn = WsByteStream<WebSocket>;
 
 // ------------------------------------------------------------------ config
 
+/// The relay's TLS material: a PEM certificate chain and its private key.
+pub struct TlsPaths {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+}
+
 pub struct RelayConfig {
     pub bind: SocketAddr,
     pub keys: HashSet<String>,
+    /// When set, the relay speaks TLS on `bind` — and *only* TLS, so a plaintext
+    /// client is refused at the handshake. Leave unset when a reverse proxy
+    /// terminates TLS in front of the relay, and set `hsts` there instead.
+    pub tls: Option<TlsPaths>,
+    /// Send `Strict-Transport-Security`. Implied by `tls`; set it explicitly for
+    /// the proxy-terminated deployment, where the relay itself sees plain HTTP
+    /// but the browser is on HTTPS.
+    pub hsts: bool,
 }
 
+/// One year. Browsers that have seen this header refuse to fall back to plain
+/// HTTP for the relay origin, even if a user types `http://`.
+const HSTS_VALUE: &str = "max-age=31536000";
+
 pub async fn run(config: RelayConfig) -> Result<()> {
-    let reg = Arc::new(Registry::new(config.keys));
+    let hsts = config.hsts || config.tls.is_some();
+    let tls = match &config.tls {
+        Some(paths) => Some(crate::tls::server_config(&paths.cert, &paths.key)?),
+        None => {
+            if !config.bind.ip().is_loopback() {
+                tracing::warn!(
+                    "asm-relay is bound off-loopback WITHOUT TLS: device tokens and terminal \
+                     traffic are in the clear. Set ASM_RELAY_TLS_CERT/ASM_RELAY_TLS_KEY, or put \
+                     a TLS-terminating proxy in front and set ASM_RELAY_HSTS=1."
+                );
+            }
+            None
+        }
+    };
+
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("binding {}", config.bind))?;
-    tracing::info!("asm-relay listening on http://{}", config.bind);
-    axum::serve(listener, router(reg))
-        .await
-        .context("relay server error")
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    tracing::info!("asm-relay listening on {scheme}://{}", config.bind);
+
+    serve(listener, tls, Arc::new(Registry::new(config.keys)), hsts).await
+}
+
+/// Serve the relay on an already-bound listener, over TLS when `tls` is set.
+///
+/// Split out of [`run`] so tests can bind an ephemeral port and still drive the
+/// real accept path rather than a copy of it.
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    tls: Option<ServerConfig>,
+    reg: Arc<Registry>,
+    hsts: bool,
+) -> Result<()> {
+    let mut app = router(reg);
+    if hsts {
+        app = app.layer(middleware::from_fn(add_hsts));
+    }
+    match tls {
+        Some(config) => serve_tls(listener, TlsAcceptor::from(Arc::new(config)), app).await,
+        None => axum::serve(listener, app)
+            .await
+            .context("relay server error"),
+    }
+}
+
+/// Accept TLS connections and serve them.
+///
+/// Hand-rolled rather than `axum::serve` because the relay needs the TLS accept
+/// in front of it. `with_upgrades` is load-bearing: the `/register` control
+/// socket and every proxied terminal stream are WebSocket upgrades, and the
+/// proxy's `hyper::upgrade::on(&mut req)` yields nothing without it.
+async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    acceptor: TlsAcceptor,
+    app: Router,
+) -> Result<()> {
+    // The relay is the one component on the public internet, and a TLS handshake
+    // is the first thing an *unauthenticated* peer can make it do. Without these
+    // two bounds, opening a connection and then saying nothing costs the attacker
+    // nothing and costs the relay a task and a file descriptor for as long as it
+    // cares to hold them.
+    let pending = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES));
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(conn) => conn,
+            // Per-connection accept errors (fd limits, resets) must not kill the
+            // relay; the listener stays live.
+            Err(e) => {
+                tracing::warn!("accept failed: {e}");
+                continue;
+            }
+        };
+        // A permit covers the handshake only, and is released as soon as it
+        // completes — established connections (long-lived terminal streams) must
+        // not hold one, or the relay would cap its own users.
+        let permit = match Arc::clone(&pending).try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(%peer, "too many TLS handshakes in flight; dropping connection");
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let app = app.clone();
+        tokio::spawn(async move {
+            let tls_stream = match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+                .await
+            {
+                Ok(Ok(s)) => s,
+                // A plaintext client that dialed the TLS port lands here. That
+                // rejection *is* the enforcement — there is no cleartext port to
+                // fall back to.
+                Ok(Err(e)) => {
+                    tracing::debug!(%peer, "TLS handshake failed: {e}");
+                    return;
+                }
+                Err(_) => {
+                    tracing::debug!(%peer, "TLS handshake timed out; dropping connection");
+                    return;
+                }
+            };
+            drop(permit);
+            let svc = hyper::service::service_fn(move |req: Request<hyper::body::Incoming>| {
+                app.clone().call(req)
+            });
+            if let Err(e) = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(tls_stream), svc)
+                .with_upgrades()
+                .await
+            {
+                tracing::debug!(%peer, "connection ended: {e}");
+            }
+        });
+    }
 }
 
 /// Build the relay router. Exposed so tests can serve it on an ephemeral port.
@@ -69,6 +208,15 @@ pub fn router(reg: Arc<Registry>) -> Router {
         .layer(middleware::from_fn_with_state(reg.clone(), require_relay_key))
         .layer(CorsLayer::permissive())
         .with_state(reg)
+}
+
+async fn add_hsts(req: Request<Body>, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    resp.headers_mut().insert(
+        axum::http::header::STRICT_TRANSPORT_SECURITY,
+        axum::http::HeaderValue::from_static(HSTS_VALUE),
+    );
+    resp
 }
 
 // ------------------------------------------------------------------ registry
