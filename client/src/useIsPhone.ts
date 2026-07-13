@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useMediaQuery } from "./useMediaQuery";
 
 /**
  * Phone device class. Phones get the stacked mobile shell in **both**
@@ -7,6 +7,10 @@ import { useEffect, useState } from "react";
  * terminal under browser chrome + keyboard. iPad mini portrait (744px) and
  * short desktop windows (never `pointer: coarse`) stay on the desktop shell —
  * matching the "iPad app = desktop web" rule.
+ *
+ * This is a LAYOUT class, not an input class: an iPad is desktop-shaped but has
+ * no keyboard to copy/paste with. For "does this user have a mouse and a
+ * keyboard", ask {@link useIsTouch} instead.
  */
 export const PHONE_MQ =
   "(max-width: 599px), ((max-height: 599px) and (pointer: coarse))";
@@ -17,14 +21,5 @@ export const PHONE_MQ =
  * since all state lives in stores/queries nothing is lost.
  */
 export function useIsPhone(): boolean {
-  const [isPhone, setIsPhone] = useState(
-    () => typeof window !== "undefined" && window.matchMedia(PHONE_MQ).matches,
-  );
-  useEffect(() => {
-    const mq = window.matchMedia(PHONE_MQ);
-    const onChange = () => setIsPhone(mq.matches);
-    mq.addEventListener("change", onChange);
-    return () => mq.removeEventListener("change", onChange);
-  }, []);
-  return isPhone;
+  return useMediaQuery(PHONE_MQ);
 }

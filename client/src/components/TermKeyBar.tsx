@@ -1,7 +1,8 @@
-import { Dispatch, MutableRefObject, SetStateAction, useState } from "react";
+import { Dispatch, MutableRefObject, SetStateAction } from "react";
 import { useTranslation } from "react-i18next";
-import { canReadClipboard, copyText, readText } from "../clipboard";
+import { copyText } from "../clipboard";
 import { CtrlLatch, TerminalHandle } from "../terminalTypes";
+import { useTerminalPaste } from "../useTerminalPaste";
 import { PasteSheet } from "./PasteSheet";
 
 interface Props {
@@ -19,7 +20,7 @@ interface Props {
  */
 export function TermKeyBar({ handleRef, ctrl, setCtrl }: Props) {
   const { t } = useTranslation();
-  const [pasteSheet, setPasteSheet] = useState(false);
+  const { onPaste, pasteSheet, submitPaste, closePasteSheet } = useTerminalPaste(handleRef);
   const send = (data: string) => () => handleRef.current?.write(data);
 
   // off → armed (one-shot) → locked (sticky) → off.
@@ -27,22 +28,6 @@ export function TermKeyBar({ handleRef, ctrl, setCtrl }: Props) {
     setCtrl((c) => (c === "off" ? "armed" : c === "armed" ? "locked" : "off"));
 
   const onKeyboard = () => handleRef.current?.focus();
-  // Reading the clipboard needs a secure context, which a phone talking to the
-  // daemon or the relay over plain HTTP does not have — so DON'T await the answer:
-  // decide synchronously, or the user gesture is spent by the time the sheet's
-  // textarea asks iOS for the keyboard. Where the read IS available it stays the
-  // one-tap path; the sheet also catches the empty//dismissed read (Safari asks for
-  // confirmation on every one).
-  const onPaste = () => {
-    if (!canReadClipboard()) {
-      setPasteSheet(true);
-      return;
-    }
-    void readText().then((text) => {
-      if (text) handleRef.current?.write(text);
-      else setPasteSheet(true);
-    });
-  };
   const onCopy = () => {
     const sel = handleRef.current?.getSelection();
     if (sel) void copyText(sel);
@@ -82,12 +67,7 @@ export function TermKeyBar({ handleRef, ctrl, setCtrl }: Props) {
           {t("keybar.copy")}
         </button>
       </div>
-      {pasteSheet && (
-        <PasteSheet
-          onSubmit={(text) => handleRef.current?.write(text)}
-          onClose={() => setPasteSheet(false)}
-        />
-      )}
+      {pasteSheet && <PasteSheet onSubmit={submitPaste} onClose={closePasteSheet} />}
     </>
   );
 }

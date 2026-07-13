@@ -7,6 +7,10 @@ import { useUiStore } from "../store";
 import { copyText } from "../clipboard";
 import { glog } from "../gestureLog";
 import { CtrlLatch, TerminalHandle } from "../terminalTypes";
+import { useIsPhone } from "../useIsPhone";
+import { useIsTouch } from "../useIsTouch";
+import { useTerminalPaste } from "../useTerminalPaste";
+import { PasteSheet } from "./PasteSheet";
 import i18n from "../i18n";
 
 /** WS close code the daemon uses when another client takes over the session. */
@@ -86,6 +90,21 @@ export function TerminalView({
   const wsRef = useRef<WebSocket | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const errorTimerRef = useRef<number | undefined>(undefined);
+  // The same handle the shell gets from onReady, kept here too so the touch
+  // overlay's own buttons can reach the effect-local xterm (paste writes over
+  // the socket; copy reads the selection through copySelRef's receipt path).
+  const handleRef = useRef<TerminalHandle | null>(null);
+  const copySelRef = useRef<() => void>(() => {});
+  const isTouch = useIsTouch();
+  const isPhone = useIsPhone();
+  // Named to stay clear of the effect-local `onPaste` DOM listener below, which
+  // handles a *native* paste event (images/files) rather than a button tap.
+  const {
+    onPaste: onPasteTapped,
+    pasteSheet,
+    submitPaste,
+    closePasteSheet,
+  } = useTerminalPaste(handleRef);
   // Transient status for an in-flight / failed image paste or a copy receipt,
   // shown as a small overlay (never written into the terminal, which a TUI
   // would repaint over).
@@ -374,15 +393,28 @@ export function TerminalView({
     // plain drags for its own mouse reporting); a plain shell selects on drag.
     // The clipboard has no observable state, so flash the outcome over the
     // terminal — a silent success is indistinguishable from "copy is broken".
-    const copySelection = async () => {
-      const ok = await copyText(term.getSelection());
-      setPasteStatus({
-        kind: ok ? "ok" : "error",
-        msg: i18n.t(ok ? "terminal.copied" : "terminal.copyFailed"),
-      });
+    const flash = (kind: "ok" | "error", msg: string) => {
+      setPasteStatus({ kind, msg });
       if (errorTimerRef.current) window.clearTimeout(errorTimerRef.current);
-      errorTimerRef.current = window.setTimeout(() => setPasteStatus(null), ok ? 1500 : 4000);
+      errorTimerRef.current = window.setTimeout(
+        () => setPasteStatus(null),
+        kind === "ok" ? 1500 : 4000,
+      );
     };
+    const copySelection = async () => {
+      const sel = term.getSelection();
+      // Only the touch overlay's Copy can land here empty — the key chords and
+      // the context menu all guard on hasSelection() — and on a tablet, where
+      // selecting means a long-press drag that's easy to miss, a Copy that did
+      // nothing at all reads as a broken button. Say what's missing instead.
+      if (!sel) {
+        flash("error", i18n.t("terminal.nothingSelected"));
+        return;
+      }
+      const ok = await copyText(sel);
+      flash(ok ? "ok" : "error", i18n.t(ok ? "terminal.copied" : "terminal.copyFailed"));
+    };
+    copySelRef.current = () => void copySelection();
 
     // Copy: on Windows/Linux we claim Ctrl-Shift-C here and leave Ctrl-C to xterm
     // so it still forwards \x03 (SIGINT). macOS ⌘-C needs nothing from us: xterm
@@ -865,16 +897,20 @@ export function TerminalView({
 
     connect();
 
-    // Hand a fresh input handle to the shell (the mobile key bar reads it).
-    onReadyRef.current?.({
+    // Hand a fresh input handle to the shell (the mobile key bar reads it) and
+    // keep it for our own touch overlay.
+    const handle: TerminalHandle = {
       write: sendRaw,
       focus: () => term.focus(),
       getSelection: () => term.getSelection(),
       scrollToEnd,
-    });
+    };
+    handleRef.current = handle;
+    onReadyRef.current?.(handle);
 
     return () => {
       mounted = false;
+      handleRef.current = null;
       onReadyRef.current?.(null);
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
       if (errorTimerRef.current) window.clearTimeout(errorTimerRef.current);
@@ -928,7 +964,34 @@ export function TerminalView({
     <div className="terminal-host">
       <div className="terminal-mount" ref={containerRef} />
       {live && (
-        <>
+        <div className="term-actions">
+          {/* Clipboard buttons for touch devices on the DESKTOP shell — iPads.
+              A phone already has Copy/Paste in the key bar docked above its
+              keyboard (so a second pair here would be redundant), and a mouse
+              user has ⌘-C / Ctrl-Shift-C. That leaves the tablet: desktop-shaped,
+              no key bar, no keyboard to press a chord on, and therefore — until
+              these buttons — no way to copy or paste at all. */}
+          {isTouch && !isPhone && (
+            <>
+              <button
+                type="button"
+                className="term-act term-copy"
+                title={i18n.t("terminal.copySelection")}
+                aria-label={i18n.t("terminal.copySelection")}
+                // Keep the tap from pulling focus out of the terminal: the
+                // selection we're about to read is the whole point of the button.
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => copySelRef.current()}
+              />
+              <button
+                type="button"
+                className="term-act term-paste"
+                title={i18n.t("terminal.pasteClipboard")}
+                aria-label={i18n.t("terminal.pasteClipboard")}
+                onClick={onPasteTapped}
+              />
+            </>
+          )}
           {/* Explicit attach affordance — the primary path on touch devices,
               where clipboard-image paste is unreliable. The 📎 glyph is set in
               CSS so there's no bare string literal in JSX. */}
@@ -942,8 +1005,9 @@ export function TerminalView({
           {/* No `accept` — any file type is a valid attachment (PDF, zip, CSV,
               …), bounded by size alone. */}
           <input ref={fileInputRef} type="file" hidden onChange={onPickFile} />
-        </>
+        </div>
       )}
+      {pasteSheet && <PasteSheet onSubmit={submitPaste} onClose={closePasteSheet} />}
       {pasteStatus && (
         <div className={`paste-status paste-status--${pasteStatus.kind}`} role="status">
           {pasteStatus.msg}
