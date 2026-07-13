@@ -59,9 +59,10 @@ export function SessionList() {
     mutationFn: ({ target, id }: MutArgs) => api.stopSession(target, id),
     onSuccess: refresh,
   });
-  // Archiving removes the session from history and deletes its branch. When the
-  // daemon guards uncommitted/unmerged work it answers 409 — confirm, then retry
-  // with force so nothing is discarded without the user's say-so.
+  // Archiving removes the session from history and deletes its branch. The click
+  // is already confirmed; this second prompt is the escalation — the daemon
+  // guards uncommitted/unmerged work with a 409, so name what would be lost and
+  // retry with force only if the user still wants it gone.
   const archive = useMutation({
     mutationFn: async ({ target, id }: MutArgs) => {
       try {
@@ -149,6 +150,7 @@ export function SessionList() {
     ctx?: { daemonLabel?: string; workspaceName?: string },
   ) => {
     const selected = active?.daemonId === daemonId && active?.sessionId === s.id;
+    const name = sessionLabel(s, ctx?.workspaceName);
     return (
       <div
         key={daemonId + ":" + s.id}
@@ -200,7 +202,9 @@ export function SessionList() {
               aria-label={t("sessionList.stopTitle")}
               onClick={(e) => {
                 e.stopPropagation();
-                stop.mutate({ target, id: s.id });
+                if (confirm(t("sessionList.confirmStop", { name }))) {
+                  stop.mutate({ target, id: s.id });
+                }
               }}
             >
               <span className="action-icon action-icon-stop" aria-hidden="true" />
@@ -234,7 +238,9 @@ export function SessionList() {
               aria-label={t("sessionList.archiveTitle")}
               onClick={(e) => {
                 e.stopPropagation();
-                archive.mutate({ target, id: s.id });
+                if (confirm(t("sessionList.confirmArchive", { name }))) {
+                  archive.mutate({ target, id: s.id });
+                }
               }}
             >
               <span className="action-icon action-icon-archive" aria-hidden="true" />
@@ -470,6 +476,15 @@ export function SessionList() {
 function basename(p: string): string {
   const parts = p.split(/[/\\]/).filter(Boolean);
   return parts.length ? parts[parts.length - 1] : p;
+}
+
+/**
+ * How a session is named in a confirm dialog: "claude · my-repo". Rows carry no
+ * visible id, so the dialog has to echo back what the row showed — otherwise a
+ * mis-click is confirmed just as readily as the intended one.
+ */
+function sessionLabel(s: Session, workspaceName?: string): string {
+  return `${s.agent_plugin_id} · ${workspaceName ?? basename(s.working_directory)}`;
 }
 
 /**

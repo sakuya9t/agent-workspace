@@ -414,9 +414,11 @@ The headless-Chrome tests drive the real client bundle, so build it once
 Chrome:
 
 ```bash
-node scripts/attach-button-test.mjs     # 📎 button → upload → path injected into the PTY
-node scripts/mobile-shell-test.mjs      # mobile adaptive shell at a phone viewport
-node scripts/copy-paste-test.mjs        # copy/paste personas (T1 + T2)
+node scripts/attach-button-test.mjs        # 📎 button → upload → path injected into the PTY
+node scripts/mobile-shell-test.mjs         # mobile adaptive shell at a phone viewport
+node scripts/copy-paste-test.mjs           # copy/paste personas (T1 + T2)
+node scripts/archive-kickout-test.mjs      # archiving kicks every client out of the session view
+node scripts/confirm-destructive-test.mjs  # stop / archive ask before they act
 ```
 
 `copy-paste`'s **T3** needs a genuinely insecure origin (a LAN IP), which a

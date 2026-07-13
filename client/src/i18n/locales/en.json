@@ -160,6 +160,8 @@
     "saveTitle": "Save conversation",
     "archiveTitle": "Archive — remove from history and delete branch",
     "saveError": "Couldn't save the conversation: {{message}}",
+    "confirmStop": "Stop \"{{name}}\"?\n\nThe agent is terminated. The session stays in history — you can still read it, save the conversation, or archive it.",
+    "confirmArchive": "Archive \"{{name}}\"?\n\nThis removes the session from history and deletes the branch and worktree it created. It cannot be undone.",
     "confirmArchiveForce": "{{message}}.\n\nArchive anyway and delete the branch? This cannot be undone.",
     "missingTitle": "{{path}} — no longer exists on the host",
     "newSessionTitle": "New session in this workspace",
