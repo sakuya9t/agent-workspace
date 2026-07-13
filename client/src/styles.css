@@ -174,7 +174,7 @@ body.col-resizing iframe {
   overscroll-behavior: contain;
   -webkit-touch-callout: none;
 }
-/* Transient image-paste status, floated over the terminal's top-right. */
+/* Transient attachment-upload status, floated over the terminal's top-right. */
 .paste-status {
   position: absolute;
   top: 8px;

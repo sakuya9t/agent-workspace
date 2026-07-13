@@ -316,9 +316,10 @@ async function req<T>(t: Target, path: string, init?: RequestInit): Promise<T> {
 }
 
 /**
- * POST raw binary (e.g. a pasted image Blob) and parse a JSON reply. Mirrors
- * `req`'s auth handling but sends the Blob as-is — fetch derives the multipart
- * boundary-free `Content-Type` from the Blob, so we don't force JSON.
+ * POST raw binary (e.g. an attached file or a pasted image Blob) and parse a
+ * JSON reply. Mirrors `req`'s auth handling but sends the Blob as-is — fetch
+ * derives the multipart boundary-free `Content-Type` from the Blob, so we don't
+ * force JSON.
  */
 async function postBlob<T>(t: Target, path: string, blob: Blob): Promise<T> {
   const headers: Record<string, string> = {
@@ -400,12 +401,19 @@ export function contentDispositionName(res: Response): string | null {
   return m ? m[1] : null;
 }
 
-/** Where a stored paste landed on the daemon host. */
-export interface PastedImage {
+/** Where a stored attachment landed on the daemon host. */
+export interface StoredAttachment {
   path: string;
   relative_path: string;
   filename: string;
 }
+
+/**
+ * Largest attachment the daemon will store (`MAX_PASTE_BYTES`). Mirrored here so
+ * the client can reject an oversize file instantly with a clear message instead
+ * of uploading it just to collect a 413. The daemon still enforces it.
+ */
+export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 
 /**
  * Enroll a device against a specific daemon; returns its device token. When the
@@ -588,11 +596,18 @@ export const api = {
       (r) => r.enrollment_token,
     ),
   /**
-   * Upload a pasted/dropped image; the daemon stores it under the session's
-   * working directory and returns the path to inject into the terminal.
+   * Upload a pasted/dropped/picked attachment of any type; the daemon stores it
+   * under the session's working directory and returns the path to inject into
+   * the terminal. `name` is advisory — it only shapes the stored filename (the
+   * daemon sanitises it and picks the directory itself). A clipboard image is a
+   * bare Blob with no name, so it's optional.
    */
-  pasteImage: (t: Target, id: string, blob: Blob) =>
-    postBlob<PastedImage>(t, `/api/sessions/${id}/paste`, blob),
+  uploadAttachment: (t: Target, id: string, blob: Blob, name?: string) =>
+    postBlob<StoredAttachment>(
+      t,
+      `/api/sessions/${id}/paste` + (name ? `?name=${encodeURIComponent(name)}` : ""),
+      blob,
+    ),
 };
 
 export function streamUrl(t: Target, id: string): string {

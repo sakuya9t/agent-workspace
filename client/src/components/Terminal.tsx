@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ChangeEvent, type MutableRefObject } from "react";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { streamUrl, api } from "../api";
+import { streamUrl, api, MAX_ATTACHMENT_BYTES } from "../api";
 import { Target } from "../connectionStore";
 import { useUiStore } from "../store";
 import { copyText } from "../clipboard";
@@ -11,6 +11,9 @@ import i18n from "../i18n";
 
 /** WS close code the daemon uses when another client takes over the session. */
 const CLOSE_SUPERSEDED = 4001;
+
+/** Size for a human, only ever used on the attachment limit (always MB-scale). */
+const formatBytes = (n: number) => `${(n / (1024 * 1024)).toFixed(1)} MB`;
 
 /** Map a single typed character to its control byte (Ctrl-A → \x01, etc.); pass
  *  anything else (multi-char sequences, non-mappable keys) through untouched. */
@@ -85,31 +88,52 @@ export function TerminalView({
     msg: string;
   } | null>(null);
 
-  // Upload a pasted/dropped/picked image, then inject its stored path over the
-  // live socket as prompt text — the drag-and-drop-equivalent the agent loads
-  // on submit. The upload finishes BEFORE the path is injected, so a slow or
-  // dropped link never leaves a dangling reference in the prompt. Lifted to
-  // component scope so the 📎 button and the terminal's paste/drop listeners
-  // share one implementation.
-  const uploadAndInject = async (blob: Blob) => {
+  const showError = (msg: string) => {
+    setPasteStatus({ kind: "error", msg });
+    if (errorTimerRef.current) window.clearTimeout(errorTimerRef.current);
+    errorTimerRef.current = window.setTimeout(() => setPasteStatus(null), 4000);
+  };
+
+  // Upload a pasted/dropped/picked file of ANY type, then inject its stored path
+  // over the live socket as prompt text — the drag-and-drop-equivalent the agent
+  // loads on submit. An image is just the common case: a PDF, a zip or a CSV is
+  // as useful to the agent, and it reads them from the same path. The upload
+  // finishes BEFORE the path is injected, so a slow or dropped link never leaves
+  // a dangling reference in the prompt. Lifted to component scope so the 📎
+  // button and the terminal's paste/drop listeners share one implementation.
+  const uploadAndInject = async (file: Blob, name?: string) => {
     if (!live) return;
-    setPasteStatus({ kind: "busy", msg: i18n.t("terminal.uploadingImage") });
+    // Pre-check the size the daemon enforces anyway, so a too-big file fails
+    // instantly and legibly instead of after a long upload ending in a 413.
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      showError(
+        i18n.t("terminal.attachTooLarge", {
+          size: formatBytes(file.size),
+          max: formatBytes(MAX_ATTACHMENT_BYTES),
+        }),
+      );
+      return;
+    }
+    const isImage = file.type.startsWith("image/");
+    setPasteStatus({
+      kind: "busy",
+      msg: name
+        ? i18n.t("terminal.uploadingNamed", { name })
+        : i18n.t("terminal.uploadingImage"),
+    });
     try {
-      const r = await api.pasteImage(target, sessionId, blob);
+      const r = await api.uploadAttachment(target, sessionId, file, name);
       const ws = wsRef.current;
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(
-          JSON.stringify({ t: "i", d: i18n.t("terminal.pastedImageRef", { path: r.relative_path }) }),
-        );
+        // Keep the verified image wording for images (docs/image-paste.md
+        // proved Claude Code loads exactly this form); everything else says
+        // "attached file", which is the same bare-path-in-prose shape.
+        const key = isImage ? "terminal.pastedImageRef" : "terminal.attachedFileRef";
+        ws.send(JSON.stringify({ t: "i", d: i18n.t(key, { path: r.relative_path }) }));
       }
       setPasteStatus(null);
     } catch (e) {
-      setPasteStatus({
-        kind: "error",
-        msg: i18n.t("terminal.pasteFailed", { message: (e as Error).message }),
-      });
-      if (errorTimerRef.current) window.clearTimeout(errorTimerRef.current);
-      errorTimerRef.current = window.setTimeout(() => setPasteStatus(null), 4000);
+      showError(i18n.t("terminal.pasteFailed", { message: (e as Error).message }));
     }
   };
   // The effect's DOM listeners reach the latest closure through this ref, so
@@ -119,7 +143,7 @@ export function TerminalView({
 
   const onPickFile = (e: ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
-    if (f && f.type.startsWith("image/")) void uploadAndInject(f);
+    if (f) void uploadAndInject(f, f.name);
     e.target.value = ""; // let the same file be picked again next time
   };
 
@@ -406,23 +430,25 @@ export function TerminalView({
       e.preventDefault();
     };
 
-    // --- Image paste / drop --- (the upload+inject itself lives at component
+    // --- File paste / drop --- (the upload+inject itself lives at component
     // scope in `uploadAndInject`, reached here via `uploadRef` so these
     // listeners don't become effect dependencies; the 📎 button shares it.)
-    const firstImage = (files: FileList | null | undefined): File | null =>
-      files ? (Array.from(files).find((f) => f.type.startsWith("image/")) ?? null) : null;
-
+    // Any file type is taken, not just images — `dragover` already advertised
+    // that by accepting any file kind, and now `drop` actually honours it.
     const onPaste = (e: ClipboardEvent) => {
       if (!live || !e.clipboardData) return;
       for (const item of Array.from(e.clipboardData.items)) {
-        if (item.kind === "file" && item.type.startsWith("image/")) {
+        if (item.kind === "file") {
           const file = item.getAsFile();
           if (file) {
             // Swallow it so xterm doesn't also paste garbage; a plain-text
-            // paste (no image item) falls through to xterm untouched.
+            // paste (whose items are all `kind: "string"`) falls through to
+            // xterm untouched.
             e.preventDefault();
             e.stopPropagation();
-            void uploadRef.current(file);
+            // A clipboard image has no meaningful name (Chrome calls it
+            // "image.png"); a file copied from a file manager does.
+            void uploadRef.current(file, file.name || undefined);
             return;
           }
         }
@@ -435,10 +461,10 @@ export function TerminalView({
     };
     const onDrop = (e: DragEvent) => {
       if (!live) return;
-      const img = firstImage(e.dataTransfer?.files);
-      if (img) {
+      const file = e.dataTransfer?.files?.[0];
+      if (file) {
         e.preventDefault();
-        void uploadRef.current(img);
+        void uploadRef.current(file, file.name || undefined);
       }
     };
     // --- Touch: drag scrolls, long-press selects, drag-after-press extends ---
@@ -781,17 +807,13 @@ export function TerminalView({
           <button
             type="button"
             className="term-attach"
-            title={i18n.t("terminal.attachImage")}
-            aria-label={i18n.t("terminal.attachImage")}
+            title={i18n.t("terminal.attachFile")}
+            aria-label={i18n.t("terminal.attachFile")}
             onClick={() => fileInputRef.current?.click()}
           />
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*"
-            hidden
-            onChange={onPickFile}
-          />
+          {/* No `accept` — any file type is a valid attachment (PDF, zip, CSV,
+              …), bounded by size alone. */}
+          <input ref={fileInputRef} type="file" hidden onChange={onPickFile} />
         </>
       )}
       {pasteStatus && (
