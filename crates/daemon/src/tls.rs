@@ -1,10 +1,22 @@
 //! HTTPS for the daemon's own listener.
 //!
-//! Without this the only encrypted ways to reach a daemon are the relay and an
-//! SSH port-forward, so a client on the LAN talking to it directly
-//! (`http://192.168.x.x:4600`) hands its device token — and every keystroke — to
-//! anyone sniffing the network. With `ASM_TLS_CERT`/`ASM_TLS_KEY` set, that same
-//! client uses `https://` and the direct path is encrypted like any other.
+//! **This does not secure the LAN journey, and it cannot. Read this before
+//! reaching for it.** A LAN daemon is reached by IP; no public CA certifies
+//! `192.168.x.x`; so the certificate is self-signed. The web client connects to
+//! a daemon with a **cross-origin `fetch`** (the user types the daemon's URL into
+//! the Connections dialog from whatever page they are on), and a browser refuses
+//! an untrusted certificate there with **no interstitial and no API to accept
+//! it** — it surfaces as an opaque `TypeError`, i.e. "daemon not started". So
+//! switching a LAN daemon to `https://` silently breaks every client that is not
+//! served by that same daemon. The interstitial the HSTS note below reasons about
+//! only exists for a *top-level navigation*, which is not how a client reaches a
+//! daemon. See `docs/security-followups.md` → 1.
+//!
+//! What this **is** for: a daemon fronted by a reverse proxy, or one with a real
+//! name and a **publicly-trusted** certificate (ACME, incl. DNS-01 for a name
+//! that resolves to a private IP). Then the browser trusts it and the journey is
+//! unchanged. Encryption that a browser accepts requires a NAME, not an IP —
+//! on a bare LAN the answer is the relay's ACME cert, not this.
 //!
 //! Certificate parsing is [`asm_relay::tls`]'s, shared with the relay: one code
 //! path for "read a PEM chain + key, refuse a mismatched pair".
@@ -13,8 +25,9 @@
 //!
 //! - **No HSTS.** A daemon is usually reached by IP or a LAN name with a
 //!   self-signed certificate, and HSTS makes the browser's certificate
-//!   interstitial *non-bypassable* — the user could never click through, and
-//!   turning TLS back off would lock them out of the host entirely.
+//!   interstitial *non-bypassable* — for the same-origin case (the daemon serving
+//!   the client itself) that would remove even the one escape hatch that exists,
+//!   and turning TLS back off would lock them out of the host entirely.
 //! - **`ConnectInfo` is inserted by hand.** `axum::serve` normally does this via
 //!   `into_make_service_with_connect_info`, but this accept loop bypasses that,
 //!   and `auth::require_auth` derives loopback trust from the peer address. If

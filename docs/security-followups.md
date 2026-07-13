@@ -47,10 +47,54 @@ Use a **real ACME cert** on the relay. A self-signed one works — point
 `ASM_RELAY_CA` at it so the daemon trusts it — but the *browser* has no such
 escape hatch and will show a certificate warning.
 
-**The daemon now serves HTTPS too** (`ASM_TLS_CERT` / `ASM_TLS_KEY`, 2026-07-12),
-so the direct LAN path — `https://host:4600` — is encrypted like any other, and
-Phase 8's "TLS or equivalent" is met. Certificate parsing is shared with the
-relay (`asm_relay::tls`). Two daemon-specific choices:
+### The daemon's own HTTPS does NOT secure the LAN journey (2026-07-12, corrected same day)
+
+`ASM_TLS_CERT` / `ASM_TLS_KEY` make the daemon serve `https://host:4600`. That
+was claimed here as "the direct LAN path is encrypted like any other". **It is
+not, and it cannot be, for the journey the product actually has.** The correction
+matters more than the feature:
+
+- A LAN daemon is reached **by IP**. No public CA will certify `192.168.x.x`, so
+  its certificate is necessarily **self-signed** (or privately signed, which is
+  the same thing to a browser that lacks the CA).
+- The client's connection to a daemon is a **cross-origin `fetch`** — the user
+  adds `https://192.168.0.159:4600` in the Connections dialog from whatever page
+  they are on (a client served by another host, a dev server, another daemon).
+- A browser refuses an untrusted certificate on a cross-origin fetch **with no
+  interstitial and no API to accept it**. It surfaces as an opaque `TypeError`,
+  indistinguishable from a dead host. There is nothing any client code can do.
+
+So daemon-terminated TLS is **unreachable by construction** in the one journey it
+was added to protect. The certificate interstitial that `tls.rs` reasons about
+("the user could never click through") only exists for a *top-level navigation* —
+i.e. only if the daemon is also the origin serving the page, which is not the
+supported journey. Turning it on silently breaks the LAN client; that is how it
+was found.
+
+**Where daemon HTTPS is still right:** a daemon behind a reverse proxy or on a
+host with a **real name and a publicly-trusted cert** (then the browser trusts it
+and nothing changes for the user), and the daemon→relay hop, where the daemon is
+a TLS *client* and can be told to trust a private CA (`ASM_RELAY_CA`). Keep the
+feature; stop presenting it as the LAN answer.
+
+**The corrected approach — encryption must terminate where a browser already
+trusts, which on a LAN means a NAME, not an IP:**
+
+1. **LAN direct = plaintext, deliberately.** The user chose their network's trust
+   boundary by binding off-loopback. Warn, never break. This is the current
+   default again.
+2. **Anything beyond the LAN = the relay**, which has a real hostname and a real
+   ACME cert. The browser sees only that cert, so there is *zero* ceremony and
+   the journey is unchanged (add relay URL + key in the UI). This is the product
+   path and where encryption genuinely belongs.
+3. **Encrypted LAN direct, if wanted:** only via a **publicly-trusted cert for a
+   name that resolves to the LAN IP** (ACME DNS-01 against a domain you own; the
+   `*.plex.direct` pattern). Then `ASM_TLS_CERT` is exactly right and the CUJ is
+   untouched. A self-signed cert is not a cheaper version of this — it is a
+   different, broken thing.
+
+Certificate parsing is shared with the relay (`asm_relay::tls`). Two
+daemon-specific choices:
 
 - **No HSTS from the daemon.** A daemon is usually reached by IP or a LAN name
   with a self-signed certificate, and HSTS makes the browser interstitial
@@ -64,10 +108,18 @@ relay (`asm_relay::tls`). Two daemon-specific choices:
 
 **What remains:**
 
-- Plaintext off-loopback is still *allowed* (warned, not refused) — that is now a
-  deliberate choice rather than the only option, since a certificate is available.
+- **The LAN hop is unencrypted again, and that is the honest state.** The daemon
+  runs plaintext off-loopback (warned, not refused). A self-signed cert does not
+  fix it — it only breaks the client. Closing this for real needs path 2 (relay
+  with an ACME cert, no client tooling, journey unchanged) or path 3 (a named,
+  publicly-trusted cert on the daemon). Both need a domain; neither needs the
+  user to install anything on their phone.
 - **mTLS** is still open: the device token remains the only credential on the
   wire. Worth revisiting if the daemon is ever exposed beyond a LAN.
+- **Guardrail worth having:** the daemon should say at startup, when it is given
+  a self-signed cert on an off-loopback bind, that browsers will refuse
+  cross-origin calls from a client served elsewhere — the failure is otherwise
+  silent and reads as "daemon not started".
 
 ## 2. `/api/fs/list` exposes the whole host filesystem — HIGH
 
