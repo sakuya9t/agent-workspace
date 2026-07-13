@@ -131,7 +131,6 @@ async fn relayed_nat_host_is_controllable_end_to_end() {
         label: "fake-node".to_string(),
         local_target: node_http,
         downstreams: ds_rx,
-        relay_ca: None,
     }));
 
     wait_online(relay, &node_id).await;

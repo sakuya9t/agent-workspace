@@ -72,13 +72,11 @@ scripts/stop.sh             # stop both (stop.sh daemon|asmux for just one)
 scripts/token.sh            # print this host's device-enrollment token
 ```
 
-Override with flags, e.g. `scripts/start.sh --bind 0.0.0.0:4600`
-(`RELEASE=1` / the `ASM_*` env still work as fallbacks). Once
+Override with env, e.g. `ASM_BIND=0.0.0.0:4600 RELEASE=1 scripts/start.sh`. Once
 a component has launched, its settings are recorded (`asm-daemon.reg` /
 `asm-relay.reg` in the runtime dir): a **flagless** `start.sh` /
 `restart-daemon.sh` keeps those recorded settings — including a `0.0.0.0` bind, a
-`--register`, relay-only-ness, the relay's TLS cert, and the plaintext-relay
-acknowledgement — rather than reverting to defaults, and the
+`--register`, and relay-only-ness — rather than reverting to defaults, and the
 recording beats inherited `ASM_*` env (shells inside an asm session inherit the
 daemon's own exports). Pass flags to actually change settings; an explicit
 `stop.sh` clears the component's recording. The rest of this section is the
@@ -162,26 +160,6 @@ Environment overrides: `ASM_BIND`, `ASM_DATA_DIR`, `ASM_CONFIG_DIR`,
 auto-spawn), `ASM_ASMUX_BIN` (explicit holder binary path), `ASMUX_SOCK` (holder
 socket path), `ASMUX_MEMORY_LIMIT` (holder ring-memory cap, bytes).
 
-`ASM_RELAY_URL` accepts `https://`/`http://` too and translates them to
-`wss://`/`ws://` — the daemon dials the relay over WebSocket, but the URL you
-have to hand is usually the one the browser uses.
-
-Transport: `ASM_TLS_CERT` / `ASM_TLS_KEY` (PEM chain + key — set both and the
-daemon serves **https/wss** on `ASM_BIND`, which is what makes a direct
-`https://host:4600` client safe), `ASM_TRUST_LOOPBACK=0` / `--no-loopback-trust`
-(require a token even from loopback — **mandatory** behind a same-host reverse
-proxy, whose requests would otherwise arrive pre-trusted), `ASM_RELAY_URL` (`wss://…`), `ASM_RELAY_KEY`,
-`ASM_RELAY_CA` (PEM
-anchors for a self-hosted relay with a private or self-signed cert), and the one
-acknowledgement the daemon requires before it will register to a **plaintext
-relay on a remote host**: `ASM_ALLOW_INSECURE_RELAY=1`. (An off-loopback
-`ASM_BIND` needs no such flag — it is plaintext too, but choosing it is the
-acknowledgement; the daemon warns at startup.) The service scripts expose these
-as flags — `--tls-cert` / `--tls-key`, `--register`, `--relay-ca`,
-`--insecure-relay`, and `--relay-tls-cert` / `--relay-tls-key` for a relay you
-run yourself — and record them, so a flagless restart keeps them.
-`scripts/wizard.sh` asks in plain language.
-
 ## Running the client
 
 There are two ways to get the browser UI in front of users.
@@ -252,25 +230,11 @@ trusts it, and SSH provides the encryption.
 
 ### Remote via direct LAN
 
-Bind the daemon off-loopback and enroll a device. Give it a certificate and the
-whole channel is encrypted — clients then use `https://<host>:4600`:
+Bind the daemon off-loopback and enroll a device:
 
 ```bash
-scripts/start.sh --bind 0.0.0.0:4600 \
-  --tls-cert /etc/asm/cert.pem --tls-key /etc/asm/key.pem
+ASM_BIND=0.0.0.0:4600 scripts/start.sh   # logs the enrollment token on startup
 ```
-
-Without `--tls-cert`/`--tls-key` it still starts — choosing an off-loopback bind
-*is* the acknowledgement — but the channel is **plaintext**: the device token and
-every keystroke are readable by anyone on that LAN. The daemon says so at
-startup, and the client flags the `http://` URL as unencrypted when you add it.
-
-A LAN host rarely has a public certificate. A **self-signed** one works, with two
-caveats: it must be a *leaf* (`CA:FALSE` — see
-[`deployment.md`](deployment.md#the-relay-tls-on-a-public-host)), and the browser
-will prompt once per host until you trust it. That is still strictly better than
-plaintext, and the daemon deliberately does **not** send HSTS, so the prompt stays
-click-through-able.
 
 Retrieve the enrollment token in any of these ways:
 

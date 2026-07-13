@@ -62,20 +62,13 @@ pub async fn require_auth(State(state): State<AppState>, mut req: Request, next:
         return next.run(req).await;
     }
 
-    // The one trust decision: loopback trust is enabled, the peer is loopback,
-    // and this is not the relay tunnel listener.
-    //
-    // `trust_loopback` exists for the reverse-proxy case: a proxy on the same
-    // host connects from 127.0.0.1, so without this switch everything it
-    // forwards — from anywhere on the internet — would arrive pre-trusted and
-    // the daemon's auth would be silently off.
+    // The one trust decision: loopback peer AND not the relay tunnel listener.
     let kind = req
         .extensions()
         .get::<ListenerKind>()
         .copied()
         .unwrap_or(ListenerKind::Primary);
-    let trusted =
-        state.config.trust_loopback && peer_is_loopback(&req) && kind != ListenerKind::Tunnel;
+    let trusted = peer_is_loopback(&req) && kind != ListenerKind::Tunnel;
     req.extensions_mut().insert(LoopbackTrust(trusted));
 
     let path = req.uri().path().to_string();

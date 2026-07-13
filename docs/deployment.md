@@ -194,18 +194,10 @@ Containerising nudges you off the loopback-trust model, so the accepted gaps in
   of `loopback_only`, so **token auth is enforced** — good. Make sure the
   enrollment token is set (item 3) and treat it as the real credential now that
   loopback-trust no longer implies "one human on the box" (item 6).
-- **Give the daemon a certificate** (`ASM_TLS_CERT` / `ASM_TLS_KEY`) if you
-  publish its port anywhere but host loopback — it then serves https/wss and the
-  direct path is encrypted. Otherwise keep the port on the host's loopback
-  (`127.0.0.1:4600:4600`) and reach it by **SSH local port-forward**, or use the
-  **relay** (below), which needs no inbound port at all.
-- **A same-host reverse proxy in front of the daemon DISABLES AUTH.** The proxy
-  connects from `127.0.0.1`, and loopback peers are trusted without a token — so
-  every request it forwards, from anywhere, arrives pre-trusted. If you front the
-  daemon with a proxy you **must** set `ASM_TRUST_LOOPBACK=0`
-  (`scripts/start.sh --no-loopback-trust`), which makes a device token mandatory
-  on every request. Giving the daemon its own certificate avoids the whole
-  question.
+- **Keep the port on the host's loopback** (`127.0.0.1:4600:4600`) and reach it
+  by **SSH local port-forward**, or terminate **TLS at a reverse proxy** in
+  front. Do not publish `4600` on a public interface — the channel is still
+  plaintext off-loopback (item 1).
 - **CORS is permissive** (item 5); if a proxy serves the client from a different
   origin, restrict allowed origins there.
 - asmux exposes **no port** — it must stay that way. Its only surface is the
@@ -238,100 +230,3 @@ volumes:
 This image must carry the agent CLIs itself (the native backend `exec`s agents
 in-process). When you migrate to the two-container split, those CLIs move to the
 `asmux` image and the daemon image slims down to just `git` + the binary.
-
-## The relay: TLS on a public host
-
-The relay is the only component that takes inbound connections from the open
-internet, and the only one that holds a certificate. It carries device tokens and
-whole terminal streams for every node registered with it, so **it must be TLS**.
-Both hops are encrypted by the same certificate: the browser dials `https://`,
-and the daemon dials `wss://` *outbound* from behind its NAT.
-
-Two shapes, both supported:
-
-```bash
-# A. The relay terminates TLS itself.
-ASM_RELAY_BIND=0.0.0.0:443 \
-ASM_RELAY_KEYS=<access-key> \
-ASM_RELAY_TLS_CERT=/etc/asm/fullchain.pem \
-ASM_RELAY_TLS_KEY=/etc/asm/privkey.pem \
-  asm-relay
-
-# B. A reverse proxy (Caddy, nginx) terminates TLS and forwards to the relay.
-ASM_RELAY_BIND=127.0.0.1:4700 ASM_RELAY_KEYS=<access-key> ASM_RELAY_HSTS=1 asm-relay
-```
-
-Notes that matter:
-
-- **Use a real ACME certificate.** A self-signed cert works for the *daemon* —
-  point `ASM_RELAY_CA` at it — but the *browser* has no equivalent escape hatch
-  and will throw a certificate warning at every user.
-- **A self-signed cert must be a leaf (`CA:FALSE`).** `openssl req -x509` marks
-  its output `CA:TRUE` by default, and rustls refuses a CA certificate presented
-  as a server's own leaf — the daemon fails to register with `CaUsedAsEndEntity`
-  while browsers accept the same cert happily, so it looks like the node is
-  broken rather than the cert. Mint it explicitly as a leaf:
-
-  ```bash
-  openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes \
-    -subj "/CN=relay.example.com" \
-    -addext "subjectAltName=DNS:relay.example.com" \
-    -addext "basicConstraints=critical,CA:FALSE"
-  ```
-
-  Then copy `cert.pem` to every node and pass `--relay-ca cert.pem`.
-- **With TLS on, the relay speaks only TLS.** There is no cleartext port to fall
-  back to; a plaintext client fails the handshake. Setting only one of
-  `ASM_RELAY_TLS_CERT` / `ASM_RELAY_TLS_KEY` is a startup error, so a typo can't
-  quietly downgrade a production relay to plaintext.
-- **In shape B, the proxy must pass WebSocket upgrades through** — the control
-  stream, every data stream, and every terminal stream are upgrades. Set
-  `ASM_RELAY_HSTS=1` so the header still reaches the browser (the relay itself
-  only sees plain HTTP in that shape).
-- **Nodes then register with `ASM_RELAY_URL=wss://relay.example.com`.** A
-  plaintext `ws://` URL to a remote host is refused at daemon boot.
-
-### Worked example: browser on A, daemon+relay on B, NAT'd daemon on C
-
-```bash
-# B — the reachable box: a daemon the LAN can reach, plus the relay C dials into.
-#     One --relay-key serves both roles: the relay accepts it, nodes present it.
-scripts/start.sh --bind 0.0.0.0:4600 \
-  --relay --relay-key s3cret \
-  --relay-tls-cert /etc/asm/fullchain.pem --relay-tls-key /etc/asm/privkey.pem
-
-# C — behind NAT: dials out to B's relay, accepts nothing inbound.
-scripts/start.sh --register wss://relay.example.com:4700 --relay-key s3cret
-
-# A — the machine you browse from: a local daemon, which also serves the web UI.
-scripts/start.sh                      # → http://127.0.0.1:4600
-```
-
-In the client on A:
-
-- **B, directly** — manage → Add → Daemon: `http://<B>:4600` + B's enrollment
-  token (`scripts/token.sh` on B). The client flags the URL as unencrypted, which
-  it is: B's daemon has no certificate, so on the LAN the token and the terminal
-  stream are readable. That's the trade you're making for a direct connection;
-  it connects regardless.
-- **C, through the relay** — manage → Add → Relay: `https://relay.example.com:4700`
-  + key `s3cret`. C appears underneath it; enroll it with C's own token. This hop
-  *is* encrypted end to end.
-
-**If you want B encrypted too**, give its daemon no LAN bind at all and have it
-register to its own relay instead — then every client hop, to B and to C alike,
-runs over the TLS relay and the client needs only the one relay entry:
-
-```bash
-# B, all traffic through its own relay: drop --bind, add --register.
-scripts/start.sh \
-  --relay --relay-key s3cret \
-  --relay-tls-cert /etc/asm/fullchain.pem --relay-tls-key /etc/asm/privkey.pem \
-  --register wss://relay.example.com:4700
-```
-
-B must then be able to resolve and reach `relay.example.com` itself, since its
-daemon dials the relay by name — the certificate is verified against the name,
-not the address. If B cannot reach its own public address, a
-`127.0.0.1 relay.example.com` line in B's `/etc/hosts` makes that hop pure
-loopback and the certificate still validates.

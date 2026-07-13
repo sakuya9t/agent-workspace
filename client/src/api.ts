@@ -259,15 +259,11 @@ function baseOf(baseUrl: string): string {
 }
 
 // fetch rejects with an opaque TypeError when the host is unreachable
-// (connection refused, DNS, offline) — name the likely cause instead. A browser
-// that rejects the daemon's certificate fails a background fetch the SAME opaque
-// way, and never shows the interstitial that would let the user accept it, so an
-// https host that "isn't started" is just as likely to be one that is running
-// perfectly behind an untrusted self-signed cert. Say both.
+// (connection refused, DNS, offline) — name the likely cause instead.
 function unreachableError(baseUrl: string): Error {
-  if (!baseUrl) return new Error(i18n.t("api.unreachable"));
-  const key = baseUrl.startsWith("https://") ? "api.unreachableAtTls" : "api.unreachableAt";
-  return new Error(i18n.t(key, { baseUrl }));
+  return new Error(
+    baseUrl ? i18n.t("api.unreachableAt", { baseUrl }) : i18n.t("api.unreachable"),
+  );
 }
 
 /**

@@ -10,64 +10,58 @@ logs can contain secrets, logs live on the daemon host, retention is
 conservative, and encryption-at-rest + production redaction are deferred. The
 items below are additional, tracked here so we don't forget.
 
-## 1. Transport encryption — DONE (relay + daemon) — LOW (residual)
+## 1. Transport encryption — DECIDED (2026-07-12): the LAN is plaintext by design
 
-**Status (2026-07-12): the relay path — the product path — is encrypted end to
-end.** What landed:
+- **What:** off-loopback HTTP + WebSocket is plaintext. Device bearer tokens,
+  terminal input/output, and diffs travel unencrypted over the LAN. This is a
+  **decision, not a gap**: the user chooses the network trust boundary by
+  binding off-loopback, and the encrypted remote path is an **SSH local
+  port-forward** (or, in the future, the relay — see below).
 
-- **The agent can dial `wss://`.** `tokio-tungstenite` carries the
-  `rustls-tls-webpki-roots` feature and the agent connects through an explicit
-  rustls connector (`asm-relay/src/tls.rs`). This was the blocker: the daemon
-  dials the relay *outbound* from behind NAT, so it is itself a TLS client, and
-  a TLS-terminating proxy in front of the relay would have locked the daemon out
-  rather than secured it.
-- **The relay serves TLS.** `ASM_RELAY_TLS_CERT` / `ASM_RELAY_TLS_KEY` (rustls,
-  ALPN pinned to `http/1.1` so the WebSocket upgrade survives). With TLS on there
-  is **no cleartext port to fall back to** — a plaintext client fails the
-  handshake. Setting only one of the two is a hard error, so a typo cannot
-  silently downgrade the relay. `ASM_RELAY_HSTS=1` covers the
-  proxy-terminated deployment.
-- **Enforced where it must be, surfaced where it shouldn't be.** The daemon
-  *refuses* a plaintext `ASM_RELAY_URL` to a remote host
-  (`ASM_ALLOW_INSECURE_RELAY=1` overrides) — a plaintext relay is never
-  deliberate and `wss://` is free. An off-loopback `ASM_BIND` *without* a
-  certificate is only *warned* about: it is a deliberate choice, refusing it
-  broke every LAN and container deployment that had legitimately made it, and a
-  certificate is now available for anyone who wants the encrypted version. The
-  web client likewise flags a plaintext daemon/relay URL as unencrypted without
-  blocking it. Loopback is exempt throughout: `http://localhost` is the local
-  daemon and the far end of an SSH forward, and browsers already treat it as a
-  secure context.
-- **Covered by `crates/asm-relay/tests/tls.rs`:** the agent registers over
-  `wss://`, HTTPS *and* WSS proxy through to the node, a plaintext client on the
-  TLS port is refused, and an untrusted certificate is rejected rather than
-  waved through.
+### TLS was built end to end and reverted the same day — read this before reopening
 
-Use a **real ACME cert** on the relay. A self-signed one works — point
-`ASM_RELAY_CA` at it so the daemon trusts it — but the *browser* has no such
-escape hatch and will show a certificate warning.
+The full implementation landed as `1dcb15e` (relay rustls + agent `wss://` +
+daemon-terminated HTTPS + script/wizard/client support, test-covered) and was
+reverted to `ebc381b` by `a36fdfa`. Not because the code failed — because the
+**design cannot satisfy the product's constraints**, and every workaround
+violates one of them:
 
-**The daemon now serves HTTPS too** (`ASM_TLS_CERT` / `ASM_TLS_KEY`, 2026-07-12),
-so the direct LAN path — `https://host:4600` — is encrypted like any other, and
-Phase 8's "TLS or equivalent" is met. Certificate parsing is shared with the
-relay (`asm_relay::tls`). Two daemon-specific choices:
+1. **Daemon-terminated TLS with a self-signed certificate is unreachable by
+   construction.** A LAN daemon is reached by IP; no public CA certifies
+   `192.168.x.x`, so its certificate is necessarily self-signed. The client
+   connects to a daemon with a **cross-origin `fetch`** (the URL typed into the
+   Connections dialog from whatever page the client is on), and a browser
+   refuses an untrusted certificate there with **no interstitial and no API to
+   accept it** — an opaque `TypeError`, indistinguishable from a dead host.
+   Turning it on made the daemon unreachable in the exact journey it was meant
+   to protect. (The interstitial only exists for top-level navigations, i.e.
+   only when the daemon itself serves the page — not the supported journey.)
+2. **Every escape from (1) is a browser-trusted certificate for a NAME, and
+   both ways to get one were rejected:**
+   - *A public name* (free dynamic-DNS like duckdns.org, or an owned domain,
+     + ACME DNS-01 for a name resolving to the LAN IP — the `*.plex.direct`
+     pattern). Works, zero device-side setup — but it makes the LAN daemon
+     depend on an external account, a public DNS record, a CT-logged hostname
+     and a renewal pipeline. **Rejected: no external dependencies.**
+   - *A private CA* (self-hosted root issuing for a local name or IP). No
+     external anything — but the root must be installed and fully trusted on
+     **every connecting device**, forever (per-device ceremony, extra hoops on
+     iOS/Android). **Rejected: no per-device setup; the connect journey — one
+     URL in the Add-daemon dialog — is immutable.**
+3. **Verdict: browser-trusted / no-external-dependency / journey-unchanged are
+   mutually exclusive on a bare LAN.** That is WebPKI policy (public CAs are
+   forbidden from certifying private IPs and local-only names), not a tooling
+   gap. So the LAN direct path is plaintext, deliberately, and the product
+   stops pretending otherwise.
 
-- **No HSTS from the daemon.** A daemon is usually reached by IP or a LAN name
-  with a self-signed certificate, and HSTS makes the browser interstitial
-  *non-bypassable* — the user could never click through, and turning TLS back off
-  would lock them out of the host entirely. The relay, which has a real name and
-  a real cert, does send it.
-- **`ASM_TRUST_LOOPBACK=0`** disables loopback trust. This is mandatory behind a
-  same-host reverse proxy: the proxy connects from `127.0.0.1`, so without it
-  every request it forwards would be loopback-trusted and the daemon's auth would
-  be silently off. (Partially addresses item 6.)
-
-**What remains:**
-
-- Plaintext off-loopback is still *allowed* (warned, not refused) — that is now a
-  deliberate choice rather than the only option, since a certificate is available.
-- **mTLS** is still open: the device token remains the only credential on the
-  wire. Worth revisiting if the daemon is ever exposed beyond a LAN.
+**When encryption returns, it returns at the relay (R5).** A deployed relay has
+a real hostname and can hold a real ACME certificate; the browser sees only
+that cert, so there is zero ceremony and the journey is unchanged (add relay
+URL + key in the UI). The reverted implementation — agent `wss://` dialing,
+relay rustls, refusal of plaintext-to-remote-relay — worked and was
+test-covered; resurrect it from `1dcb15e` when R5 lands rather than rebuilding.
+Until then, keep the SSH-tunnel recommendation prominent, and never route the
+fix through the daemon's own listener again.
 
 ## 2. `/api/fs/list` exposes the whole host filesystem — HIGH
 

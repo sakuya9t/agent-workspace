@@ -13,17 +13,14 @@
 //! never runs it.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use futures::{SinkExt, StreamExt};
-use rustls::ClientConfig;
 use tokio::io::copy_bidirectional;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::Connector;
 
 use crate::protocol::{
     DownstreamInfo, NodeMsg, RelayMsg, BACKOFF_MAX, BACKOFF_MIN, BACKOFF_STABLE_RESET, DATA_PATH,
@@ -63,10 +60,6 @@ pub struct AgentConfig {
     /// targets against it. For a leaf, this is a receiver whose value stays the
     /// empty vec (its sender may be dropped — the agent tolerates that).
     pub downstreams: watch::Receiver<Vec<ResolvedDownstream>>,
-    /// Extra PEM trust anchors for the relay's certificate, for a self-hosted
-    /// relay behind a private CA or a self-signed cert. `None` trusts the public
-    /// web PKI only, which is all an ACME-certificated relay needs.
-    pub relay_ca: Option<Vec<u8>>,
 }
 
 impl AgentConfig {
@@ -100,24 +93,12 @@ impl AgentConfig {
 /// Run the agent forever, reconnecting with jittered exponential backoff. The
 /// caller runs this as a task and aborts it to stop (used by the daemon and by
 /// tests).
-///
-/// The TLS config is built once, up front: a bad CA bundle is a permanent
-/// misconfiguration, so it fails loudly here instead of being retried forever.
 pub async fn run(cfg: AgentConfig) {
-    let tls = match crate::tls::client_config(cfg.relay_ca.as_deref()) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!(node = %cfg.node_id, "relay TLS config is unusable, not registering: {e:#}");
-            return;
-        }
-    };
     let mut backoff = BACKOFF_MIN;
     loop {
         let started = Instant::now();
-        match run_once(&cfg, &tls).await {
-            Ok(()) => {
-                tracing::info!(node = %cfg.node_id, "relay control stream closed; reconnecting")
-            }
+        match run_once(&cfg).await {
+            Ok(()) => tracing::info!(node = %cfg.node_id, "relay control stream closed; reconnecting"),
             Err(e) => tracing::warn!(node = %cfg.node_id, "relay agent connection error: {e:#}"),
         }
         if started.elapsed() >= BACKOFF_STABLE_RESET {
@@ -129,12 +110,12 @@ pub async fn run(cfg: AgentConfig) {
 }
 
 /// One connection lifetime: register, then pump control until the socket drops.
-async fn run_once(cfg: &AgentConfig, tls: &Arc<ClientConfig>) -> Result<()> {
+async fn run_once(cfg: &AgentConfig) -> Result<()> {
     let url = format!(
         "{}{}?{}={}",
         cfg.relay_url, REGISTER_PATH, RELAY_KEY_QUERY, cfg.relay_key
     );
-    let ws = dial(&url, tls)
+    let (ws, _resp) = tokio_tungstenite::connect_async(&url)
         .await
         .with_context(|| format!("dialing relay control stream at {url}"))?;
     let (mut sink, mut stream) = ws.split();
@@ -192,7 +173,7 @@ async fn run_once(cfg: &AgentConfig, tls: &Arc<ClientConfig>) -> Result<()> {
                 Some(Ok(Message::Text(t))) => {
                     match serde_json::from_str::<RelayMsg>(t.as_str()) {
                         Ok(RelayMsg::Open { stream_id, target }) => {
-                            spawn_data_stream(cfg.clone(), tls.clone(), stream_id, target);
+                            spawn_data_stream(cfg.clone(), stream_id, target);
                         }
                         Ok(RelayMsg::Pong { .. }) => {}
                         Ok(RelayMsg::Error { code, message }) => {
@@ -216,20 +197,15 @@ async fn run_once(cfg: &AgentConfig, tls: &Arc<ClientConfig>) -> Result<()> {
 
 /// Dial a data WSS for one client connection and splice it to the local target.
 /// Detached: a failed or slow stream never blocks the control loop or siblings.
-fn spawn_data_stream(cfg: AgentConfig, tls: Arc<ClientConfig>, stream_id: String, target: String) {
+fn spawn_data_stream(cfg: AgentConfig, stream_id: String, target: String) {
     tokio::spawn(async move {
-        if let Err(e) = serve_data_stream(&cfg, &tls, &stream_id, &target).await {
+        if let Err(e) = serve_data_stream(&cfg, &stream_id, &target).await {
             tracing::warn!(%target, %stream_id, "data stream failed: {e:#}");
         }
     });
 }
 
-async fn serve_data_stream(
-    cfg: &AgentConfig,
-    tls: &Arc<ClientConfig>,
-    stream_id: &str,
-    target: &str,
-) -> Result<()> {
+async fn serve_data_stream(cfg: &AgentConfig, stream_id: &str, target: &str) -> Result<()> {
     let Some(addr) = cfg.resolve(target) else {
         bail!("no local target for node_id `{target}`");
     };
@@ -237,7 +213,9 @@ async fn serve_data_stream(
         "{}{}?{}={}&{}={}",
         cfg.relay_url, DATA_PATH, RELAY_KEY_QUERY, cfg.relay_key, DATA_STREAM_QUERY, stream_id
     );
-    let ws = dial(&url, tls).await.context("dialing relay data stream")?;
+    let (ws, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .context("dialing relay data stream")?;
     let mut ws_bytes = WsByteStream::new(ws);
     let mut tcp = TcpStream::connect(addr)
         .await
@@ -246,28 +224,6 @@ async fn serve_data_stream(
         .await
         .context("splicing data stream")?;
     Ok(())
-}
-
-/// A WebSocket to the relay, TLS-wrapped or not depending on the URL scheme.
-type RelayWs =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-/// Dial one WebSocket to the relay.
-///
-/// Tungstenite selects by scheme: a `wss://` URL is verified against `tls`'s
-/// trust anchors, and a `ws://` URL (loopback dev, tests) ignores the connector
-/// and stays plaintext. Off-loopback plaintext is refused earlier, in the
-/// daemon's config, rather than here — the agent is also used by tests that
-/// legitimately talk `ws://` to a loopback relay.
-async fn dial(url: &str, tls: &Arc<ClientConfig>) -> Result<RelayWs> {
-    let (ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(
-        url,
-        None,
-        false,
-        Some(Connector::Rustls(tls.clone())),
-    )
-    .await?;
-    Ok(ws)
 }
 
 /// ±[`crate::protocol::BACKOFF_JITTER`] jitter, sourced from the wall clock's

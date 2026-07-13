@@ -29,10 +29,6 @@ thiserror.workspace = true
 futures.workspace = true
 parking_lot.workspace = true
 tokio-tungstenite.workspace = true
-rustls.workspace = true
-tokio-rustls.workspace = true
-rustls-pemfile.workspace = true
-webpki-roots.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http.workspace = true
@@ -42,5 +38,3 @@ http-body-util.workspace = true
 # in-process e2e: a blocking HTTP client (ureq) drives real traffic through the
 # relay while a fake node (axum) stands in for a NAT'd daemon.
 ureq.workspace = true
-# the TLS e2e mints a throwaway self-signed cert for the relay listener.
-rcgen.workspace = true

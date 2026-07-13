@@ -157,6 +157,16 @@ guidance (deployment.md addition, R5): real certificate, port 443.
 > of work: enable `rustls-tls-webpki-roots` on `tokio-tungstenite` + wire the
 > connector, then relay-side rustls or a proxy, with a real ACME cert (no client
 > UX change). Tracked in `security-followups.md` → 1 and `backlog.md` → SEC-1.
+>
+> **Update (2026-07-12): this was implemented in full and then reverted.**
+> `1dcb15e` delivered exactly the order of work above (agent `wss://` connector,
+> relay rustls with ALPN pinned to `http/1.1`, plaintext-to-remote-relay refusal,
+> tests in `crates/asm-relay/tests/tls.rs`), riding along with daemon-terminated
+> HTTPS — which turned out to make a LAN daemon *unreachable* from the web
+> client (browsers refuse a self-signed cert on a cross-origin `fetch`) and was
+> reverted wholesale to keep the LAN journey plaintext by design (`a36fdfa`;
+> see `security-followups.md` → 1). The relay half was sound: when R5 needs it,
+> **resurrect it from `1dcb15e`** instead of rebuilding.
 
 ### Daemon-side auth interaction (existing conventions, unchanged)
 
@@ -192,22 +202,13 @@ asm-relay (bin):
                         note: binding 0.0.0.0 is permission-denied for agents
                         in this dev environment — tests always bind loopback)
   ASM_RELAY_KEYS        comma-separated accepted access keys (MVP: one)
-  ASM_RELAY_TLS_CERT / ASM_RELAY_TLS_KEY   PEM chain + key; set both to serve
-                        TLS directly. The relay then speaks ONLY TLS on its
-                        bind — there is no cleartext port to fall back to.
-                        Leave both unset behind a TLS-terminating proxy.
-  ASM_RELAY_HSTS        =1 to send Strict-Transport-Security (implied when
-                        serving TLS directly; set it for the proxy deployment)
+  ASM_RELAY_TLS_CERT / ASM_RELAY_TLS_KEY   optional rustls (NOT IMPLEMENTED — SEC-1)
 
 asm-daemon additions:
-  ASM_RELAY_URL         e.g. wss://relay.example.com — presence enables the
-                        registration task (R2). A plaintext ws:// URL to a
-                        REMOTE host is refused at boot (ASM_ALLOW_INSECURE_RELAY=1
-                        to override); ws:// to loopback stays allowed for dev.
+  ASM_RELAY_URL         e.g. ws://relay.example.com — presence enables the
+                        registration task (R2). NOTE: wss:// not supported yet
+                        (agent tokio-tungstenite has no TLS feature — SEC-1)
   ASM_RELAY_KEY         relay access key
-  ASM_RELAY_CA          PEM trust anchors for a self-hosted relay behind a
-                        private CA or a self-signed cert. Unset = public web
-                        PKI, which is all an ACME-certificated relay needs.
   ASM_NODE_LABEL        default: hostname
   ASM_RELAY_DOWNSTREAMS comma-separated host:port targets on the private net
                         (R4; labels/node_ids discovered by probing /health)

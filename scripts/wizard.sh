@@ -98,53 +98,9 @@ run_script() {
 
 # ── connectivity → flags ──────────────────────────────────────────────────
 FLAGS=(); ROLE=""; RELAY_KEY=""; RELAY_URL=""; DAEMON_PORT="4600"; RELAY_PORT="4700"
-RELAY_TLS=0; RELAY_TLS_CERT=""; RELAY_TLS_KEY=""; RELAY_CA=""
-DAEMON_TLS=0; DAEMON_TLS_CERT=""; DAEMON_TLS_KEY=""
 
 this_ip() { local ip; ip="$(hostname -I 2>/dev/null | awk '{print $1}')"; printf '%s' "${ip:-<this-host-ip>}"; }
 client_relay_url() { case "$1" in ws://*) printf 'http://%s' "${1#ws://}" ;; wss://*) printf 'https://%s' "${1#wss://}" ;; *) printf '%s' "$1" ;; esac; }
-# A TLS relay URL. https:// counts: the daemon accepts it and translates it to
-# wss://, so someone who pasted the browser's URL must still be asked about a
-# private CA — otherwise the node boots fine and silently never registers.
-_is_tls_relay_url() { case "$1" in wss://*|https://*) return 0 ;; *) return 1 ;; esac; }
-
-# Offer the daemon a certificate. With one it serves https:// and the direct LAN
-# path is encrypted like any other; without one it is plaintext — a legitimate
-# choice on a network you trust, so this informs rather than interrogates.
-ask_daemon_tls() {
-  title "TLS for this daemon"
-  note "Without a certificate, clients reach it over plain http:// — on that network the"
-  note "device token and everything you type is readable by anyone watching the traffic."
-  note "With one, they use https://<this-host>:$DAEMON_PORT and the direct path is encrypted."
-  if yesno "Do you have a TLS certificate for this host?" n; then
-    prompt_required DAEMON_TLS_CERT "Path to the certificate chain (PEM)"
-    prompt_required DAEMON_TLS_KEY  "Path to the private key (PEM)"
-    FLAGS+=(--tls-cert "$DAEMON_TLS_CERT" --tls-key "$DAEMON_TLS_KEY")
-    DAEMON_TLS=1
-  else
-    note "OK — plaintext. Fine on a network you trust; otherwise use “Behind NAT” with a"
-    note "relay that has a certificate, or reach this host through an SSH tunnel."
-  fi
-}
-
-# The relay is the one component that faces the open internet, and the only one
-# that can hold a certificate. Offer it one.
-ask_relay_tls() {
-  title "TLS for the relay"
-  note "The relay carries the device token and the whole terminal stream for every node"
-  note "registered to it. With a certificate it serves https:// and wss://; without one,"
-  note "all of that crosses it in the clear."
-  if yesno "Do you have a TLS certificate for this relay?" n; then
-    prompt_required RELAY_TLS_CERT "Path to the certificate chain (PEM)"
-    prompt_required RELAY_TLS_KEY  "Path to the private key (PEM)"
-    FLAGS+=(--relay-tls-cert "$RELAY_TLS_CERT" --relay-tls-key "$RELAY_TLS_KEY")
-    RELAY_TLS=1
-  else
-    note "OK — a plaintext relay. Fine on a trusted LAN. Before this box is reachable"
-    note "from the internet, get a real certificate (any ACME client issues one free):"
-    note "browsers cannot be told to trust a self-signed relay, they can only warn."
-  fi
-}
 
 # Ask how this host is reached and build FLAGS + ROLE for a start/restart.
 choose_connectivity() {
@@ -171,7 +127,6 @@ choose_connectivity() {
     lan)
       prompt_port DAEMON_PORT "Port for network clients to connect to" "4600"
       FLAGS=(--bind "0.0.0.0:$DAEMON_PORT")
-      ask_daemon_tls
       ;;
     relayhost)
       prompt_port DAEMON_PORT "Daemon port (for direct LAN clients too)" "4600"
@@ -179,34 +134,17 @@ choose_connectivity() {
       prompt_port RELAY_PORT "Relay port (private nodes register here)" "4700"
       FLAGS=(--bind "0.0.0.0:$DAEMON_PORT" --relay --relay-key "$RELAY_KEY")
       [ "$RELAY_PORT" != "4700" ] && FLAGS+=(--relay-bind "0.0.0.0:$RELAY_PORT")
-      ask_daemon_tls
-      ask_relay_tls
       ;;
     relayonly)
       prompt_required RELAY_KEY "Relay access key (shared secret nodes & clients present)"
       prompt_port RELAY_PORT "Relay port (private nodes register here)" "4700"
       FLAGS=(--relay-only --relay-key "$RELAY_KEY")
       [ "$RELAY_PORT" != "4700" ] && FLAGS+=(--relay-bind "0.0.0.0:$RELAY_PORT")
-      ask_relay_tls
       ;;
     nat)
-      prompt_required RELAY_URL "Relay URL to register to (e.g. wss://relay.example.com)"
+      prompt_required RELAY_URL "Relay URL to register to (e.g. ws://relay-host:4700)"
       prompt_required RELAY_KEY "Relay access key (must match the relay host's)"
       FLAGS=(--register "$RELAY_URL" --relay-key "$RELAY_KEY")
-      if _relay_url_is_plaintext_remote "$RELAY_URL"; then
-        title "Heads up — that relay URL is unencrypted"
-        note "ws:// to a remote host sends the device token and every keystroke in the clear."
-        note "If the relay has a certificate, register to it as wss:// instead."
-        yesno "Continue with the plaintext relay anyway?" n || { log "cancelled — nothing ran."; exit 0; }
-        FLAGS+=(--insecure-relay)
-      elif _is_tls_relay_url "$RELAY_URL"; then
-        # A public (ACME) cert just works. A private one has to be handed over,
-        # or this node will boot fine and then silently never register.
-        if yesno "Is that relay's certificate self-signed or privately signed?" n; then
-          prompt_required RELAY_CA "Path to the CA / certificate PEM to trust"
-          FLAGS+=(--relay-ca "$RELAY_CA")
-        fi
-      fi
       ;;
   esac
 
@@ -215,12 +153,6 @@ choose_connectivity() {
 
 # ── post-run guidance, tailored to the role ───────────────────────────────
 post_tips() {
-  # The relay's schemes follow whether it got a certificate above.
-  local rws=ws rhttp=http rhost dhttp=http
-  if [ "$RELAY_TLS" = 1 ]; then rws=wss; rhttp=https; fi
-  if [ "$DAEMON_TLS" = 1 ]; then dhttp=https; fi
-  rhost="$(this_ip)"
-
   case "$ROLE" in
     local)
       title "Next"
@@ -231,35 +163,21 @@ post_tips() {
       title "Enrolling a client on the network"
       local tok; tok="$("$HERE/token.sh" 2>/dev/null | tail -n1 || true)"
       if [ -n "$tok" ]; then note "enrollment token: $(bold "$tok")"; else note "get the token: scripts/token.sh"; fi
-      note "in the client → manage → add a daemon:  $dhttp://$rhost:$DAEMON_PORT   + that token"
-      if [ "$DAEMON_TLS" = 1 ]; then
-        note "…using the hostname the certificate was issued for, not the bare IP — TLS"
-        note "verifies the name. A self-signed cert will prompt the browser once."
-      else
-        note "the client flags that URL as unencrypted — expected here, and it still connects."
-      fi
+      note "in the client → manage → add a daemon:  http://$(this_ip):$DAEMON_PORT   + that token"
       ;;
   esac
   case "$ROLE" in
     relayhost | relayonly)
       title "Point a NAT'd node at this relay"
       log "on each private node, run its own wizard and pick “Behind NAT”, or:"
-      note "scripts/start.sh --register $rws://$rhost:$RELAY_PORT --relay-key $RELAY_KEY"
-      if [ "$RELAY_TLS" = 1 ]; then
-        note "…using the hostname your certificate was issued for, not the bare IP —"
-        note "TLS verifies the name, so an IP will be rejected."
-      fi
+      note "scripts/start.sh --register ws://$(this_ip):$RELAY_PORT --relay-key $RELAY_KEY"
       title "In the client"
-      note "manage → Relays → add:  $rhttp://$rhost:$RELAY_PORT   + key  $RELAY_KEY"
-      [ "$RELAY_TLS" = 1 ] || note "(plaintext relay: the client will ask you to confirm that)"
+      note "manage → Relays → add:  http://$(this_ip):$RELAY_PORT   + key  $RELAY_KEY"
       ;;
     nat)
       title "Confirm the registration"
       log "this host dials the relay in the background — check it connected:"
       note "grep -a 'registered control stream' $LOG_DIR/asm-daemon.log"
-      if _is_tls_relay_url "$RELAY_URL"; then
-        note "a TLS failure shows up here too — as 'relay agent connection error'."
-      fi
       title "In the client"
       note "manage → Relays → add:  $(client_relay_url "$RELAY_URL")   + key  $RELAY_KEY"
       note "your node then appears under that relay, ready to connect."
