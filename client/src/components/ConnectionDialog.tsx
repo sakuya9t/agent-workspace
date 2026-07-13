@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Trans, useTranslation } from "react-i18next";
 import { api, enrollDevice, listRelayNodes, probeHealth } from "../api";
@@ -10,6 +10,7 @@ import {
   useConnStore,
 } from "../connectionStore";
 import { checkTargetUrl } from "../secureUrl";
+import { useDaemonStates } from "../useDaemons";
 import { useUiStore } from "../store";
 
 type ConnectionMode = "existing" | "add";
@@ -55,11 +56,27 @@ export function ConnectionDialog() {
   // The daemon serves this bundle, so a phone on the LAN lands here same-origin
   // — but it is not a loopback peer, so it must enroll like any other device.
   // Without this the local row would sit at "unauthorized" with nothing to do.
-  const localNeedsEnroll = Boolean(local) && !local?.token && !isLoopbackOrigin();
+  //
+  // The page's own origin answers that for the common cases, but not for all of
+  // them: a Vite dev server proxies /api server-side, so what the daemon judges
+  // is the PROXY's address, not the browser's. A loopback-looking page whose
+  // proxy dials the daemon over the LAN gets a 401 too. So take the 401 itself
+  // as the other trigger — it is the ground truth, and it carries a status code
+  // rather than a localized string.
+  const localState = useDaemonStates().find((s) => s.daemon.id === "local");
+  const localUnauthorized =
+    (localState?.error as { status?: number } | undefined)?.status === 401;
+  const localNeedsEnroll =
+    Boolean(local) && !local?.token && (!isLoopbackOrigin() || localUnauthorized);
 
   // Enrolling this device is the one thing a phone MUST do here, and it lives on
-  // the Existing tab — so open there rather than on "add another host".
+  // the Existing tab — so open there rather than on "add another host". The need
+  // can also appear late (the 401 lands after mount), hence the effect; it keys
+  // on the transition, so it does not fight a user who then picks Add.
   const [mode, setMode] = useState<ConnectionMode>(localNeedsEnroll ? "existing" : "add");
+  useEffect(() => {
+    if (show && localNeedsEnroll) setMode("existing");
+  }, [show, localNeedsEnroll]);
 
   // Live, so the warning appears as the URL is typed rather than on submit. A
   // plaintext URL is flagged, never blocked: a LAN daemon has no TLS to offer,
