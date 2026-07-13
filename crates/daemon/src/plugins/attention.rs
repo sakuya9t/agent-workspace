@@ -19,7 +19,7 @@ mod claude;
 mod codex;
 
 pub(crate) use claude::{claude_attention, claude_idle_error};
-pub(crate) use codex::codex_attention;
+pub(crate) use codex::{codex_attention, codex_still_working};
 
 /// The shared default classifier, over the raw decoded output **tail**.
 ///

@@ -88,11 +88,21 @@ impl SessionManager {
     }
 
     /// Output has been silent for [`IDLE_AFTER`]: a *working* session is now idle,
-    /// waiting for the next input — unless the agent's screen says it stopped
-    /// **on an error** (Claude Code's "API Error: …" prints with no bell and no
-    /// prompt, so this settle is the only moment that distinguishes "finished,
-    /// waiting" from "died mid-turn"). A blocked/errored session is sticky and
-    /// stays that way — silence doesn't mean it stopped needing you.
+    /// waiting for the next input — unless the agent's own screen says otherwise.
+    /// Silence is not proof the turn ended, so before settling we let the plugin
+    /// read the screen for the two states it would otherwise misread:
+    ///
+    /// * it stopped **on an error** — Claude Code's "API Error: …" prints with no
+    ///   bell and no prompt, so this settle is the only moment that distinguishes
+    ///   "finished, waiting" from "died mid-turn"
+    ///   ([`idle_error`](AgentPlugin::idle_error));
+    /// * it is **still working** — Codex goes quiet while blocked on a sub-agent,
+    ///   and leaves background terminals running past the end of a turn
+    ///   ([`idle_busy`](AgentPlugin::idle_busy)). That holds the session at
+    ///   `Activity`, and the settle is retried on the next tick.
+    ///
+    /// A blocked/errored session is sticky and stays that way — silence doesn't
+    /// mean it stopped needing you.
     pub(super) fn on_idle(
         &self,
         id: &str,
@@ -104,11 +114,23 @@ impl SessionManager {
         if *last_attn != AttentionState::Activity {
             return;
         }
+        // Rendered once, and only for a plugin that can read it: a screen snapshot
+        // costs a terminal render, and this tick repeats for as long as it's quiet.
+        let stopped_on_error = match plugin {
+            Some(p) => {
+                let screen = handle.screen_text();
+                if p.idle_busy(&screen) {
+                    return; // still working — this silence isn't the end of the turn
+                }
+                p.idle_error(&screen)
+            }
+            None => None,
+        };
         // Fresh idle prompt: whatever the user types next is composing again,
         // so clear the submit latch — their keystroke echo is suppressed until
         // they submit the next line.
         sig.submitted.store(false, Ordering::Relaxed);
-        let (state, reason) = match plugin.and_then(|p| p.idle_error(&handle.screen_text())) {
+        let (state, reason) = match stopped_on_error {
             Some(reason) => (AttentionState::Error, reason),
             None => (AttentionState::Idle, "idle — waiting for input".to_string()),
         };

@@ -1709,6 +1709,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    // ---- still-working settle (stays working, does not go idle) ----
+
+    #[test]
+    fn codex_idle_settle_waiting_on_sub_agent_stays_working() {
+        // The reported bug, end-to-end: Codex is blocked in `wait_agent` — nothing
+        // to do itself, so the PTY goes quiet and the silence timer fires — but the
+        // turn is still in flight. The settle must read the screen and hold the
+        // session at Activity instead of calling it idle.
+        let (manager, dir) = test_manager();
+        let codex = manager.registry.get("codex").unwrap();
+        let screen = "\
+\u{2022} Waiting for agents\n\
+\u{25e6} Working (49s \u{2022} esc to interrupt) \u{b7} 1 background terminal running \u{b7} /ps to view\n\
+\u{203a} Run /review on my current changes";
+        let handle = mock_handle_with_screen(screen);
+        let sig = Interaction::default();
+        let mut last_attn = AttentionState::Activity;
+        manager.on_idle("sid", &handle, Some(&codex), &mut last_attn, &sig);
+        assert_eq!(last_attn, AttentionState::Activity);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn codex_idle_settle_with_background_terminal_stays_working() {
+        // The other half: the turn ended, but the background terminal it started
+        // is still running — quiet, yet not done, so it must not settle to idle.
+        let (manager, dir) = test_manager();
+        let codex = manager.registry.get("codex").unwrap();
+        let screen = "\
+\u{2022} Started it.\n\
+\u{2500} Worked for 5m 50s \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+  1 background terminal running \u{b7} /ps to view \u{b7} /stop to close\n\
+\u{203a} Run /review on my current changes";
+        let handle = mock_handle_with_screen(screen);
+        let sig = Interaction::default();
+        let mut last_attn = AttentionState::Activity;
+        manager.on_idle("sid", &handle, Some(&codex), &mut last_attn, &sig);
+        assert_eq!(last_attn, AttentionState::Activity);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn codex_idle_settle_after_finished_turn_reads_as_idle() {
+        // The guard on the two above: with nothing in flight and nothing left
+        // running, a finished Codex turn must still settle to idle — otherwise the
+        // session would never hand back to the user.
+        let (manager, dir) = test_manager();
+        let codex = manager.registry.get("codex").unwrap();
+        let screen = "\
+\u{2022} Ran sleep 25\n\
+\u{2022} Command completed successfully.\n\
+\u{203a} Run /review on my current changes\n\
+  gpt-5.6-sol xhigh \u{b7} ~/dev/agent-workspace";
+        let handle = mock_handle_with_screen(screen);
+        let sig = Interaction::default();
+        let mut last_attn = AttentionState::Activity;
+        manager.on_idle("sid", &handle, Some(&codex), &mut last_attn, &sig);
+        assert_eq!(last_attn, AttentionState::Idle);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn background_noise_does_not_clear_error() {
         // The captured stall had "1 shell still running": a background

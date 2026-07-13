@@ -81,6 +81,12 @@ impl AgentPlugin for CodexPlugin {
     fn attention(&self, screen: &str, bell: bool) -> (AttentionState, Option<String>) {
         attention::codex_attention(screen, bell)
     }
+    // Codex goes quiet while it is still working — blocked in `wait_agent` on a
+    // sub-agent, or with a background terminal outliving the turn that started
+    // it — so the silence timer alone would settle a busy session to idle.
+    fn idle_busy(&self, screen: &str) -> bool {
+        attention::codex_still_working(screen)
+    }
     fn usage(&self, cx: &TranscriptContext) -> Option<AgentUsage> {
         usage::codex_usage(cx)
     }

@@ -108,6 +108,19 @@ pub trait AgentPlugin: Send + Sync {
         None
     }
 
+    /// Also called at the idle settle, with the rendered visible screen: is the
+    /// agent quiet because it is **still working** rather than done? The silence
+    /// timer reads "no output" as "the turn is over, your move", which is wrong
+    /// for an agent parked on a long tool call, blocked waiting on a sub-agent,
+    /// or whose turn ended leaving background work running (Codex renders both —
+    /// see [`attention::codex_still_working`]). `true` holds the session at
+    /// [`AttentionState::Activity`]; the settle is retried on each later tick, so
+    /// it lands on idle once the agent really is done. The default — providers
+    /// with no such rendering — never holds.
+    fn idle_busy(&self, _screen: &str) -> bool {
+        false
+    }
+
     /// Best-effort token/context usage for a running session, read from the
     /// agent's own on-disk transcript (mirrors its `/status` / `/usage`). Agents
     /// that don't persist usage return `None`.
