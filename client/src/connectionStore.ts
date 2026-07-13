@@ -6,10 +6,7 @@ import i18n from "./i18n";
  * aggregates their sessions in the left panel.
  *
  * - `baseUrl === ""` is same-origin (the daemon serving this page / the Vite
- *   dev proxy). Same-origin is NOT the same as loopback: the daemon serves the
- *   client itself, so a phone on the LAN opening `https://<host>:4600` is
- *   same-origin too, and the daemon only waives the token for loopback peers.
- *   So the local entry carries a `token` like any other once enrolled.
+ *   dev proxy) — the local/loopback case, no token needed.
  * - A non-empty `baseUrl` is a remote daemon: direct LAN, an SSH-forwarded
  *   localhost port, or one reached through a relay (`baseUrl` then ends in
  *   `/n/<node_id>` and `relayKey`/`via` are set). `token` is set when the
@@ -98,16 +95,9 @@ function load(): DaemonConn[] {
       const arr = JSON.parse(raw) as DaemonConn[];
       if (Array.isArray(arr) && arr.length) {
         // Ensure the local daemon is always present and first, preserving its
-        // connected state and device token; default older entries (no
-        // `connected`) to true. The token matters off-loopback: a phone opening
-        // the daemon-served UI over the LAN is same-origin but still has to
-        // enroll, and dropping the token here would re-401 it on every reload.
+        // connected state; default older entries (no `connected`) to true.
         const persistedLocal = arr.find((d) => d.id === "local");
-        const local: DaemonConn = {
-          ...LOCAL,
-          token: persistedLocal?.token ?? null,
-          connected: persistedLocal?.connected ?? true,
-        };
+        const local: DaemonConn = { ...LOCAL, connected: persistedLocal?.connected ?? true };
         const others = arr
           .filter((d) => d.id !== "local" && d.baseUrl !== "")
           .map((d) => ({ ...d, connected: d.connected ?? true }));
@@ -206,16 +196,5 @@ export const useConnStore = create<ConnState>((set, get) => ({
 
 /** Non-reactive accessor to the local daemon target (for one-off calls). */
 export function localTarget(): Target {
-  const local = useConnStore.getState().daemons.find((d) => d.id === "local");
-  return { baseUrl: "", token: local?.token ?? null };
-}
-
-/**
- * Is this page served from a loopback origin? Only then does the daemon trust
- * the peer without a token (see ASM_TRUST_LOOPBACK). The same bundle served to
- * a phone over the LAN is same-origin but off-loopback, so it must enroll.
- */
-export function isLoopbackOrigin(): boolean {
-  const h = location.hostname;
-  return h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "[::1]";
+  return { baseUrl: "", token: null };
 }

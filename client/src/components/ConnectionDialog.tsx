@@ -1,16 +1,8 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Trans, useTranslation } from "react-i18next";
 import { api, enrollDevice, listRelayNodes, probeHealth } from "../api";
-import {
-  daemonLabel,
-  isLoopbackOrigin,
-  localTarget,
-  RelayConn,
-  useConnStore,
-} from "../connectionStore";
-import { checkTargetUrl } from "../secureUrl";
-import { useDaemonStates } from "../useDaemons";
+import { daemonLabel, localTarget, RelayConn, useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
 
 type ConnectionMode = "existing" | "add";
@@ -30,7 +22,6 @@ export function ConnectionDialog() {
   const setShow = useUiStore((s) => s.setShowConnection);
   const daemons = useConnStore((s) => s.daemons);
   const addDaemon = useConnStore((s) => s.addDaemon);
-  const updateDaemon = useConnStore((s) => s.updateDaemon);
   const removeDaemon = useConnStore((s) => s.removeDaemon);
   const relays = useConnStore((s) => s.relays);
   const addRelay = useConnStore((s) => s.addRelay);
@@ -46,46 +37,8 @@ export function ConnectionDialog() {
   const [relayKey, setRelayKey] = useState("");
   const [relayLabel, setRelayLabel] = useState("");
   const [relayErr, setRelayErr] = useState<string | null>(null);
+  const [mode, setMode] = useState<ConnectionMode>("add");
   const [addKind, setAddKind] = useState<AddKind>("daemon");
-
-  const [localToken, setLocalToken] = useState("");
-  const [localBusy, setLocalBusy] = useState(false);
-  const [localErr, setLocalErr] = useState<string | null>(null);
-
-  const local = daemons.find((d) => d.id === "local");
-  // The daemon serves this bundle, so a phone on the LAN lands here same-origin
-  // — but it is not a loopback peer, so it must enroll like any other device.
-  // Without this the local row would sit at "unauthorized" with nothing to do.
-  //
-  // The page's own origin answers that for the common cases, but not for all of
-  // them: a Vite dev server proxies /api server-side, so what the daemon judges
-  // is the PROXY's address, not the browser's. A loopback-looking page whose
-  // proxy dials the daemon over the LAN gets a 401 too. So take the 401 itself
-  // as the other trigger — it is the ground truth, and it carries a status code
-  // rather than a localized string.
-  const localState = useDaemonStates().find((s) => s.daemon.id === "local");
-  const localUnauthorized =
-    (localState?.error as { status?: number } | undefined)?.status === 401;
-  const localNeedsEnroll =
-    Boolean(local) && !local?.token && (!isLoopbackOrigin() || localUnauthorized);
-
-  // Enrolling this device is the one thing a phone MUST do here, and it lives on
-  // the Existing tab — so open there rather than on "add another host". The need
-  // can also appear late (the 401 lands after mount), hence the effect; it keys
-  // on the transition, so it does not fight a user who then picks Add.
-  const [mode, setMode] = useState<ConnectionMode>(localNeedsEnroll ? "existing" : "add");
-  useEffect(() => {
-    if (show && localNeedsEnroll) setMode("existing");
-  }, [show, localNeedsEnroll]);
-
-  // Live, so the warning appears as the URL is typed rather than on submit. A
-  // plaintext URL is flagged, never blocked: a LAN daemon has no TLS to offer,
-  // so refusing it would just make the product unusable on a trusted network.
-  // Only an unparseable URL stops the add.
-  const urlProblem = url.trim() ? checkTargetUrl(url.trim().replace(/\/$/, "")) : null;
-  const relayUrlProblem = relayUrl.trim()
-    ? checkTargetUrl(relayUrl.trim().replace(/\/$/, ""))
-    : null;
 
   const { data: localEnrollToken } = useQuery({
     queryKey: ["enrollment-token"],
@@ -96,45 +49,10 @@ export function ConnectionDialog() {
 
   if (!show) return null;
 
-  /**
-   * Enroll this device against the daemon that served the page. Same-origin, so
-   * there is no URL to type and no certificate to trust beyond the one the
-   * browser already accepted to load this page — just the enrollment token.
-   */
-  const enrollLocal = async () => {
-    const tok = localToken.trim();
-    if (!tok) {
-      setLocalErr(t("connection.errNoToken"));
-      return;
-    }
-    setLocalBusy(true);
-    setLocalErr(null);
-    try {
-      const res = await enrollDevice("", tok, name.trim() || navigator.platform || "device");
-      await probeHealth("", res.device_token);
-      updateDaemon("local", { token: res.device_token, connected: true });
-      qc.invalidateQueries({ queryKey: ["daemon"] });
-      qc.invalidateQueries({ queryKey: ["enrollment-token"] });
-      setLocalToken("");
-    } catch (e) {
-      setLocalErr(String(e instanceof Error ? e.message : e));
-    } finally {
-      setLocalBusy(false);
-    }
-  };
-
   const addRemote = async () => {
     const targetUrl = url.trim().replace(/\/$/, "");
     if (!targetUrl) {
       setErr(t("connection.errNoUrl"));
-      return;
-    }
-    if (urlProblem === "invalid") {
-      setErr(t("connection.errBadUrl"));
-      return;
-    }
-    if (urlProblem === "websocket") {
-      setErr(t("connection.errWsScheme"));
       return;
     }
     setBusy(true);
@@ -173,15 +91,15 @@ export function ConnectionDialog() {
       setRelayErr(t("relay.errNoKey"));
       return;
     }
-    if (relayUrlProblem === "invalid") {
-      setRelayErr(t("relay.errBadUrl"));
-      return;
+    let label = relayLabel.trim();
+    if (!label) {
+      try {
+        label = new URL(u).host;
+      } catch {
+        setRelayErr(t("relay.errBadUrl"));
+        return;
+      }
     }
-    if (relayUrlProblem === "websocket") {
-      setRelayErr(t("relay.errWsScheme"));
-      return;
-    }
-    const label = relayLabel.trim() || new URL(u).host;
     setRelayErr(null);
     addRelay({ url: u, accessKey: relayKey.trim(), label });
     setRelayUrl("");
@@ -260,33 +178,6 @@ export function ConnectionDialog() {
                 ))}
               </div>
 
-              {localNeedsEnroll && (
-                <div className="conn-callout">
-                  <div className="conn-callout-title">{t("connection.enrollLocalTitle")}</div>
-                  <div className="dim small">
-                    {t("connection.enrollLocalHint", { cmd: "asm-daemon token" })}
-                  </div>
-                  <div className="conn-node-connect">
-                    <input
-                      className="input mono small"
-                      placeholder={t("connection.tokenPlaceholder", { cmd: "asm-daemon token" })}
-                      value={localToken}
-                      autoCapitalize="none"
-                      autoCorrect="off"
-                      spellCheck={false}
-                      onChange={(e) => setLocalToken(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" && !localBusy) enrollLocal();
-                      }}
-                    />
-                    <button className="btn tiny" disabled={localBusy} onClick={enrollLocal}>
-                      {localBusy ? t("connection.enrolling") : t("connection.enroll")}
-                    </button>
-                  </div>
-                  {localErr && <div className="conn-node-error error-line small">{localErr}</div>}
-                </div>
-              )}
-
               {localEnrollToken && (
                 <div className="conn-callout">
                   <div className="conn-callout-title">{t("connection.enrollTokenLabel")}</div>
@@ -361,9 +252,6 @@ export function ConnectionDialog() {
                   />
                   <label className="form-label">{t("relay.labelLabel")}</label>
                   <input className="input" value={relayLabel} onChange={(e) => setRelayLabel(e.target.value)} />
-                  {relayUrlProblem === "insecure" && (
-                    <div className="conn-insecure-warn small">{t("relay.insecureWarn")}</div>
-                  )}
                   {relayErr && <div className="error conn-form-error">{relayErr}</div>}
                   <div className="conn-hint dim small">{t("relay.tip")}</div>
                   <div className="conn-form-actions">
@@ -381,7 +269,7 @@ export function ConnectionDialog() {
                   <input
                     className="input mono"
                     placeholder={t("connection.urlPlaceholder", {
-                      lan: "https://asm.example.com",
+                      lan: "http://192.168.0.5:4600",
                       tunnel: "http://localhost:4600",
                     })}
                     value={url}
@@ -401,10 +289,6 @@ export function ConnectionDialog() {
 
                   <label className="form-label">{t("connection.nameLabel")}</label>
                   <input className="input" value={name} onChange={(e) => setName(e.target.value)} />
-
-                  {urlProblem === "insecure" && (
-                    <div className="conn-insecure-warn small">{t("connection.insecureWarn")}</div>
-                  )}
 
                   {err && <div className="error conn-form-error">{err}</div>}
 

@@ -109,24 +109,6 @@ pick it up**.
   token-enforcement caveat: [`security-followups.md`](security-followups.md) → 11.
 - VS Code correctness fix: relayed hosts get a disabled button + honest hint
   instead of a misdirected Remote-SSH deep link.
-- **LAN self-enrollment** (2026-07-12, client-only; fallout from SEC-1's TLS).
-  The daemon serves the client, so opening `https://<host>:4600` on a phone *is*
-  the app — same-origin, nothing to add. But the client conflated **same-origin**
-  with **loopback**: `connectionStore` pinned the local entry to `token: null`
-  and dropped it on rehydrate, while the daemon waives the token only for
-  loopback *peers*. A LAN device therefore sat at "unauthorized" with no
-  affordance to fix it, and the only way in was to add the daemon a second time
-  as a cross-origin host — which then failed its own way, because a background
-  fetch to an untrusted self-signed cert throws the same opaque `TypeError` as a
-  dead host and never shows the interstitial that would let the user accept it.
-  Fix: the local entry carries and persists a device token; the connections
-  dialog offers **Enroll this device** when the page is same-origin but
-  off-loopback (and opens on that tab); `api.unreachableAtTls` stops blaming a
-  stopped daemon for what is usually a rejected certificate. Proof:
-  `scripts/lan-enroll-test.mjs` (TLS daemon on `0.0.0.0`, LAN-IP origin, real
-  Chrome: 401 → enroll → 200 → survives reload). Interstitial-on-first-open is
-  inherent to self-signed certs; a publicly-trusted relay cert (**R5**) is the
-  path that removes it.
 - Image/screenshot paste: paste, drag-drop, or the 📎 button feed an image into
   a live terminal → daemon stores it under `<cwd>/.asm/pastes/`
   (`POST /api/sessions/:id/paste`, magic-byte + size validated) → client injects
@@ -274,7 +256,7 @@ pick it up**.
 | RF-GATE | Build gate & test safety net: react-hooks + recommended eslint, minimal CI, HTTP-router test harness, `MockHolder`, asmux e2e for readBuffer/detach/backpressure/takeover, `generated.rs` drift check, migration-ladder test + `user_version` guard | **P1/P2** | — (before REC ideally; before M4-C wiring definitely) | refactoring-plan.md → §6.4 |
 | RF-OPS | **Truthful health, deadlines and task supervision:** liveness/readiness probes for DB writer + holder; cancellation tree for background tasks; blocking-work boundary; child/client request deadlines; jittered reconnect; structured reliability metrics | **P2** | minimal RF-GATE; Git deadline implementation shares RF-REC | refactoring-plan.md → §7.3 |
 | SEC-2 | Constrain `/api/fs/list` + workspace roots | **P1** | RF-ERR recommended (403 mapping) | security-followups.md → 2 (HIGH) |
-| SEC-1 | Transport encryption off-loopback. **PARTLY DONE, and the daemon half was wrong (2026-07-12)**: relay TLS + `wss://` agent + `ASM_TRUST_LOOPBACK=0` are right and stand. But **daemon-terminated HTTPS does not secure the LAN journey and cannot**: a LAN daemon is reached by IP, so its cert is self-signed, and the client's cross-origin `fetch` is refused by the browser with no interstitial and no API to accept it — unreachable by construction, surfacing as "daemon not started". Reverted to plaintext on the LAN. Closing it for real needs a **name + a publicly-trusted cert** (relay ACME, or DNS-01 for a name pointing at the LAN IP) | **P2** (was P3) | needs a domain | security-followups.md → 1 |
+| SEC-1 | Transport encryption off-loopback (direct mode TLS; relay TLS — **agent `wss://` (code) + relay rustls/proxy**) | **P1/P2** | partially ties to R5 | security-followups.md → 1 (HIGH) |
 | V0 | Web-editor de-risking spike (scratchpad only) | **P2** | R1–R3 (done) | vscode-over-relay-plan.md → V0 |
 | V1 | Relay cookie auth + daemon editor proxy | **P2** | V0 go decision | vscode-over-relay-plan.md → V1 |
 | V2 | IDE launcher, detection, editor tickets | **P2** | V1 | vscode-over-relay-plan.md → V2 |
@@ -513,34 +495,21 @@ exactly two frame types; MOB-PUSH, MVP-RICH and V3 each need a
 server→client frame and would otherwise each invent one. Detail:
 refactoring-plan.md → §6.3.
 
-### SEC-2 — fs-list / workspace roots (P1, the remaining HIGH)
+### SEC-1 / SEC-2 — the two HIGH security items (P1)
 
-Gates exposing ASM beyond a trusted LAN. `fs-list` browses the whole host
-filesystem and any client can register any workspace root. Self-contained daemon
-work: a server-side allowed-roots config, enforced for both browsing and
-registration.
-
-### SEC-1 — transport encryption (relay path done; direct mode open, P2)
-
-**The relay path — the product path — is encrypted as of 2026-07-12.** The agent
-dials `wss://` (a `tokio-tungstenite` TLS feature plus an explicit rustls
-connector, which was the *code* blocker: the daemon dials the relay outbound, so
-a TLS proxy in front of the relay was useless until the agent could speak TLS
-itself), and the relay serves rustls behind `ASM_RELAY_TLS_CERT/KEY`. A plaintext
-`ws://` relay on a remote host is **refused** by the daemon at boot
-(`--insecure-relay` overrides). See `crates/asm-relay/tests/tls.rs`.
-
-**Direct mode landed too**: `ASM_TLS_CERT` / `ASM_TLS_KEY` make the daemon serve
-https/wss on its own bind, so a LAN client reaches it at `https://host:4600` —
-Phase 8's "TLS or equivalent". An off-loopback bind *without* a certificate stays
-allowed (warned at startup, flagged in the client): it is a deliberate choice,
-and refusing it only broke the LAN and container deployments that had made it.
-Also landed: `ASM_TRUST_LOOPBACK=0`, without which a same-host reverse proxy in
-front of the daemon silently disables auth (its requests arrive from 127.0.0.1
-and are loopback-trusted).
-
-What is left is **mTLS** — the device token is still the only credential on the
-wire — plus the residual plaintext-by-choice path above.
+Gate exposing ASM beyond a trusted LAN. SEC-2 (fs-list browses the whole host
+filesystem; any client can register any workspace root) is self-contained
+daemon work: server-side allowed-roots config enforced for both browsing and
+registration. SEC-1 (plaintext HTTP/WS off loopback) splits: the **relay path**
+(the product path) is plaintext today and is **not just an ops item** — it needs
+(i) a TLS feature enabled on the daemon agent's `tokio-tungstenite` so it can
+dial `wss://` at all (it is currently compiled without TLS, so a TLS reverse
+proxy in front of the relay is useless until this lands — a code change), plus
+(ii) relay-side rustls (`ASM_RELAY_TLS_CERT/KEY`, described in
+connectivity-execution-plan.md but **not yet implemented** in the relay binary)
+or a TLS-terminating proxy, with a real ACME cert so there is no client UX
+change; **direct mode** needs the Phase-8 TLS/mTLS deliverable (self-signed +
+pinning or ACME). Until then the SSH-tunnel recommendation stays prominent.
 
 SEC-2 code-level substrate (2026-07-12 review): there are today **three**
 divergent notions of allowed root — `fs::list` enforces none;
