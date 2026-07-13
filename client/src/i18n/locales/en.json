@@ -327,7 +327,8 @@
   },
   "mobile": {
     "back": "Back to sessions",
-    "details": "Details"
+    "details": "Details",
+    "jumpToEnd": "Jump to latest output"
   },
   "keybar": {
     "label": "Terminal keys",

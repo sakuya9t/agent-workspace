@@ -1875,6 +1875,37 @@ body.col-resizing iframe {
   padding: 6px;
   background: #0b0e14;
 }
+/* "Jump to latest" — floats over the terminal only while the view is scrolled
+   away from the live tail (TerminalView.onScrollState), the way a chat app's
+   jump-to-newest does. Centred, so it never lands under the 📎 attach button.
+   Phone-only: a desktop has a wheel and a scrollbar. */
+.term-jump {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  font-size: 18px;
+  line-height: 1;
+  border-radius: 50%;
+  cursor: pointer;
+  color: var(--text);
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  box-shadow: 0 2px 10px rgb(0 0 0 / 45%);
+}
+.term-jump::before {
+  content: "↓";
+}
+.term-jump:active {
+  background: var(--panel);
+}
 
 /* Details sheet — RightPanel over the still-mounted terminal. */
 .details-sheet-backdrop {

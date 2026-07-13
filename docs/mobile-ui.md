@@ -195,6 +195,42 @@ Terminal screen.
   `setPointerCapture`; no overlay at all means the phone is running a stale
   bundle.
 
+- **Jump to latest output** (added 2026-07-13, `scripts/term-jump-test.mjs`): a
+  round `↓` pill (`.term-jump`) floats over the terminal *only* while the view
+  has left the live tail, the way a chat app's jump-to-newest does. A phone has
+  no wheel and no scrollbar, so the only way back was a reverse drag — and for a
+  TUI that owns its own scroll, one drag per screenful, indefinitely.
+
+  The design is entirely about serving the **two scroll models** that share this
+  terminal (diagnosed in [`terminal-scrollback.md`](terminal-scrollback.md)) with
+  one affordance:
+
+  | | Who scrolls | "Am I at the end?" | The way back |
+  |---|---|---|---|
+  | **codex, shell, ended-session replay** (normal buffer) | xterm's viewport | `viewportY < baseY` — exact | `scrollToBottom()` |
+  | **claude** (alt screen + mouse reporting) | the app | *unknowable* — nothing in xterm's buffer moves | give the app back its wheel |
+
+  The second row is the whole problem. Claude takes the wheel as **mouse
+  reports** and redraws its window from its own transcript, so xterm scrolls
+  nothing, knows nothing, and a viewport-based pill would never appear at all.
+  The only place the app's offset is observable is the reports *leaving* for it —
+  so `TerminalView` counts the net wheel-UP reports the app is holding
+  (`triggerMouseEvent`, which it already wraps for the selection guard) and the
+  pill hands them back as wheel-DOWNs. The app clamps at its own bottom, so
+  **overshoot is free** — which is precisely what lets a merely approximate
+  counter (a stale one, after the app auto-followed new output) stay correct. The
+  burst is collected and sent as one WS frame / one pty write rather than one per
+  report.
+
+  A TUI in the alternate screen that does *not* take the wheel (vim, less) is
+  deliberately left out: its wheel becomes ↑/↓ keys the app may interpret however
+  it likes, so neither model can say where "the end" is. The counter stays 0 and
+  the pill never appears — better than appearing and lying.
+
+  Phone-only, and a deliberate parity break in mobile's favor (the desktop has a
+  wheel and a scrollbar). Live sessions *and* read-only replays, so it sits in the
+  terminal body rather than the key bar, which ended sessions don't get.
+
 - **Soft-keyboard geometry:** viewport meta gains
   `interactive-widget=resizes-content` (Android); an `useVisualViewportHeight`
   hook drives the shell height on iOS so the key bar sits exactly above the
@@ -252,6 +288,7 @@ desktop (select session on load).
 | Stop / archive / takeover confirm / attention ack | Identical (row buttons + row tap) |
 | Terminal + status header + View usage | Terminal screen + header buttons |
 | Keyboard input incl. Esc/Ctrl/arrows | Soft keyboard + key bar (new) |
+| Scrolling back: wheel + scrollbar | Drag, + a jump-to-latest pill (new — parity break in mobile's favor) |
 | Right panel: VS Code, fields, cleanup, summary | Details sheet, same component (VS Code hidden — see below) |
 | SCM: status, changed files, diff, pull, rebase, commit graph, commit detail | Details sheet, same components; modals as sheets |
 | New session / new workspace / directory picker / connection & relay manage / usage | Same dialogs as full-screen sheets |

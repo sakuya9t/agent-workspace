@@ -50,6 +50,9 @@ interface Props {
   ctrlRef?: MutableRefObject<CtrlLatch>;
   /** Called after an "armed" one-shot latch is consumed, so the bar resets. */
   onCtrlConsumed?: () => void;
+  /** Fires when the view leaves / returns to the live tail, so a shell can offer
+   *  a jump-to-end affordance (the mobile pill). See the scroll-state block. */
+  onScrollState?: (scrolledAway: boolean) => void;
 }
 
 /**
@@ -67,6 +70,7 @@ export function TerminalView({
   onReady,
   ctrlRef,
   onCtrlConsumed,
+  onScrollState,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   // Reached from inside the WS effect without becoming effect dependencies
@@ -75,6 +79,8 @@ export function TerminalView({
   onReadyRef.current = onReady;
   const onCtrlConsumedRef = useRef(onCtrlConsumed);
   onCtrlConsumedRef.current = onCtrlConsumed;
+  const onScrollStateRef = useRef(onScrollState);
+  onScrollStateRef.current = onScrollState;
   // The live socket, mirrored out of the effect so the component-scope image
   // upload can inject over it without the effect's listeners depending on it.
   const wsRef = useRef<WebSocket | null>(null);
@@ -302,6 +308,10 @@ export function TerminalView({
         // none), so leave the normal buffer's history alone while a TUI owns
         // the screen.
         if (term.buffer.active.type === "normal") term.clear();
+        // The snapshot repaints the app's CURRENT window, so whatever scroll the
+        // old socket's reports left it holding is not ours to give back.
+        wheelUp = 0;
+        scheduleScrollCheck();
         safeFit(fit);
         sendResize();
       };
@@ -330,7 +340,17 @@ export function TerminalView({
 
     // Raw send — used by the key bar handle (explicit control codes) and as the
     // base for typed input.
+    //
+    // `batch`, when open, collects instead of sending: a jump-to-end (below)
+    // synthesizes one wheel event per report the app is owed, and each would
+    // otherwise be its own WS frame and its own pty write. Collected, the whole
+    // burst leaves as one.
+    let batch: string[] | null = null;
     const sendRaw = (d: string) => {
+      if (batch) {
+        batch.push(d);
+        return;
+      }
       if (live && ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ t: "i", d }));
       }
@@ -722,6 +742,109 @@ export function TerminalView({
       if (gesture === "select" || holdSelection) e.preventDefault();
     };
 
+    // --- Scrolled away from the live tail, and the way back ------------------
+    //
+    // Two scroll models share this terminal, and a jump-to-end has to serve both:
+    //
+    //   * TERMINAL-owned scrollback — codex, a shell, and every replay of an
+    //     ended session (all normal-buffer). The wheel moves xterm's own
+    //     viewport, so `viewportY < baseY` IS the answer and scrollToBottom() is
+    //     the way back. Exact.
+    //
+    //   * APP-owned scroll — claude, or any TUI holding mouse reporting. The
+    //     wheel never touches the viewport: it leaves as a mouse report and the
+    //     app redraws its window from its own transcript (docs/terminal-
+    //     scrollback.md). xterm therefore cannot see that the app is scrolled up
+    //     at all — nothing in its buffer moved. So count the wheel-UP reports the
+    //     app was handed, and hand them back as wheel-DOWNs. The app clamps at its
+    //     own bottom, so an overshoot costs nothing — which is what lets a merely
+    //     approximate counter (a stale one, after the app auto-followed new
+    //     output) stay safe.
+    //
+    // A TUI in the alternate screen that does NOT take the wheel (vim, less) is
+    // deliberately left out: its wheel becomes ↑/↓ keys the app is free to
+    // interpret however it likes, so neither model can say where "the end" is.
+    // The counter stays 0 there and the affordance simply never appears, rather
+    // than appearing and lying.
+    const WHEEL_NOTCH_PX = 120; // one classic notch: always ≥ 1 row, so it always reports
+    /** Net wheel-UP reports the running app is holding, ≥ 0. Live sessions only:
+     *  a replay's input goes nowhere, and its history can well re-arm mouse mode. */
+    let wheelUp = 0;
+    let scrolledAway = false;
+    let checkRaf: number | undefined;
+
+    const atLiveTail = () => {
+      const buf = term.buffer.active;
+      return wheelUp === 0 && buf.viewportY >= buf.baseY;
+    };
+    // Coalesced: a drag fires a scroll event per frame, and a wheeled app one
+    // per report.
+    const scheduleScrollCheck = () => {
+      if (checkRaf !== undefined) return;
+      checkRaf = requestAnimationFrame(() => {
+        checkRaf = undefined;
+        const away = !atLiveTail();
+        if (away === scrolledAway) return;
+        scrolledAway = away;
+        onScrollStateRef.current?.(away);
+      });
+    };
+
+    const scrollToEnd = () => {
+      term.scrollToBottom(); // terminal-owned scrollback; a no-op when already there
+      let owed = wheelUp; // snapshot: each dispatch below decrements the counter
+      if (owed > 0) {
+        // Aim at the middle of the grid, not the (0,0) a bare WheelEvent reports
+        // from — a TUI is entitled to scroll the pane under the pointer.
+        const r = screenEl()?.getBoundingClientRect();
+        batch = [];
+        while (owed-- > 0) {
+          term.element?.dispatchEvent(
+            new WheelEvent("wheel", {
+              deltaY: WHEEL_NOTCH_PX,
+              deltaMode: WheelEvent.DOM_DELTA_PIXEL,
+              clientX: r ? r.left + r.width / 2 : 0,
+              clientY: r ? r.top + r.height / 2 : 0,
+              bubbles: true,
+              cancelable: true,
+            }),
+          );
+        }
+        const burst = batch.join("");
+        batch = null;
+        if (burst) sendRaw(burst);
+      }
+      wheelUp = 0;
+      scheduleScrollCheck();
+    };
+
+    // The only place the app's scroll offset is observable: the reports leaving
+    // for it. `sent` is false when the active protocol declined the event, so the
+    // count follows what the app actually received.
+    if (coreMouse?.triggerMouseEvent) {
+      const trigger = coreMouse.triggerMouseEvent.bind(coreMouse);
+      coreMouse.triggerMouseEvent = (ev) => {
+        const sent = trigger(ev);
+        // CoreMouseButton.WHEEL = 4; CoreMouseAction.UP = 0, DOWN = 1.
+        if (sent && live && ev.button === 4) {
+          wheelUp = Math.max(0, wheelUp + (ev.action === 0 ? 1 : -1));
+          scheduleScrollCheck();
+        }
+        return sent;
+      };
+    }
+
+    // onScroll covers output-driven scrolls; the viewport's own DOM scroll event
+    // covers the user's (xterm suppresses onScroll for those — the viewport is
+    // where they originate).
+    const scrollSub = term.onScroll(scheduleScrollCheck);
+    const bufferSub = term.buffer.onBufferChange(() => {
+      wheelUp = 0; // a different app owns the screen now; its offset isn't ours
+      scheduleScrollCheck();
+    });
+    const viewportEl = term.element?.querySelector(".xterm-viewport") as HTMLElement | null;
+    viewportEl?.addEventListener("scroll", scheduleScrollCheck, { passive: true });
+
     container.addEventListener("mousedown", onMouseDownCapture, true);
     container.addEventListener("contextmenu", onContextMenu);
     container.addEventListener("paste", onPaste, true);
@@ -747,6 +870,7 @@ export function TerminalView({
       write: sendRaw,
       focus: () => term.focus(),
       getSelection: () => term.getSelection(),
+      scrollToEnd,
     });
 
     return () => {
@@ -765,6 +889,10 @@ export function TerminalView({
       container.removeEventListener("pointercancel", onPointerUp, true);
       container.removeEventListener("touchmove", onTouchMove, { capture: true });
       container.removeEventListener("touchend", onTouchEnd, { capture: true });
+      viewportEl?.removeEventListener("scroll", scheduleScrollCheck);
+      scrollSub.dispose();
+      bufferSub.dispose();
+      if (checkRaf !== undefined) cancelAnimationFrame(checkRaf);
       window.clearTimeout(pressTimer);
       window.clearTimeout(holdTimer);
       window.clearInterval(autoScrollTimer);

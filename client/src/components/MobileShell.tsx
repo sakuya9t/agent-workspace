@@ -87,6 +87,15 @@ export function MobileShell() {
     if (!live) setCtrl("off");
   }, [live]);
 
+  // Scrolled back through history — a phone has no wheel and no scrollbar, so
+  // the way home is a long reverse drag (and for a TUI that owns its own scroll,
+  // one drag per screenful). Offer a jump instead, only while it means something.
+  const [scrolledAway, setScrolledAway] = useState(false);
+  const onTerminalReady = useCallback((h: TerminalHandle | null) => {
+    handleRef.current = h;
+    if (!h) setScrolledAway(false); // terminal went away; so did its scroll
+  }, []);
+
   // Track the visual viewport so the key bar stays above the soft keyboard.
   const vh = useVisualViewportHeight();
   const shellStyle = vh != null ? { height: `${vh}px` } : undefined;
@@ -147,15 +156,26 @@ export function MobileShell() {
 
       <div className="mobile-term-body">
         {activeSession && target ? (
-          <TerminalView
-            key={active.daemonId + ":" + activeSession.id}
-            target={target}
-            sessionId={activeSession.id}
-            live={live}
-            onReady={(h) => (handleRef.current = h)}
-            ctrlRef={ctrlRef}
-            onCtrlConsumed={consumeCtrl}
-          />
+          <>
+            <TerminalView
+              key={active.daemonId + ":" + activeSession.id}
+              target={target}
+              sessionId={activeSession.id}
+              live={live}
+              onReady={onTerminalReady}
+              ctrlRef={ctrlRef}
+              onCtrlConsumed={consumeCtrl}
+              onScrollState={setScrolledAway}
+            />
+            {scrolledAway && (
+              <button
+                className="term-jump"
+                onClick={() => handleRef.current?.scrollToEnd()}
+                aria-label={t("mobile.jumpToEnd")}
+                title={t("mobile.jumpToEnd")}
+              />
+            )}
+          </>
         ) : (
           <div className="empty big">{t("app.emptyTerminal")}</div>
         )}

@@ -10,6 +10,9 @@ export interface TerminalHandle {
   focus: () => void;
   /** Current selection text (for the key bar's Copy). */
   getSelection: () => string;
+  /** Return the view to the live tail — the terminal's own scrollback, and any
+   *  scroll the running app is holding (see TerminalView's scroll-state block). */
+  scrollToEnd: () => void;
 }
 
 /**

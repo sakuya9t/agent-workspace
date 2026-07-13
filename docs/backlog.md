@@ -215,6 +215,16 @@ pick it up**.
   starting *on text* scrolling only one row — the DOM renderer replaced the span
   the touch had latched onto, silently starving the listener; the gesture now
   rides on pointer capture. `scripts/touch-select-test.mjs`, `mobile-ui.md`.
+- **Jump to latest output on a phone** (2026-07-13, client-only): a `.term-jump`
+  pill floats over the mobile terminal whenever the view has left the live tail,
+  and returns it. It has to serve the two scroll models `terminal-scrollback.md`
+  diagnosed, which is the whole of the design: for terminal-owned scrollback
+  (codex, shell, replays) `viewportY < baseY` is exact and `scrollToBottom()` is
+  the way back; for an **app-owned** scroll (claude — alt screen + mouse
+  reporting) xterm's buffer never moves at all, so the wheel-UP *reports* the app
+  was handed are counted and handed back as wheel-DOWNs (it clamps at its own
+  bottom, so overshoot is free — which is what makes an approximate counter
+  safe). `scripts/term-jump-test.mjs` drives a real shell into each shape.
 - **Client polish, uncredited:** `97cfe0d`/`3dad62e` two-level connection dialog
   (Existing/Add × Daemon/Relay); `f7c7640` app icons + blocked-session favicon
   blink and `d291a4e` tab-title blink (`f7c7640` also shipped most of MOB-PWA —
