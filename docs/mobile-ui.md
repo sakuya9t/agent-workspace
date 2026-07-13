@@ -48,6 +48,22 @@ PHONE_MQ = (max-width: 599px), ((max-height: 599px) and (pointer: coarse))
   listener). Crossing the boundary (rotation, resize) swaps shells live; all
   state lives in stores/queries, so nothing is lost.
 
+### Layout class ≠ input class
+
+`PHONE_MQ` answers "how much room is there", **not** "what is this driven with".
+A tablet is desktop-*shaped* and finger-*driven*, and anything keyed off
+`useIsPhone()` alone silently assumes those two go together. They don't, and the
+gap is exactly one device wide: the iPad took the desktop shell (so it never saw
+the phone key bar) and had no keyboard (so it could never press ⌘-C / Ctrl-V) —
+leaving it, for a while, the one client that could select text but not copy it.
+
+So there is a second, independent hook (`useIsTouch()` = `(pointer: coarse)`) for
+input-class questions. `pointer` (not `any-pointer`) describes the **primary**
+pointer, which is what makes it the right test: a touchscreen laptop reports a
+*fine* primary pointer and keeps its key chords, so it must not be handed
+touch-only controls. Reach for `useIsTouch()` whenever the question is "can this
+user press a key / hover", and for `useIsPhone()` only when it is "will this fit".
+
 ## Mobile information architecture
 
 Two screens plus one sheet. The session list is home; the terminal is a
@@ -144,7 +160,34 @@ Terminal screen.
   | Drag, still held | Extends the selection cell-by-cell, forward or backward; holding near the top/bottom edge auto-scrolls so a selection can outrun one screenful |
   | Tap | Dismisses the selection |
 
-  Then `Copy` on the key bar puts it on the clipboard.
+  Then `Copy` on the key bar puts it on the clipboard — or, on a tablet, the
+  `⧉` button below.
+
+- **Clipboard buttons on the terminal** (added 2026-07-13,
+  `scripts/touch-clipboard-test.mjs`): the terminal's bottom-right action row is
+  `[⧉ copy] [📋 paste] [📎 attach]`, with the clipboard pair rendered only when
+  `useIsTouch() && !useIsPhone()`.
+
+  That predicate is the whole feature. A phone already has Copy/Paste on the key
+  bar docked above its keyboard, and a mouse user has ⌘-C / Ctrl-Shift-C; both
+  would only be cluttered by a second pair. What was left over was the tablet —
+  desktop shell, no key bar, no keyboard — which had **no way to copy or paste at
+  all**, even though the long-press selection gesture above worked there the whole
+  time. The buttons reuse the paths that already existed (`useTerminalPaste()` is
+  shared with the key bar, so the secure-context dance is written once; `Copy`
+  flashes the same `.paste-status` receipt as Ctrl-Shift-C).
+
+  `Copy` with an empty selection says *"Select some text first"* rather than
+  no-oping: it is the one copy path reachable without a selection (the key chords
+  and the context menu all guard on `hasSelection()`), and on a tablet — where
+  selecting means a long-press drag that is easy to miss — a button that does
+  nothing at all reads as a broken button.
+
+  **Testing gotcha.** Chrome's `Emulation.setEmulatedMedia` does **not** support
+  the `pointer` media feature — it silently no-ops, and every touch assertion
+  passes for the wrong reason. Only `setDeviceMetricsOverride({mobile: true})` +
+  `setTouchEmulationEnabled` actually flips `(pointer: coarse)`, so the test
+  asserts the media query itself before trusting anything downstream.
 
   Two things make this more than "listen for `touchmove`":
 

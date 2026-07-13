@@ -200,11 +200,19 @@ body.col-resizing iframe {
   color: var(--danger, #e5484d);
 }
 /* Floating attach-image button; the primary paste affordance on touch. */
-.term-attach {
+/* Floating action row over the terminal's bottom-right corner: [copy] [paste]
+   📎, the clipboard pair only on touch (see Terminal.tsx). The row owns the
+   positioning so buttons can be added without re-deriving offsets. */
+.term-actions {
   position: absolute;
   bottom: 10px;
   right: 14px;
   z-index: 5;
+  display: flex;
+  gap: 6px;
+}
+.term-attach,
+.term-act {
   width: 30px;
   height: 30px;
   display: flex;
@@ -216,14 +224,34 @@ body.col-resizing iframe {
   cursor: pointer;
   border: 1px solid var(--border);
   background: var(--panel-2);
+  /* A button does NOT inherit `color`, and ⧉ is a monochrome glyph: without this
+     it renders in the UA's default black and vanishes into the dark terminal.
+     The emoji beside it are colour fonts, so the bug hits only this one icon. */
+  color: var(--text);
   opacity: 0.5;
   transition: opacity 0.15s ease;
 }
 .term-attach::before {
   content: "📎";
 }
-.term-attach:hover {
+.term-copy::before {
+  content: "⧉";
+  font-size: 19px; /* the geometric glyph draws smaller than the emoji beside it */
+}
+.term-paste::before {
+  content: "📋";
+}
+.term-attach:hover,
+.term-act:hover {
   opacity: 1;
+}
+/* Touch has no hover to reveal these with, and a 50%-faded control reads as
+   disabled — the one place the terminal's chrome should be plainly visible. */
+@media (pointer: coarse) {
+  .term-attach,
+  .term-act {
+    opacity: 0.85;
+  }
 }
 
 /* sessions */

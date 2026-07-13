@@ -320,8 +320,11 @@
     "pastedImageRef": "[pasted image {{path}}] ",
     "attachedFileRef": "[attached file {{path}}] ",
     "attachFile": "Attach file",
+    "copySelection": "Copy selection",
+    "pasteClipboard": "Paste",
     "copied": "Copied",
-    "copyFailed": "Copy failed"
+    "copyFailed": "Copy failed",
+    "nothingSelected": "Select some text first"
   },
   "mobile": {
     "back": "Back to sessions",
