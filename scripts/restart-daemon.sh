@@ -80,6 +80,14 @@ fi
 # Stop the daemon: it detaches and leaves the holder's children running.
 stop_one asm-daemon "$DAEMON_PIDFILE"
 
-# Bring it back; startup adopts the still-live holder sessions.
+# Bring it back. The daemon binds first and adopts the still-live holder sessions
+# behind the listener (so its health check never races a long adopt), which means
+# "up" and "sessions are back" are now two distinct moments — wait for the second
+# one before claiming it.
 start_daemon
-log "daemon restarted — sessions re-adopted from the holder."
+if wait_reconciled; then
+  log "daemon restarted — sessions re-adopted from the holder."
+else
+  err "daemon is up, but the holder adopt pass has not finished — see $LOG_DIR/asm-daemon.log"
+  exit 1
+fi

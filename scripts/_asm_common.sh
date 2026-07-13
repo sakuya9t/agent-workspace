@@ -145,6 +145,23 @@ wait_health() {
   return 1
 }
 
+# The daemon binds BEFORE it adopts the holder's sessions, so `/health` answers
+# in milliseconds however many survived (that is why the check above can keep a
+# short fuse). Adoption is a serial holder round-trip per session and lands a
+# little later; this waits for it, purely so a script can honestly claim the
+# sessions are back. 60s: adoption is ~1s/session in the worst case seen.
+wait_reconciled() {
+  local i
+  command -v curl >/dev/null 2>&1 || return 0
+  for i in $(seq 1 600); do
+    if curl -sf "http://$ASM_BIND/health" 2>/dev/null | grep -q '"reconciling":false'; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
 # The relay is enabled purely by config (a relay access key is present), never
 # by the daemon binary — it is a shared rendezvous, not a per-daemon sidecar.
 relay_enabled() { [ -n "${ASM_RELAY_KEYS:-}" ]; }

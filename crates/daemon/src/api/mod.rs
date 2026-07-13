@@ -103,13 +103,62 @@ pub fn router(state: AppState) -> Router {
         }
     }
 
-    // Auth runs inside CORS so preflight is handled before token checks.
+    // Innermost first: the reconcile gate runs *after* auth (an unauthenticated
+    // request must be rejected, not parked), and auth runs inside CORS so
+    // preflight is handled before token checks.
     app.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        await_startup_reconcile,
+    ))
+    .layer(axum::middleware::from_fn_with_state(
         state.clone(),
         crate::auth::require_auth,
     ))
     .layer(CorsLayer::permissive())
     .with_state(state)
+}
+
+/// How long a live-session request will wait for the startup reconcile pass
+/// before giving up and running anyway. Adoption of a large session set takes
+/// seconds; this is the backstop for a holder that never answers, so the request
+/// fails its own honest way instead of hanging forever.
+const READY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Session sub-resources that resolve a *live* backend handle, and so mean
+/// nothing until the startup reconcile pass has adopted the survivors.
+const LIVE_ROUTES: [&str; 4] = ["stream", "stop", "resize", "paste"];
+
+fn needs_live_session(path: &str) -> bool {
+    path.strip_prefix("/api/sessions/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(_, sub)| LIVE_ROUTES.contains(&sub))
+}
+
+/// Park requests that need a live session until adoption has run.
+///
+/// The listener binds before the reconcile pass, so for the first seconds after
+/// a restart a surviving session is `running` in the DB but not yet in `live`.
+/// Attaching in that window would otherwise be served the read-only history
+/// path — a live agent that looks dead. Everything else (`/health`, the session
+/// list, auth) answers immediately, which is the whole point of binding early.
+async fn await_startup_reconcile(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if needs_live_session(req.uri().path()) && !state.manager.is_ready() {
+        tracing::debug!(path = %req.uri().path(), "waiting for startup reconcile");
+        if tokio::time::timeout(READY_WAIT, state.manager.wait_until_ready())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                path = %req.uri().path(),
+                "startup reconcile still running after {READY_WAIT:?}; serving anyway"
+            );
+        }
+    }
+    next.run(req).await
 }
 
 // ---------- handlers ----------
@@ -126,6 +175,9 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "database": "ok",
         "backend": state.manager.backend_id(),
         "active_sessions": state.manager.live_count(),
+        // Up and serving, but still adopting the sessions the previous daemon
+        // left running — `active_sessions` is still climbing toward the truth.
+        "reconciling": !state.manager.is_ready(),
     }))
 }
 
@@ -556,5 +608,26 @@ impl IntoResponse for AppError {
 impl From<anyhow::Error> for AppError {
     fn from(e: anyhow::Error) -> Self {
         AppError(StatusCode::BAD_REQUEST, format!("{e:#}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_live_session;
+
+    #[test]
+    fn gates_only_the_routes_that_resolve_a_live_handle() {
+        assert!(needs_live_session("/api/sessions/abc/stream"));
+        assert!(needs_live_session("/api/sessions/abc/stop"));
+        assert!(needs_live_session("/api/sessions/abc/resize"));
+        assert!(needs_live_session("/api/sessions/abc/paste"));
+
+        // Pure DB/git reads, and session creation — none of them touch `live`,
+        // so they must not wait on adoption.
+        assert!(!needs_live_session("/api/sessions"));
+        assert!(!needs_live_session("/api/sessions/abc"));
+        assert!(!needs_live_session("/api/sessions/abc/transcript"));
+        assert!(!needs_live_session("/api/sessions/abc/scm/status"));
+        assert!(!needs_live_session("/health"));
     }
 }

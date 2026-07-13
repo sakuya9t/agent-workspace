@@ -331,18 +331,33 @@ export async function createSandbox(name = "asm-test") {
       return conn;
     },
 
+    /**
+     * Wait until the daemon is up **and has finished adopting** the sessions a
+     * previous daemon left running. The daemon binds before that pass (so
+     * `/health` answers regardless of how many sessions survived), and reports
+     * `reconciling: true` while it runs — a restart test that raced ahead of it
+     * would see an adopted session as merely `running`-in-the-DB, with no live
+     * handle behind it.
+     */
     async waitHealth(timeoutMs = 15000) {
       const deadline = Date.now() + timeoutMs;
+      let last;
       while (Date.now() < deadline) {
         try {
           const res = await fetch(`${sb.http}/health`);
-          if (res.ok) return await res.json();
+          if (res.ok) {
+            last = await res.json();
+            if (!last.reconciling) return last;
+          }
         } catch {
           /* not up yet */
         }
         await sleep(150);
       }
-      throw new Error(`daemon /health did not come up on ${base} — see ${sb.logPath("daemon")}`);
+      const why = last?.reconciling
+        ? `daemon is up on ${base} but never finished adopting sessions`
+        : `daemon /health did not come up on ${base}`;
+      throw new Error(`${why} — see ${sb.logPath("daemon")}`);
     },
 
     stop(procName) {

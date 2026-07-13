@@ -96,6 +96,26 @@ itself is gone (host reboot), live sessions are truly dead → reconcile to
 `indeterminate` (the mid-flight outcome is unknown, not a proven failure — see
 [Reconciliation states](#reconciliation-states)).
 
+### Adoption runs *behind* the listener
+
+That pass is **one serial holder round-trip per session**, so its cost scales
+with how many sessions survived — a restart with 7 live sessions spent 8 s in it.
+It therefore runs **after** the daemon binds its port, not before: boot-to-
+`/health` stays flat no matter how many sessions are being adopted. Doing it the
+other way round meant `/health` did not answer until the last session was
+adopted, and `start.sh`'s 6 s health check pronounced a perfectly healthy daemon
+dead (seen on 2026-07-12).
+
+The price is a window — bound → ready — in which a survivor is `running` in
+SQLite but not yet in the daemon's `live` map. An attach landing there would
+otherwise fall through to the read-only history path and show a **live agent as a
+dead terminal**, so requests that resolve a live handle
+(`stream`/`stop`/`resize`/`paste`) park until the pass lands
+(`SessionManager::wait_until_ready`, gated in `api::await_startup_reconcile`).
+Everything else — `/health`, the session list, auth — answers immediately, which
+is the entire point. `/health` reports `"reconciling": true` for the duration, so
+a supervisor can tell *up but still adopting* from *up*.
+
 ## Adopt invariant (the headline "terminal intact" promise)
 
 "Zero-flicker resume" needs **more than a persisted cursor.** After a daemon

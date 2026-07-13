@@ -109,23 +109,23 @@ async fn main() -> Result<()> {
 
     let manager = Arc::new(SessionManager::new(db, registry, backend, worktree_root));
 
-    // Reconcile sessions left live by a previous run: adopt survivors from the
-    // holder, or mark them failed/indeterminate. (Native marks them `failed`.)
-    if let Err(e) = manager.startup_reconcile().await {
-        tracing::error!("startup reconcile failed: {e:#}");
-    }
-
     // Re-reconcile after each daemon↔asmux reconnect (the supervisor has already
     // re-attached the live sessions; this catches exits missed while detached).
+    // A pass is blocking holder I/O, so it runs on a blocking thread; the
+    // manager serializes it against the startup pass.
     if let Some(mut rx) = reconnect_rx {
         let mgr = manager.clone();
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(ReconnectEvent::Connected) => {
-                        if let Err(e) = mgr.reconcile_after_reconnect() {
-                            tracing::warn!("post-reconnect reconcile failed: {e:#}");
-                        }
+                        let mgr = mgr.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Err(e) = mgr.reconcile_after_reconnect() {
+                                tracing::warn!("post-reconnect reconcile failed: {e:#}");
+                            }
+                        })
+                        .await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -154,6 +154,15 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding {}", config.bind))?;
     tracing::info!("listening on http://{}", config.bind);
+
+    // Only now reconcile the sessions a previous run left live: adopt survivors
+    // from the holder, or mark them failed/indeterminate. (Native marks them
+    // `failed`.) This runs *behind* the bound listener because adoption is one
+    // serial holder round-trip per session — with 7 live sessions it took 8s,
+    // and doing it first meant `/health` did not answer until it finished, so a
+    // supervisor's health check timed out on a daemon that was fine. Requests
+    // that need a live session wait for the pass (see `api::READY_WAIT`).
+    manager.spawn_startup_reconcile();
 
     // Connect-info exposes the peer address so auth can trust loopback. The
     // primary listener stamps `Primary`, so genuine loopback here is trusted.

@@ -8,6 +8,7 @@ use anyhow::{anyhow, bail, Result};
 use parking_lot::Mutex;
 use serde::Serialize;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 /// How long output must be silent before a *working* session is considered idle
@@ -106,6 +107,14 @@ pub struct SessionManager {
     worktree_root: PathBuf,
     /// Per-session interaction signals, keyed by session id (see [`Interaction`]).
     interactions: Mutex<HashMap<String, Arc<Interaction>>>,
+    /// Serializes reconcile passes. Startup runs one in the background while a
+    /// holder reconnect can fire another; without this, both could see the same
+    /// session as "alive in the holder, not in `live`" and adopt it twice.
+    /// Only ever taken on a blocking thread (a pass is a serial holder RPC).
+    reconcile_pass: Mutex<()>,
+    /// `false` until the startup reconcile pass has finished. See
+    /// [`Self::wait_until_ready`].
+    ready_tx: watch::Sender<bool>,
 }
 
 impl SessionManager {
@@ -122,6 +131,8 @@ impl SessionManager {
             live: Mutex::new(HashMap::new()),
             worktree_root,
             interactions: Mutex::new(HashMap::new()),
+            reconcile_pass: Mutex::new(()),
+            ready_tx: watch::channel(false).0,
         }
     }
 
@@ -321,6 +332,52 @@ impl SessionManager {
         n
     }
 
+    /// Has the startup reconcile pass finished? Surfaced on `/health` so a
+    /// supervisor or gateway can tell "up but still adopting" from "up".
+    pub fn is_ready(&self) -> bool {
+        *self.ready_tx.borrow()
+    }
+
+    /// Resolve once the startup reconcile pass has finished.
+    ///
+    /// The HTTP listener binds *before* that pass runs, so between bind and
+    /// ready a session the previous daemon left running is in the DB as
+    /// `running` but not yet in `live`. Any request that resolves a live handle
+    /// must wait here first — otherwise attaching to a perfectly healthy session
+    /// takes the not-live path and the client is served a dead, read-only
+    /// terminal. Callers should bound the wait (see `api::READY_WAIT`).
+    pub async fn wait_until_ready(&self) {
+        let mut rx = self.ready_tx.subscribe();
+        loop {
+            if *rx.borrow_and_update() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                return; // sender lives in `self`, so this is unreachable in practice
+            }
+        }
+    }
+
+    /// Run [`Self::startup_reconcile`] off the boot path, marking the manager
+    /// ready when it lands.
+    ///
+    /// Adoption is a serial holder round-trip per session, so it scales with how
+    /// many sessions survived: a restart with 7 live sessions spent 8s here,
+    /// during which the daemon had not yet bound its port and `start.sh`'s 6s
+    /// health check declared a perfectly healthy daemon dead. Reconciling behind
+    /// the listener keeps boot-to-`/health` flat regardless of session count.
+    pub fn spawn_startup_reconcile(self: &Arc<Self>) {
+        let mgr = self.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = mgr.startup_reconcile() {
+                tracing::error!("startup reconcile failed: {e:#}");
+            }
+            // Ready even when the pass failed: it is done, and making every
+            // attach wait on a pass that will not come back is strictly worse.
+            mgr.ready_tx.send_replace(true);
+        });
+    }
+
     /// Reconcile sessions left live in the DB after a restart.
     ///
     /// - In-process backend: the PTYs are gone, so those rows become `failed`.
@@ -328,7 +385,11 @@ impl SessionManager {
     ///   alive in the holder → **adopt** (re-attach, mark `running`); a real exit
     ///   record → `exited`/`failed`; absent from the holder → **`indeterminate`**
     ///   (the holder itself died, so no completion record exists).
-    pub async fn startup_reconcile(self: &Arc<Self>) -> Result<()> {
+    ///
+    /// Blocking (holder RPCs); [`Self::spawn_startup_reconcile`] is how the
+    /// daemon runs it.
+    pub fn startup_reconcile(self: &Arc<Self>) -> Result<()> {
+        let _pass = self.reconcile_pass.lock();
         if !self.backend.keep_sessions_on_shutdown() {
             let n = self.db.reconcile_orphans_on_startup(now_millis())?;
             if n > 0 {
@@ -358,7 +419,11 @@ impl SessionManager {
     /// (`asmux-protocol.md` → Liveness). A transient `list` failure here is
     /// *not* treated as "the holder is gone" (unlike startup): the sessions are
     /// almost certainly fine, so we log and wait for the next reconnect.
+    ///
+    /// Blocking, and serialized against the startup pass — a reconnect during
+    /// startup adoption must queue behind it, not race it.
     pub fn reconcile_after_reconnect(self: &Arc<Self>) -> Result<()> {
+        let _pass = self.reconcile_pass.lock();
         match self.backend.holder_list() {
             Ok(holder) => self.reconcile_from_holder(holder),
             Err(e) => {
@@ -755,6 +820,12 @@ mod tests {
         holder_list_fails: bool,
         /// Whether `adopt()` yields a live handle (`Some`) or gives up (`None`).
         adopt_ok: bool,
+        /// Signalled on entry to `adopt()`, so a test can assert on the state the
+        /// daemon serves *while* a pass is still running.
+        adopt_entered: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+        /// Stand in for the real cost of adoption (a holder round-trip per
+        /// session — seconds, for a large set).
+        adopt_delay: Duration,
         /// Records `end_session_stream` calls as `(id, "exited"|"vanished")` so the
         /// reconnect-reconcile branches can be asserted without a real holder.
         end_calls: Arc<Mutex<Vec<(String, String)>>>,
@@ -782,6 +853,10 @@ mod tests {
             _rows: u16,
             _cols: u16,
         ) -> Result<Option<Arc<dyn BackendSession>>> {
+            if let Some(tx) = &self.adopt_entered {
+                let _ = tx.send(());
+            }
+            std::thread::sleep(self.adopt_delay);
             Ok(self.adopt_ok.then(mock_session))
         }
         fn end_session_stream(&self, id: &str, outcome: StreamEnd) {
@@ -929,7 +1004,7 @@ mod tests {
         let (manager, dir) = test_manager();
         insert_running(&manager.db, "s-native");
 
-        manager.startup_reconcile().await.unwrap();
+        manager.startup_reconcile().unwrap();
 
         let s = manager.get_session("s-native").unwrap().unwrap();
         assert_eq!(s.status, SessionStatus::Failed);
@@ -947,13 +1022,57 @@ mod tests {
         let (manager, dir) = test_manager_with(backend);
         insert_running(&manager.db, "s-adopt");
 
-        manager.startup_reconcile().await.unwrap();
+        manager.startup_reconcile().unwrap();
 
         let s = manager.get_session("s-adopt").unwrap().unwrap();
         assert_eq!(s.status, SessionStatus::Running, "adopted → running");
         assert!(
             manager.live_handle("s-adopt").is_some(),
             "adopted handle re-attached into the live map"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_runs_behind_the_listener_and_gates_live_lookups() {
+        // Adoption is serial holder I/O, so it must not sit on the boot path: the
+        // daemon binds, then adopts. The cost of that is a window where a
+        // survivor is `running` in the DB but not yet in `live` — and an attach
+        // landing there would take the not-live path and serve a dead, read-only
+        // terminal for a session that is perfectly alive. So: never block the
+        // boot, always block the live lookup.
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            holder: vec![holder_entry("s-slow", true, 0, 0)],
+            adopt_ok: true,
+            adopt_entered: Some(entered_tx),
+            adopt_delay: Duration::from_millis(300),
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_with(backend);
+        insert_running(&manager.db, "s-slow");
+
+        manager.spawn_startup_reconcile();
+
+        // Mid-pass (the mock is parked inside `adopt`): the daemon is already
+        // serving — this is what keeps boot-to-`/health` flat no matter how many
+        // sessions survived — but it does not yet claim to be ready.
+        entered_rx.recv().await.unwrap();
+        assert!(!manager.is_ready(), "the pass must not run on the boot path");
+        assert!(manager.live_handle("s-slow").is_none(), "not adopted yet");
+
+        // A live-session request parks here rather than reading that empty map.
+        manager.wait_until_ready().await;
+
+        assert!(manager.is_ready());
+        assert!(
+            manager.live_handle("s-slow").is_some(),
+            "once the pass lands, the survivor is live and an attach streams it"
+        );
+        assert_eq!(
+            manager.get_session("s-slow").unwrap().unwrap().status,
+            SessionStatus::Running
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -970,7 +1089,7 @@ mod tests {
         let (manager, dir) = test_manager_with(backend);
         insert_running(&manager.db, "s-noadopt");
 
-        manager.startup_reconcile().await.unwrap();
+        manager.startup_reconcile().unwrap();
 
         let s = manager.get_session("s-noadopt").unwrap().unwrap();
         assert_eq!(s.status, SessionStatus::Indeterminate);
@@ -994,7 +1113,7 @@ mod tests {
         insert_running(&manager.db, "s-exit");
         insert_running(&manager.db, "s-signal");
 
-        manager.startup_reconcile().await.unwrap();
+        manager.startup_reconcile().unwrap();
 
         let exited = manager.get_session("s-exit").unwrap().unwrap();
         assert_eq!(exited.status, SessionStatus::Exited);
@@ -1016,7 +1135,7 @@ mod tests {
         let (manager, dir) = test_manager_with(backend);
         insert_running(&manager.db, "s-absent");
 
-        manager.startup_reconcile().await.unwrap();
+        manager.startup_reconcile().unwrap();
 
         let s = manager.get_session("s-absent").unwrap().unwrap();
         assert_eq!(s.status, SessionStatus::Indeterminate);
@@ -1036,7 +1155,7 @@ mod tests {
         insert_running(&manager.db, "s-a");
         insert_running(&manager.db, "s-b");
 
-        manager.startup_reconcile().await.unwrap();
+        manager.startup_reconcile().unwrap();
 
         for id in ["s-a", "s-b"] {
             assert_eq!(
