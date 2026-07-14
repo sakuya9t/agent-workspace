@@ -27,6 +27,10 @@ impl SessionManager {
             // Carries OSC-escape state across chunks so a window-title update
             // split over two reads isn't miscounted as a bell (see `scan_bell`).
             let mut in_osc = false;
+            // Whether this session's agent-native conversation id is on record
+            // yet. Captured while the session is alive so that a fork can resume
+            // the *right* conversation later — see `capture_native_id`.
+            let mut native_captured = false;
 
             loop {
                 // Only a *working* session needs the close idle watch; a blocked
@@ -39,6 +43,17 @@ impl SessionManager {
                 };
                 let idle_tick = tokio::time::sleep(idle_delay);
 
+                // Poll for the agent's own conversation id until we have it, then
+                // never again. An agent writes its transcript a moment after it
+                // starts, not at exec time, so this cannot be a one-shot at spawn.
+                let capture_tick = async {
+                    if native_captured {
+                        std::future::pending::<()>().await
+                    } else {
+                        tokio::time::sleep(CAPTURE_EVERY).await
+                    }
+                };
+
                 tokio::select! {
                     changed = status_rx.changed() => {
                         if changed.is_err() {
@@ -46,9 +61,19 @@ impl SessionManager {
                         }
                         let st = status_rx.borrow().clone();
                         if st.is_terminal() {
+                            // Last chance: a session that died inside the first
+                            // capture tick still has a transcript on disk, and is
+                            // exactly the kind of session someone wants to fork.
+                            if !native_captured {
+                                self.clone().capture_native_id(&id, plugin.clone(), started_at).await;
+                            }
                             self.on_exit(&id, &handle, started_at, st, plugin.as_ref()).await;
                             break;
                         }
+                    }
+                    _ = capture_tick => {
+                        native_captured =
+                            self.clone().capture_native_id(&id, plugin.clone(), started_at).await;
                     }
                     recv = out_rx.recv() => {
                         match recv {
@@ -85,6 +110,63 @@ impl SessionManager {
             }
             self.interactions.lock().remove(&id);
         });
+    }
+
+    /// Record the agent's own conversation id for a live session, so that a fork
+    /// can later resume *that* conversation rather than guess at one.
+    ///
+    /// This is deliberately done while the session runs, not at fork time. The
+    /// transcript-matching in [`crate::plugins::usage`] is a heuristic — Claude's
+    /// is literally "the newest `*.jsonl` in this cwd's directory" — and two
+    /// sessions sharing a working directory (normal once worktree isolation is
+    /// off, and *guaranteed* for a same-branch fork) can collapse onto whichever
+    /// transcript was written last. Reporting the wrong token count is survivable;
+    /// resuming the wrong conversation is not. Capturing early, while this session
+    /// is the only recent writer, is when that heuristic is at its most reliable —
+    /// and once captured the id is never re-derived.
+    ///
+    /// Returns whether the id is now on record (including when a previous tick
+    /// wrote it), so the caller can stop polling.
+    async fn capture_native_id(
+        self: Arc<Self>,
+        id: &str,
+        plugin: Option<Arc<dyn AgentPlugin>>,
+        started_at: i64,
+    ) -> bool {
+        let Some(plugin) = plugin else {
+            return true; // no plugin, nothing to capture, stop asking
+        };
+        let Ok(Some(session)) = self.db.get_session(id) else {
+            return false;
+        };
+        if session.agent_session_id.is_some() {
+            return true;
+        }
+
+        let id = id.to_string();
+        let this = self.clone();
+        // Reads a transcript off disk: keep it off the async runtime.
+        tokio::task::spawn_blocking(move || {
+            let cx = TranscriptContext {
+                cwd: PathBuf::from(&session.working_directory),
+                started_at_ms: started_at,
+            };
+            let Some(native_id) = plugin.native_session_id(&cx) else {
+                return false;
+            };
+            match this.db.set_agent_session_id(&id, &native_id) {
+                Ok(_) => {
+                    tracing::debug!(session = %id, native_id = %native_id, "captured the agent's conversation id");
+                    true
+                }
+                Err(e) => {
+                    tracing::warn!(session = %id, "could not record the agent's conversation id: {e:#}");
+                    false
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
     }
 
     /// Output has been silent for [`IDLE_AFTER`]: a *working* session is now idle,

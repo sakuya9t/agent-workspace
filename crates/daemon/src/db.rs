@@ -82,8 +82,8 @@ impl Db {
             "INSERT INTO sessions (
                 id, agent_plugin_id, command, args, env, working_directory, workspace_id,
                 status, rows, cols, last_event_seq, exit_code, attention_state, attention_reason,
-                created_at, updated_at, last_activity_at, risky
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                created_at, updated_at, last_activity_at, risky, agent_session_id, forked_from
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             rusqlite::params![
                 s.id,
                 s.agent_plugin_id,
@@ -103,9 +103,26 @@ impl Db {
                 s.updated_at,
                 s.last_activity_at,
                 s.risky as i64,
+                s.agent_session_id,
+                s.forked_from,
             ],
         )?;
         Ok(())
+    }
+
+    /// Record the agent's own conversation id for a live session. Written once —
+    /// the first successful capture wins, and later ticks must not overwrite it
+    /// with a re-derived guess (see [`Session::agent_session_id`]). The
+    /// `IS NULL` guard makes that a property of the statement rather than of
+    /// every caller.
+    pub fn set_agent_session_id(&self, id: &str, native_id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE sessions SET agent_session_id = ?2
+             WHERE id = ?1 AND agent_session_id IS NULL",
+            rusqlite::params![id, native_id],
+        )?;
+        Ok(n > 0)
     }
 
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
@@ -113,7 +130,7 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT id, agent_plugin_id, command, args, env, working_directory, workspace_id,
                     status, rows, cols, last_event_seq, exit_code, attention_state, attention_reason,
-                    created_at, updated_at, last_activity_at, risky
+                    created_at, updated_at, last_activity_at, risky, agent_session_id, forked_from
              FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
@@ -125,7 +142,7 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT id, agent_plugin_id, command, args, env, working_directory, workspace_id,
                     status, rows, cols, last_event_seq, exit_code, attention_state, attention_reason,
-                    created_at, updated_at, last_activity_at, risky
+                    created_at, updated_at, last_activity_at, risky, agent_session_id, forked_from
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map([id], row_to_session)?;
@@ -550,6 +567,8 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         updated_at: row.get(15)?,
         last_activity_at: row.get(16)?,
         risky: row.get::<_, i64>(17)? != 0,
+        agent_session_id: row.get(18)?,
+        forked_from: row.get(19)?,
     })
 }
 
@@ -628,6 +647,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA_V6)?;
         conn.pragma_update(None, "user_version", 6)?;
         tracing::info!("applied schema migration v6");
+    }
+    if version < 7 {
+        conn.execute_batch(SCHEMA_V7)?;
+        conn.pragma_update(None, "user_version", 7)?;
+        tracing::info!("applied schema migration v7");
     }
     Ok(())
 }
@@ -749,6 +773,19 @@ UPDATE workspace_instances SET owns_branch = 1
     WHERE isolation = 'worktree' AND branch LIKE 'asm-session/%';
 "#;
 
+// Session forking. `agent_session_id` is the agent's own conversation id, written
+// once while the session is live (see `Session::agent_session_id` for why it is
+// not re-derived at fork time); `forked_from` is the origin's session id.
+//
+// Both are nullable with no backfill: sessions that predate this migration never
+// had their native id captured, so a fork of one falls back to the digest brief.
+// Backfilling by re-running the transcript heuristic now would be exactly the
+// guess the live capture exists to avoid.
+const SCHEMA_V7: &str = r#"
+ALTER TABLE sessions ADD COLUMN agent_session_id TEXT;
+ALTER TABLE sessions ADD COLUMN forked_from TEXT;
+"#;
+
 /// Batches terminal events into transactions to keep write amplification low.
 fn event_writer_loop(mut conn: Connection, mut rx: UnboundedReceiver<EventMsg>) {
     // Block for the first event, then drain whatever else is queued.
@@ -840,6 +877,8 @@ mod tests {
             updated_at: 1,
             last_activity_at: 1,
             risky: false,
+            agent_session_id: None,
+            forked_from: None,
         })
         .unwrap();
     }

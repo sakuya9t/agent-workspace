@@ -69,6 +69,27 @@ function persistWidths(w: PanelWidths) {
   }
 }
 
+/** The origin of a fork, as the dialog needs to describe and submit it. */
+export interface ForkSource {
+  daemonId: string;
+  sessionId: string;
+  /** Shown so the user can see what they are forking. */
+  title: string;
+  /** The origin's agent — the fork's default, though it can be changed. */
+  agentPluginId: string;
+  /** The origin's branch, or null if it isn't on one (a direct checkout). */
+  branch: string | null;
+  /** Whether the origin is still running: a same-branch fork would share its
+   *  working directory with a live agent, which the dialog warns about. */
+  live: boolean;
+  /**
+   * Whether the origin's agent kept a conversation we can resume. With it, a
+   * fork onto the same agent carries the whole conversation; without it — or onto
+   * a different agent — it carries a written summary instead.
+   */
+  hasConversation: boolean;
+}
+
 interface UiState {
   activeSession: ActiveRef | null;
   setActive: (a: ActiveRef | null) => void;
@@ -82,6 +103,14 @@ interface UiState {
    */
   newSessionWorkspaceId: string | null;
   openNewSession: (daemonId?: string | null, workspaceId?: string | null) => void;
+  /**
+   * The session being forked, when the dialog is open in fork mode. A fork
+   * inherits its origin's daemon, workspace and place, so the dialog hides those
+   * choices and offers only the two a fork actually has: which agent to hand the
+   * work to, and whether to stay on the origin's branch or branch off it.
+   */
+  forkSource: ForkSource | null;
+  openFork: (source: ForkSource) => void;
   showNewWorkspace: boolean;
   setShowNewWorkspace: (v: boolean) => void;
   /** Daemon the new-workspace dialog registers into. */
@@ -121,6 +150,15 @@ export const useUiStore = create<UiState>((set, get) => ({
       showNewSession: true,
       newSessionDaemonId: daemonId,
       newSessionWorkspaceId: workspaceId,
+      forkSource: null,
+    }),
+  forkSource: null,
+  openFork: (source) =>
+    set({
+      showNewSession: true,
+      newSessionDaemonId: source.daemonId,
+      newSessionWorkspaceId: null,
+      forkSource: source,
     }),
   showNewWorkspace: false,
   setShowNewWorkspace: (v) => set({ showNewWorkspace: v }),

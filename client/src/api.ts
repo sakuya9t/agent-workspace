@@ -43,6 +43,14 @@ export interface Session {
   title?: string | null;
   /** Branch held by the session's workspace instance, for the info popover. */
   branch?: string | null;
+  /** Origin session id when this session was forked from another; null otherwise. */
+  forked_from?: string | null;
+  /**
+   * Whether the agent kept a conversation the daemon could resume. A fork onto
+   * the same agent then carries the whole conversation; otherwise it carries a
+   * written summary. (Absent on old daemons.)
+   */
+  has_agent_conversation?: boolean;
 }
 
 export interface AgentOption {
@@ -239,6 +247,23 @@ export interface CreateSessionBody {
   /** Start point for a newly created branch; defaults to HEAD. */
   base_ref?: string;
   /** Selected agent-option toggles (e.g. permission-skipping flags), keyed by option key. */
+  options?: Record<string, boolean>;
+}
+
+/**
+ * A fork inherits its origin's daemon, workspace and working directory, so none
+ * of those are here. The only two choices a fork has are which agent to hand the
+ * work to, and where it runs relative to the origin's branch.
+ */
+export interface ForkSessionBody {
+  /** The agent to fork into — the origin's own, or a different one. */
+  agent_plugin_id: string;
+  /**
+   * Continue on the origin's branch, sharing its worktree, instead of branching
+   * off it into a new one. Safe once the origin has stopped; while it is still
+   * running this puts two agents in one directory.
+   */
+  same_branch?: boolean;
   options?: Record<string, boolean>;
 }
 
@@ -485,6 +510,16 @@ export const api = {
     req<{ usage: SessionUsage }>(t, `/api/sessions/${id}/usage`).then((r) => r.usage),
   createSession: (t: Target, body: CreateSessionBody) =>
     req<{ session: Session }>(t, "/api/sessions", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }).then((r) => r.session),
+  /**
+   * Fork a session into a new one carrying its context. Slow by nature — the
+   * daemon may run an agent headlessly to write the handoff brief — so callers
+   * should show progress rather than assume this returns promptly.
+   */
+  forkSession: (t: Target, id: string, body: ForkSessionBody) =>
+    req<{ session: Session }>(t, `/api/sessions/${id}/fork`, {
       method: "POST",
       body: JSON.stringify(body),
     }).then((r) => r.session),

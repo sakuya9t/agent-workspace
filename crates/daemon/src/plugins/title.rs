@@ -159,7 +159,7 @@ fn claude_first_prompt(text: &str) -> Option<String> {
 }
 
 /// The session uuid from a rollout head (`session_meta` is the first record).
-fn codex_session_id(head: &str) -> Option<String> {
+pub(crate) fn codex_session_id(head: &str) -> Option<String> {
     for line in head.lines() {
         if !line.contains("session_meta") {
             continue;

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -7,6 +7,7 @@ use serde::Serialize;
 pub(crate) mod attention;
 pub mod builtin;
 pub mod conversation;
+pub mod fork;
 pub mod title;
 pub mod usage;
 
@@ -54,6 +55,23 @@ pub struct LaunchSpec {
     /// Arbitrary custom commands require explicit user approval before launch.
     pub requires_approval: bool,
 }
+
+/// A one-shot, non-interactive run of an agent CLI, used to summarize a forked
+/// session's digest into a handoff brief (see [`crate::summarize`]).
+///
+/// This is a *full agent* running headless, not a chat completion: it can call
+/// tools and edit files. The caller runs it in a throwaway directory with stdin
+/// closed and a deadline — never in the user's worktree.
+#[derive(Debug, Clone)]
+pub struct HeadlessSpec {
+    pub command: String,
+    pub args: Vec<String>,
+    /// Where the agent writes its final answer, for CLIs that can be told to
+    /// (`codex exec -o`). `None` means the answer lands on stdout, which for
+    /// some CLIs also carries a banner and ANSI — see [`crate::summarize`].
+    pub output_file: Option<PathBuf>,
+}
+
 
 /// Compiled-in agent plugin. MVP uses static traits; no dynamic loading.
 pub trait AgentPlugin: Send + Sync {
@@ -155,6 +173,77 @@ pub trait AgentPlugin: Send + Sync {
     fn title(&self, _cx: &TranscriptContext) -> Option<String> {
         None
     }
+
+    /// This agent's *own* conversation id for the session that ran in `cx.cwd`,
+    /// read from the same on-disk transcript [`usage`] reads. `None` = the agent
+    /// keeps no resumable conversation (a plain shell), or none can be matched.
+    ///
+    /// Called repeatedly while the session is alive; the **first** `Some` is
+    /// persisted and never re-derived (see [`crate::domain::Session::agent_session_id`]).
+    fn native_session_id(&self, _cx: &TranscriptContext) -> Option<String> {
+        None
+    }
+
+    /// Launch this agent so it continues the conversation `native_id`, as a
+    /// **fork**: a new conversation seeded with the old one, leaving the origin's
+    /// transcript untouched. `None` = no native resume; the caller falls back to
+    /// [`Continuity::Brief`].
+    ///
+    /// `seed` is the opening prompt, and every agent that supports this also
+    /// accepts one alongside the resume — so a native fork still boots saying
+    /// what it understands rather than silently picking up mid-thought.
+    fn build_fork(
+        &self,
+        _ctx: &AgentContext,
+        _native_id: &str,
+        _seed: &str,
+    ) -> Option<Result<LaunchSpec>> {
+        None
+    }
+
+    /// A compact, deterministic digest of the session's conversation: what the
+    /// user asked for (verbatim), what the agent changed, and where it left off.
+    ///
+    /// Deliberately not an LLM summary. It is built straight from the agent's own
+    /// transcript, so it is exact, instant, free and offline — and it stays small
+    /// (a few thousand tokens even for a session whose transcript runs to tens of
+    /// MB), which is what makes it safe to hand to *any* agent, and cheap enough
+    /// to summarize further if [`crate::summarize`] is available.
+    fn digest(&self, _cx: &TranscriptContext) -> Option<String> {
+        None
+    }
+
+    /// A non-interactive run of this agent that answers `prompt`, writing its
+    /// final answer to `out` if the CLI supports being told to. `None` = this
+    /// agent has no headless mode, so it can't be used as a summarizer.
+    ///
+    /// See [`HeadlessSpec`] — the result is a full agent, and must be run
+    /// sandboxed by the caller.
+    fn headless(&self, _prompt: &str, _out: &Path) -> Option<HeadlessSpec> {
+        None
+    }
+
+    /// Whether this agent takes an opening prompt as a positional argument, so a
+    /// forked session can be launched already pointed at its brief.
+    ///
+    /// **Off by default, and that default is load-bearing.** A shell would treat
+    /// a trailing argument as a *script to run*, so handing one a seed prompt
+    /// would execute the brief instead of reading it.
+    fn accepts_seed_prompt(&self) -> bool {
+        false
+    }
+
+    /// Whether [`build_fork`](Self::build_fork) only finds the origin's
+    /// conversation when the fork runs in the origin's own working directory.
+    ///
+    /// True for Claude Code, which keys transcripts by cwd
+    /// (`~/.claude/projects/<encoded-cwd>/`): resuming from a fresh worktree would
+    /// look in the wrong directory and find nothing. False for Codex, whose
+    /// rollouts are addressed by uuid from anywhere on the box. The fork planner
+    /// reads this to decide whether a native fork is even on the table.
+    fn native_fork_requires_same_cwd(&self) -> bool {
+        false
+    }
 }
 
 /// Serializable plugin metadata for the client.
@@ -183,6 +272,11 @@ impl PluginRegistry {
 
     pub fn get(&self, id: &str) -> Option<Arc<dyn AgentPlugin>> {
         self.agents.iter().find(|p| p.id() == id).cloned()
+    }
+
+    /// Every registered plugin, in registration order.
+    pub fn agents(&self) -> &[Arc<dyn AgentPlugin>] {
+        &self.agents
     }
 
     pub fn describe(&self) -> Vec<PluginInfo> {

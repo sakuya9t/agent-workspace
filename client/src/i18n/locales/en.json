@@ -67,6 +67,21 @@
     "plain": "plain",
     "missing": "missing"
   },
+  "fork": {
+    "title": "Fork \"{{name}}\"",
+    "placeLabel": "Where it runs",
+    "sameBranch": "Continue on the same branch ({{branch}})",
+    "noBranch": "Continue on the same branch — this session isn't on one",
+    "sameBranchHelp": "Off: the fork branches off this session's branch, in a worktree of its own. On: it continues on the same branch, in the same directory.",
+    "sameBranchHint": "The fork shares this session's branch and working directory.",
+    "newBranchHint": "The fork gets its own branch and working directory, starting from {{branch}}.",
+    "liveSameBranchWarning": "This session is still running. Two agents editing the same files can overwrite each other's work.",
+    "carriesConversation": "The fork keeps the same agent, so it carries the whole conversation.",
+    "carriesSummary": "The fork carries a summary of this session — its requests, the files it changed, and where it left off.",
+    "start": "Fork session",
+    "forking": "Forking…",
+    "summarizing": "Summarizing the conversation…"
+  },
   "newSession": {
     "title": "New session",
     "daemonLabel": "Daemon",
@@ -158,6 +173,8 @@
     "inUseTitle": "Open on another client — click to take over",
     "stopTitle": "Stop session",
     "saveTitle": "Save conversation",
+    "forkTitle": "Fork — continue this work in a new session, with its context",
+    "forkUnavailableTitle": "Forking needs a coding agent (Claude Code, Codex or opencode) installed on this host",
     "archiveTitle": "Archive — remove from history and delete branch",
     "saveError": "Couldn't save the conversation: {{message}}",
     "confirmStop": "Stop \"{{name}}\"?\n\nThe agent is terminated. The session stays in history — you can still read it, save the conversation, or archive it.",

@@ -13,7 +13,7 @@ use tower_http::services::ServeDir;
 
 use crate::config::Config;
 use crate::plugins::current_platform;
-use crate::session_manager::{CreateSessionRequest, SessionManager};
+use crate::session_manager::{CreateSessionRequest, ForkRequest, SessionManager};
 use crate::source_control::SourceControl;
 use crate::util::now_millis;
 
@@ -67,6 +67,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/:id/transcript", get(get_transcript))
         .route("/api/sessions/:id/usage", get(get_session_usage))
         .route("/api/sessions/:id/workspace", get(get_session_workspace))
+        .route("/api/sessions/:id/fork", post(fork_session))
         .route("/api/sessions/:id/stop", post(stop_session))
         .route("/api/sessions/:id/archive", post(archive_session))
         .route("/api/sessions/:id/cleanup", post(cleanup_instance))
@@ -333,6 +334,13 @@ fn session_json(s: &crate::domain::Session, state: &AppState) -> serde_json::Val
             .flatten()
             .and_then(|i| i.branch);
         obj.insert("branch".into(), json!(branch));
+        // Whether this session's agent kept a conversation we could resume. A fork
+        // that keeps the same agent then carries the whole conversation; anything
+        // else carries a written brief. The id itself stays on the host.
+        obj.insert(
+            "has_agent_conversation".into(),
+            json!(s.agent_session_id.is_some()),
+        );
     }
     v
 }
@@ -388,8 +396,52 @@ async fn create_session(
         create_branch: body.create_branch,
         base_ref: body.base_ref,
         options: body.options.into_iter().collect(),
+        fork: None,
     };
     let session = state.manager.create_session(req)?;
+    Ok(Json(json!({ "session": session })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ForkSessionBody {
+    /// The agent to fork into — the origin's own, or a different one.
+    agent_plugin_id: String,
+    /// Continue on the origin's branch, in its worktree, instead of branching off
+    /// it. Safe once the origin has stopped; while it is still running, this puts
+    /// two agents in one directory and the client is expected to have warned.
+    #[serde(default)]
+    same_branch: bool,
+    #[serde(default)]
+    options: HashMap<String, bool>,
+    #[serde(default)]
+    rows: Option<u16>,
+    #[serde(default)]
+    cols: Option<u16>,
+}
+
+/// Fork a session: a new session on the origin's branch (or one off it), carrying
+/// the origin's context.
+///
+/// `spawn_blocking` is not an optimization here. Forking runs `git worktree add`
+/// and may run an agent CLI headlessly for tens of seconds to write the handoff
+/// brief; on the async runtime that would stall every other request in the daemon
+/// for the duration.
+async fn fork_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ForkSessionBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let req = ForkRequest {
+        agent_plugin_id: body.agent_plugin_id,
+        options: body.options.into_iter().collect(),
+        same_branch: body.same_branch,
+        rows: body.rows.unwrap_or(24),
+        cols: body.cols.unwrap_or(80),
+    };
+    let manager = state.manager.clone();
+    let session = tokio::task::spawn_blocking(move || manager.fork_session(&id, req))
+        .await
+        .map_err(|e| anyhow::anyhow!("fork task panicked: {e}"))??;
     Ok(Json(json!({ "session": session })))
 }
 

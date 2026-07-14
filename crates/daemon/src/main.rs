@@ -7,6 +7,7 @@ mod domain;
 mod plugins;
 mod session_manager;
 mod source_control;
+mod summarize;
 mod util;
 mod workspace;
 

@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -153,20 +151,18 @@ pub async fn upload(
         stem
     };
 
-    let asm_dir = PathBuf::from(&session.working_directory).join(".asm");
-    let paste_dir = asm_dir.join("pastes");
-    std::fs::create_dir_all(&paste_dir).map_err(|e| {
-        AppError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("create paste dir: {e}"),
-        )
-    })?;
-
-    // Keep pastes out of version control without touching tracked files or the
-    // repo's git config: a self-contained `*` ignore inside `.asm/` covers
-    // every worktree layout. Best-effort — a failure here doesn't fail the
-    // paste (the file is still usable), it just risks a dirty status entry.
-    let _ = std::fs::write(asm_dir.join(".gitignore"), "*\n");
+    // `.asm/` is the session-local scratch dir, and it ignores itself — see
+    // [`crate::util::asm_dir`], which the fork brief also writes into.
+    // `Path` in this module is axum's extractor, hence the fully-qualified type.
+    let paste_dir = crate::util::asm_dir(std::path::Path::new(&session.working_directory))
+        .map(|d| d.join("pastes"))
+        .and_then(|d| std::fs::create_dir_all(&d).map(|_| d))
+        .map_err(|e| {
+            AppError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("create paste dir: {e}"),
+            )
+        })?;
 
     // Keep the client's stem so the path reads meaningfully in the prompt
     // (`spec-3f2a1b9c.pdf` tells the agent more than `3f2a1b9c….pdf`), and add a

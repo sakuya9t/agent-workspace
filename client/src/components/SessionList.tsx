@@ -4,7 +4,8 @@ import { useTranslation } from "react-i18next";
 import { api, Session, SessionStatus, AttentionState, Workspace } from "../api";
 import { daemonLabel, Target, targetOf, useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
-import { DaemonState, useDaemonStates } from "../useDaemons";
+import { DaemonState, useDaemonPlugins, useDaemonStates } from "../useDaemons";
+import { canForkInto } from "./NewSessionDialog";
 import { isLive } from "../status";
 import { relTime } from "../i18n/time";
 import { attentionLabel, endedLabel, statusLabel } from "../i18n/labels";
@@ -39,12 +40,14 @@ export function SessionList() {
   const setActive = useUiStore((s) => s.setActive);
   const openNewSession = useUiStore((s) => s.openNewSession);
   const openNewWorkspace = useUiStore((s) => s.openNewWorkspace);
+  const openFork = useUiStore((s) => s.openFork);
   const setShowConnection = useUiStore((s) => s.setShowConnection);
   const updateDaemon = useConnStore((s) => s.updateDaemon);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
 
   const states = useDaemonStates();
+  const pluginsByDaemon = useDaemonPlugins();
 
   const toggle = (id: string) =>
     setCollapsed((prev) => {
@@ -152,6 +155,8 @@ export function SessionList() {
     const selected = active?.daemonId === daemonId && active?.sessionId === s.id;
     const name = sessionLabel(s, ctx?.workspaceName);
     const title = sessionTitle(s, ctx?.workspaceName);
+    // Nothing to fork into if this host has no coding agent installed.
+    const canFork = canForkInto(pluginsByDaemon[daemonId]);
     return (
       <div
         key={daemonId + ":" + s.id}
@@ -219,6 +224,37 @@ export function SessionList() {
               {endedLabel(s.status)}
               {s.exit_code !== null ? ` · ${s.exit_code}` : ""}
             </span>
+          )}
+          {/* Fork: continue this session's work in a new one, carrying its
+              context. Offered for live and finished sessions alike — forking a
+              finished session is how you pick work back up. An archived session
+              has had its worktree and branch discarded, so there is no place left
+              to fork into. Disabled when the host has no agent to fork into. */}
+          {s.status !== "archived" && (
+            <button
+              className="icon-btn"
+              title={
+                canFork
+                  ? t("sessionList.forkTitle")
+                  : t("sessionList.forkUnavailableTitle")
+              }
+              aria-label={t("sessionList.forkTitle")}
+              disabled={!canFork}
+              onClick={(e) => {
+                e.stopPropagation();
+                openFork({
+                  daemonId,
+                  sessionId: s.id,
+                  title,
+                  agentPluginId: s.agent_plugin_id,
+                  branch: s.branch ?? null,
+                  live: isLive(s.status),
+                  hasConversation: s.has_agent_conversation ?? false,
+                });
+              }}
+            >
+              <span className="action-icon action-icon-fork" aria-hidden="true" />
+            </button>
           )}
           {/* Save works for any non-archived session (live or ended); archived
               sessions have been discarded, so there's nothing to save. */}

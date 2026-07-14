@@ -1,6 +1,25 @@
 # Session recovery
 
-**Status:** designed, not implemented. Backlog row: **REC**.
+> **Status: superseded — implemented as [forking](fork-session.md) (2026-07-14).**
+>
+> Recovery turned out to be a special case of a more general operation: a fork
+> whose origin has stopped and which stays on the origin's branch. So it shipped
+> as **fork**, which also handles what this document could not — a **live** origin,
+> and a fork onto a **different agent**.
+>
+> This document remains the reasoning behind the design, and most of it still
+> holds: the plugin seam, the capture-the-native-id-while-alive argument (§2), the
+> point-at-a-file-don't-paste-a-transcript argument (§3), and the per-provider
+> resume table are all implemented as written. Two things in it are **not** built,
+> and are the live follow-ups — backlog rows **FORK-SHELL** (§3's PTY-scrollback
+> brief, for a shell origin) and **FORK-OC** (§2's opencode native resume).
+>
+> One thing changed in the shipping design: the fallback brief is not just a
+> rendered transcript. Its core is a compact **digest** — see
+> [`fork-session.md`](fork-session.md), which explains why that removes the need
+> for a large LLM summarization step entirely.
+>
+> Read [`fork-session.md`](fork-session.md) for what actually exists.
 
 A session that ended still holds most of its value: a branch with work on it, a
 worktree with that work checked out, and a conversation in which an agent

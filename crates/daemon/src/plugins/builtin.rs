@@ -1,11 +1,15 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 
 use super::conversation;
+use super::fork;
 use super::title;
 use super::usage::{self, AgentUsage, TranscriptContext};
-use super::{attention, find_in_path, AgentContext, AgentOption, AgentPlugin, LaunchSpec};
+use super::{
+    attention, find_in_path, AgentContext, AgentOption, AgentPlugin, HeadlessSpec, LaunchSpec,
+};
 use crate::domain::AttentionState;
 
 const ALL_PLATFORMS: &[&str] = &["linux", "macos", "windows"];
@@ -101,6 +105,18 @@ impl AgentPlugin for CodexPlugin {
     fn title(&self, cx: &TranscriptContext) -> Option<String> {
         title::codex_session_title(cx)
     }
+    fn native_session_id(&self, cx: &TranscriptContext) -> Option<String> {
+        fork::codex_native_id(cx)
+    }
+    fn digest(&self, cx: &TranscriptContext) -> Option<String> {
+        fork::codex_digest(cx)
+    }
+    fn accepts_seed_prompt(&self) -> bool {
+        true
+    }
+    // `native_fork_requires_same_cwd` stays false: rollouts live under
+    // `~/.codex/sessions/**` and are addressed by uuid, so unlike Claude, Codex
+    // resumes fine from a brand-new worktree.
     fn options(&self) -> Vec<AgentOption> {
         vec![AgentOption {
             key: "bypass_approvals".into(),
@@ -114,6 +130,49 @@ impl AgentPlugin for CodexPlugin {
     }
     fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
         cli_launch(self, ctx, "bypass_approvals", "--dangerously-bypass-approvals-and-sandbox")
+    }
+    /// `codex fork <id> <prompt>` — a subcommand, so unlike Claude's flags it has
+    /// to *lead* argv, ahead of the danger flag. This is the reason forking is a
+    /// whole plugin method rather than a few extra args contributed to
+    /// `build_launch`.
+    fn build_fork(
+        &self,
+        ctx: &AgentContext,
+        native_id: &str,
+        seed: &str,
+    ) -> Option<Result<LaunchSpec>> {
+        Some(self.detect_binary().ok_or_else(|| anyhow!("`codex` binary not found in PATH")).map(
+            |command| {
+                let mut args = vec!["fork".to_string()];
+                if ctx.opt("bypass_approvals") {
+                    args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+                }
+                args.push(native_id.to_string());
+                args.push(seed.to_string());
+                LaunchSpec {
+                    command,
+                    args,
+                    env: ctx.extra_env.clone(),
+                    requires_approval: false,
+                }
+            },
+        ))
+    }
+    fn headless(&self, prompt: &str, out: &Path) -> Option<HeadlessSpec> {
+        // `-o` writes just the final message. Without it the answer arrives on
+        // stdout wrapped in progress output and a token-usage footer.
+        Some(HeadlessSpec {
+            command: self.detect_binary()?,
+            args: vec![
+                "exec".into(),
+                "--color".into(),
+                "never".into(),
+                "-o".into(),
+                out.to_string_lossy().into_owned(),
+                prompt.to_string(),
+            ],
+            output_file: Some(out.to_path_buf()),
+        })
     }
 }
 
@@ -154,6 +213,20 @@ impl AgentPlugin for ClaudePlugin {
     fn title(&self, cx: &TranscriptContext) -> Option<String> {
         title::claude_session_title(cx)
     }
+    fn native_session_id(&self, cx: &TranscriptContext) -> Option<String> {
+        fork::claude_native_id(cx)
+    }
+    fn digest(&self, cx: &TranscriptContext) -> Option<String> {
+        fork::claude_digest(cx)
+    }
+    fn accepts_seed_prompt(&self) -> bool {
+        true
+    }
+    // `~/.claude/projects/<encoded-cwd>/`: a resume from a different directory
+    // looks in a different project and finds nothing.
+    fn native_fork_requires_same_cwd(&self) -> bool {
+        true
+    }
     fn options(&self) -> Vec<AgentOption> {
         vec![AgentOption {
             key: "skip_permissions".into(),
@@ -167,6 +240,46 @@ impl AgentPlugin for ClaudePlugin {
     }
     fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
         cli_launch(self, ctx, "skip_permissions", "--dangerously-skip-permissions")
+    }
+    /// `claude --resume <id> --fork-session <prompt>`. `--fork-session` is what
+    /// keeps this a fork: it gives the new session its own id, so the origin's
+    /// transcript is never appended to.
+    ///
+    /// Claude finds a resumed conversation by cwd, so this only works when the
+    /// fork runs in the origin's directory. A fork onto a *new* worktree is a new
+    /// cwd, and the caller falls back to the brief — see `SessionManager::fork_session`.
+    fn build_fork(
+        &self,
+        ctx: &AgentContext,
+        native_id: &str,
+        seed: &str,
+    ) -> Option<Result<LaunchSpec>> {
+        Some(self.detect_binary().ok_or_else(|| anyhow!("`claude` binary not found in PATH")).map(
+            |command| {
+                let mut args = Vec::new();
+                if ctx.opt("skip_permissions") {
+                    args.push("--dangerously-skip-permissions".to_string());
+                }
+                args.push("--resume".to_string());
+                args.push(native_id.to_string());
+                args.push("--fork-session".to_string());
+                args.push(seed.to_string());
+                LaunchSpec {
+                    command,
+                    args,
+                    env: ctx.extra_env.clone(),
+                    requires_approval: false,
+                }
+            },
+        ))
+    }
+    fn headless(&self, prompt: &str, _out: &Path) -> Option<HeadlessSpec> {
+        // `-p` prints the final answer to stdout, clean.
+        Some(HeadlessSpec {
+            command: self.detect_binary()?,
+            args: vec!["-p".into(), prompt.to_string()],
+            output_file: None,
+        })
     }
 }
 
@@ -205,6 +318,21 @@ impl AgentPlugin for OpencodePlugin {
     }
     fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
         cli_launch(self, ctx, "auto_approve", "--auto")
+    }
+    fn accepts_seed_prompt(&self) -> bool {
+        true
+    }
+    // No `digest` / `native_session_id`: opencode keeps its conversation in a
+    // SQLite db rather than a per-cwd transcript, so both need a schema read we
+    // haven't written. A forked opencode session therefore gets the brief, and a
+    // fork *of* one falls back to its raw terminal stream. It can still act as
+    // the summarizer for other agents' forks, which is what `headless` is for.
+    fn headless(&self, prompt: &str, _out: &Path) -> Option<HeadlessSpec> {
+        Some(HeadlessSpec {
+            command: self.detect_binary()?,
+            args: vec!["run".into(), prompt.to_string()],
+            output_file: None,
+        })
     }
 }
 

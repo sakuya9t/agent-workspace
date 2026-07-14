@@ -72,6 +72,20 @@ pick it up**.
 
 ## Already done (context, do not re-plan)
 
+- **Fork a session (2026-07-14)** — [`fork-session.md`](fork-session.md).
+  Continue a session's work in a new one, on its branch or a branch off it, with
+  its context. **This landed row REC**: forking a *stopped* session onto its own
+  branch is recovery, and forking also does what REC could not — a **live**
+  origin, and a **different** target agent. Same-agent forks resume the agent's
+  own conversation natively (`claude --resume … --fork-session`, `codex fork`);
+  everything else gets a brief. The brief's core is a **deterministic digest**
+  read from the agent's transcript — ~1–4k tokens even from a 33 MB session — so
+  no big LLM call is needed; an installed agent CLI optionally turns it into prose
+  in seconds (`summarize.rs`), and a fork never fails if it can't. `agent_session_id`
+  is captured **while the session lives** (SCHEMA_V7), because the transcript
+  heuristics are too loose to pick a conversation to resume at fork time.
+  Follow-ups: **FORK-SHELL**, **FORK-OC**.
+
 - **Holder-theft hardening (2026-07-12 incident).** A test inherited the dev
   host's ambient `ASMUX_SOCK`, unlinked the live holder's socket, and six live
   sessions were lost. Fixed on three levels:
@@ -258,7 +272,9 @@ pick it up**.
 
 | ID | Item | Priority | Depends on | Source (design) |
 | --- | --- | --- | --- | --- |
-| REC | **Session recovery** — continue a recoverable non-live session in a new session on the same branch, reusing its worktree, seeded with its conversation. **Stage A** = `AgentPlugin` resume seam + schema fields (`agent_session_id`, `recovered_from`) + native-id capture while live + `POST /api/sessions/:id/recover` + UI; native resume for claude and codex. **Stage B** = fallback brief for shell/custom/misses. **Stage C** = opencode native resume. | **P1** | FIX + RF-FLOW + RF-LIFE + RF-REC; worktree reuse + argv passthrough already exist | session-recovery.md |
+| ~~REC~~ | **Session recovery — landed, as the more general [fork](fork-session.md).** Forking a *stopped* session onto its *own* branch is exactly recovery, so one feature covers both, and it also does what REC could not: fork a **live** session, and fork onto a **different agent**. Shipped: the `AgentPlugin` fork seam, SCHEMA_V7 (`agent_session_id` + `forked_from`), native-id capture while live, `POST /api/sessions/:id/fork`, native fork for claude + codex, the digest/summary brief, and the UI. Two pieces of the old design remain, split out as **FORK-SHELL** and **FORK-OC** below. | ~~P1~~ **done** | — | fork-session.md |
+| FORK-SHELL | Fork a **shell / custom_command** origin usefully: it keeps no transcript, so it gets a brief with no digest today. Its real context is its scrollback (`terminal_events` → vt100 → ANSI-stripped prose) — the one source where a shell's brief is genuinely *good* (a shell has real scrollback; the TUI agents have none, which is why they use their own transcripts). This is REC Stage B. | **P3** | fork (done) | session-recovery.md → §3; fork-session.md |
+| FORK-OC | **opencode native fork**: read its conversation id out of `~/.local/share/opencode/opencode.db` and launch `opencode --session <id> --fork`. Pure plugin change — `native_session_id` + `build_fork`; the fork flow does not move. An opencode fork gets the brief meanwhile. This is REC Stage C. | **P3** | fork (done) | session-recovery.md → §2; fork-session.md |
 | FIX | **Verified latent defects** (2026-07-12 review, all hand-verified): `pull` credential-prompt hang; adopt→reconnect cursor-0 rewind; worktree created before create-validation, no rollback; asmux silent ring-alloc output drop; `exit_signal` never populated; fabricated adopt defaults; server/client disagreement over whether `indeterminate` is terminal; invalid `ASM_BACKEND` silently selects non-durable native mode | **P1** | — (~2–3 days incl. regression tests) | refactoring-plan.md → §6.1 |
 | RF-FLOW | **Bounded terminal flow + durable persistence:** byte-budget output/command queues with explicit overload semantics; writer health + retry/degraded state + shutdown flush; acknowledged input/kill semantics; streaming history/transcripts; retention/compaction; disk-full/slow-consumer fault tests | **P1** | FIX + minimal RF-GATE harness | refactoring-plan.md → §7.1 |
 | RF-LIFE | **Explicit lifecycle state machine + units of work:** named status capabilities, conditional transitions/per-session serialization, atomic metadata/migrations, create+teardown sagas, central `go_live`/`finish`, concurrency/failure-step tests | **P1** | FIX + minimal RF-GATE harness; before REC | refactoring-plan.md → §7.2 |

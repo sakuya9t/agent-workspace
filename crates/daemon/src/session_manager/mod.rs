@@ -22,6 +22,12 @@ const IDLE_AFTER: Duration = Duration::from_secs(4);
 /// the agent (see [`Interaction::submitted`]).
 const ECHO_WINDOW: Duration = Duration::from_millis(1000);
 
+/// How often a live session is checked for the agent's own conversation id, until
+/// one is found. An agent writes its transcript shortly *after* it starts, so this
+/// cannot be a single attempt at spawn — but once captured it is never re-derived,
+/// and the polling stops. See [`SessionManager::capture_native_id`].
+const CAPTURE_EVERY: Duration = Duration::from_secs(5);
+
 use crate::backend::{
     BackendSession, BackendSpawnSpec, BackendStatus, HolderEntry, SessionBackend, StreamEnd,
 };
@@ -29,12 +35,16 @@ use crate::db::Db;
 use crate::domain::{
     AttentionState, Session, SessionStatus, SessionSummary, Workspace, WorkspaceInstance,
 };
+use crate::plugins::usage::TranscriptContext;
 use crate::plugins::{attention, AgentContext, AgentPlugin, PluginRegistry};
 use crate::util::now_millis;
 use crate::workspace;
 
+mod fork;
 mod monitor;
 mod workspaces;
+
+pub use fork::ForkRequest;
 
 /// A destructive operation was refused because it would discard uncommitted or
 /// unmerged work. Carried as a typed error so the API can answer `409 Conflict`
@@ -76,6 +86,33 @@ pub struct CreateSessionRequest {
     pub base_ref: Option<String>,
     /// Selected agent-option toggles (see `AgentPlugin::options`).
     pub options: Vec<(String, bool)>,
+    /// Set when this session is a fork: how it inherits the origin's context.
+    /// Resolved by [`SessionManager::fork_session`] before the session exists,
+    /// and applied here once the working directory is known.
+    pub fork: Option<ForkPlan>,
+}
+
+/// A resolved decision about how a forked session picks up its origin's context.
+/// Built by [`SessionManager::fork_session`], consumed by `create_session`.
+#[derive(Debug, Clone)]
+pub struct ForkPlan {
+    /// Origin session id — persisted as `forked_from`, giving the UI a lineage.
+    pub origin_id: String,
+    pub seed: ForkSeed,
+}
+
+/// The two ways a fork inherits context. Every fork gets exactly one.
+#[derive(Debug, Clone)]
+pub enum ForkSeed {
+    /// The agent reloads the origin's *own* conversation, forking it so the
+    /// origin's transcript is never appended to. Full fidelity, no summarizing,
+    /// and only possible when the fork keeps the same agent.
+    Native { native_id: String },
+    /// The agent is pointed at a brief written into its working directory.
+    /// The path is handed over, never the text: a transcript typed into a TUI hits
+    /// bracketed-paste and input-length limits, and one passed in argv would be
+    /// readable by any process on the box via `/proc`.
+    Brief { markdown: String },
 }
 
 /// Per-session signal shared from the input path (the API's WebSocket handler)
@@ -184,13 +221,21 @@ impl SessionManager {
         // Resolve the working directory and (optionally) an isolated instance.
         let (resolved_cwd, instance) = self.resolve_workspace(&id, &req)?;
 
-        let ctx = AgentContext {
+        let mut ctx = AgentContext {
             command: req.command.clone(),
             extra_args: req.args.clone(),
             extra_env: req.env.clone(),
             options: req.options.clone(),
         };
-        let launch = plugin.build_launch(&ctx)?;
+
+        // A fork's launch line differs from a fresh session's: either it resumes
+        // the origin's conversation natively, or it opens pointed at a brief we
+        // write into the working directory we just resolved. Both need the cwd,
+        // which is why this happens here and not in `fork_session`.
+        let launch = match &req.fork {
+            Some(plan) => self.fork_launch(&plugin, &mut ctx, plan, &resolved_cwd)?,
+            None => plugin.build_launch(&ctx)?,
+        };
 
         if launch.requires_approval && !req.approve_custom {
             bail!("launch requires explicit approval (custom command)");
@@ -227,6 +272,9 @@ impl SessionManager {
             updated_at: now,
             last_activity_at: now,
             risky,
+            // Captured later, by the monitor, while this session is alive.
+            agent_session_id: None,
+            forked_from: req.fork.as_ref().map(|f| f.origin_id.clone()),
         };
         self.db.insert_session(&session)?;
         if let Some(inst) = &instance {
@@ -928,6 +976,8 @@ mod tests {
             updated_at: now,
             last_activity_at: now,
             risky: false,
+            agent_session_id: None,
+            forked_from: None,
         })
         .unwrap();
     }
@@ -957,6 +1007,7 @@ mod tests {
             create_branch: false,
             base_ref: None,
             options: vec![],
+            fork: None,
         }
     }
 

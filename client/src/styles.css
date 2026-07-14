@@ -952,6 +952,17 @@ body.col-resizing iframe {
   padding: 8px 12px;
   font-size: 12px;
 }
+/* A consequence the user chose but should not miss — e.g. forking onto a live
+   session's own branch, where two agents end up editing one directory. Orange,
+   not red: nothing has gone wrong, but it can. */
+.warn {
+  color: #ff9e64;
+  border-left: 2px solid #ff9e64;
+  background: rgba(255, 158, 100, 0.08);
+  padding: 6px 10px;
+  margin: 6px 0;
+  border-radius: 3px;
+}
 .dim {
   color: var(--dim);
 }
@@ -1171,6 +1182,15 @@ body.col-resizing iframe {
 .action-icon-save-transcript {
   mask-image: url("/icons/actions/save-transcript.png");
   -webkit-mask-image: url("/icons/actions/save-transcript.png");
+}
+/* Fork: a branch splitting off a line of work. Inline SVG rather than a PNG like
+   its neighbours only because the hand-drawn set has no fork glyph yet — it masks
+   to currentColor identically, and a matching PNG can drop in here later.
+   (`recover-session.png` sits unused in the icon folder: it is a restore arrow,
+   drawn for the recovery feature, and reads wrong for a fork.) */
+.action-icon-fork {
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='4' cy='3' r='1.7'/%3E%3Ccircle cx='4' cy='13' r='1.7'/%3E%3Ccircle cx='12' cy='3' r='1.7'/%3E%3Cpath d='M4 4.7v6.6'/%3E%3Cpath d='M12 4.7v1.6a3 3 0 0 1-3 3H4'/%3E%3C/svg%3E");
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='4' cy='3' r='1.7'/%3E%3Ccircle cx='4' cy='13' r='1.7'/%3E%3Ccircle cx='12' cy='3' r='1.7'/%3E%3Cpath d='M4 4.7v6.6'/%3E%3Cpath d='M12 4.7v1.6a3 3 0 0 1-3 3H4'/%3E%3C/svg%3E");
 }
 .action-icon-git-merge {
   mask-image: url("/icons/actions/git-merge.png");

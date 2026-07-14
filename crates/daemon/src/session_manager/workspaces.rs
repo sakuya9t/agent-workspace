@@ -96,7 +96,13 @@ impl SessionManager {
                             workspace::BranchSpec::New { name, base }
                         }
                         Some(name) => workspace::BranchSpec::Existing { name },
-                        None => workspace::BranchSpec::Auto { name: &auto },
+                        // `base` is "HEAD" unless the caller set one. A fork onto
+                        // a new branch names no branch (so it gets the unique
+                        // `asm-session/<id>` form, which the orphan sweep and
+                        // archive-time branch cleanup already understand) but does
+                        // set `base_ref` to the origin's branch — so it starts from
+                        // the origin's work rather than from the repo's HEAD.
+                        None => workspace::BranchSpec::Auto { name: &auto, base },
                     };
                     // `Existing` checks out a branch the user already had (`main`,
                     // `release`, a feature branch). We create the worktree for it,

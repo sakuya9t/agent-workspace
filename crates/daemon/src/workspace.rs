@@ -26,9 +26,12 @@ pub fn init_repo(root: &Path) -> Result<()> {
 
 /// How a managed worktree's branch is chosen.
 pub enum BranchSpec<'a> {
-    /// Create a fresh app-managed branch off HEAD; on name collision fall back
-    /// to a detached HEAD so session creation never blocks.
-    Auto { name: &'a str },
+    /// Create a fresh app-managed branch starting at `base` (`"HEAD"` for an
+    /// ordinary new session; a fork passes the origin's branch, so the fork
+    /// starts from the work it is forking rather than from the repo's HEAD). On
+    /// name collision, fall back to a detached worktree so session creation never
+    /// blocks.
+    Auto { name: &'a str, base: &'a str },
     /// Create a new branch `name` starting at `base` (a branch, tag, or commit).
     New { name: &'a str, base: &'a str },
     /// Check out an existing branch `name` in the new worktree.
@@ -50,12 +53,12 @@ pub fn create_worktree(
         .ok_or_else(|| anyhow!("non-UTF8 worktree path"))?;
 
     match spec {
-        BranchSpec::Auto { name } => {
-            if git(root, &["worktree", "add", "-b", name, path_str, "HEAD"]).is_ok() {
+        BranchSpec::Auto { name, base } => {
+            if git(root, &["worktree", "add", "-b", name, path_str, base]).is_ok() {
                 return Ok(Some(name.to_string()));
             }
             // Branch name may collide; fall back to a detached worktree.
-            git(root, &["worktree", "add", "--detach", path_str, "HEAD"])
+            git(root, &["worktree", "add", "--detach", path_str, base])
                 .map_err(|e| anyhow!("worktree add failed: {e}"))?;
             Ok(None)
         }
