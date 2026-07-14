@@ -37,6 +37,10 @@ impl AgentPlugin for ShellPlugin {
     fn detect_binary(&self) -> Option<String> {
         Some(default_shell())
     }
+    // A shell has no turns to classify — the user is the one driving it.
+    fn tracks_attention(&self) -> bool {
+        false
+    }
     fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
         let command = default_shell();
         let args = if cfg!(target_os = "windows") {

@@ -46,7 +46,7 @@ impl SessionManager {
                         }
                         let st = status_rx.borrow().clone();
                         if st.is_terminal() {
-                            self.on_exit(&id, &handle, started_at, st).await;
+                            self.on_exit(&id, &handle, started_at, st, plugin.as_ref()).await;
                             break;
                         }
                     }
@@ -152,6 +152,21 @@ impl SessionManager {
         last_input_ms: i64,
         submitted: bool,
     ) {
+        // A non-tracking agent (plain shell): the user drives and reads the
+        // terminal themselves, so derived working/idle/blocked states are
+        // noise — a shell prompt showing `password:` is not an approval gate
+        // we manage. Record activity so "last active" stays truthful; nothing
+        // else. `last_attn` never leaves None, so the idle settle is inert too.
+        if plugin.is_some_and(|p| !p.tracks_attention()) {
+            let now = now_millis();
+            if now - *last_write >= 400 {
+                *last_write = now;
+                let _ =
+                    self.db
+                        .update_activity(id, handle.last_seq(), now, AttentionState::None, None);
+            }
+            return;
+        }
         // Maintain a small decoded tail for the default (tail-based) classifier.
         tail.push_str(&String::from_utf8_lossy(bytes));
         trim_tail(tail, 4096);
@@ -227,6 +242,7 @@ impl SessionManager {
         handle: &Arc<dyn BackendSession>,
         started_at: i64,
         status: BackendStatus,
+        plugin: Option<&Arc<dyn AgentPlugin>>,
     ) {
         let now = now_millis();
         let last_seq = handle.last_seq();
@@ -278,6 +294,15 @@ impl SessionManager {
             (None, AttentionState::None, None, status_to_write.as_str().to_string())
         } else {
             (exit_code, attention, reason, exit_label)
+        };
+
+        // A non-tracking agent (plain shell) never carries an attention badge:
+        // a non-zero exit is routine there (it's the last command's status),
+        // and the row's ended-status already shows the code.
+        let (attention, reason) = if plugin.is_some_and(|p| !p.tracks_attention()) {
+            (AttentionState::None, None)
+        } else {
+            (attention, reason)
         };
 
         let _ = self

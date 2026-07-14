@@ -77,6 +77,17 @@ pub trait AgentPlugin: Send + Sync {
         false
     }
 
+    /// Whether the monitor classifies this agent's output into attention
+    /// states (working / idle / blocked / error) at all. On for agent TUIs,
+    /// whose prompts and turn boundaries the daemon can read; **off for a
+    /// plain shell**, where the user drives the terminal themselves and any
+    /// state derived from its output is noise (`password:` at a shell prompt
+    /// is not an approval gate we manage). A non-tracking session stays at
+    /// [`AttentionState::None`] for its whole life — no badge, ever.
+    fn tracks_attention(&self) -> bool {
+        true
+    }
+
     /// Classify the session's current attention state (working / idle / blocked)
     /// from recent terminal output. `text` is the rendered **visible screen**
     /// when [`attention_uses_screen`](Self::attention_uses_screen) is true, and

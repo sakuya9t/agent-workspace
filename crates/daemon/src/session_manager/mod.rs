@@ -248,12 +248,14 @@ impl SessionManager {
             Err(e) => {
                 let now = now_millis();
                 let _ = self.db.update_status(&id, SessionStatus::Failed, None, now);
-                let _ = self.db.set_attention(
-                    &id,
-                    AttentionState::Failed,
-                    Some("backend spawn failed"),
-                    now,
-                );
+                if plugin.tracks_attention() {
+                    let _ = self.db.set_attention(
+                        &id,
+                        AttentionState::Failed,
+                        Some("backend spawn failed"),
+                        now,
+                    );
+                }
                 return Err(e.context("backend failed to create session"));
             }
         };
@@ -522,17 +524,28 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Mark a session `indeterminate` with the acmux-style advisory.
+    /// Mark a session `indeterminate` with the acmux-style advisory. The
+    /// advisory badge only applies to agents whose sessions we classify at
+    /// all; for a non-tracking agent (plain shell) the `indeterminate` status
+    /// already says the daemon doesn't know, and judging the outcome is the
+    /// user's job either way.
     fn reconcile_indeterminate(&self, id: &str) -> Result<()> {
         let now = now_millis();
         self.db
             .update_status(id, SessionStatus::Indeterminate, None, now)?;
-        self.db.set_attention(
-            id,
-            AttentionState::LikelyBlocked,
-            Some("no completion record — the session holder exited while this was running; check the preserved output before assuming it finished"),
-            now,
-        )?;
+        let tracks = self
+            .db
+            .get_session(id)?
+            .and_then(|s| self.registry.get(&s.agent_plugin_id))
+            .is_none_or(|p| p.tracks_attention());
+        if tracks {
+            self.db.set_attention(
+                id,
+                AttentionState::LikelyBlocked,
+                Some("no completion record — the session holder exited while this was running; check the preserved output before assuming it finished"),
+                now,
+            )?;
+        }
         Ok(())
     }
 
@@ -891,10 +904,14 @@ mod tests {
     /// Seed a session row already marked `running` (as if a prior daemon left it
     /// live), so `startup_reconcile` finds it via `live_session_ids()`.
     fn insert_running(db: &Db, id: &str) {
+        insert_running_agent(db, id, "shell");
+    }
+
+    fn insert_running_agent(db: &Db, id: &str, agent: &str) {
         let now = now_millis();
         db.insert_session(&Session {
             id: id.to_string(),
-            agent_plugin_id: "shell".into(),
+            agent_plugin_id: agent.into(),
             command: "sh".into(),
             args: vec![],
             env: vec![],
@@ -1127,19 +1144,27 @@ mod tests {
     #[tokio::test]
     async fn holder_absent_entry_is_indeterminate() {
         // The session is gone from the holder (the holder itself died), so no
-        // completion record exists → indeterminate, flagged for the user.
+        // completion record exists → indeterminate. The advisory badge flags a
+        // tracked agent's session for the user; a shell (non-tracking) gets the
+        // indeterminate status but never a badge — its outcome is the user's to
+        // judge either way.
         let backend = Arc::new(MockBackend {
             keep_on_shutdown: true,
             ..Default::default()
         });
         let (manager, dir) = test_manager_with(backend);
-        insert_running(&manager.db, "s-absent");
+        insert_running_agent(&manager.db, "s-absent", "claude");
+        insert_running(&manager.db, "s-absent-shell");
 
         manager.startup_reconcile().unwrap();
 
         let s = manager.get_session("s-absent").unwrap().unwrap();
         assert_eq!(s.status, SessionStatus::Indeterminate);
         assert_eq!(s.attention_state, AttentionState::LikelyBlocked);
+
+        let sh = manager.get_session("s-absent-shell").unwrap().unwrap();
+        assert_eq!(sh.status, SessionStatus::Indeterminate);
+        assert_eq!(sh.attention_state, AttentionState::None, "shells carry no badge");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1599,6 +1624,26 @@ mod tests {
             &mut last_attn, &mut false, now_millis(), false,
         );
         assert_eq!(last_attn, AttentionState::ApprovalNeeded);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn shell_output_is_never_classified() {
+        // Shells opt out of attention tracking (`tracks_attention` = false): the
+        // user drives the terminal themselves, so even output that would read as
+        // an approval gate for an agent must stay unclassified. Only the
+        // activity timestamp is recorded.
+        let (manager, dir) = test_manager();
+        let shell = manager.registry.get("shell").unwrap();
+        let handle = mock_handle();
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::None);
+        manager.on_output(
+            "sid", &handle, b"Proceed? (y/n)", Some(&shell), &mut tail, &mut last_write,
+            &mut last_attn, &mut false, 0, false,
+        );
+        assert_eq!(last_attn, AttentionState::None);
+        assert!(last_write > 0, "activity must still be recorded");
         let _ = std::fs::remove_dir_all(dir);
     }
 
