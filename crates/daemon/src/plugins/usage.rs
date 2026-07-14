@@ -20,7 +20,7 @@ use serde_json::Value;
 
 /// Allow the agent's file mtime to predate our recorded start by this much
 /// (clock skew / launch lag) before we consider it too stale to be ours.
-const SLACK_MS: i64 = 120_000;
+pub(crate) const SLACK_MS: i64 = 120_000;
 
 /// Inputs a plugin needs to locate its on-disk session transcript. Shared with
 /// [`super::conversation`], which renders the same file as Markdown.
@@ -542,7 +542,7 @@ fn window_label(minutes: u64) -> String {
 
 // ---------- shared fs helpers ----------
 
-fn home_dir() -> Option<PathBuf> {
+pub(crate) fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
@@ -601,7 +601,7 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<(i64, PathBuf)>, depth: u32) {
 
 /// Read up to `max` bytes from the start of a file (avoids loading huge rollouts
 /// just to sniff their cwd).
-fn read_head(path: &Path, max: usize) -> Option<String> {
+pub(crate) fn read_head(path: &Path, max: usize) -> Option<String> {
     let mut f = fs::File::open(path).ok()?;
     let mut buf = vec![0u8; max];
     let n = f.read(&mut buf).ok()?;

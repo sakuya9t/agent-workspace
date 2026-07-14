@@ -179,7 +179,11 @@
     "disconnect": "disconnect",
     "connect": "connect",
     "disconnectTitle": "Disconnect — keep the host listed but stop polling it",
-    "connectTitle": "Connect — resume polling with the same token"
+    "connectTitle": "Connect — resume polling with the same token",
+    "infoTitle": "Session details",
+    "infoBranch": "Branch",
+    "infoId": "Session ID",
+    "infoPath": "Directory"
   },
   "rightPanel": {
     "header": "Details",

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { api, Session, SessionStatus, AttentionState, Workspace } from "../api";
@@ -151,6 +151,7 @@ export function SessionList() {
   ) => {
     const selected = active?.daemonId === daemonId && active?.sessionId === s.id;
     const name = sessionLabel(s, ctx?.workspaceName);
+    const title = sessionTitle(s, ctx?.workspaceName);
     return (
       <div
         key={daemonId + ":" + s.id}
@@ -163,7 +164,10 @@ export function SessionList() {
             style={{ background: STATUS_COLOR[s.status] }}
             title={statusLabel(s.status)}
           />
-          <span className="session-agent">{s.agent_plugin_id}</span>
+          <span className="session-title" title={title}>
+            {title}
+          </span>
+          <SessionInfo s={s} />
           {s.risky && (
             <span className="risk-badge" title={t("sessionList.riskTitle")}>
               {t("sessionList.riskBadge")}
@@ -189,8 +193,9 @@ export function SessionList() {
           )}
         </div>
         <div className="session-sub">
-          <span className="mono" title={s.working_directory}>
-            {ctx?.workspaceName ?? basename(s.working_directory)}
+          <span>
+            {s.agent_plugin_id}
+            {ctx?.workspaceName ? ` · ${ctx.workspaceName}` : ""}
           </span>
           <span className="dim">{relTime(s.last_activity_at)}</span>
         </div>
@@ -314,7 +319,7 @@ export function SessionList() {
         {open && (
           <div className="tree-leaves">
             {sessions.length ? (
-              sessions.map((s) => row(daemonId, target, s))
+              sessions.map((s) => row(daemonId, target, s, { workspaceName: w.name }))
             ) : (
               <div className="tree-empty">{t("sessionList.noActiveSessions")}</div>
             )}
@@ -473,18 +478,99 @@ export function SessionList() {
   );
 }
 
+/**
+ * The session's info button: hover (pointer devices) or tap pops a small
+ * fixed-position panel with the identifiers the row no longer shows — branch,
+ * session uuid, directory. Fixed positioning because the list is a scroll
+ * container that would clip an absolutely-positioned child; any outside click
+ * or scroll dismisses it.
+ */
+function SessionInfo({ s }: { s: Session }) {
+  const { t } = useTranslation();
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+  // Hover previews (mouseleave closes); a click pins the panel open so its
+  // contents can be selected and copied. Outside click/scroll always closes.
+  const [pinned, setPinned] = useState(false);
+
+  useEffect(() => {
+    if (!pos) return;
+    const close = () => {
+      setPos(null);
+      setPinned(false);
+    };
+    document.addEventListener("click", close);
+    document.addEventListener("scroll", close, true);
+    return () => {
+      document.removeEventListener("click", close);
+      document.removeEventListener("scroll", close, true);
+    };
+  }, [pos]);
+
+  const openAt = (el: HTMLElement) => {
+    const r = el.getBoundingClientRect();
+    setPos({
+      top: r.bottom + 6,
+      left: Math.max(8, Math.min(r.left, window.innerWidth - 328)),
+    });
+  };
+
+  return (
+    <>
+      <button
+        className="info-btn"
+        title={t("sessionList.infoTitle")}
+        aria-label={t("sessionList.infoTitle")}
+        onClick={(e) => {
+          // Not a toggle: on touch the tap fires mouseenter first, and a toggle
+          // would immediately close what the hover just opened.
+          e.stopPropagation();
+          openAt(e.currentTarget);
+          setPinned(true);
+        }}
+        onMouseEnter={(e) => openAt(e.currentTarget)}
+        onMouseLeave={() => {
+          if (!pinned) setPos(null);
+        }}
+      />
+      {pos && (
+        <div className="info-pop" style={pos} onClick={(e) => e.stopPropagation()}>
+          <div className="info-row">
+            <span>{t("sessionList.infoBranch")}</span>
+            <span className="mono">{s.branch ?? "—"}</span>
+          </div>
+          <div className="info-row">
+            <span>{t("sessionList.infoId")}</span>
+            <span className="mono">{s.id}</span>
+          </div>
+          <div className="info-row">
+            <span>{t("sessionList.infoPath")}</span>
+            <span className="mono">{s.working_directory}</span>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
 function basename(p: string): string {
   const parts = p.split(/[/\\]/).filter(Boolean);
   return parts.length ? parts[parts.length - 1] : p;
 }
 
+/** The row's primary label: the agent's own title for the session, else the
+ * workspace/directory naming the row showed before titles existed. */
+function sessionTitle(s: Session, workspaceName?: string): string {
+  return s.title ?? workspaceName ?? basename(s.working_directory);
+}
+
 /**
- * How a session is named in a confirm dialog: "claude · my-repo". Rows carry no
- * visible id, so the dialog has to echo back what the row showed — otherwise a
- * mis-click is confirmed just as readily as the intended one.
+ * How a session is named in a confirm dialog: "claude · Fix the flaky test".
+ * Rows carry no visible id, so the dialog has to echo back what the row
+ * showed — otherwise a mis-click is confirmed just as readily as the intended
+ * one.
  */
 function sessionLabel(s: Session, workspaceName?: string): string {
-  return `${s.agent_plugin_id} · ${workspaceName ?? basename(s.working_directory)}`;
+  return `${s.agent_plugin_id} · ${sessionTitle(s, workspaceName)}`;
 }
 
 /**

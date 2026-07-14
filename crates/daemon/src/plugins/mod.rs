@@ -7,6 +7,7 @@ use serde::Serialize;
 pub(crate) mod attention;
 pub mod builtin;
 pub mod conversation;
+pub mod title;
 pub mod usage;
 
 use crate::domain::AttentionState;
@@ -133,6 +134,14 @@ pub trait AgentPlugin: Send + Sync {
     /// shell) or when none can be matched to this session — the transcript
     /// endpoint then serves the raw PTY stream instead.
     fn conversation(&self, _cx: &TranscriptContext) -> Option<String> {
+        None
+    }
+
+    /// Best-effort human title for the session — the name the agent's own LLM
+    /// gave it, falling back to the first user prompt (see [`title`]). `None`
+    /// for agents with no on-disk record of their own; the session list then
+    /// falls back to workspace/directory naming.
+    fn title(&self, _cx: &TranscriptContext) -> Option<String> {
         None
     }
 }

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 
 use super::conversation;
+use super::title;
 use super::usage::{self, AgentUsage, TranscriptContext};
 use super::{attention, find_in_path, AgentContext, AgentOption, AgentPlugin, LaunchSpec};
 use crate::domain::AttentionState;
@@ -93,6 +94,9 @@ impl AgentPlugin for CodexPlugin {
     fn conversation(&self, cx: &TranscriptContext) -> Option<String> {
         conversation::codex_conversation(cx)
     }
+    fn title(&self, cx: &TranscriptContext) -> Option<String> {
+        title::codex_session_title(cx)
+    }
     fn options(&self) -> Vec<AgentOption> {
         vec![AgentOption {
             key: "bypass_approvals".into(),
@@ -143,6 +147,9 @@ impl AgentPlugin for ClaudePlugin {
     fn conversation(&self, cx: &TranscriptContext) -> Option<String> {
         conversation::claude_conversation(cx)
     }
+    fn title(&self, cx: &TranscriptContext) -> Option<String> {
+        title::claude_session_title(cx)
+    }
     fn options(&self) -> Vec<AgentOption> {
         vec![AgentOption {
             key: "skip_permissions".into(),
@@ -177,6 +184,9 @@ impl AgentPlugin for OpencodePlugin {
     }
     fn bell_means_attention(&self) -> bool {
         true
+    }
+    fn title(&self, cx: &TranscriptContext) -> Option<String> {
+        title::opencode_session_title(cx)
     }
     fn options(&self) -> Vec<AgentOption> {
         vec![AgentOption {

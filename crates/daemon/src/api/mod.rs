@@ -293,22 +293,46 @@ async fn cleanup_instance(
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
-    // Augment each session with `attached` (is a live client currently on it?)
-    // so the UI can prompt for takeover instead of silently stealing it.
-    let sessions: Vec<serde_json::Value> = state
-        .manager
-        .list_sessions()?
-        .iter()
-        .map(|s| with_attached(s, &state))
-        .collect();
+    // `session_json` reads agent files on a title-cache miss — keep the whole
+    // enrichment off the async runtime.
+    let sessions: Vec<serde_json::Value> = tokio::task::spawn_blocking(move || {
+        Ok::<_, anyhow::Error>(
+            state
+                .manager
+                .list_sessions()?
+                .iter()
+                .map(|s| session_json(s, &state))
+                .collect(),
+        )
+    })
+    .await
+    .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("list task: {e}")))??;
     Ok(Json(json!({ "sessions": sessions })))
 }
 
-/// Serialize a session and add the runtime `attached` flag.
-fn with_attached(s: &crate::domain::Session, state: &AppState) -> serde_json::Value {
+/// Serialize a session plus what the list view derives at read time: `attached`
+/// (is a live client currently on it? — so the UI can prompt for takeover
+/// instead of silently stealing it), the agent's own `title` for the session,
+/// and the `branch` its workspace instance holds. Blocking: a title-cache miss
+/// reads the agent's transcript.
+fn session_json(s: &crate::domain::Session, state: &AppState) -> serde_json::Value {
     let mut v = serde_json::to_value(s).unwrap_or_else(|_| json!({}));
     if let Some(obj) = v.as_object_mut() {
         obj.insert("attached".into(), json!(state.attachments.is_attached(&s.id)));
+        let title = state.manager.registry().get(&s.agent_plugin_id).and_then(|p| {
+            p.title(&crate::plugins::usage::TranscriptContext {
+                cwd: std::path::PathBuf::from(&s.working_directory),
+                started_at_ms: s.created_at,
+            })
+        });
+        obj.insert("title".into(), json!(title));
+        let branch = state
+            .manager
+            .get_instance_for_session(&s.id)
+            .ok()
+            .flatten()
+            .and_then(|i| i.branch);
+        obj.insert("branch".into(), json!(branch));
     }
     v
 }
@@ -373,8 +397,14 @@ async fn get_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    match state.manager.get_session(&id)? {
-        Some(s) => Ok(Json(json!({ "session": with_attached(&s, &state) }))),
+    // Same blocking enrichment as `list_sessions`.
+    let session = tokio::task::spawn_blocking(move || {
+        Ok::<_, anyhow::Error>(state.manager.get_session(&id)?.map(|s| session_json(&s, &state)))
+    })
+    .await
+    .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("get task: {e}")))??;
+    match session {
+        Some(s) => Ok(Json(json!({ "session": s }))),
         None => Err(AppError(StatusCode::NOT_FOUND, "no such session".into())),
     }
 }

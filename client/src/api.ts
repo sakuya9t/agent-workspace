@@ -39,6 +39,10 @@ export interface Session {
   risky: boolean;
   /** Whether a live client is currently attached (for takeover prompts). */
   attached?: boolean;
+  /** The agent's own name for the session (best-effort; absent on old daemons). */
+  title?: string | null;
+  /** Branch held by the session's workspace instance, for the info popover. */
+  branch?: string | null;
 }
 
 export interface AgentOption {

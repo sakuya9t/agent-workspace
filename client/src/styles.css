@@ -280,6 +280,67 @@ body.col-resizing iframe {
 .session-agent {
   font-weight: 600;
 }
+.session-title {
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.info-btn {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--dim);
+  font-family: Georgia, "Times New Roman", serif;
+  font-style: italic;
+  font-size: 10px;
+  line-height: 1;
+  cursor: help;
+}
+/* The glyph lives in CSS so the button carries no untranslatable text node. */
+.info-btn::before {
+  content: "i";
+}
+.info-btn:hover {
+  color: var(--text);
+  border-color: var(--dim);
+}
+.info-pop {
+  position: fixed;
+  z-index: 1000;
+  min-width: 200px;
+  max-width: min(320px, 88vw);
+  padding: 8px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  font-size: 12px;
+  cursor: default;
+}
+.info-pop .info-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 2px 0;
+}
+.info-pop .info-row > span:first-child {
+  flex: none;
+  color: var(--dim);
+}
+.info-pop .info-row .mono {
+  text-align: right;
+  word-break: break-all;
+  user-select: text;
+}
 .attn-badge {
   margin-left: auto;
   color: #0b0e14;

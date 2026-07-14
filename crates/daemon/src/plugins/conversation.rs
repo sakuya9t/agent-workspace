@@ -25,15 +25,13 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use super::title::clip_title;
 use super::usage::{claude_transcript_path, codex_rollout_path, TranscriptContext};
 
 /// Per-block clip for tool inputs and outputs: enough to see what ran and how it
 /// came back, without pasting a whole file listing into the document.
 const CLIP_LINES: usize = 12;
 const CLIP_CHARS: usize = 800;
-
-/// Longest document title we synthesize from a first user message.
-const TITLE_CHARS: usize = 72;
 
 /// Render a Claude Code session's own transcript as Markdown. `None` when no
 /// transcript can be matched to this session (the agent never wrote one, or it
@@ -78,8 +76,9 @@ fn document(title: &str, agent: &str, cwd: &Path, source: &Path, body: &str) -> 
 // ---------- Claude Code ----------
 
 /// The title Claude gave the session (it rewrites `ai-title` as the topic
-/// firms up, so the last one wins).
-fn claude_title(text: &str) -> Option<String> {
+/// firms up, so the last one wins). Shared with [`super::title`], which shows
+/// it in the session list.
+pub(crate) fn claude_title(text: &str) -> Option<String> {
     let mut title = None;
     for line in text.lines() {
         let v: Value = match serde_json::from_str(line) {
@@ -154,7 +153,7 @@ fn render_claude(text: &str, agent: &str) -> String {
 
 /// Claude appends `<system-reminder>` blocks to user turns; they're harness
 /// plumbing the user never typed, and they dwarf the prompt in the export.
-fn strip_reminders(text: &str) -> String {
+pub(crate) fn strip_reminders(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("<system-reminder>") {
@@ -212,22 +211,13 @@ fn render_codex(text: &str, agent: &str) -> String {
     md.out
 }
 
-/// First user line of a rendered body, for a Codex document title (Codex records
-/// no title of its own). Clipped on a word boundary — a title cut mid-word reads
-/// like a bug.
+/// First user line of a rendered body, for a Codex document title (the rollout
+/// records no title of its own).
 fn first_user_line(body: &str) -> Option<String> {
     let mut lines = body.lines().skip_while(|l| !l.starts_with("## User"));
     lines.next()?; // the heading
     let first = lines.map(str::trim).find(|l| !l.is_empty())?;
-    if first.chars().count() <= TITLE_CHARS {
-        return Some(first.to_string());
-    }
-    let clipped: String = first.chars().take(TITLE_CHARS).collect();
-    let cut = clipped
-        .rsplit_once(' ')
-        .map(|(head, _)| head)
-        .unwrap_or(&clipped);
-    Some(format!("{}…", cut.trim_end_matches(['.', ',', ';', ':'])))
+    clip_title(first)
 }
 
 // ---------- Markdown assembly ----------
@@ -443,7 +433,7 @@ mod tests {
         let body = format!("## User · now\n\n{}\n", "alpha beta gamma ".repeat(10));
         let title = first_user_line(&body).unwrap();
         assert!(
-            title.chars().count() <= TITLE_CHARS + 1,
+            title.chars().count() <= crate::plugins::title::TITLE_CHARS + 1,
             "too long: {title}"
         );
         assert!(title.ends_with('…'), "{title}");
