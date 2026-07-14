@@ -422,9 +422,6 @@ body.col-resizing iframe {
 .tree-node.lvl2 {
   padding-left: 34px;
 }
-.tree-node.lvl2 .tree-add {
-  margin-left: auto;
-}
 .error-line {
   color: #f7768e;
 }
@@ -715,8 +712,19 @@ body.col-resizing iframe {
      squeezed does the label itself start to ellipsize. */
   flex-shrink: 100;
 }
-.tree-badge {
+/* The trailing controls — count badge, “+”, “×” — ride as one right-aligned
+   group. They must not each claim `margin-left: auto`: flexbox splits the free
+   space evenly between every auto margin, so the gaps between them would open
+   and close with the length of the label beside them. One auto margin on the
+   group keeps the buttons at a fixed offset from the panel's right edge. */
+.tree-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   margin-left: auto;
+  flex: none;
+}
+.tree-badge {
   background: var(--accent-2);
   color: var(--text);
   border-radius: 10px;
@@ -735,23 +743,19 @@ body.col-resizing iframe {
   cursor: pointer;
   flex: none;
 }
-.tree-node.lvl1 .tree-badge + .tree-add {
-  margin-left: 6px;
-}
-.tree-node.lvl1 .tree-add {
-  margin-left: auto;
-}
 .tree-add:hover {
   border-color: var(--accent);
   color: var(--text);
 }
+/* Shares .tree-add's box so the host row's controls form one even trio with the
+   workspace rows' “+”/“×”. Like every other action icon, it pictures what the
+   click does — a broken link to disconnect, a joined one to connect — not the
+   state it is in; the row's own subtitle already says DISCONNECTED. */
 .conn-toggle {
-  margin-left: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex: none;
-}
-/* When disconnected there is no badge/“+”, so right-align the connect button. */
-.tree-branch.disconnected .conn-toggle {
-  margin-left: auto;
 }
 .tree-branch.disconnected .tree-label,
 .tree-branch.disconnected .tree-sub,
@@ -1195,6 +1199,14 @@ body.col-resizing iframe {
 .action-icon-git-detach {
   mask-image: url("/icons/actions/git-detach.png");
   -webkit-mask-image: url("/icons/actions/git-detach.png");
+}
+.action-icon-connect-daemon {
+  mask-image: url("/icons/actions/connect-daemon.png");
+  -webkit-mask-image: url("/icons/actions/connect-daemon.png");
+}
+.action-icon-disconnect-daemon {
+  mask-image: url("/icons/actions/disconnect-daemon.png");
+  -webkit-mask-image: url("/icons/actions/disconnect-daemon.png");
 }
 .rebase-picker {
   display: flex;

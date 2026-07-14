@@ -292,29 +292,31 @@ export function SessionList() {
               {w.is_git ? t("common.git") : t("common.plain")}
             </span>
           )}
-          {sessions.length > 0 && <span className="tree-badge">{sessions.length}</span>}
-          <button
-            className="tree-add"
-            title={t("sessionList.newSessionTitle")}
-            onClick={(e) => {
-              e.stopPropagation();
-              openNewSession(daemonId, w.id);
-            }}
-          >
-            +
-          </button>
-          <button
-            className="tree-add"
-            title={t("sessionList.removeWsTitle")}
-            onClick={(e) => {
-              e.stopPropagation();
-              if (confirm(t("sessionList.confirmRemoveWorkspace", { name: w.name }))) {
-                removeWs.mutate({ target, id: w.id });
-              }
-            }}
-          >
-            ×
-          </button>
+          <div className="tree-actions">
+            {sessions.length > 0 && <span className="tree-badge">{sessions.length}</span>}
+            <button
+              className="tree-add"
+              title={t("sessionList.newSessionTitle")}
+              onClick={(e) => {
+                e.stopPropagation();
+                openNewSession(daemonId, w.id);
+              }}
+            >
+              +
+            </button>
+            <button
+              className="tree-add"
+              title={t("sessionList.removeWsTitle")}
+              onClick={(e) => {
+                e.stopPropagation();
+                if (confirm(t("sessionList.confirmRemoveWorkspace", { name: w.name }))) {
+                  removeWs.mutate({ target, id: w.id });
+                }
+              }}
+            >
+              ×
+            </button>
+          </div>
         </div>
         {open && (
           <div className="tree-leaves">
@@ -362,33 +364,46 @@ export function SessionList() {
                   ? t("sessionList.unreachable")
                   : t("sessionList.connecting")}
           </span>
-          {connected && bundle && <span className="tree-badge">{active.length}</span>}
-          {connected && (
+          <div className="tree-actions">
+            {connected && bundle && <span className="tree-badge">{active.length}</span>}
+            {connected && (
+              <button
+                className="tree-add"
+                title={t("sessionList.newWorkspaceTitle")}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openNewWorkspace(daemon.id);
+                }}
+              >
+                +
+              </button>
+            )}
             <button
-              className="tree-add"
-              title={t("sessionList.newWorkspaceTitle")}
+              className="tree-add conn-toggle"
+              title={
+                connected
+                  ? t("sessionList.disconnectTitle")
+                  : t("sessionList.connectTitle")
+              }
+              aria-label={
+                connected
+                  ? t("sessionList.disconnectTitle")
+                  : t("sessionList.connectTitle")
+              }
               onClick={(e) => {
                 e.stopPropagation();
-                openNewWorkspace(daemon.id);
+                updateDaemon(daemon.id, { connected: !connected });
               }}
             >
-              +
+              <span
+                className={
+                  "action-icon " +
+                  (connected ? "action-icon-disconnect-daemon" : "action-icon-connect-daemon")
+                }
+                aria-hidden="true"
+              />
             </button>
-          )}
-          <button
-            className="btn tiny conn-toggle"
-            title={
-              connected
-                ? t("sessionList.disconnectTitle")
-                : t("sessionList.connectTitle")
-            }
-            onClick={(e) => {
-              e.stopPropagation();
-              updateDaemon(daemon.id, { connected: !connected });
-            }}
-          >
-            {connected ? t("sessionList.disconnect") : t("sessionList.connect")}
-          </button>
+          </div>
         </div>
 
         {open && !connected && (
@@ -418,7 +433,9 @@ export function SessionList() {
                   <span className="chevron">{isOpen(adhocKey) ? "▾" : "▸"}</span>
                   <span className="tree-icon">▫</span>
                   <span className="tree-label">{t("sessionList.adhoc")}</span>
-                  <span className="tree-badge">{adhoc.length}</span>
+                  <div className="tree-actions">
+                    <span className="tree-badge">{adhoc.length}</span>
+                  </div>
                 </div>
                 {isOpen(adhocKey) && (
                   <div className="tree-leaves">

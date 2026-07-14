@@ -176,8 +176,6 @@
     "disconnectedNotPolling": "disconnected — not polling",
     "local": "local",
     "newWorkspaceTitle": "New workspace on this host",
-    "disconnect": "disconnect",
-    "connect": "connect",
     "disconnectTitle": "Disconnect — keep the host listed but stop polling it",
     "connectTitle": "Connect — resume polling with the same token",
     "infoTitle": "Session details",
