@@ -36,6 +36,14 @@ pub struct Config {
     /// Auto-spawn asmux if its socket is dead (`ASM_ASMUX_AUTOSPAWN=0` disables,
     /// e.g. when asmux is a peer container the daemon only connects to).
     pub asmux_autospawn: bool,
+    /// How long to wait for the holder's socket to appear before giving up
+    /// (`ASM_ASMUX_WAIT_MS`, default 15000).
+    ///
+    /// A single connect attempt is wrong in both deployments: as a peer
+    /// container asmux may still be starting, and locally the socket may be
+    /// briefly absent. Dying on the first refused connect is what turned a
+    /// missing socket into a hard boot failure on 2026-07-12.
+    pub asmux_wait: Duration,
     /// Explicit asmux binary path (`ASM_ASMUX_BIN`); else a sibling of the
     /// daemon binary, else `asmux` on `PATH`.
     pub asmux_bin: Option<PathBuf>,
@@ -102,6 +110,11 @@ impl Config {
         };
         let asmux_socket = env_path("ASMUX_SOCK").unwrap_or_else(|| runtime_dir.join("asmux.sock"));
         let asmux_autospawn = !matches!(std::env::var("ASM_ASMUX_AUTOSPAWN").as_deref(), Ok("0"));
+        let asmux_wait = std::env::var("ASM_ASMUX_WAIT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_millis(15_000));
         let asmux_bin = env_path("ASM_ASMUX_BIN");
 
         let relay_url = env_nonempty("ASM_RELAY_URL");
@@ -132,6 +145,7 @@ impl Config {
             backend,
             asmux_socket,
             asmux_autospawn,
+            asmux_wait,
             asmux_bin,
             relay_url,
             relay_key,

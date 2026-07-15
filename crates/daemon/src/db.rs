@@ -29,6 +29,10 @@ pub struct EventMsg {
     pub ts_ms: i64,
     pub stream: u8,
     pub bytes: Vec<u8>,
+    /// The asmux ring cursor *after* this chunk. Persisted (per batch) as the
+    /// session's `backend_cursor` so a cold-stitch adopt can re-attach the ring
+    /// tail exactly where cold history ends. 0 for the native backend.
+    pub head_cursor: u64,
 }
 
 /// Cloneable handle used by session backends to enqueue terminal events.
@@ -78,8 +82,8 @@ impl Db {
             "INSERT INTO sessions (
                 id, agent_plugin_id, command, args, env, working_directory, workspace_id,
                 status, rows, cols, last_event_seq, exit_code, attention_state, attention_reason,
-                created_at, updated_at, last_activity_at, risky
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                created_at, updated_at, last_activity_at, risky, agent_session_id, forked_from
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             rusqlite::params![
                 s.id,
                 s.agent_plugin_id,
@@ -99,9 +103,26 @@ impl Db {
                 s.updated_at,
                 s.last_activity_at,
                 s.risky as i64,
+                s.agent_session_id,
+                s.forked_from,
             ],
         )?;
         Ok(())
+    }
+
+    /// Record the agent's own conversation id for a live session. Written once —
+    /// the first successful capture wins, and later ticks must not overwrite it
+    /// with a re-derived guess (see [`Session::agent_session_id`]). The
+    /// `IS NULL` guard makes that a property of the statement rather than of
+    /// every caller.
+    pub fn set_agent_session_id(&self, id: &str, native_id: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        let n = conn.execute(
+            "UPDATE sessions SET agent_session_id = ?2
+             WHERE id = ?1 AND agent_session_id IS NULL",
+            rusqlite::params![id, native_id],
+        )?;
+        Ok(n > 0)
     }
 
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
@@ -109,7 +130,7 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT id, agent_plugin_id, command, args, env, working_directory, workspace_id,
                     status, rows, cols, last_event_seq, exit_code, attention_state, attention_reason,
-                    created_at, updated_at, last_activity_at, risky
+                    created_at, updated_at, last_activity_at, risky, agent_session_id, forked_from
              FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
@@ -121,7 +142,7 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT id, agent_plugin_id, command, args, env, working_directory, workspace_id,
                     status, rows, cols, last_event_seq, exit_code, attention_state, attention_reason,
-                    created_at, updated_at, last_activity_at, risky
+                    created_at, updated_at, last_activity_at, risky, agent_session_id, forked_from
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map([id], row_to_session)?;
@@ -308,8 +329,9 @@ impl Db {
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO workspace_instances
-                (id, workspace_id, session_id, path, branch, isolation, status, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                (id, workspace_id, session_id, path, branch, isolation, status, created_at,
+                 owns_worktree, owns_branch)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             rusqlite::params![
                 i.id,
                 i.workspace_id,
@@ -319,6 +341,8 @@ impl Db {
                 i.isolation,
                 i.status,
                 i.created_at,
+                i.owns_worktree as i64,
+                i.owns_branch as i64,
             ],
         )?;
         Ok(())
@@ -327,10 +351,29 @@ impl Db {
     pub fn get_instance_for_session(&self, session_id: &str) -> Result<Option<WorkspaceInstance>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, workspace_id, session_id, path, branch, isolation, status, created_at
+            "SELECT id, workspace_id, session_id, path, branch, isolation, status, created_at,
+                    owns_worktree, owns_branch
              FROM workspace_instances WHERE session_id = ?1 ORDER BY created_at DESC LIMIT 1",
         )?;
         let mut rows = stmt.query_map([session_id], row_to_instance)?;
+        rows.next().transpose().map_err(Into::into)
+    }
+
+    /// The `(owns_worktree, owns_branch)` flags recorded for the newest instance
+    /// at `path`, or `None` if no session has ever run there. Ownership belongs
+    /// to the resource rather than to whoever is currently sharing it, so a
+    /// session joining an existing worktree inherits the flags of the instance
+    /// that created it — and inherits nothing (`None`) for a worktree we never
+    /// made, which is what keeps a user's own checkout safe from archive.
+    pub fn instance_ownership_at_path(&self, path: &str) -> Result<Option<(bool, bool)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT owns_worktree, owns_branch FROM workspace_instances
+             WHERE path = ?1 ORDER BY created_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map([path], |r| {
+            Ok((r.get::<_, i64>(0)? != 0, r.get::<_, i64>(1)? != 0))
+        })?;
         rows.next().transpose().map_err(Into::into)
     }
 
@@ -437,20 +480,25 @@ impl Db {
         Ok(())
     }
 
-    /// Persist the asmux ring cursor the daemon has drained up to, for adopt.
-    pub fn set_backend_cursor(&self, id: &str, cursor: u64) -> Result<()> {
+    /// The highest terminal-event `seq` persisted for a session (0 if none). A
+    /// cold-stitch adopt continues the sequence from here — not the throttled
+    /// `last_event_seq`, which can lag and would make new events collide with
+    /// already-persisted seqs (dropped by `INSERT OR IGNORE`).
+    pub fn max_event_seq(&self, session_id: &str) -> Result<u64> {
         let conn = self.conn.lock();
-        conn.execute(
-            "UPDATE sessions SET backend_cursor = ?2 WHERE id = ?1",
-            rusqlite::params![id, cursor as i64],
-        )?;
-        Ok(())
+        let mut stmt =
+            conn.prepare("SELECT COALESCE(MAX(seq), 0) FROM terminal_events WHERE session_id = ?1")?;
+        let mut rows = stmt.query_map([session_id], |r| r.get::<_, i64>(0))?;
+        match rows.next() {
+            Some(r) => Ok(r?.max(0) as u64),
+            None => Ok(0),
+        }
     }
 
-    /// The persisted `consumed` cursor. Reserved for the M3-exact adopt path
-    /// (cold-stitch + `attach FromCursor(consumed)`); the current adopt replays
-    /// the holder ring `FromEarliest`.
-    #[allow(dead_code)]
+    /// The persisted `consumed` cursor — the exact end of this session's cold
+    /// history (written per batch by the event writer). A cold-stitch adopt seeds
+    /// `vt100` from cold history and re-attaches the holder ring
+    /// `FromCursor(consumed)` for the un-drained tail.
     pub fn get_backend_cursor(&self, id: &str) -> Result<u64> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare("SELECT backend_cursor FROM sessions WHERE id = ?1")?;
@@ -519,6 +567,8 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         updated_at: row.get(15)?,
         last_activity_at: row.get(16)?,
         risky: row.get::<_, i64>(17)? != 0,
+        agent_session_id: row.get(18)?,
+        forked_from: row.get(19)?,
     })
 }
 
@@ -553,6 +603,8 @@ fn row_to_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceInstanc
         isolation: row.get(5)?,
         status: row.get(6)?,
         created_at: row.get(7)?,
+        owns_worktree: row.get::<_, i64>(8)? != 0,
+        owns_branch: row.get::<_, i64>(9)? != 0,
     })
 }
 
@@ -590,6 +642,16 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA_V5)?;
         conn.pragma_update(None, "user_version", 5)?;
         tracing::info!("applied schema migration v5");
+    }
+    if version < 6 {
+        conn.execute_batch(SCHEMA_V6)?;
+        conn.pragma_update(None, "user_version", 6)?;
+        tracing::info!("applied schema migration v6");
+    }
+    if version < 7 {
+        conn.execute_batch(SCHEMA_V7)?;
+        conn.pragma_update(None, "user_version", 7)?;
+        tracing::info!("applied schema migration v7");
     }
     Ok(())
 }
@@ -691,6 +753,39 @@ const SCHEMA_V5: &str = r#"
 ALTER TABLE sessions ADD COLUMN backend_cursor INTEGER NOT NULL DEFAULT 0;
 "#;
 
+// Records what a session's instance actually *created*, so archiving can only
+// reclaim what we made. Before this, teardown inferred ownership from
+// `isolation` and deleted `branch` for any managed worktree — so a session
+// started on an existing branch (`main`, `release`) took that branch down with
+// it on archive.
+//
+// The backfill for pre-existing rows errs toward keeping things: a leaked
+// worktree or branch is recoverable (and the orphan sweep collects `asm-session/*`
+// leftovers anyway), a deleted `main` is not. So only `asm-session/*` branches —
+// the ones only we ever create — are backfilled as owned; a branch the user
+// named themselves is left unowned even if we did create it.
+const SCHEMA_V6: &str = r#"
+ALTER TABLE workspace_instances ADD COLUMN owns_worktree INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE workspace_instances ADD COLUMN owns_branch INTEGER NOT NULL DEFAULT 0;
+
+UPDATE workspace_instances SET owns_worktree = 1 WHERE isolation = 'worktree';
+UPDATE workspace_instances SET owns_branch = 1
+    WHERE isolation = 'worktree' AND branch LIKE 'asm-session/%';
+"#;
+
+// Session forking. `agent_session_id` is the agent's own conversation id, written
+// once while the session is live (see `Session::agent_session_id` for why it is
+// not re-derived at fork time); `forked_from` is the origin's session id.
+//
+// Both are nullable with no backfill: sessions that predate this migration never
+// had their native id captured, so a fork of one falls back to the digest brief.
+// Backfilling by re-running the transcript heuristic now would be exactly the
+// guess the live capture exists to avoid.
+const SCHEMA_V7: &str = r#"
+ALTER TABLE sessions ADD COLUMN agent_session_id TEXT;
+ALTER TABLE sessions ADD COLUMN forked_from TEXT;
+"#;
+
 /// Batches terminal events into transactions to keep write amplification low.
 fn event_writer_loop(mut conn: Connection, mut rx: UnboundedReceiver<EventMsg>) {
     // Block for the first event, then drain whatever else is queued.
@@ -726,6 +821,106 @@ fn write_batch(conn: &mut Connection, batch: &[EventMsg]) -> Result<()> {
             ])?;
         }
     }
+    // Advance each session's persisted `backend_cursor` to the max ring cursor in
+    // this batch (never regressing), atomically with the events it belongs to.
+    // This is the exact end-of-cold-history anchor a cold-stitch adopt re-attaches
+    // from. Only holder-backed sessions carry a non-zero cursor.
+    {
+        let mut max_cursor: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+        for m in batch {
+            if m.head_cursor > 0 {
+                let e = max_cursor.entry(m.session_id.as_str()).or_insert(0);
+                *e = (*e).max(m.head_cursor);
+            }
+        }
+        if !max_cursor.is_empty() {
+            let mut stmt = tx.prepare_cached(
+                "UPDATE sessions SET backend_cursor = MAX(backend_cursor, ?2) WHERE id = ?1",
+            )?;
+            for (id, cursor) in max_cursor {
+                stmt.execute(rusqlite::params![id, cursor as i64])?;
+            }
+        }
+    }
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{AttentionState, Session, SessionStatus};
+
+    fn temp_db() -> (Db, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("asm-db-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        (Db::open(&dir.join("t.sqlite3")).unwrap(), dir)
+    }
+
+    fn seed_session(db: &Db, id: &str) {
+        db.insert_session(&Session {
+            id: id.into(),
+            agent_plugin_id: "shell".into(),
+            command: "sh".into(),
+            args: vec![],
+            env: vec![],
+            working_directory: "/tmp".into(),
+            workspace_id: None,
+            status: SessionStatus::Running,
+            rows: 24,
+            cols: 80,
+            last_event_seq: 0,
+            exit_code: None,
+            attention_state: AttentionState::None,
+            attention_reason: None,
+            created_at: 1,
+            updated_at: 1,
+            last_activity_at: 1,
+            risky: false,
+            agent_session_id: None,
+            forked_from: None,
+        })
+        .unwrap();
+    }
+
+    /// The exact cold-stitch anchor: after a batch flush, `backend_cursor` equals
+    /// the max ring cursor persisted, and `max_event_seq` the max seq — so an
+    /// adopt re-attaches from the true end of cold history and continues the
+    /// sequence without colliding with existing rows.
+    #[test]
+    fn backend_cursor_and_max_seq_track_persisted_events() {
+        let (db, dir) = temp_db();
+        seed_session(&db, "s1");
+        let sink = db.events();
+        for (seq, cursor) in [(1u64, 100u64), (2, 250), (3, 400)] {
+            sink.send(EventMsg {
+                session_id: "s1".into(),
+                seq,
+                ts_ms: 0,
+                stream: 0,
+                bytes: vec![b'x'; 10],
+                head_cursor: cursor,
+            });
+        }
+        // Let the event-writer thread flush the batch.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        assert_eq!(db.get_backend_cursor("s1").unwrap(), 400);
+        assert_eq!(db.max_event_seq("s1").unwrap(), 3);
+        assert_eq!(db.read_events_after("s1", 0).unwrap().len(), 30);
+        // A later batch never regresses the cursor.
+        sink.send(EventMsg {
+            session_id: "s1".into(),
+            seq: 4,
+            ts_ms: 0,
+            stream: 0,
+            bytes: vec![b'y'; 5],
+            head_cursor: 550,
+        });
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert_eq!(db.get_backend_cursor("s1").unwrap(), 550);
+        assert_eq!(db.max_event_seq("s1").unwrap(), 4);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

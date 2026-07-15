@@ -157,6 +157,16 @@ guidance (deployment.md addition, R5): real certificate, port 443.
 > of work: enable `rustls-tls-webpki-roots` on `tokio-tungstenite` + wire the
 > connector, then relay-side rustls or a proxy, with a real ACME cert (no client
 > UX change). Tracked in `security-followups.md` → 1 and `backlog.md` → SEC-1.
+>
+> **Update (2026-07-12): this was implemented in full and then reverted.**
+> `1dcb15e` delivered exactly the order of work above (agent `wss://` connector,
+> relay rustls with ALPN pinned to `http/1.1`, plaintext-to-remote-relay refusal,
+> tests in `crates/asm-relay/tests/tls.rs`), riding along with daemon-terminated
+> HTTPS — which turned out to make a LAN daemon *unreachable* from the web
+> client (browsers refuse a self-signed cert on a cross-origin `fetch`) and was
+> reverted wholesale to keep the LAN journey plaintext by design (`a36fdfa`;
+> see `security-followups.md` → 1). The relay half was sound: when R5 needs it,
+> **resurrect it from `1dcb15e`** instead of rebuilding.
 
 ### Daemon-side auth interaction (existing conventions, unchanged)
 

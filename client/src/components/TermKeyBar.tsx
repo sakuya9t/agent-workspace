@@ -1,7 +1,9 @@
 import { Dispatch, MutableRefObject, SetStateAction } from "react";
 import { useTranslation } from "react-i18next";
-import { copyText, readText } from "../clipboard";
+import { copyText } from "../clipboard";
 import { CtrlLatch, TerminalHandle } from "../terminalTypes";
+import { useTerminalPaste } from "../useTerminalPaste";
+import { PasteSheet } from "./PasteSheet";
 
 interface Props {
   /** Live handle onto the mounted terminal (see TerminalView.onReady). */
@@ -18,6 +20,7 @@ interface Props {
  */
 export function TermKeyBar({ handleRef, ctrl, setCtrl }: Props) {
   const { t } = useTranslation();
+  const { onPaste, pasteSheet, submitPaste, closePasteSheet } = useTerminalPaste(handleRef);
   const send = (data: string) => () => handleRef.current?.write(data);
 
   // off → armed (one-shot) → locked (sticky) → off.
@@ -25,47 +28,46 @@ export function TermKeyBar({ handleRef, ctrl, setCtrl }: Props) {
     setCtrl((c) => (c === "off" ? "armed" : c === "armed" ? "locked" : "off"));
 
   const onKeyboard = () => handleRef.current?.focus();
-  const onPaste = async () => {
-    const text = await readText();
-    if (text) handleRef.current?.write(text);
-  };
   const onCopy = () => {
     const sel = handleRef.current?.getSelection();
     if (sel) void copyText(sel);
   };
 
   return (
-    <div className="term-keybar" role="toolbar" aria-label={t("keybar.label")}>
-      <button className="kb" onClick={send("\x1b")}>
-        {t("keybar.esc")}
-      </button>
-      <button className="kb" onClick={send("\x09")}>
-        {t("keybar.tab")}
-      </button>
-      <button className="kb" onClick={send("\x1b[Z")}>
-        {t("keybar.shiftTab")}
-      </button>
-      <button
-        className={"kb" + (ctrl !== "off" ? " on" : "") + (ctrl === "locked" ? " locked" : "")}
-        onClick={cycleCtrl}
-        aria-pressed={ctrl !== "off"}
-      >
-        {t("keybar.ctrl")}
-      </button>
-      <button className="kb" onClick={send("\x03")}>
-        {t("keybar.ctrlC")}
-      </button>
-      <button className="kb up" onClick={send("\x1b[A")} aria-label={t("keybar.up")} />
-      <button className="kb down" onClick={send("\x1b[B")} aria-label={t("keybar.down")} />
-      <button className="kb left" onClick={send("\x1b[D")} aria-label={t("keybar.left")} />
-      <button className="kb right" onClick={send("\x1b[C")} aria-label={t("keybar.right")} />
-      <button className="kb kbd" onClick={onKeyboard} aria-label={t("keybar.keyboard")} />
-      <button className="kb" onClick={onPaste}>
-        {t("keybar.paste")}
-      </button>
-      <button className="kb" onClick={onCopy}>
-        {t("keybar.copy")}
-      </button>
-    </div>
+    <>
+      <div className="term-keybar" role="toolbar" aria-label={t("keybar.label")}>
+        <button className="kb" onClick={send("\x1b")}>
+          {t("keybar.esc")}
+        </button>
+        <button className="kb" onClick={send("\x09")}>
+          {t("keybar.tab")}
+        </button>
+        <button className="kb" onClick={send("\x1b[Z")}>
+          {t("keybar.shiftTab")}
+        </button>
+        <button
+          className={"kb" + (ctrl !== "off" ? " on" : "") + (ctrl === "locked" ? " locked" : "")}
+          onClick={cycleCtrl}
+          aria-pressed={ctrl !== "off"}
+        >
+          {t("keybar.ctrl")}
+        </button>
+        <button className="kb" onClick={send("\x03")}>
+          {t("keybar.ctrlC")}
+        </button>
+        <button className="kb up" onClick={send("\x1b[A")} aria-label={t("keybar.up")} />
+        <button className="kb down" onClick={send("\x1b[B")} aria-label={t("keybar.down")} />
+        <button className="kb left" onClick={send("\x1b[D")} aria-label={t("keybar.left")} />
+        <button className="kb right" onClick={send("\x1b[C")} aria-label={t("keybar.right")} />
+        <button className="kb kbd" onClick={onKeyboard} aria-label={t("keybar.keyboard")} />
+        <button className="kb" onClick={onPaste}>
+          {t("keybar.paste")}
+        </button>
+        <button className="kb" onClick={onCopy}>
+          {t("keybar.copy")}
+        </button>
+      </div>
+      {pasteSheet && <PasteSheet onSubmit={submitPaste} onClose={closePasteSheet} />}
+    </>
   );
 }

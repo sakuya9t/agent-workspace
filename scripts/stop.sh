@@ -18,15 +18,17 @@ asm_parse_args "$@" || { usage; exit 2; }
 asm_configure
 
 what="${ASM_POSITIONAL[0]:-all}"
+# An explicit stop also clears the component's recorded launch config (.reg) —
+# a later flagless start.sh/restart-daemon.sh must not resurrect it.
 case "$what" in
   daemon) stop_one asm-daemon "$DAEMON_PIDFILE"; rm -f "$DAEMON_STATE_FILE" ;;
   asmux)  stop_one asmux "$ASMUX_PIDFILE" ;;
-  relay)  stop_one asm-relay "$RELAY_PIDFILE" ;;
+  relay)  stop_one asm-relay "$RELAY_PIDFILE"; rm -f "$RELAY_STATE_FILE" ;;
   all)
     # Daemon first (it detaches from the holder), then the holder, then the relay.
     stop_one asm-daemon "$DAEMON_PIDFILE"; rm -f "$DAEMON_STATE_FILE"
     stop_one asmux "$ASMUX_PIDFILE"
-    stop_one asm-relay "$RELAY_PIDFILE"
+    stop_one asm-relay "$RELAY_PIDFILE"; rm -f "$RELAY_STATE_FILE"
     ;;
   *) usage; exit 2 ;;
 esac

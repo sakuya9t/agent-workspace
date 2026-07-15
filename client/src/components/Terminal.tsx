@@ -1,15 +1,24 @@
 import { useEffect, useRef, useState, type ChangeEvent, type MutableRefObject } from "react";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { streamUrl, api } from "../api";
+import { streamUrl, api, MAX_ATTACHMENT_BYTES } from "../api";
 import { Target } from "../connectionStore";
 import { useUiStore } from "../store";
 import { copyText } from "../clipboard";
+import { glog } from "../gestureLog";
 import { CtrlLatch, TerminalHandle } from "../terminalTypes";
+import { useIsPhone } from "../useIsPhone";
+import { useIsTouch } from "../useIsTouch";
+import { useTerminalPaste } from "../useTerminalPaste";
+import { PasteSheet } from "./PasteSheet";
+import { TermControlPanel } from "./TermControlPanel";
 import i18n from "../i18n";
 
 /** WS close code the daemon uses when another client takes over the session. */
 const CLOSE_SUPERSEDED = 4001;
+
+/** Size for a human, only ever used on the attachment limit (always MB-scale). */
+const formatBytes = (n: number) => `${(n / (1024 * 1024)).toFixed(1)} MB`;
 
 /** Map a single typed character to its control byte (Ctrl-A → \x01, etc.); pass
  *  anything else (multi-char sequences, non-mappable keys) through untouched. */
@@ -27,7 +36,10 @@ function toCtrl(s: string): string {
  * (Windows/Linux) so plain Ctrl-C stays SIGINT to the agent. macOS ⌘-C is
  * served natively by xterm's own `copy`-event listener; elsewhere the native
  * copy gesture *is* Ctrl-C, so we claim the Ctrl-Shift-C chord instead —
- * hence the platform split.
+ * hence the platform split. Paste is the mirror image: ⌘-V is already native on
+ * macOS, while on Windows/Linux we take Ctrl-V away from xterm (it would send
+ * ^V) so the browser's own paste runs — the only paste that carries an image.
+ * See the key handler below.
  */
 const isMac = /Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent);
 
@@ -43,6 +55,9 @@ interface Props {
   ctrlRef?: MutableRefObject<CtrlLatch>;
   /** Called after an "armed" one-shot latch is consumed, so the bar resets. */
   onCtrlConsumed?: () => void;
+  /** Fires when the view leaves / returns to the live tail, so a shell can offer
+   *  a jump-to-end affordance (the mobile pill). See the scroll-state block. */
+  onScrollState?: (scrolledAway: boolean) => void;
 }
 
 /**
@@ -60,6 +75,7 @@ export function TerminalView({
   onReady,
   ctrlRef,
   onCtrlConsumed,
+  onScrollState,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   // Reached from inside the WS effect without becoming effect dependencies
@@ -68,11 +84,45 @@ export function TerminalView({
   onReadyRef.current = onReady;
   const onCtrlConsumedRef = useRef(onCtrlConsumed);
   onCtrlConsumedRef.current = onCtrlConsumed;
+  const onScrollStateRef = useRef(onScrollState);
+  onScrollStateRef.current = onScrollState;
   // The live socket, mirrored out of the effect so the component-scope image
   // upload can inject over it without the effect's listeners depending on it.
   const wsRef = useRef<WebSocket | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const errorTimerRef = useRef<number | undefined>(undefined);
+  // The same handle the shell gets from onReady, kept here too so the touch
+  // overlay's own buttons can reach the effect-local xterm (paste writes over
+  // the socket; copy reads the selection through copySelRef's receipt path).
+  const handleRef = useRef<TerminalHandle | null>(null);
+  const copySelRef = useRef<() => void>(() => {});
+  const isTouch = useIsTouch();
+  const isPhone = useIsPhone();
+  // Scrolled back from the live tail. The phone shell reads this out through
+  // onScrollState to drive its own jump pill; we also keep it here so an iPad —
+  // touch on the DESKTOP shell, hence no wheel and no scrollbar — gets the same
+  // jump affordance (rendered below, gated `isTouch && !isPhone`). Fed by the
+  // scroll-state block inside the WS effect.
+  const [scrolledAway, setScrolledAway] = useState(false);
+
+  // The iPad control panel's Ctrl latch. The phone shell hands TerminalView a
+  // latch through ctrlRef; the desktop shell (an iPad) hands it none, so we own
+  // one here and feed it into the same soft-keyboard transform (see sendTyped).
+  // panelCtrlRef mirrors the state so the effect-local sendTyped can read it
+  // without becoming a dependency (which would rebuild the terminal).
+  const [panelCtrl, setPanelCtrl] = useState<CtrlLatch>("off");
+  const panelCtrlRef = useRef<CtrlLatch>("off");
+  panelCtrlRef.current = panelCtrl;
+  const cyclePanelCtrl = () =>
+    setPanelCtrl((c) => (c === "off" ? "armed" : c === "armed" ? "locked" : "off"));
+  // Named to stay clear of the effect-local `onPaste` DOM listener below, which
+  // handles a *native* paste event (images/files) rather than a button tap.
+  const {
+    onPaste: onPasteTapped,
+    pasteSheet,
+    submitPaste,
+    closePasteSheet,
+  } = useTerminalPaste(handleRef);
   // Transient status for an in-flight / failed image paste or a copy receipt,
   // shown as a small overlay (never written into the terminal, which a TUI
   // would repaint over).
@@ -81,31 +131,52 @@ export function TerminalView({
     msg: string;
   } | null>(null);
 
-  // Upload a pasted/dropped/picked image, then inject its stored path over the
-  // live socket as prompt text — the drag-and-drop-equivalent the agent loads
-  // on submit. The upload finishes BEFORE the path is injected, so a slow or
-  // dropped link never leaves a dangling reference in the prompt. Lifted to
-  // component scope so the 📎 button and the terminal's paste/drop listeners
-  // share one implementation.
-  const uploadAndInject = async (blob: Blob) => {
+  const showError = (msg: string) => {
+    setPasteStatus({ kind: "error", msg });
+    if (errorTimerRef.current) window.clearTimeout(errorTimerRef.current);
+    errorTimerRef.current = window.setTimeout(() => setPasteStatus(null), 4000);
+  };
+
+  // Upload a pasted/dropped/picked file of ANY type, then inject its stored path
+  // over the live socket as prompt text — the drag-and-drop-equivalent the agent
+  // loads on submit. An image is just the common case: a PDF, a zip or a CSV is
+  // as useful to the agent, and it reads them from the same path. The upload
+  // finishes BEFORE the path is injected, so a slow or dropped link never leaves
+  // a dangling reference in the prompt. Lifted to component scope so the 📎
+  // button and the terminal's paste/drop listeners share one implementation.
+  const uploadAndInject = async (file: Blob, name?: string) => {
     if (!live) return;
-    setPasteStatus({ kind: "busy", msg: i18n.t("terminal.uploadingImage") });
+    // Pre-check the size the daemon enforces anyway, so a too-big file fails
+    // instantly and legibly instead of after a long upload ending in a 413.
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      showError(
+        i18n.t("terminal.attachTooLarge", {
+          size: formatBytes(file.size),
+          max: formatBytes(MAX_ATTACHMENT_BYTES),
+        }),
+      );
+      return;
+    }
+    const isImage = file.type.startsWith("image/");
+    setPasteStatus({
+      kind: "busy",
+      msg: name
+        ? i18n.t("terminal.uploadingNamed", { name })
+        : i18n.t("terminal.uploadingImage"),
+    });
     try {
-      const r = await api.pasteImage(target, sessionId, blob);
+      const r = await api.uploadAttachment(target, sessionId, file, name);
       const ws = wsRef.current;
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(
-          JSON.stringify({ t: "i", d: i18n.t("terminal.pastedImageRef", { path: r.relative_path }) }),
-        );
+        // Keep the verified image wording for images (docs/image-paste.md
+        // proved Claude Code loads exactly this form); everything else says
+        // "attached file", which is the same bare-path-in-prose shape.
+        const key = isImage ? "terminal.pastedImageRef" : "terminal.attachedFileRef";
+        ws.send(JSON.stringify({ t: "i", d: i18n.t(key, { path: r.relative_path }) }));
       }
       setPasteStatus(null);
     } catch (e) {
-      setPasteStatus({
-        kind: "error",
-        msg: i18n.t("terminal.pasteFailed", { message: (e as Error).message }),
-      });
-      if (errorTimerRef.current) window.clearTimeout(errorTimerRef.current);
-      errorTimerRef.current = window.setTimeout(() => setPasteStatus(null), 4000);
+      showError(i18n.t("terminal.pasteFailed", { message: (e as Error).message }));
     }
   };
   // The effect's DOM listeners reach the latest closure through this ref, so
@@ -115,7 +186,7 @@ export function TerminalView({
 
   const onPickFile = (e: ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
-    if (f && f.type.startsWith("image/")) void uploadAndInject(f);
+    if (f) void uploadAndInject(f, f.name);
     e.target.value = ""; // let the same file be picked again next time
   };
 
@@ -274,6 +345,10 @@ export function TerminalView({
         // none), so leave the normal buffer's history alone while a TUI owns
         // the screen.
         if (term.buffer.active.type === "normal") term.clear();
+        // The snapshot repaints the app's CURRENT window, so whatever scroll the
+        // old socket's reports left it holding is not ours to give back.
+        wheelUp = 0;
+        scheduleScrollCheck();
         safeFit(fit);
         sendResize();
       };
@@ -302,17 +377,36 @@ export function TerminalView({
 
     // Raw send — used by the key bar handle (explicit control codes) and as the
     // base for typed input.
+    //
+    // `batch`, when open, collects instead of sending: a jump-to-end (below)
+    // synthesizes one wheel event per report the app is owed, and each would
+    // otherwise be its own WS frame and its own pty write. Collected, the whole
+    // burst leaves as one.
+    let batch: string[] | null = null;
     const sendRaw = (d: string) => {
+      if (batch) {
+        batch.push(d);
+        return;
+      }
       if (live && ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ t: "i", d }));
       }
     };
-    // Soft-keyboard input honors the mobile Ctrl latch; an "armed" one-shot is
-    // consumed after a single key (key-bar buttons send raw and bypass this).
+    // Soft-keyboard input honors a Ctrl latch; an "armed" one-shot is consumed
+    // after a single key (bar/panel buttons send raw and bypass this). The phone
+    // shell owns the latch (ctrlRef); on the desktop shell (iPad) it's ours, fed
+    // from the control panel through panelCtrlRef.
     const sendTyped = (d: string) => {
-      const latch = ctrlRef?.current;
+      const latchRef = ctrlRef ?? panelCtrlRef;
+      const latch = latchRef.current;
       if (latch && latch !== "off") {
-        if (latch === "armed") onCtrlConsumedRef.current?.();
+        if (latch === "armed") {
+          if (ctrlRef) onCtrlConsumedRef.current?.();
+          else {
+            panelCtrlRef.current = "off"; // immediate, so a fast second key isn't caught
+            setPanelCtrl("off");
+          }
+        }
         sendRaw(toCtrl(d));
       } else {
         sendRaw(d);
@@ -326,37 +420,59 @@ export function TerminalView({
     // plain drags for its own mouse reporting); a plain shell selects on drag.
     // The clipboard has no observable state, so flash the outcome over the
     // terminal — a silent success is indistinguishable from "copy is broken".
-    const copySelection = async () => {
-      const ok = await copyText(term.getSelection());
-      setPasteStatus({
-        kind: ok ? "ok" : "error",
-        msg: i18n.t(ok ? "terminal.copied" : "terminal.copyFailed"),
-      });
+    const flash = (kind: "ok" | "error", msg: string) => {
+      setPasteStatus({ kind, msg });
       if (errorTimerRef.current) window.clearTimeout(errorTimerRef.current);
-      errorTimerRef.current = window.setTimeout(() => setPasteStatus(null), ok ? 1500 : 4000);
+      errorTimerRef.current = window.setTimeout(
+        () => setPasteStatus(null),
+        kind === "ok" ? 1500 : 4000,
+      );
     };
+    const copySelection = async () => {
+      const sel = term.getSelection();
+      // Only the touch overlay's Copy can land here empty — the key chords and
+      // the context menu all guard on hasSelection() — and on a tablet, where
+      // selecting means a long-press drag that's easy to miss, a Copy that did
+      // nothing at all reads as a broken button. Say what's missing instead.
+      if (!sel) {
+        flash("error", i18n.t("terminal.nothingSelected"));
+        return;
+      }
+      const ok = await copyText(sel);
+      flash(ok ? "ok" : "error", i18n.t(ok ? "terminal.copied" : "terminal.copyFailed"));
+    };
+    copySelRef.current = () => void copySelection();
 
-    // On Windows/Linux we claim Ctrl-Shift-C here and leave Ctrl-C to xterm so
-    // it still forwards \x03 (SIGINT). macOS ⌘-C needs nothing from us: xterm
-    // doesn't cancel the ⌘-C keydown, so the browser fires a native `copy`
-    // event that xterm's own listener serves from the selection — synchronously,
-    // which also covers insecure contexts. (Paste is native too: ⌘-V and
-    // Ctrl-Shift-V keydowns pass through xterm uncancelled, and the browser's
-    // paste event lands on xterm's textarea. Plain Ctrl-V stays ^V to the app.)
+    // Copy: on Windows/Linux we claim Ctrl-Shift-C here and leave Ctrl-C to xterm
+    // so it still forwards \x03 (SIGINT). macOS ⌘-C needs nothing from us: xterm
+    // doesn't cancel the ⌘-C keydown, so the browser fires a native `copy` event
+    // that xterm's own listener serves from the selection — synchronously, which
+    // also covers insecure contexts.
+    //
+    // Paste: only the browser's *native* paste carries an image — the image lives
+    // in the `paste` event's clipboardData, which `onPaste` below uploads. So a
+    // paste gesture is useful to us only if it reaches the browser uncancelled.
+    // macOS ⌘-V does, which is why image paste worked there and nowhere else:
+    //   - plain Ctrl-V: xterm maps it to ^V and preventDefault()s, so Chrome
+    //     skips its paste command and NO paste event ever fires;
+    //   - Ctrl-Shift-V: Chrome's *paste-as-plain-text*, whose clipboardData is
+    //     stripped to text — an image-only clipboard arrives empty.
+    // Windows was therefore left with no way to paste an image at all. So claim
+    // Ctrl-V and hand it straight back to the browser. This spends ^V (readline's
+    // quoted-insert, vim's visual-block) on Windows/Linux, the same trade Windows
+    // Terminal and VS Code's terminal make — vim's own Ctrl-Q is the way back.
     term.attachCustomKeyEventHandler((e) => {
-      if (
-        e.type === "keydown" &&
-        !isMac &&
-        e.ctrlKey &&
-        e.shiftKey &&
-        !e.altKey &&
-        !e.metaKey &&
-        (e.key === "c" || e.key === "C") &&
-        term.hasSelection()
-      ) {
+      if (e.type !== "keydown" || isMac || !e.ctrlKey || e.altKey || e.metaKey) return true;
+      if (e.shiftKey && (e.key === "c" || e.key === "C") && term.hasSelection()) {
         void copySelection();
         e.preventDefault();
         return false; // swallow: don't let xterm forward it as input
+      }
+      if (!e.shiftKey && (e.key === "v" || e.key === "V")) {
+        // Deliberately no preventDefault: xterm must not send ^V, but the
+        // browser MUST still run its paste command — that is what fires the
+        // `paste` event (image → onPaste; text → xterm's own paste listener).
+        return false;
       }
       return true;
     });
@@ -367,6 +483,13 @@ export function TerminalView({
     // read "". Swallow the press in capture phase (xterm's bubble listeners on
     // a descendant never see it); the browser still fires contextmenu.
     const onMouseDownCapture = (e: MouseEvent) => {
+      // A touch selection has just been made: this is the compatibility mousedown
+      // the browser synthesizes from the lift, and xterm would clear on it.
+      if (holdSelection) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
       if (e.button === 2 && term.hasSelection()) e.stopPropagation();
     };
     // Right-click copies on every platform (the "universal" affordance), then
@@ -374,29 +497,37 @@ export function TerminalView({
     // browser menu — whose Paste works even in insecure contexts (xterm parks
     // its hidden textarea under the cursor for exactly that).
     const onContextMenu = (e: MouseEvent) => {
+      // A long-press can raise contextmenu too; that's our selection gesture, not
+      // a right-click, so swallow it rather than copy-and-clear what it just made.
+      if (gesture === "select" || holdSelection) {
+        e.preventDefault();
+        return;
+      }
       if (!term.hasSelection()) return; // nothing selected: leave the default
       void copySelection();
       term.clearSelection();
       e.preventDefault();
     };
 
-    // --- Image paste / drop --- (the upload+inject itself lives at component
+    // --- File paste / drop --- (the upload+inject itself lives at component
     // scope in `uploadAndInject`, reached here via `uploadRef` so these
     // listeners don't become effect dependencies; the 📎 button shares it.)
-    const firstImage = (files: FileList | null | undefined): File | null =>
-      files ? (Array.from(files).find((f) => f.type.startsWith("image/")) ?? null) : null;
-
+    // Any file type is taken, not just images — `dragover` already advertised
+    // that by accepting any file kind, and now `drop` actually honours it.
     const onPaste = (e: ClipboardEvent) => {
       if (!live || !e.clipboardData) return;
       for (const item of Array.from(e.clipboardData.items)) {
-        if (item.kind === "file" && item.type.startsWith("image/")) {
+        if (item.kind === "file") {
           const file = item.getAsFile();
           if (file) {
             // Swallow it so xterm doesn't also paste garbage; a plain-text
-            // paste (no image item) falls through to xterm untouched.
+            // paste (whose items are all `kind: "string"`) falls through to
+            // xterm untouched.
             e.preventDefault();
             e.stopPropagation();
-            void uploadRef.current(file);
+            // A clipboard image has no meaningful name (Chrome calls it
+            // "image.png"); a file copied from a file manager does.
+            void uploadRef.current(file, file.name || undefined);
             return;
           }
         }
@@ -409,40 +540,221 @@ export function TerminalView({
     };
     const onDrop = (e: DragEvent) => {
       if (!live) return;
-      const img = firstImage(e.dataTransfer?.files);
-      if (img) {
+      const file = e.dataTransfer?.files?.[0];
+      if (file) {
         e.preventDefault();
-        void uploadRef.current(img);
+        void uploadRef.current(file, file.name || undefined);
       }
     };
-    // --- Touch scroll ---
-    // xterm's built-in touch handler only nudges its own scrollback viewport, so
-    // on a TUI (an alternate-screen app, or anything with mouse reporting on) a
-    // swipe does nothing: there is no scrollback to move and the gesture is never
-    // forwarded to the app. Desktop avoids this because the *wheel* path forwards
-    // to the app — mouse-wheel reports, or ↑/↓ for a no-scrollback screen. Mirror
-    // that on touch: translate a vertical drag into wheel events aimed at xterm's
-    // element so the identical wheel logic runs (smooth scrollback for a shell,
-    // app-forwarded scroll for a TUI). Registered in the capture phase with
-    // stopPropagation so xterm's own touch handler on `.xterm` never also fires
-    // and double-scrolls.
-    let touchY: number | null = null;
-    let touchScrolling = false;
-    const TOUCH_SLOP = 6; // px of travel before a drag counts as a scroll (not a tap)
-    const onTouchStart = (e: TouchEvent) => {
-      touchScrolling = false;
-      touchY = e.touches.length === 1 ? e.touches[0].clientY : null;
+    // --- Touch: drag scrolls, long-press selects, drag-after-press extends ---
+    //
+    // Scroll: xterm's built-in touch handler only nudges its own scrollback
+    // viewport, so on a TUI (alternate screen, or mouse reporting on) a swipe did
+    // nothing — no scrollback to move, and the gesture never reached the app.
+    // Desktop escapes this because the *wheel* path forwards to the app (wheel
+    // reports, or ↑/↓ for a no-scrollback screen), so translate a vertical drag
+    // into wheel events aimed at xterm's element and the identical wheel logic
+    // runs. xterm's own touch scroll is suppressed (capture-phase
+    // stopPropagation) so it can't double-scroll.
+    //
+    // Selection: xterm has NO touch selection — its selection service is
+    // mouse-only and `.xterm` carries `user-select: none`, so neither xterm nor
+    // the browser would ever select a cell from a fingertip. Synthesize the
+    // gesture and push it through xterm's own selection model via term.select(),
+    // which is what makes the existing copy paths (the key bar's Copy,
+    // getSelection(), the Ctrl-Shift-C/right-click handlers) work unchanged.
+    //
+    // Both ride on POINTER events, not touch events, because the DOM renderer
+    // REPLACES a row's <span>s whenever that row repaints. A touch that started
+    // on one of those spans is retargeted to a node that is no longer in the
+    // tree, so its touchmoves silently stop propagating to any listener — no
+    // touchcancel, just nothing. Scrolling repaints rows, so a drag beginning on
+    // TEXT scrolled exactly one row and then died, while a drag beginning on
+    // blank space (whose target is the row <div> — recycled, not replaced)
+    // scrolled normally. setPointerCapture pins the gesture to the container, so
+    // what happens to the element under the finger stops mattering.
+    const LONG_PRESS_MS = 450;
+    const TOUCH_SLOP = 8; // px of travel before a drag is a scroll, not a press
+    const EDGE = 24; // px from an edge where an extend-drag auto-scrolls
+    /** Word chars stop at these — xterm's own `wordSeparator` default, so a
+     *  long-press grabs the same word a desktop double-click would. */
+    const WORD_SEPARATORS = " ()[]{}'\"`";
+
+    type Gesture = "idle" | "scroll" | "select";
+    let gesture: Gesture = "idle";
+    let pointerId: number | null = null;
+    let startX = 0;
+    let startY = 0;
+    let lastX = 0;
+    let lastY = 0;
+    let pressTimer: number | undefined;
+    let autoScrollTimer: number | undefined;
+    /** The long-pressed word, in absolute buffer cells; a drag extends off it in
+     *  either direction. Half-open: [col,row) → [endCol,endRow). */
+    let anchor: { col: number; row: number; endCol: number; endRow: number } | null = null;
+    /** True while a just-made touch selection is settling, so the compatibility
+     *  mouse events the browser fires after the finger lifts don't reach xterm's
+     *  selection service — which clears the selection on any mousedown. */
+    let holdSelection = false;
+    let holdTimer: number | undefined;
+
+    const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
+    const screenEl = () => term.element?.querySelector(".xterm-screen") as HTMLElement | null;
+
+    /** Client px → absolute buffer cell (scrollback included), clamped to the screen. */
+    const cellAt = (x: number, y: number) => {
+      const el = screenEl();
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return null;
+      const col = clamp(Math.floor(((x - r.left) / r.width) * term.cols), 0, term.cols - 1);
+      const viewRow = clamp(Math.floor(((y - r.top) / r.height) * term.rows), 0, term.rows - 1);
+      return { col, row: term.buffer.active.viewportY + viewRow };
     };
-    const onTouchMove = (e: TouchEvent) => {
-      if (touchY === null || e.touches.length !== 1) return; // ignore taps / pinch
-      const y = e.touches[0].clientY;
-      if (!touchScrolling) {
-        if (Math.abs(y - touchY) < TOUCH_SLOP) return; // still might be a tap
-        touchScrolling = true;
-        touchY = y; // rebase so the first step isn't a jump of the whole slop
+
+    /** The word spanning `col` on buffer line `row`, or that single cell if the
+     *  press landed on whitespace//a separator. */
+    const wordAt = (col: number, row: number) => {
+      const line = term.buffer.active.getLine(row);
+      if (!line) return null;
+      const isWord = (i: number) => {
+        const cell = line.getCell(i);
+        if (!cell) return false;
+        if (cell.getWidth() === 0) return true; // trailing half of a wide (CJK) char
+        const ch = cell.getChars();
+        return ch !== "" && !WORD_SEPARATORS.includes(ch);
+      };
+      if (!isWord(col)) return { col, row, endCol: col + 1, endRow: row };
+      let s = col;
+      let e = col;
+      while (s > 0 && isWord(s - 1)) s--;
+      while (e < term.cols - 1 && isWord(e + 1)) e++;
+      return { col: s, row, endCol: e + 1, endRow: row };
+    };
+
+    // term.select(col, row, length) walks `length` cells rightward from the start,
+    // wrapping by `cols` — so a selection is just a half-open run of absolute cell
+    // offsets, and dragging backward past the anchor simply swaps the two ends.
+    const offOf = (col: number, row: number) => row * term.cols + col;
+    const selectTo = (cur: { col: number; row: number }) => {
+      if (!anchor) return;
+      const aStart = offOf(anchor.col, anchor.row);
+      const aEnd = offOf(anchor.endCol, anchor.endRow); // exclusive
+      const c = offOf(cur.col, cur.row);
+      const [start, end] =
+        c + 1 > aEnd ? [aStart, c + 1] // dragged forward, past the word
+        : c < aStart ? [c, aEnd] // dragged backward, before the word
+        : [aStart, aEnd]; // still inside the word
+      term.select(start % term.cols, Math.floor(start / term.cols), end - start);
+    };
+
+    /** Pin the gesture to the container: from here the finger can wander over rows
+     *  the renderer is busy replacing, and what becomes of the element under it
+     *  stops mattering.
+     *
+     *  Best-effort, and deliberately NOT on the critical path. Capture is the part
+     *  of this gesture an engine is most likely to refuse — it is only defined for
+     *  an *active* pointer, and the long-press timer fires outside any pointer
+     *  event handler. Blink allows a capture from there (which is all Chrome's
+     *  device emulation can ever prove), other engines need not, and the throw used
+     *  to escape beginSelect() BEFORE it selected anything: a "long press does
+     *  nothing" of exactly the kind iOS reports. So select the word first, attempt
+     *  the capture in a try/catch, and retry it from the next pointermove — a
+     *  handler no engine objects to. */
+    const grabPointer = () => {
+      if (pointerId === null || container.hasPointerCapture(pointerId)) return;
+      try {
+        container.setPointerCapture(pointerId);
+      } catch (e) {
+        glog("capture-failed", (e as Error).name);
       }
-      const deltaY = touchY - y; // finger down → deltaY<0 → scroll toward older, like a wheel
-      touchY = y;
+    };
+
+    const beginSelect = () => {
+      const cell = cellAt(startX, startY);
+      const word = cell && wordAt(cell.col, cell.row);
+      if (!cell || !word) return;
+      gesture = "select";
+      anchor = word;
+      selectTo(cell); // first: a refused capture must not cost us the word
+      grabPointer();
+      navigator.vibrate?.(8); // the only feedback that the press "took" (iOS has none)
+      glog("select", `${word.col},${word.row} "${term.getSelection().slice(0, 24)}"`);
+    };
+
+    // Extending past the top/bottom edge scrolls, so a selection can run beyond
+    // one screenful. Only armed while a selection drag is live.
+    const autoScrollTick = () => {
+      if (gesture !== "select") return;
+      const el = screenEl();
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      const dir = lastY < r.top + EDGE ? -1 : lastY > r.bottom - EDGE ? 1 : 0;
+      if (dir === 0) return;
+      term.scrollLines(dir);
+      const cell = cellAt(lastX, lastY);
+      if (cell) selectTo(cell);
+    };
+
+    const endGesture = () => {
+      if (pointerId !== null && container.hasPointerCapture(pointerId)) {
+        container.releasePointerCapture(pointerId);
+      }
+      window.clearTimeout(pressTimer);
+      window.clearInterval(autoScrollTimer);
+      autoScrollTimer = undefined;
+      gesture = "idle";
+      pointerId = null;
+      anchor = null;
+    };
+
+    const onPointerDown = (e: PointerEvent) => {
+      if (e.pointerType !== "touch") return; // mouse/pen keep xterm's own path
+      if (pointerId !== null) {
+        endGesture(); // a second finger (pinch/zoom): abandon, own nothing
+        return;
+      }
+      pointerId = e.pointerId;
+      gesture = "idle";
+      startX = lastX = e.clientX;
+      startY = lastY = e.clientY;
+      pressTimer = window.setTimeout(beginSelect, LONG_PRESS_MS);
+    };
+
+    const onPointerMove = (e: PointerEvent) => {
+      if (e.pointerId !== pointerId) return;
+      const x = e.clientX;
+      const y = e.clientY;
+
+      if (gesture === "select") {
+        grabPointer(); // if the timer's capture was refused, this handler's won't be
+        lastX = x;
+        lastY = y;
+        const cell = cellAt(x, y);
+        if (cell) selectTo(cell);
+        autoScrollTimer ??= window.setInterval(autoScrollTick, 90);
+        e.preventDefault();
+        return;
+      }
+
+      if (gesture === "idle") {
+        if (Math.abs(y - startY) < TOUCH_SLOP && Math.abs(x - startX) < TOUCH_SLOP) {
+          return; // still inside the slop — the long press is still on the table
+        }
+        // It moved before the press landed, so this is a scroll, not a selection.
+        window.clearTimeout(pressTimer);
+        gesture = "scroll";
+        grabPointer();
+        lastX = x;
+        lastY = y; // rebase, so the first step isn't a jump of the whole slop
+        glog("scroll");
+        e.preventDefault();
+        return;
+      }
+
+      const deltaY = lastY - y; // finger down → deltaY<0 → toward older, like a wheel
+      lastX = x;
+      lastY = y;
       if (deltaY !== 0) {
         term.element?.dispatchEvent(
           new WheelEvent("wheel", {
@@ -453,23 +765,157 @@ export function TerminalView({
           }),
         );
       }
-      e.preventDefault(); // we own this gesture — suppress page bounce/overscroll
-      e.stopPropagation(); // and xterm's built-in touch scroll must not also run
+      e.preventDefault();
     };
-    const onTouchEnd = () => {
-      touchY = null;
-      touchScrolling = false;
+
+    const onPointerUp = (e: PointerEvent) => {
+      if (e.pointerId !== pointerId) return;
+      // A `pointercancel` landing here with gesture=idle is the engine claiming the
+      // touch for a gesture of its own, before our long press could land.
+      glog(e.type === "pointercancel" ? "cancel" : "up", `gesture=${gesture}`);
+      if (gesture === "select") {
+        // Keep the highlight — the key bar's Copy reads it. Swallow the mouse
+        // events the browser synthesizes from the lift for ~a beat, or xterm's
+        // selection service would clear what we just selected.
+        holdSelection = true;
+        window.clearTimeout(holdTimer);
+        holdTimer = window.setTimeout(() => (holdSelection = false), 700);
+        e.preventDefault();
+      } else if (gesture === "idle" && term.hasSelection()) {
+        term.clearSelection(); // a plain tap dismisses the selection
+      }
+      endGesture();
     };
+
+    // Only the suppression lives on touch events; the gesture itself is on
+    // pointer events (see above). Once the renderer detaches the touch's target
+    // these stop firing — but xterm's own touch listener is starved by exactly
+    // the same detachment, so nothing is left to double-scroll.
+    const onTouchMove = (e: TouchEvent) => {
+      e.stopPropagation(); // xterm's built-in touch scroll must never run
+      if (gesture !== "idle") e.preventDefault(); // ...nor a page bounce/overscroll
+    };
+    const onTouchEnd = (e: TouchEvent) => {
+      // Suppress the synthetic mousedown/click that would clear a fresh selection.
+      // (Checked both ways because pointerup/touchend ordering isn't worth betting on.)
+      if (gesture === "select" || holdSelection) e.preventDefault();
+    };
+
+    // --- Scrolled away from the live tail, and the way back ------------------
+    //
+    // Two scroll models share this terminal, and a jump-to-end has to serve both:
+    //
+    //   * TERMINAL-owned scrollback — codex, a shell, and every replay of an
+    //     ended session (all normal-buffer). The wheel moves xterm's own
+    //     viewport, so `viewportY < baseY` IS the answer and scrollToBottom() is
+    //     the way back. Exact.
+    //
+    //   * APP-owned scroll — claude, or any TUI holding mouse reporting. The
+    //     wheel never touches the viewport: it leaves as a mouse report and the
+    //     app redraws its window from its own transcript (docs/terminal-
+    //     scrollback.md). xterm therefore cannot see that the app is scrolled up
+    //     at all — nothing in its buffer moved. So count the wheel-UP reports the
+    //     app was handed, and hand them back as wheel-DOWNs. The app clamps at its
+    //     own bottom, so an overshoot costs nothing — which is what lets a merely
+    //     approximate counter (a stale one, after the app auto-followed new
+    //     output) stay safe.
+    //
+    // A TUI in the alternate screen that does NOT take the wheel (vim, less) is
+    // deliberately left out: its wheel becomes ↑/↓ keys the app is free to
+    // interpret however it likes, so neither model can say where "the end" is.
+    // The counter stays 0 there and the affordance simply never appears, rather
+    // than appearing and lying.
+    const WHEEL_NOTCH_PX = 120; // one classic notch: always ≥ 1 row, so it always reports
+    /** Net wheel-UP reports the running app is holding, ≥ 0. Live sessions only:
+     *  a replay's input goes nowhere, and its history can well re-arm mouse mode. */
+    let wheelUp = 0;
+    let reportedAway = false;
+    let checkRaf: number | undefined;
+
+    const atLiveTail = () => {
+      const buf = term.buffer.active;
+      return wheelUp === 0 && buf.viewportY >= buf.baseY;
+    };
+    // Coalesced: a drag fires a scroll event per frame, and a wheeled app one
+    // per report.
+    const scheduleScrollCheck = () => {
+      if (checkRaf !== undefined) return;
+      checkRaf = requestAnimationFrame(() => {
+        checkRaf = undefined;
+        const away = !atLiveTail();
+        if (away === reportedAway) return;
+        reportedAway = away;
+        onScrollStateRef.current?.(away); // the phone shell's jump pill
+        setScrolledAway(away); // our own iPad jump pill (rendered below)
+      });
+    };
+
+    const scrollToEnd = () => {
+      term.scrollToBottom(); // terminal-owned scrollback; a no-op when already there
+      let owed = wheelUp; // snapshot: each dispatch below decrements the counter
+      if (owed > 0) {
+        // Aim at the middle of the grid, not the (0,0) a bare WheelEvent reports
+        // from — a TUI is entitled to scroll the pane under the pointer.
+        const r = screenEl()?.getBoundingClientRect();
+        batch = [];
+        while (owed-- > 0) {
+          term.element?.dispatchEvent(
+            new WheelEvent("wheel", {
+              deltaY: WHEEL_NOTCH_PX,
+              deltaMode: WheelEvent.DOM_DELTA_PIXEL,
+              clientX: r ? r.left + r.width / 2 : 0,
+              clientY: r ? r.top + r.height / 2 : 0,
+              bubbles: true,
+              cancelable: true,
+            }),
+          );
+        }
+        const burst = batch.join("");
+        batch = null;
+        if (burst) sendRaw(burst);
+      }
+      wheelUp = 0;
+      scheduleScrollCheck();
+    };
+
+    // The only place the app's scroll offset is observable: the reports leaving
+    // for it. `sent` is false when the active protocol declined the event, so the
+    // count follows what the app actually received.
+    if (coreMouse?.triggerMouseEvent) {
+      const trigger = coreMouse.triggerMouseEvent.bind(coreMouse);
+      coreMouse.triggerMouseEvent = (ev) => {
+        const sent = trigger(ev);
+        // CoreMouseButton.WHEEL = 4; CoreMouseAction.UP = 0, DOWN = 1.
+        if (sent && live && ev.button === 4) {
+          wheelUp = Math.max(0, wheelUp + (ev.action === 0 ? 1 : -1));
+          scheduleScrollCheck();
+        }
+        return sent;
+      };
+    }
+
+    // onScroll covers output-driven scrolls; the viewport's own DOM scroll event
+    // covers the user's (xterm suppresses onScroll for those — the viewport is
+    // where they originate).
+    const scrollSub = term.onScroll(scheduleScrollCheck);
+    const bufferSub = term.buffer.onBufferChange(() => {
+      wheelUp = 0; // a different app owns the screen now; its offset isn't ours
+      scheduleScrollCheck();
+    });
+    const viewportEl = term.element?.querySelector(".xterm-viewport") as HTMLElement | null;
+    viewportEl?.addEventListener("scroll", scheduleScrollCheck, { passive: true });
 
     container.addEventListener("mousedown", onMouseDownCapture, true);
     container.addEventListener("contextmenu", onContextMenu);
     container.addEventListener("paste", onPaste, true);
     container.addEventListener("dragover", onDragOver);
     container.addEventListener("drop", onDrop);
-    container.addEventListener("touchstart", onTouchStart, { capture: true, passive: true });
+    container.addEventListener("pointerdown", onPointerDown, true);
+    container.addEventListener("pointermove", onPointerMove, { capture: true, passive: false });
+    container.addEventListener("pointerup", onPointerUp, true);
+    container.addEventListener("pointercancel", onPointerUp, true);
     container.addEventListener("touchmove", onTouchMove, { capture: true, passive: false });
-    container.addEventListener("touchend", onTouchEnd, { capture: true });
-    container.addEventListener("touchcancel", onTouchEnd, { capture: true });
+    container.addEventListener("touchend", onTouchEnd, { capture: true, passive: false });
 
     const ro = new ResizeObserver(() => {
       safeFit(fit);
@@ -479,16 +925,24 @@ export function TerminalView({
 
     connect();
 
-    // Hand a fresh input handle to the shell (the mobile key bar reads it).
-    onReadyRef.current?.({
+    // Hand a fresh input handle to the shell (the mobile key bar reads it) and
+    // keep it for our own touch overlay.
+    const handle: TerminalHandle = {
       write: sendRaw,
       focus: () => term.focus(),
       getSelection: () => term.getSelection(),
-    });
+      scrollToEnd,
+    };
+    handleRef.current = handle;
+    onReadyRef.current?.(handle);
 
     return () => {
       mounted = false;
+      handleRef.current = null;
       onReadyRef.current?.(null);
+      setScrolledAway(false); // the rebuilt terminal opens at its live tail
+      setPanelCtrl("off"); // don't carry a latch across a reconnect/relive
+
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
       if (errorTimerRef.current) window.clearTimeout(errorTimerRef.current);
       container.removeEventListener("mousedown", onMouseDownCapture, true);
@@ -496,10 +950,19 @@ export function TerminalView({
       container.removeEventListener("paste", onPaste, true);
       container.removeEventListener("dragover", onDragOver);
       container.removeEventListener("drop", onDrop);
-      container.removeEventListener("touchstart", onTouchStart, { capture: true });
+      container.removeEventListener("pointerdown", onPointerDown, true);
+      container.removeEventListener("pointermove", onPointerMove, { capture: true });
+      container.removeEventListener("pointerup", onPointerUp, true);
+      container.removeEventListener("pointercancel", onPointerUp, true);
       container.removeEventListener("touchmove", onTouchMove, { capture: true });
       container.removeEventListener("touchend", onTouchEnd, { capture: true });
-      container.removeEventListener("touchcancel", onTouchEnd, { capture: true });
+      viewportEl?.removeEventListener("scroll", scheduleScrollCheck);
+      scrollSub.dispose();
+      bufferSub.dispose();
+      if (checkRaf !== undefined) cancelAnimationFrame(checkRaf);
+      window.clearTimeout(pressTimer);
+      window.clearTimeout(holdTimer);
+      window.clearInterval(autoScrollTimer);
       ro.disconnect();
       dataSub.dispose();
       wsRef.current = null;
@@ -533,25 +996,55 @@ export function TerminalView({
       <div className="terminal-mount" ref={containerRef} />
       {live && (
         <>
-          {/* Explicit attach affordance — the primary path on touch devices,
-              where clipboard-image paste is unreliable. The 📎 glyph is set in
-              CSS so there's no bare string literal in JSX. */}
-          <button
-            type="button"
-            className="term-attach"
-            title={i18n.t("terminal.attachImage")}
-            aria-label={i18n.t("terminal.attachImage")}
-            onClick={() => fileInputRef.current?.click()}
-          />
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*"
-            hidden
-            onChange={onPickFile}
-          />
+          {/* Attach as a standalone corner button for the phone key bar's users
+              and mouse desktop. On iPad it folds into the control panel below
+              (alongside Copy/Paste), so the terminal stays clean — the whole
+              point of the tablet redesign. The 📎 glyph is CSS, so there's no
+              bare string literal in JSX. */}
+          {!(isTouch && !isPhone) && (
+            <div className="term-actions">
+              <button
+                type="button"
+                className="term-attach"
+                title={i18n.t("terminal.attachFile")}
+                aria-label={i18n.t("terminal.attachFile")}
+                onClick={() => fileInputRef.current?.click()}
+              />
+            </div>
+          )}
+          {/* iPad (touch on the DESKTOP shell): the collapsible TUI control panel
+              — the tablet's stand-in for the phone's docked key bar and the mouse
+              user's keyboard chords. Copy reads the selection; Paste and Attach
+              reuse the same paths the standalone buttons did. */}
+          {isTouch && !isPhone && (
+            <TermControlPanel
+              handleRef={handleRef}
+              ctrl={panelCtrl}
+              onCycleCtrl={cyclePanelCtrl}
+              onCopy={() => copySelRef.current()}
+              onPaste={onPasteTapped}
+              onAttach={() => fileInputRef.current?.click()}
+            />
+          )}
+          {/* No `accept` — any file type is a valid attachment (PDF, zip, CSV,
+              …), bounded by size alone. Shared by both attach affordances above. */}
+          <input ref={fileInputRef} type="file" hidden onChange={onPickFile} />
         </>
       )}
+      {/* Jump back to the live tail — the iPad counterpart to the phone shell's
+          pill (MobileShell renders its own). A tablet takes the desktop shell but
+          has no wheel or scrollbar, so this is its only way home from a scroll.
+          Outside the `live` gate above: a replay's scrollback scrolls away too. */}
+      {isTouch && !isPhone && scrolledAway && (
+        <button
+          type="button"
+          className="term-jump"
+          onClick={() => handleRef.current?.scrollToEnd()}
+          aria-label={i18n.t("mobile.jumpToEnd")}
+          title={i18n.t("mobile.jumpToEnd")}
+        />
+      )}
+      {pasteSheet && <PasteSheet onSubmit={submitPaste} onClose={closePasteSheet} />}
       {pasteStatus && (
         <div className={`paste-status paste-status--${pasteStatus.kind}`} role="status">
           {pasteStatus.msg}

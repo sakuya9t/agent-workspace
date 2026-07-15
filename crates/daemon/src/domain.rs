@@ -131,6 +131,26 @@ pub struct Session {
     /// Launched with a guardrail-disabling agent flag (e.g. skip-permissions /
     /// bypass-sandbox). Surfaced as a risk badge in the UI.
     pub risky: bool,
+    /// The agent's *own* conversation id (Claude's `sessionId`, Codex's rollout
+    /// uuid), captured while the session is alive and never re-derived. A fork
+    /// that keeps the same agent resumes this conversation natively.
+    ///
+    /// Captured live rather than at fork time on purpose: the transcript-matching
+    /// heuristics in [`crate::plugins::usage`] are "newest file in the directory"
+    /// and are fragile enough that two sessions sharing a cwd can collapse onto
+    /// one transcript. Reporting the wrong token count is survivable; *resuming
+    /// the wrong conversation* is not.
+    ///
+    /// Kept off the wire: it addresses a conversation on this host and no client
+    /// has a use for it. The API exposes the one fact a client *does* need —
+    /// `has_agent_conversation` — so the fork dialog can say whether a fork will
+    /// carry the whole conversation or a summary of it.
+    #[serde(skip_serializing, default)]
+    pub agent_session_id: Option<String>,
+    /// Origin session id when this session was forked from another. `None` for a
+    /// session started from scratch. Gives the UI a lineage, including a chain
+    /// when a fork is itself forked.
+    pub forked_from: Option<String>,
 }
 
 /// An enrolled client device. The `token` is the bearer credential and is
@@ -192,6 +212,16 @@ pub struct WorkspaceInstance {
     /// "active" | "released"
     pub status: String,
     pub created_at: i64,
+    /// Whether we created `path` and may remove it when the last session there
+    /// is archived. False when the session joined a worktree that already
+    /// existed — the user's own checkout is not ours to reclaim.
+    #[serde(default)]
+    pub owns_worktree: bool,
+    /// Whether we created `branch` and may delete it on archive. False when the
+    /// session was handed a branch that already existed (`main`, `release`, a
+    /// feature branch): we only borrowed it, and archiving must leave it intact.
+    #[serde(default)]
+    pub owns_branch: bool,
 }
 
 /// Structural session summary written on exit / segment boundary.

@@ -165,13 +165,16 @@ body.col-resizing iframe {
 .terminal-mount {
   width: 100%;
   height: 100%;
-  /* Terminal scrolling is driven from JS (see the touch handler in Terminal.tsx),
-     so keep the browser from starting its own touch gesture — native pan/zoom or
-     a page-level pull-to-refresh/overscroll bounce — on a swipe over the grid. */
+  /* Every touch gesture over the grid is ours (see the pointer handlers in
+     Terminal.tsx: drag scrolls, long-press selects), so keep the browser from
+     starting one of its own — native pan/zoom, a page-level pull-to-refresh or
+     overscroll bounce, or iOS's long-press callout, which would race the
+     long-press-to-select. */
   touch-action: none;
   overscroll-behavior: contain;
+  -webkit-touch-callout: none;
 }
-/* Transient image-paste status, floated over the terminal's top-right. */
+/* Transient attachment-upload status, floated over the terminal's top-right. */
 .paste-status {
   position: absolute;
   top: 8px;
@@ -197,11 +200,19 @@ body.col-resizing iframe {
   color: var(--danger, #e5484d);
 }
 /* Floating attach-image button; the primary paste affordance on touch. */
-.term-attach {
+/* Floating action row over the terminal's bottom-right corner: [copy] [paste]
+   📎, the clipboard pair only on touch (see Terminal.tsx). The row owns the
+   positioning so buttons can be added without re-deriving offsets. */
+.term-actions {
   position: absolute;
   bottom: 10px;
   right: 14px;
   z-index: 5;
+  display: flex;
+  gap: 6px;
+}
+.term-attach,
+.term-act {
   width: 30px;
   height: 30px;
   display: flex;
@@ -213,14 +224,189 @@ body.col-resizing iframe {
   cursor: pointer;
   border: 1px solid var(--border);
   background: var(--panel-2);
+  /* A button does NOT inherit `color`, and ⧉ is a monochrome glyph: without this
+     it renders in the UA's default black and vanishes into the dark terminal.
+     The emoji beside it are colour fonts, so the bug hits only this one icon. */
+  color: var(--text);
   opacity: 0.5;
   transition: opacity 0.15s ease;
 }
 .term-attach::before {
   content: "📎";
 }
-.term-attach:hover {
+.term-copy::before {
+  content: "⧉";
+  font-size: 19px; /* the geometric glyph draws smaller than the emoji beside it */
+}
+.term-paste::before {
+  content: "📋";
+}
+.term-attach:hover,
+.term-act:hover {
   opacity: 1;
+}
+/* Touch has no hover to reveal these with, and a 50%-faded control reads as
+   disabled — the one place the terminal's chrome should be plainly visible. */
+@media (pointer: coarse) {
+  .term-attach,
+  .term-act {
+    opacity: 0.85;
+  }
+}
+
+/* "Jump to latest" — floats over the terminal only while the view is scrolled
+   away from the live tail, the way a chat app's jump-to-newest does. Rendered by
+   both shells (MobileShell's pill, and TerminalView's own for iPad): a touch
+   device has no wheel and no scrollbar, so the tap is its only way home. Centred,
+   so it never lands under the bottom-right 📎 attach button. Anchors to the
+   `position: relative` parent — `.mobile-term-body` on phone, `.terminal-host`
+   on iPad. */
+.term-jump {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  font-size: 18px;
+  line-height: 1;
+  border-radius: 50%;
+  cursor: pointer;
+  color: var(--text);
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  box-shadow: 0 2px 10px rgb(0 0 0 / 45%);
+}
+.term-jump::before {
+  content: "↓";
+}
+.term-jump:active {
+  background: var(--panel);
+}
+
+/* iPad control panel (TermControlPanel.tsx) — the collapsible corner stand-in
+   for the phone's docked key bar. Collapsed: a lone toggle in the terminal's
+   bottom-right corner. Expanded: the full key grid, growing up and left from
+   that corner so it stays anchored and never runs off-screen. Both anchor to the
+   `position: relative` .terminal-host. */
+.term-panel-toggle {
+  position: absolute;
+  bottom: 10px;
+  right: 14px;
+  z-index: 6;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  line-height: 1;
+  border-radius: 10px;
+  cursor: pointer;
+  color: var(--text);
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  box-shadow: 0 2px 10px rgb(0 0 0 / 45%);
+}
+.term-panel-toggle::before {
+  content: "⌨";
+}
+.term-panel-toggle:active {
+  background: var(--panel);
+}
+.term-panel {
+  position: absolute;
+  bottom: 10px;
+  right: 14px;
+  z-index: 6;
+  max-width: min(92%, 360px);
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 8px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  box-shadow: 0 4px 18px rgb(0 0 0 / 50%);
+}
+.term-panel .kb {
+  flex: none;
+  min-width: 40px;
+  height: 38px;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  line-height: 1;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+  touch-action: manipulation;
+}
+.term-panel .kb:active {
+  background: var(--accent-2);
+}
+/* Ctrl latch: armed (outlined) vs locked (filled) — mirrors the phone key bar. */
+.term-panel .kb.on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.term-panel .kb.locked {
+  background: var(--accent-2);
+  color: var(--accent);
+}
+.term-panel .kb.up::before {
+  content: "↑";
+}
+.term-panel .kb.down::before {
+  content: "↓";
+}
+.term-panel .kb.left::before {
+  content: "←";
+}
+.term-panel .kb.right::before {
+  content: "→";
+}
+.term-panel .kb.kbd::before {
+  content: "⌨";
+  font-size: 16px;
+}
+.term-panel .kb.attach::before {
+  content: "📎";
+  font-size: 15px;
+}
+.term-panel-close {
+  flex: none;
+  width: 40px;
+  height: 38px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  line-height: 1;
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--text);
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+}
+.term-panel-close::before {
+  content: "✕";
+}
+.term-panel-close:active {
+  background: var(--accent-2);
 }
 
 /* sessions */
@@ -248,6 +434,67 @@ body.col-resizing iframe {
 }
 .session-agent {
   font-weight: 600;
+}
+.session-title {
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.info-btn {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--dim);
+  font-family: Georgia, "Times New Roman", serif;
+  font-style: italic;
+  font-size: 10px;
+  line-height: 1;
+  cursor: help;
+}
+/* The glyph lives in CSS so the button carries no untranslatable text node. */
+.info-btn::before {
+  content: "i";
+}
+.info-btn:hover {
+  color: var(--text);
+  border-color: var(--dim);
+}
+.info-pop {
+  position: fixed;
+  z-index: 1000;
+  min-width: 200px;
+  max-width: min(320px, 88vw);
+  padding: 8px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  font-size: 12px;
+  cursor: default;
+}
+.info-pop .info-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 2px 0;
+}
+.info-pop .info-row > span:first-child {
+  flex: none;
+  color: var(--dim);
+}
+.info-pop .info-row .mono {
+  text-align: right;
+  word-break: break-all;
+  user-select: text;
 }
 .attn-badge {
   margin-left: auto;
@@ -329,9 +576,6 @@ body.col-resizing iframe {
 }
 .tree-node.lvl2 {
   padding-left: 34px;
-}
-.tree-node.lvl2 .tree-add {
-  margin-left: auto;
 }
 .error-line {
   color: #f7768e;
@@ -623,8 +867,19 @@ body.col-resizing iframe {
      squeezed does the label itself start to ellipsize. */
   flex-shrink: 100;
 }
-.tree-badge {
+/* The trailing controls — count badge, “+”, “×” — ride as one right-aligned
+   group. They must not each claim `margin-left: auto`: flexbox splits the free
+   space evenly between every auto margin, so the gaps between them would open
+   and close with the length of the label beside them. One auto margin on the
+   group keeps the buttons at a fixed offset from the panel's right edge. */
+.tree-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   margin-left: auto;
+  flex: none;
+}
+.tree-badge {
   background: var(--accent-2);
   color: var(--text);
   border-radius: 10px;
@@ -643,23 +898,19 @@ body.col-resizing iframe {
   cursor: pointer;
   flex: none;
 }
-.tree-node.lvl1 .tree-badge + .tree-add {
-  margin-left: 6px;
-}
-.tree-node.lvl1 .tree-add {
-  margin-left: auto;
-}
 .tree-add:hover {
   border-color: var(--accent);
   color: var(--text);
 }
+/* Shares .tree-add's box so the host row's controls form one even trio with the
+   workspace rows' “+”/“×”. Like every other action icon, it pictures what the
+   click does — a broken link to disconnect, a joined one to connect — not the
+   state it is in; the row's own subtitle already says DISCONNECTED. */
 .conn-toggle {
-  margin-left: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex: none;
-}
-/* When disconnected there is no badge/“+”, so right-align the connect button. */
-.tree-branch.disconnected .conn-toggle {
-  margin-left: auto;
 }
 .tree-branch.disconnected .tree-label,
 .tree-branch.disconnected .tree-sub,
@@ -828,6 +1079,16 @@ body.col-resizing iframe {
 .section-title.with-branch > span:first-child {
   flex: none;
 }
+.branch-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+}
+.branch-attachment-btn {
+  flex: none;
+}
 
 /* misc */
 .empty {
@@ -845,6 +1106,17 @@ body.col-resizing iframe {
   color: #f7768e;
   padding: 8px 12px;
   font-size: 12px;
+}
+/* A consequence the user chose but should not miss — e.g. forking onto a live
+   session's own branch, where two agents end up editing one directory. Orange,
+   not red: nothing has gone wrong, but it can. */
+.warn {
+  color: #ff9e64;
+  border-left: 2px solid #ff9e64;
+  background: rgba(255, 158, 100, 0.08);
+  padding: 6px 10px;
+  margin: 6px 0;
+  border-radius: 3px;
 }
 .dim {
   color: var(--dim);
@@ -1041,6 +1313,76 @@ body.col-resizing iframe {
   opacity: 0.5;
   cursor: not-allowed;
 }
+.action-icon {
+  display: block;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  background: currentColor;
+  mask-position: center;
+  mask-repeat: no-repeat;
+  mask-size: contain;
+  -webkit-mask-position: center;
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-size: contain;
+}
+.action-icon-stop {
+  mask-image: url("/icons/actions/stop.png");
+  -webkit-mask-image: url("/icons/actions/stop.png");
+}
+.action-icon-archive {
+  mask-image: url("/icons/actions/archive.png");
+  -webkit-mask-image: url("/icons/actions/archive.png");
+}
+.action-icon-save-transcript {
+  mask-image: url("/icons/actions/save-transcript.png");
+  -webkit-mask-image: url("/icons/actions/save-transcript.png");
+}
+/* Fork: a branch splitting off a line of work. Inline SVG rather than a PNG like
+   its neighbours only because the hand-drawn set has no fork glyph yet — it masks
+   to currentColor identically, and a matching PNG can drop in here later.
+   (`recover-session.png` sits unused in the icon folder: it is a restore arrow,
+   drawn for the recovery feature, and reads wrong for a fork.) */
+.action-icon-fork {
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='4' cy='3' r='1.7'/%3E%3Ccircle cx='4' cy='13' r='1.7'/%3E%3Ccircle cx='12' cy='3' r='1.7'/%3E%3Cpath d='M4 4.7v6.6'/%3E%3Cpath d='M12 4.7v1.6a3 3 0 0 1-3 3H4'/%3E%3C/svg%3E");
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='4' cy='3' r='1.7'/%3E%3Ccircle cx='4' cy='13' r='1.7'/%3E%3Ccircle cx='12' cy='3' r='1.7'/%3E%3Cpath d='M4 4.7v6.6'/%3E%3Cpath d='M12 4.7v1.6a3 3 0 0 1-3 3H4'/%3E%3C/svg%3E");
+}
+.action-icon-git-merge {
+  mask-image: url("/icons/actions/git-merge.png");
+  -webkit-mask-image: url("/icons/actions/git-merge.png");
+}
+.action-icon-git-rebase {
+  mask-image: url("/icons/actions/git-rebase.png");
+  -webkit-mask-image: url("/icons/actions/git-rebase.png");
+}
+.action-icon-git-fetch {
+  mask-image: url("/icons/actions/git-fetch.png");
+  -webkit-mask-image: url("/icons/actions/git-fetch.png");
+}
+.action-icon-git-pull {
+  mask-image: url("/icons/actions/git-pull.png");
+  -webkit-mask-image: url("/icons/actions/git-pull.png");
+}
+.action-icon-git-push {
+  mask-image: url("/icons/actions/git-push.png");
+  -webkit-mask-image: url("/icons/actions/git-push.png");
+}
+.action-icon-git-attach {
+  mask-image: url("/icons/actions/git-attach.png");
+  -webkit-mask-image: url("/icons/actions/git-attach.png");
+}
+.action-icon-git-detach {
+  mask-image: url("/icons/actions/git-detach.png");
+  -webkit-mask-image: url("/icons/actions/git-detach.png");
+}
+.action-icon-connect-daemon {
+  mask-image: url("/icons/actions/connect-daemon.png");
+  -webkit-mask-image: url("/icons/actions/connect-daemon.png");
+}
+.action-icon-disconnect-daemon {
+  mask-image: url("/icons/actions/disconnect-daemon.png");
+  -webkit-mask-image: url("/icons/actions/disconnect-daemon.png");
+}
 .rebase-picker {
   display: flex;
   flex-wrap: wrap;
@@ -1086,27 +1428,91 @@ body.col-resizing iframe {
 .rebase-picker-row .btn {
   flex: none;
 }
-.scm-op-result {
-  white-space: pre-wrap;
-  word-break: break-word;
-  margin: 4px 0;
-  padding: 6px 8px;
-  background: var(--panel-2);
-  border-radius: 6px;
-  line-height: 1.4;
-}
 .scm-op-notice {
+  position: relative;
   display: flex;
   align-items: flex-start;
   gap: 8px;
+  margin: 8px 0;
+  padding: 9px 30px 9px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: 6px;
+  color: var(--text);
 }
-.scm-op-text {
+.scm-op-success {
+  border-left-color: #9ece6a;
+}
+.scm-op-error {
+  border-left-color: #f7768e;
+}
+.scm-op-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  margin-top: 1px;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+.scm-op-success .scm-op-status {
+  color: #9ece6a;
+}
+.scm-op-error .scm-op-status {
+  color: #f7768e;
+}
+.scm-op-copy {
   flex: 1;
   min-width: 0;
 }
+.scm-op-title {
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+.scm-op-summary {
+  margin-top: 2px;
+  color: var(--dim);
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.scm-op-details {
+  margin-top: 6px;
+}
+.scm-op-details summary {
+  width: fit-content;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 11px;
+  user-select: none;
+}
+.scm-op-details pre {
+  max-height: 180px;
+  margin: 7px 0 0;
+  padding: 7px 8px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Cascadia Code", monospace;
+  font-size: 11px;
+  line-height: 1.45;
+}
 .scm-op-dismiss {
+  position: absolute;
+  top: 7px;
+  right: 7px;
   flex: none;
-  margin: -1px -2px 0 0;
   padding: 0 3px;
   background: none;
   border: none;
@@ -1129,6 +1535,69 @@ body.col-resizing iframe {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.branch-controls .branch-pill {
+  flex: 1;
+}
+/* where the branch sits: each remote's tip for it, and the commit it is based on */
+.scm-refs {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 2px 0 8px;
+}
+.scm-ref {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+}
+.ref-tag {
+  flex: none;
+  max-width: 90px;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--panel-2);
+  color: var(--dim);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ref-tag.upstream {
+  border-color: var(--accent-2);
+  color: var(--accent);
+}
+.ref-tag.base {
+  border-style: dashed;
+}
+.ref-hash {
+  flex: none;
+  font-size: 11px;
+}
+.ref-note {
+  min-width: 0;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ref-counts {
+  display: flex;
+  flex: none;
+  gap: 5px;
+  margin-left: auto;
+  padding-left: 4px;
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+}
+.ref-count.ahead {
+  color: #9ece6a;
+}
+.ref-count.behind {
+  color: #e0af68;
 }
 .changed-file {
   display: flex;
@@ -1238,6 +1707,16 @@ body.col-resizing iframe {
   font-weight: 600;
   color: var(--accent);
   border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 0 4px;
+  vertical-align: 1px;
+}
+.base-pill {
+  margin-left: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--dim);
+  border: 1px dashed var(--dim);
   border-radius: 4px;
   padding: 0 4px;
   vertical-align: 1px;
@@ -1672,7 +2151,6 @@ body.col-resizing iframe {
   padding: 6px;
   background: #0b0e14;
 }
-
 /* Details sheet — RightPanel over the still-mounted terminal. */
 .details-sheet-backdrop {
   position: fixed;
@@ -1914,4 +2392,60 @@ body.col-resizing iframe {
 .term-keybar .kb.kbd::before {
   content: "⌨";
   font-size: 16px;
+}
+
+/* Paste target for contexts with no clipboard read (see PasteSheet.tsx). */
+.paste-sheet {
+  width: 420px;
+}
+.paste-sheet-input {
+  width: 100%;
+  padding: 8px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  resize: none;
+}
+.paste-sheet-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* Touch-gesture tracer (`?gesturelog=1`, see gestureLog.ts). Debug-only, and it
+   must not become part of the gesture it watches: the panel ignores touches, so a
+   press falls through to the terminal underneath it, and only the copy chip takes
+   one. */
+.gesture-log {
+  position: fixed;
+  inset: auto 0 0 0;
+  z-index: 9999;
+  max-height: 42vh;
+  overflow: hidden;
+  padding: 4px 6px;
+  background: rgba(0, 0, 0, 0.82);
+  border-top: 1px solid var(--accent);
+  pointer-events: none;
+}
+.gesture-log-lines {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px;
+  line-height: 1.35;
+  color: #7fe3c0;
+  white-space: pre;
+}
+.gesture-log-copy {
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  padding: 4px 10px;
+  font-size: 11px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  pointer-events: auto;
 }

@@ -202,6 +202,18 @@ pub async fn branches(
     Ok(Json(json!({ "branches": branches, "head": head })))
 }
 
+/// Refresh every remote's tracking refs, so the remote commits the panel shows
+/// are current rather than as-of-the-last-fetch. Changes no branch.
+pub async fn fetch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let cwd = session_cwd(&state, &id).await?;
+    let scm = state.scm.clone();
+    let output = run_blocking(move || scm.fetch(&cwd)).await?;
+    Ok(Json(json!({ "output": output })))
+}
+
 /// Fast-forward-only pull of the session's current branch.
 pub async fn pull(
     State(state): State<AppState>,
@@ -211,6 +223,45 @@ pub async fn pull(
     let scm = state.scm.clone();
     let output = run_blocking(move || scm.pull(&cwd)).await?;
     Ok(Json(json!({ "output": output })))
+}
+
+/// Push the session's current branch to origin, creating the remote branch when
+/// it doesn't exist yet.
+pub async fn push(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let cwd = session_cwd(&state, &id).await?;
+    let scm = state.scm.clone();
+    let output = run_blocking(move || scm.push(&cwd)).await?;
+    Ok(Json(json!({ "output": output })))
+}
+
+async fn set_branch_attached(
+    state: AppState,
+    id: String,
+    attached: bool,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let manager = state.manager.clone();
+    let branch = run_blocking(move || manager.set_instance_branch_attached(&id, attached)).await?;
+    Ok(Json(json!({ "branch": branch, "attached": attached })))
+}
+
+/// Release the session worktree's branch so another worktree can check it out.
+/// The session stays at the exact same commit with all local changes intact.
+pub async fn detach_branch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    set_branch_attached(state, id, false).await
+}
+
+/// Reclaim the session's recorded branch after the other checkout releases it.
+pub async fn attach_branch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    set_branch_attached(state, id, true).await
 }
 
 #[derive(Debug, Deserialize)]

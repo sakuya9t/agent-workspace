@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Query, State};
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -12,8 +12,8 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
 use crate::config::Config;
-use crate::plugins::current_platform;
-use crate::session_manager::{CreateSessionRequest, SessionManager};
+use crate::plugins::{current_platform, PluginModels};
+use crate::session_manager::{CreateSessionRequest, ForkRequest, SessionManager};
 use crate::source_control::SourceControl;
 use crate::util::now_millis;
 
@@ -53,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/devices/:id/revoke", post(auth::revoke_device))
         .route("/api/fs/list", get(fs::list))
         .route("/api/plugins", get(list_plugins))
+        .route("/api/plugins/:id/models", get(list_plugin_models))
         .route("/api/workspaces", get(list_workspaces).post(add_workspace))
         .route("/api/workspaces/:id", delete(remove_workspace))
         .route("/api/workspaces/:id/init-git", post(init_workspace_git))
@@ -64,8 +65,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:id", get(get_session))
         .route("/api/sessions/:id/summary", get(get_summary))
+        .route("/api/sessions/:id/transcript", get(get_transcript))
         .route("/api/sessions/:id/usage", get(get_session_usage))
         .route("/api/sessions/:id/workspace", get(get_session_workspace))
+        .route("/api/sessions/:id/fork", post(fork_session))
         .route("/api/sessions/:id/stop", post(stop_session))
         .route("/api/sessions/:id/archive", post(archive_session))
         .route("/api/sessions/:id/cleanup", post(cleanup_instance))
@@ -87,7 +90,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/:id/scm/log", get(scm::log))
         .route("/api/sessions/:id/scm/commit", get(scm::commit))
         .route("/api/sessions/:id/scm/branches", get(scm::branches))
+        .route("/api/sessions/:id/scm/fetch", post(scm::fetch))
         .route("/api/sessions/:id/scm/pull", post(scm::pull))
+        .route("/api/sessions/:id/scm/push", post(scm::push))
+        .route("/api/sessions/:id/scm/detach-branch", post(scm::detach_branch))
+        .route("/api/sessions/:id/scm/attach-branch", post(scm::attach_branch))
         .route("/api/sessions/:id/scm/rebase", post(scm::rebase))
         .route("/api/sessions/:id/scm/merge", post(scm::merge));
 
@@ -98,13 +105,62 @@ pub fn router(state: AppState) -> Router {
         }
     }
 
-    // Auth runs inside CORS so preflight is handled before token checks.
+    // Innermost first: the reconcile gate runs *after* auth (an unauthenticated
+    // request must be rejected, not parked), and auth runs inside CORS so
+    // preflight is handled before token checks.
     app.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        await_startup_reconcile,
+    ))
+    .layer(axum::middleware::from_fn_with_state(
         state.clone(),
         crate::auth::require_auth,
     ))
     .layer(CorsLayer::permissive())
     .with_state(state)
+}
+
+/// How long a live-session request will wait for the startup reconcile pass
+/// before giving up and running anyway. Adoption of a large session set takes
+/// seconds; this is the backstop for a holder that never answers, so the request
+/// fails its own honest way instead of hanging forever.
+const READY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Session sub-resources that resolve a *live* backend handle, and so mean
+/// nothing until the startup reconcile pass has adopted the survivors.
+const LIVE_ROUTES: [&str; 4] = ["stream", "stop", "resize", "paste"];
+
+fn needs_live_session(path: &str) -> bool {
+    path.strip_prefix("/api/sessions/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(_, sub)| LIVE_ROUTES.contains(&sub))
+}
+
+/// Park requests that need a live session until adoption has run.
+///
+/// The listener binds before the reconcile pass, so for the first seconds after
+/// a restart a surviving session is `running` in the DB but not yet in `live`.
+/// Attaching in that window would otherwise be served the read-only history
+/// path — a live agent that looks dead. Everything else (`/health`, the session
+/// list, auth) answers immediately, which is the whole point of binding early.
+async fn await_startup_reconcile(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if needs_live_session(req.uri().path()) && !state.manager.is_ready() {
+        tracing::debug!(path = %req.uri().path(), "waiting for startup reconcile");
+        if tokio::time::timeout(READY_WAIT, state.manager.wait_until_ready())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                path = %req.uri().path(),
+                "startup reconcile still running after {READY_WAIT:?}; serving anyway"
+            );
+        }
+    }
+    next.run(req).await
 }
 
 // ---------- handlers ----------
@@ -121,6 +177,9 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "database": "ok",
         "backend": state.manager.backend_id(),
         "active_sessions": state.manager.live_count(),
+        // Up and serving, but still adopting the sessions the previous daemon
+        // left running — `active_sessions` is still climbing toward the truth.
+        "reconciling": !state.manager.is_ready(),
     }))
 }
 
@@ -140,6 +199,25 @@ fn hostname() -> String {
 
 async fn list_plugins(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({ "plugins": state.manager.registry().describe() }))
+}
+
+/// The models a client can pick for one agent, for the new-session / fork
+/// dropdown. Kept off `/api/plugins` because it can be slow — opencode shells out
+/// to `opencode models` — so it is only paid when the dialog needs it. Runs on a
+/// blocking thread for the same reason.
+async fn list_plugin_models(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let plugin = state
+        .manager
+        .registry()
+        .get(&id)
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, format!("unknown agent plugin `{id}`")))?;
+    let models = tokio::task::spawn_blocking(move || PluginModels::describe(plugin.as_ref()))
+        .await
+        .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("models task: {e}")))?;
+    Ok(Json(json!({ "models": models })))
 }
 
 async fn list_workspaces(
@@ -236,22 +314,53 @@ async fn cleanup_instance(
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
-    // Augment each session with `attached` (is a live client currently on it?)
-    // so the UI can prompt for takeover instead of silently stealing it.
-    let sessions: Vec<serde_json::Value> = state
-        .manager
-        .list_sessions()?
-        .iter()
-        .map(|s| with_attached(s, &state))
-        .collect();
+    // `session_json` reads agent files on a title-cache miss — keep the whole
+    // enrichment off the async runtime.
+    let sessions: Vec<serde_json::Value> = tokio::task::spawn_blocking(move || {
+        Ok::<_, anyhow::Error>(
+            state
+                .manager
+                .list_sessions()?
+                .iter()
+                .map(|s| session_json(s, &state))
+                .collect(),
+        )
+    })
+    .await
+    .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("list task: {e}")))??;
     Ok(Json(json!({ "sessions": sessions })))
 }
 
-/// Serialize a session and add the runtime `attached` flag.
-fn with_attached(s: &crate::domain::Session, state: &AppState) -> serde_json::Value {
+/// Serialize a session plus what the list view derives at read time: `attached`
+/// (is a live client currently on it? — so the UI can prompt for takeover
+/// instead of silently stealing it), the agent's own `title` for the session,
+/// and the `branch` its workspace instance holds. Blocking: a title-cache miss
+/// reads the agent's transcript.
+fn session_json(s: &crate::domain::Session, state: &AppState) -> serde_json::Value {
     let mut v = serde_json::to_value(s).unwrap_or_else(|_| json!({}));
     if let Some(obj) = v.as_object_mut() {
         obj.insert("attached".into(), json!(state.attachments.is_attached(&s.id)));
+        let title = state.manager.registry().get(&s.agent_plugin_id).and_then(|p| {
+            p.title(&crate::plugins::usage::TranscriptContext {
+                cwd: std::path::PathBuf::from(&s.working_directory),
+                started_at_ms: s.created_at,
+            })
+        });
+        obj.insert("title".into(), json!(title));
+        let branch = state
+            .manager
+            .get_instance_for_session(&s.id)
+            .ok()
+            .flatten()
+            .and_then(|i| i.branch);
+        obj.insert("branch".into(), json!(branch));
+        // Whether this session's agent kept a conversation we could resume. A fork
+        // that keeps the same agent then carries the whole conversation; anything
+        // else carries a written brief. The id itself stays on the host.
+        obj.insert(
+            "has_agent_conversation".into(),
+            json!(s.agent_session_id.is_some()),
+        );
     }
     v
 }
@@ -286,6 +395,16 @@ struct CreateSessionBody {
     base_ref: Option<String>,
     #[serde(default)]
     options: HashMap<String, bool>,
+    /// Model override; omit to start with the agent's own configured default.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// Treat an empty or whitespace-only model string as "no override" — the client's
+/// "Default" dropdown entry sends `""`, which must launch with no model flag
+/// rather than pass an empty `--model` to the agent.
+fn normalize_model(model: Option<String>) -> Option<String> {
+    model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty())
 }
 
 async fn create_session(
@@ -307,8 +426,57 @@ async fn create_session(
         create_branch: body.create_branch,
         base_ref: body.base_ref,
         options: body.options.into_iter().collect(),
+        model: normalize_model(body.model),
+        fork: None,
     };
     let session = state.manager.create_session(req)?;
+    Ok(Json(json!({ "session": session })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ForkSessionBody {
+    /// The agent to fork into — the origin's own, or a different one.
+    agent_plugin_id: String,
+    /// Continue on the origin's branch, in its worktree, instead of branching off
+    /// it. Safe once the origin has stopped; while it is still running, this puts
+    /// two agents in one directory and the client is expected to have warned.
+    #[serde(default)]
+    same_branch: bool,
+    #[serde(default)]
+    options: HashMap<String, bool>,
+    /// Model override for the fork; omit to use the target agent's own default.
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    rows: Option<u16>,
+    #[serde(default)]
+    cols: Option<u16>,
+}
+
+/// Fork a session: a new session on the origin's branch (or one off it), carrying
+/// the origin's context.
+///
+/// `spawn_blocking` is not an optimization here. Forking runs `git worktree add`
+/// and may run an agent CLI headlessly for tens of seconds to write the handoff
+/// brief; on the async runtime that would stall every other request in the daemon
+/// for the duration.
+async fn fork_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ForkSessionBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let req = ForkRequest {
+        agent_plugin_id: body.agent_plugin_id,
+        options: body.options.into_iter().collect(),
+        model: normalize_model(body.model),
+        same_branch: body.same_branch,
+        rows: body.rows.unwrap_or(24),
+        cols: body.cols.unwrap_or(80),
+    };
+    let manager = state.manager.clone();
+    let session = tokio::task::spawn_blocking(move || manager.fork_session(&id, req))
+        .await
+        .map_err(|e| anyhow::anyhow!("fork task panicked: {e}"))??;
     Ok(Json(json!({ "session": session })))
 }
 
@@ -316,8 +484,14 @@ async fn get_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    match state.manager.get_session(&id)? {
-        Some(s) => Ok(Json(json!({ "session": with_attached(&s, &state) }))),
+    // Same blocking enrichment as `list_sessions`.
+    let session = tokio::task::spawn_blocking(move || {
+        Ok::<_, anyhow::Error>(state.manager.get_session(&id)?.map(|s| session_json(&s, &state)))
+    })
+    .await
+    .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("get task: {e}")))??;
+    match session {
+        Some(s) => Ok(Json(json!({ "session": s }))),
         None => Err(AppError(StatusCode::NOT_FOUND, "no such session".into())),
     }
 }
@@ -330,6 +504,103 @@ async fn get_summary(
         Some(s) => Ok(Json(json!({ "summary": s }))),
         None => Err(AppError(StatusCode::NOT_FOUND, "no summary yet".into())),
     }
+}
+
+/// `?format=raw` opts out of the rendered conversation.
+#[derive(Debug, Default, Deserialize)]
+struct TranscriptQuery {
+    format: Option<String>,
+}
+
+/// Download a session's conversation as Markdown, rendered from the agent's own
+/// on-disk transcript (see [`crate::plugins::conversation`]).
+///
+/// This deliberately does *not* serve the recorded PTY stream by default: those
+/// bytes are what a TUI sent a terminal — escape sequences and repainted frames,
+/// tens of MB of them, which no editor renders and no human can read.
+/// `?format=raw` still returns them, because they're the exact bytes replayed on
+/// history attach and that's what you want when debugging replay. Raw is also
+/// the fallback for agents that keep no transcript of their own (a plain shell),
+/// where the PTY bytes *are* the record.
+///
+/// There is no delta — every call returns everything recorded so far (for a live
+/// session, the conversation up to now). Archived sessions have had their bytes
+/// discarded, so nothing is offered for them.
+async fn get_transcript(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<TranscriptQuery>,
+) -> Result<Response, AppError> {
+    let s = state
+        .manager
+        .get_session(&id)?
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "no such session".into()))?;
+    if s.status == crate::domain::SessionStatus::Archived {
+        return Err(AppError(
+            StatusCode::CONFLICT,
+            "transcript unavailable for an archived session".into(),
+        ));
+    }
+
+    if q.format.as_deref() != Some("raw") {
+        // Reads and parses an agent file that can run to hundreds of MB — keep
+        // it off the async runtime.
+        let manager = state.manager.clone();
+        let sess = s.clone();
+        let rendered = tokio::task::spawn_blocking(move || {
+            manager.registry().get(&sess.agent_plugin_id).and_then(|p| {
+                p.conversation(&crate::plugins::usage::TranscriptContext {
+                    cwd: std::path::PathBuf::from(&sess.working_directory),
+                    started_at_ms: sess.created_at,
+                })
+            })
+        })
+        .await
+        .map_err(|e| {
+            AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("transcript task: {e}"))
+        })?;
+
+        if let Some(markdown) = rendered {
+            return Ok(attachment(
+                markdown.into_bytes(),
+                "text/markdown; charset=utf-8",
+                &transcript_filename(&s, "md"),
+            ));
+        }
+    }
+
+    let bytes = state.manager.db().read_events_after(&id, 0)?;
+    Ok(attachment(bytes, "text/plain; charset=utf-8", &transcript_filename(&s, "log")))
+}
+
+/// A file-download response. `no-store` because a live session's transcript
+/// grows under the same URL.
+fn attachment(body: Vec<u8>, content_type: &str, filename: &str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type.to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// A safe download filename for a session's transcript. The session id is a
+/// UUID, but the agent plugin id is free-form, so fold anything outside
+/// `[A-Za-z0-9._-]` to `_` — this both tidies the name and keeps stray bytes
+/// out of the `Content-Disposition` header.
+fn transcript_filename(s: &crate::domain::Session, ext: &str) -> String {
+    let agent: String = s
+        .agent_plugin_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .collect();
+    format!("session-{agent}-{}.{ext}", s.id)
 }
 
 /// Best-effort token/context usage for a session, read from the agent's own
@@ -348,7 +619,7 @@ async fn get_session_usage(
     let manager = state.manager.clone();
     let usage = tokio::task::spawn_blocking(move || {
         manager.registry().get(&s.agent_plugin_id).and_then(|p| {
-            p.usage(&crate::plugins::usage::UsageContext {
+            p.usage(&crate::plugins::usage::TranscriptContext {
                 cwd: std::path::PathBuf::from(&s.working_directory),
                 started_at_ms: s.created_at,
             })
@@ -454,5 +725,36 @@ impl IntoResponse for AppError {
 impl From<anyhow::Error> for AppError {
     fn from(e: anyhow::Error) -> Self {
         AppError(StatusCode::BAD_REQUEST, format!("{e:#}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{needs_live_session, normalize_model};
+
+    #[test]
+    fn normalize_model_treats_blank_as_no_override() {
+        // The client's "Default" dropdown entry sends `""`; it must launch with
+        // no model flag, not an empty `--model`.
+        assert_eq!(normalize_model(None), None);
+        assert_eq!(normalize_model(Some("".into())), None);
+        assert_eq!(normalize_model(Some("   ".into())), None);
+        assert_eq!(normalize_model(Some("  sonnet ".into())).as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn gates_only_the_routes_that_resolve_a_live_handle() {
+        assert!(needs_live_session("/api/sessions/abc/stream"));
+        assert!(needs_live_session("/api/sessions/abc/stop"));
+        assert!(needs_live_session("/api/sessions/abc/resize"));
+        assert!(needs_live_session("/api/sessions/abc/paste"));
+
+        // Pure DB/git reads, and session creation — none of them touch `live`,
+        // so they must not wait on adoption.
+        assert!(!needs_live_session("/api/sessions"));
+        assert!(!needs_live_session("/api/sessions/abc"));
+        assert!(!needs_live_session("/api/sessions/abc/transcript"));
+        assert!(!needs_live_session("/api/sessions/abc/scm/status"));
+        assert!(!needs_live_session("/health"));
     }
 }

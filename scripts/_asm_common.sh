@@ -39,6 +39,7 @@ asm_parse_args() {
       --label)        _need "$1" "${2:-}" || return 2; export ASM_NODE_LABEL="$2"; reconfig=1; shift 2 ;;
       --release)      PROFILE=release; shift ;;
       --relay)        want_relay=1; shift ;;
+      --relay-only)   want_relay=1; export ASM_RELAY_ONLY=1; shift ;;
       --relay-bind)   _need "$1" "${2:-}" || return 2; export ASM_RELAY_BIND="$2"; want_relay=1; shift 2 ;;
       --relay-key)    _need "$1" "${2:-}" || return 2; key="$2"; shift 2 ;;
       --register)     _need "$1" "${2:-}" || return 2; export ASM_RELAY_URL="$2"; reconfig=1; shift 2 ;;
@@ -59,11 +60,13 @@ asm_parse_args() {
     err "--relay needs --relay-key KEY (the access key nodes present)"
     return 2
   fi
-  # Record whether a daemon-affecting override (bind/label/relay registration) was
-  # passed THIS invocation, so start_daemon can re-apply it to an already-running
-  # daemon instead of silently dropping it. Always set fresh — it describes this
-  # command line, not persisted config, so it is never an env fallback.
+  # Record whether a daemon-affecting override (bind/label/relay registration)
+  # or a relay flag was passed THIS invocation, so start_daemon can re-apply the
+  # former to an already-running daemon and the recorded-config loaders know
+  # which components this command line re-specified. Always set fresh — they
+  # describe this command line, not persisted config, never an env fallback.
   export ASM_DAEMON_RECONFIG="$reconfig"
+  export ASM_RELAY_RECONFIG="$want_relay"
   return 0
 }
 
@@ -97,9 +100,12 @@ asm_configure() {
   ASMUX_PIDFILE="$ASM_RUNTIME_DIR/asmux.pid"
   DAEMON_PIDFILE="$ASM_RUNTIME_DIR/asm-daemon.pid"
   # The config signature the running daemon was launched with, so start.sh can
-  # tell when a re-run's flags actually change it (see start_daemon).
+  # tell when a re-run's flags actually change it (see start_daemon), and so a
+  # flagless restart can keep it instead of reverting to defaults.
   DAEMON_STATE_FILE="$ASM_RUNTIME_DIR/asm-daemon.reg"
   RELAY_PIDFILE="$ASM_RUNTIME_DIR/asm-relay.pid"
+  # Same for the bundled relay: bind|keys|relay-only, recorded by start_relay.
+  RELAY_STATE_FILE="$ASM_RUNTIME_DIR/asm-relay.reg"
 
   mkdir -p "$ASM_DATA_DIR" "$ASM_RUNTIME_DIR" "$LOG_DIR"
 }
@@ -139,9 +145,71 @@ wait_health() {
   return 1
 }
 
+# The daemon binds BEFORE it adopts the holder's sessions, so `/health` answers
+# in milliseconds however many survived (that is why the check above can keep a
+# short fuse). Adoption is a serial holder round-trip per session and lands a
+# little later; this waits for it, purely so a script can honestly claim the
+# sessions are back. 60s: adoption is ~1s/session in the worst case seen.
+wait_reconciled() {
+  local i
+  command -v curl >/dev/null 2>&1 || return 0
+  for i in $(seq 1 600); do
+    if curl -sf "http://$ASM_BIND/health" 2>/dev/null | grep -q '"reconciling":false'; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
 # The relay is enabled purely by config (a relay access key is present), never
 # by the daemon binary — it is a shared rendezvous, not a per-daemon sidecar.
 relay_enabled() { [ -n "${ASM_RELAY_KEYS:-}" ]; }
+
+# ── recorded config ────────────────────────────────────────────────────────
+# A flagless start/restart must keep what's running, not silently revert to
+# defaults (a 0.0.0.0 bind dropping back to loopback, a --register vanishing).
+# The launch config of each component is recorded in a .reg file; these loaders
+# re-apply it when THIS invocation's flags didn't re-specify that component.
+#
+# Precedence: flags > recorded config > environment > defaults. The recording
+# deliberately BEATS the environment: a shell inside an asm session inherits the
+# daemon's own resolved ASM_* exports (ASM_BIND & co.), so env values cannot be
+# read as user intent — trusting them made every in-session restart revert to
+# whatever the spawning daemon happened to export. Env still works as a fallback
+# when nothing was recorded (e.g. the first start after boot).
+
+# Daemon side (DAEMON_STATE_FILE: bind|label|register-url|register-key).
+# Any daemon-affecting flag (--bind/--label/--register) re-specifies the daemon
+# config as a whole — fields you don't pass revert to env/defaults. With no such
+# flag, the recording is authoritative, including its empty fields.
+daemon_load_recorded_config() {
+  if [ "${ASM_DAEMON_RECONFIG:-0}" = 1 ]; then return 0; fi
+  local rec bind label url key
+  rec="$(cat "$DAEMON_STATE_FILE" 2>/dev/null || true)"
+  if [ -z "$rec" ]; then return 0; fi
+  IFS='|' read -r bind label url key <<<"$rec" || true
+  if [ -n "$bind" ]; then export ASM_BIND="$bind"; fi
+  if [ -n "$label" ]; then export ASM_NODE_LABEL="$label"; else unset ASM_NODE_LABEL; fi
+  if [ -n "$url" ];   then export ASM_RELAY_URL="$url";     else unset ASM_RELAY_URL; fi
+  if [ -n "$key" ];   then export ASM_RELAY_KEY="$key";     else unset ASM_RELAY_KEY; fi
+}
+
+# Relay side (RELAY_STATE_FILE: bind|keys|relay-only). Skipped whenever a
+# --relay* flag was passed — that re-specifies the relay config as a whole.
+# Relay-only-ness is restored only on a fully flagless run: passing a daemon
+# flag says "I want the daemon here too".
+relay_load_recorded_config() {
+  if [ "${ASM_RELAY_RECONFIG:-0}" = 1 ]; then return 0; fi
+  local rec bind keys only
+  rec="$(cat "$RELAY_STATE_FILE" 2>/dev/null || true)"
+  if [ -z "$rec" ]; then return 0; fi
+  IFS='|' read -r bind keys only <<<"$rec" || true
+  if [ -z "$keys" ]; then return 0; fi
+  export ASM_RELAY_KEYS="$keys"
+  if [ -n "$bind" ]; then export ASM_RELAY_BIND="$bind"; fi
+  if [ "${ASM_DAEMON_RECONFIG:-0}" = 0 ]; then export ASM_RELAY_ONLY="${only:-0}"; fi
+}
 
 wait_relay() {
   local i host key
@@ -168,6 +236,7 @@ start_relay() {
   ASM_RELAY_BIND="$ASM_RELAY_BIND" ASM_RELAY_KEYS="$ASM_RELAY_KEYS" \
     nohup "$RELAY_BIN" >>"$LOG_DIR/asm-relay.log" 2>&1 </dev/null &
   echo $! > "$RELAY_PIDFILE"
+  printf '%s|%s|%s' "$ASM_RELAY_BIND" "$ASM_RELAY_KEYS" "${ASM_RELAY_ONLY:-0}" > "$RELAY_STATE_FILE"
   if wait_relay; then
     log "relay up (pid $(cat "$RELAY_PIDFILE"))  http://$ASM_RELAY_BIND"
   else
@@ -178,11 +247,41 @@ start_relay() {
 
 # Start the holder (idempotent). It runs detached (nohup) so it outlives the
 # daemon — that is what makes sessions durable across a daemon restart.
+# Does a LIVE holder answer on the socket? This is the only check that means
+# anything: a pid can be alive while the socket is gone (an "orphan" — the holder
+# still holds PTYs but nothing can dial it). Gating on pid alone is what let the
+# 2026-07-12 incident wedge the stack; `asmux probe` exits 0 only if someone answers.
+holder_live() {
+  [ -x "$ASMUX_BIN" ] || return 1
+  ASMUX_SOCK="$ASMUX_SOCK" ASM_RUNTIME_DIR="$ASM_RUNTIME_DIR" \
+    "$ASMUX_BIN" probe >/dev/null 2>&1
+}
+
 start_asmux() {
-  if pid_alive "$ASMUX_PIDFILE"; then
-    log "asmux already running (pid $(cat "$ASMUX_PIDFILE"))"
+  if holder_live; then
+    log "asmux already running (pid $(cat "$ASMUX_PIDFILE" 2>/dev/null || echo '?'))"
     return 0
   fi
+
+  # Pid alive but nobody answering = an orphaned holder: its socket was unlinked
+  # out from under it. asmux now rebinds itself within ~5s, so give it a moment
+  # before concluding anything.
+  if pid_alive "$ASMUX_PIDFILE"; then
+    local p i
+    p="$(cat "$ASMUX_PIDFILE")"
+    log "asmux (pid $p) is alive but not answering on $ASMUX_SOCK — waiting for it to rebind..."
+    for i in $(seq 1 20); do
+      sleep 0.5
+      if holder_live; then log "asmux recovered its socket (pid $p) — sessions intact"; return 0; fi
+    done
+    err "asmux (pid $p) is ORPHANED: alive, holding live PTYs, but unreachable — its socket path"
+    err "is owned by something else, or rebinding failed. Its sessions CANNOT be attached, and"
+    err "killing it will lose them. Inspect first:  $LOG_DIR/asmux.log"
+    err "To force a clean holder anyway (THIS KILLS ITS SESSIONS):"
+    err "    kill $p && scripts/start.sh"
+    return 1
+  fi
+
   [ -x "$ASMUX_BIN" ] || { err "missing $ASMUX_BIN — build first (cargo build -p asmux)"; return 1; }
   log "starting asmux holder..."
   ASM_RUNTIME_DIR="$ASM_RUNTIME_DIR" ASMUX_SOCK="$ASMUX_SOCK" \

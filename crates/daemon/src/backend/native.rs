@@ -8,7 +8,10 @@ use parking_lot::Mutex;
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use tokio::sync::{broadcast, watch};
 
-use super::{BackendSession, BackendSpawnSpec, BackendStatus, SessionBackend, Snapshot};
+use super::{
+    BackendSession, BackendSpawnSpec, BackendStatus, HistoryRing, SessionBackend, Snapshot,
+    HISTORY_RING_BYTES,
+};
 use crate::db::{EventMsg, EventSink};
 use crate::util::now_millis;
 
@@ -84,10 +87,12 @@ impl SessionBackend for NativePtyBackend {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(
             spec.rows, spec.cols, SCROLLBACK,
         )));
+        let history = Arc::new(Mutex::new(HistoryRing::new(HISTORY_RING_BYTES)));
         let seq = Arc::new(AtomicU64::new(0));
 
         let session = Arc::new(NativeSession {
             parser: parser.clone(),
+            history: history.clone(),
             tx: tx.clone(),
             writer: Mutex::new(writer),
             master: Mutex::new(pair.master),
@@ -103,7 +108,7 @@ impl SessionBackend for NativePtyBackend {
         std::thread::Builder::new()
             .name(format!("asm-pty-{}", short(&session_id)))
             .spawn(move || {
-                reader_loop(reader, parser, tx, events, session_id, seq, status_tx, child);
+                reader_loop(reader, parser, history, tx, events, session_id, seq, status_tx, child);
             })
             .context("spawning pty reader thread")?;
 
@@ -113,6 +118,7 @@ impl SessionBackend for NativePtyBackend {
 
 struct NativeSession {
     parser: Arc<Mutex<vt100::Parser>>,
+    history: Arc<Mutex<HistoryRing>>,
     tx: broadcast::Sender<Arc<[u8]>>,
     writer: Mutex<Box<dyn Write + Send>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -123,9 +129,10 @@ struct NativeSession {
 
 impl BackendSession for NativeSession {
     fn attach(&self) -> (Snapshot, broadcast::Receiver<Arc<[u8]>>) {
-        // The reader processes+broadcasts under the emulator lock the helper
-        // holds, so the receiver starts exactly where the snapshot ends.
-        super::attach_with_history(&self.parser, &self.tx, &self.seq)
+        // The reader processes+broadcasts (and pushes the ring) under the locks
+        // the helper holds, so the receiver starts exactly where the snapshot
+        // ends.
+        super::attach_with_history(&self.parser, &self.history, &self.tx, &self.seq)
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -177,6 +184,7 @@ impl BackendSession for NativeSession {
 fn reader_loop(
     mut reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
+    history: Arc<Mutex<HistoryRing>>,
     tx: broadcast::Sender<Arc<[u8]>>,
     events: EventSink,
     session_id: String,
@@ -212,8 +220,17 @@ fn reader_loop(
                         ts_ms: now_millis(),
                         stream: 0,
                         bytes: chunk.to_vec(),
+                        // In-process PTYs never adopt, so no ring cursor to track.
+                        head_cursor: 0,
                     });
-                    let _ = tx.send(arc);
+                    // Push the ring and broadcast under the ring lock so a
+                    // normal-buffer attach (which reads the ring + subscribes
+                    // under that lock) sees a single consistent stream.
+                    {
+                        let mut h = history.lock();
+                        h.push(arc.clone());
+                        let _ = tx.send(arc);
+                    }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,

@@ -1,10 +1,20 @@
 # Durable Sessions via an Out-of-Process Session Holder ("asmux")
 
-Status: **M1–M3 landed; M4–M5 pending.** The standalone holder (`crates/asmux` +
-`crates/asmux-wire`), the daemon-side `SidecarBackend` over an async client, and
-adopt-on-restart are all implemented and tested — sessions survive a daemon
-restart end-to-end (`scripts/durable-restart-test.mjs`). Remaining: M4 hardening
-(watchdog/reconnect, soft-reboot, exact cold-stitch adopt) and M5 Windows.
+Status: **M1–M3 landed; M4 Stage A + B landed; M4 Stage C + M5 pending.** The
+standalone holder (`crates/asmux` + `crates/asmux-wire`), the daemon-side
+`SidecarBackend` over an async client, and adopt-on-restart are all implemented
+and tested — sessions survive a daemon restart end-to-end
+(`scripts/durable-restart-test.mjs`). **M4 Stage A** added the daemon↔asmux
+reconnect supervisor (dial → hello → re-attach → drain, exponential backoff), a
+10 s idle watchdog + heartbeat, in-place backpressure resync, a `list`-reconcile
+after every reconnect, and the `Holder` trait that makes all of it testable.
+**M4 Stage B** made adopt **exact via cold-stitch**: seed `vt100` + the
+raw-history ring from the daemon's SQLite cold history, then
+`attach FromCursor(consumed)` for the un-drained tail, with a visible gap marker
+when the ring wrapped — so a session whose output outgrew the 2 MiB holder ring is
+reconstructed exactly after a restart (proven: the cold-stitch discriminator in
+`durable-restart-test.mjs`). Remaining: M4 **Stage C** (soft-reboot, `purge`,
+metadata RPCs, `readBuffer`, orphan UI, periodic snapshot store) and M5 Windows.
 Adapts the "acmux" design (from the agent-conductor project) to this codebase.
 
 Locked decisions: sidecar crate/binary named **`asmux`**; wire encoding is
@@ -86,6 +96,26 @@ itself is gone (host reboot), live sessions are truly dead → reconcile to
 `indeterminate` (the mid-flight outcome is unknown, not a proven failure — see
 [Reconciliation states](#reconciliation-states)).
 
+### Adoption runs *behind* the listener
+
+That pass is **one serial holder round-trip per session**, so its cost scales
+with how many sessions survived — a restart with 7 live sessions spent 8 s in it.
+It therefore runs **after** the daemon binds its port, not before: boot-to-
+`/health` stays flat no matter how many sessions are being adopted. Doing it the
+other way round meant `/health` did not answer until the last session was
+adopted, and `start.sh`'s 6 s health check pronounced a perfectly healthy daemon
+dead (seen on 2026-07-12).
+
+The price is a window — bound → ready — in which a survivor is `running` in
+SQLite but not yet in the daemon's `live` map. An attach landing there would
+otherwise fall through to the read-only history path and show a **live agent as a
+dead terminal**, so requests that resolve a live handle
+(`stream`/`stop`/`resize`/`paste`) park until the pass lands
+(`SessionManager::wait_until_ready`, gated in `api::await_startup_reconcile`).
+Everything else — `/health`, the session list, auth — answers immediately, which
+is the entire point. `/health` reports `"reconciling": true` for the duration, so
+a supervisor can tell *up but still adopting* from *up*.
+
 ## Adopt invariant (the headline "terminal intact" promise)
 
 "Zero-flicker resume" needs **more than a persisted cursor.** After a daemon
@@ -153,6 +183,34 @@ Length-prefixed binary FlatBuffers frames over a **Unix domain socket** at
 RPC semantics, error codes, cursor/replay rules, backpressure, and the
 never-crash lints are specified in [`asmux-protocol.md`](asmux-protocol.md) —
 that document is the frozen contract; this one is the rationale.
+
+### Socket ownership: the path is a live resource, not a lock file
+
+A holder's socket path is the only way to reach the PTYs it owns, and **unlinking
+it is silently destructive**: the running asmux keeps its listener fd open, so it
+logs nothing and dies none the wiser, but nobody can dial it by path again. Its
+sessions are then lost at the next daemon restart, with no completion record —
+they reconcile to `indeterminate`.
+
+So asmux **probes before it unlinks** (`crates/asmux/src/socket.rs`):
+
+| at the path | meaning | action |
+| --- | --- | --- |
+| nothing | clean start | bind |
+| a file, nobody answers | the owner died without cleanup | unlink, bind |
+| **someone answers** | **a live holder owns it** | **refuse, exit non-zero** |
+
+`ASMUX_TAKEOVER=1` overrides the refusal — displacing a holder must be asked for,
+never inferred.
+
+This is not defensive theatre. On **2026-07-12** an e2e test inherited the dev
+host's ambient `ASMUX_SOCK` (the daemon resolves it *before* `ASM_RUNTIME_DIR`,
+so the test's private runtime dir was ignored), unlinked and rebound the real
+holder's socket, and then removed it on exit. The real holder ran on, orphaned
+and unreachable; the next daemon boot failed with *"asmux socket is unavailable
+and ASM_ASMUX_AUTOSPAWN=0"*, the orphan was killed to recover, and **six live
+sessions died**. The guard above makes that specific failure impossible; the test
+side is fixed in `scripts/lib/testenv.mjs` (see [`setup.md`](setup.md) → Tests).
 
 Key semantics that matter to the daemon:
 
@@ -300,16 +358,44 @@ sessions instead of dropping them — see [`deployment.md`](deployment.md).
   completion record). Duplicate `create` is idempotent (holder-side launch
   fingerprint). **Verified end-to-end** by `scripts/durable-restart-test.mjs`:
   create → `SIGTERM` daemon → restart → session still `running`, screen
-  reconstructed (marker present), still accepts input. _Follow-up:_ the current
-  adopt reconstructs from the holder **ring** (exact while the session's output
-  fits the ring; approximate + repaint beyond it). The M3-exact path — seed from
-  cold history and `attach FromCursor(backend_cursor)` with a real **gap marker**
-  when the ring wrapped past `consumed` — is scaffolded (`backend_cursor` is
-  persisted; `get_backend_cursor` + `HolderEntry.head_cursor` are ready) but not
-  yet the default.
-- **M4 — hardening.** Soft-reboot (hash drift + confirm), orphan surfacing/adopt,
-  `purge`, metadata RPCs, `readLog`, heartbeat/watchdog reconnect with backoff,
-  slow-attacher drop + resync, `list`-after-reconnect reconciliation.
+  reconstructed (marker present), still accepts input. _The M3 ring-replay
+  follow-up (exact cold-stitch) landed as M4 Stage B — see below._
+- **M4 — hardening.**
+  - **Stage A — _Done._** The daemon↔asmux connection now has a single owner: a
+    **supervisor task** in `AsmuxClient` (dial → `hello` → re-attach every routed
+    session `FromCursor(last_cursor)` → drain the command channel) that reconnects
+    with exponential backoff (100 ms→5 s) on any drop, plus a **10 s idle
+    watchdog** (asmux's 1 Hz heartbeat keeps it fed; ten seconds of silence tears
+    the wedged socket down) and an outbound heartbeat. The public handle
+    (`cmd_tx`, `routes`, `pending`) is stable across reconnects, so drain tasks
+    keep their route and resume seamlessly. `sidecar.rs`'s `Detached` arm now
+    **resyncs in place** on a backpressure eviction (`attach FromCursor`) instead
+    of ending the stream. A `list`-reconcile runs after **every** reconnect
+    (`SessionManager::reconcile_after_reconnect` → the shared
+    `reconcile_from_holder`), catching exits missed while detached. `AsmuxClient`
+    now implements a `Holder` trait so the reconnect/reconcile paths are
+    unit-testable; a `MockHolder`-free unit suite covers the reconcile branches
+    and an in-process-asmux test covers a real forced-drop → reconnect → resume.
+    (This absorbed RF-M4 #2 — the reconnect-supervisor home + `Holder` trait.)
+  - **Stage B — _Done._** Adopt is now **exact via cold-stitch**. `backend_cursor`
+    is made exact by advancing it in the same transaction as the terminal-event
+    batch (`EventMsg.head_cursor` → `write_batch`), replacing the throttled drain
+    write, so it is the true end of cold history. `adopt` then seeds a fresh
+    `vt100` **and** the raw-history ring from cold history (`read_events_after`),
+    continues the sequence from the exact `max_event_seq` (not the throttled
+    `last_event_seq`, which would collide under `INSERT OR IGNORE`), and
+    `attach FromCursor(consumed)` for the un-drained tail `(consumed..head]`. If
+    the ring wrapped past `consumed` (`BUFFER_GAP`), it renders a visible **gap
+    marker** (`render_gap_marker`) for the lost span and resyncs `FromEarliest`.
+    So a session whose output outgrew the 2 MiB ring is reconstructed exactly —
+    proven by the cold-stitch discriminator in `durable-restart-test.mjs` (emit a
+    marker, then > 2 MiB of filler, restart, assert the marker survives).
+    _Deferred to Stage C:_ the periodic `(snapshot, cursor)` store that would
+    bound cold-history replay cost on adopt (Stage B replays full cold history,
+    correct and fine for realistic session sizes on a one-time adopt).
+  - **Stage C — pending.** Soft-reboot (hash drift + confirm), orphan
+    surfacing/adopt, `purge`, metadata RPCs, `readBuffer`/`readLog`, and the
+    periodic `(snapshot, cursor)` store.
 - **M5 — Windows.** ConPTY + AF_UNIX/named-pipe transport + ACL socket perms.
 
 ## Decisions

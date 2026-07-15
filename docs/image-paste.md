@@ -1,18 +1,70 @@
-# Image / screenshot paste into sessions
+# File attachments (and image / screenshot paste) into sessions
 
 Status: **implemented** (daemon endpoint + web client incl. 📎 button),
-2026-07-05. Verified by `scripts/paste-test.mjs` (11 checks, daemon + WS), a
+2026-07-05. Verified by `scripts/paste-test.mjs` (22 checks, daemon + WS), a
 headless-Chrome click-through of the 📎 button against the real bundle (upload +
 placeholder echo), and a CLI probe of the agent side (below).
 
+2026-07-12: clipboard-image paste was **macOS-only** until now — no key on
+Windows/Linux could deliver an image to the page. Fixed by taking Ctrl-V from
+xterm (see *Which key actually pastes*, below), and covered by the personas in
+`scripts/copy-paste-test.mjs` so it can't silently regress again.
+
+2026-07-12: **widened from images to any file type, ≤ 10 MiB.** An agent gets as
+much out of a PDF, a zip, or a CSV as it does out of a screenshot, and the
+transport was never image-specific — only the validation was. The magic-byte
+allowlist is gone; **size is now the only bound**. See *From images to any file*
+below for what that changed and why it's safe here.
+
 ## Goal
 
-Let a user paste (or drag-drop) a screenshot straight into a live session and
-have the session's agent ingest it. Target UX:
+Let a user paste, drag-drop, or pick **any file** straight into a live session
+and have the session's agent ingest it. Target UX:
 
-> Focus the terminal → paste an image → the input line shows a placeholder like
-> `[pasted image .asm/pastes/ab12….png]` → press Enter → the agent loads the
-> image. Works on any network (loopback, LAN, SSH-forward, relay).
+> Focus the terminal → paste an image (or hit 📎 and pick `spec.pdf`) → the input
+> line shows a placeholder like `[pasted image .asm/pastes/shot-ab12….png]` or
+> `[attached file .asm/pastes/spec-ab12….pdf]` → press Enter → the agent loads
+> it. Works on any network (loopback, LAN, SSH-forward, relay).
+
+## From images to any file
+
+The mechanism below (file on the node + path in the prompt) was never
+image-specific — an agent reads a PDF or unzips an archive from a path exactly
+as it loads a PNG from one. Only the *validation* was image-specific, so that is
+all that had to go:
+
+| | before | now |
+| --- | --- | --- |
+| type check | magic-byte allowlist (PNG/JPEG/GIF/WebP), else `415` | none — any bytes are stored |
+| size cap | 5 MiB (Claude Code's per-image limit) | **10 MiB** |
+| picker | `<input accept="image/*">` | no `accept` — every file is offerable |
+| drop / paste | first `image/*` item; a dropped PDF was a **silent no-op** | first file item, whatever it is |
+| stored name | `<uuid>.<sniffed-ext>` | `<stem>-<uuid8>.<ext>` — keeps the user's name |
+| placeholder | `[pasted image <path>]` | same for images; `[attached file <path>]` otherwise |
+| oversize UX | uploaded in full, then a `413` | client pre-checks the size and fails instantly |
+
+Two things are worth calling out:
+
+- **Why dropping the allowlist is fine here.** The endpoint writes bytes to a
+  file and never executes, parses, or serves them; it is authed like every other
+  `/api` route; and ASM is a LAN-local tool where the user attaching the file is
+  the user who owns the workspace. A type allowlist was buying nothing against
+  that threat model while costing the whole PDF/zip use case. What actually
+  bounds the endpoint is the size cap, which is enforced server-side and cannot
+  be talked out of.
+- **The client now names the file, so the name is now untrusted input.** That is
+  the one new surface, and it is handled in `safe_stem_ext`: the name is reduced
+  to a single path component (basename only, `[A-Za-z0-9._-]`, no leading dots,
+  truncated), then made unique with a uuid. The *directory* is still derived
+  entirely from the session record, so `../../../../tmp/evil.pdf` lands at
+  `.asm/pastes/evil-3f2a1b9c.pdf` — sanitised, not rejected. Unit-tested in
+  `paste.rs`, and asserted end-to-end in `paste-test.mjs`.
+
+The 5 MiB cap used to be justified as "Claude Code's per-image limit". That
+reasoning only ever applied to images; 10 MiB is a round number that comfortably
+holds a paper, a source tarball, or a log bundle. An image over Claude's own
+limit is now something the agent rejects on read, rather than something ASM
+refuses to store — the right place for that policy.
 
 ## Why the mechanism is "file on the node + path in the prompt"
 
@@ -48,17 +100,44 @@ fallback.
 - **Capture** — `components/Terminal.tsx` offers three entry points, all sharing
   one `uploadAndInject`: a `paste` (capture-phase) listener, `drop`/`dragover`
   listeners on the terminal mount, and an explicit **📎 attach button** + hidden
-  `<input type=file accept=image/*>` (the primary affordance on touch devices,
-  where clipboard-image paste is unreliable). On an `image/*` item paste/drop
-  `preventDefault()`s (so xterm never sees binary garbage); a plain-text paste
-  falls through to xterm untouched.
-- **Upload then inject (in that order)** — `api.pasteImage` POSTs the raw Blob;
-  only after the upload resolves does the client send the placeholder over the
-  **existing** WS input frame (`{t:"i", d:"[pasted image <relpath>] "}`). Because
-  the file is confirmed on the node before the path appears, a slow or dropped
-  link never leaves a dangling reference in the prompt — this is what satisfies
-  "works in all network conditions".
-- **Feedback** — a small non-intrusive overlay (`Uploading image…` / an error
+  `<input type=file>` with **no `accept`** (the primary affordance on touch
+  devices, where clipboard-image paste is unreliable). Any *file* item
+  paste/drop `preventDefault()`s (so xterm never sees binary garbage); a
+  plain-text paste — whose clipboard items are all `kind: "string"` — falls
+  through to xterm untouched. `dragover` always accepted any file kind; before
+  the widening `drop` then quietly discarded everything that wasn't an image,
+  which is the worst kind of no-op: the cursor said yes and nothing happened.
+- **Which key actually pastes** — only the browser's **native** paste carries the
+  image (the file item lives in the `paste` event's `clipboardData`), so a paste
+  gesture is useful to us only if it reaches the browser *uncancelled*. That is
+  why image paste originally worked on macOS and **nowhere else** — on Windows /
+  Linux both gestures dead-ended, and the terminal has no ⌘ key to fall back on:
+
+  | gesture | `paste` event | `clipboardData` | why |
+  | --- | --- | --- | --- |
+  | ⌘-V (macOS) | fires | `file:image/png` | xterm doesn't touch ⌘-V |
+  | Ctrl-V (was) | **never fires** | — | xterm maps it to `^V` and `preventDefault()`s, so Chrome skips its paste command |
+  | Ctrl-Shift-V | fires | **empty** | it is Chrome's *paste-as-plain-text*; the image is stripped by the browser |
+
+  So `Terminal.tsx`'s key handler now claims **Ctrl-V on Windows/Linux and hands
+  it straight back to the browser** (returns `false` to xterm, *without* a
+  `preventDefault` — xterm must not send `^V`, but Chrome must still run its
+  paste command). The cost is `^V` (readline quoted-insert, vim visual-block) on
+  those platforms — the same trade Windows Terminal and VS Code's terminal make;
+  vim's own `Ctrl-Q` is the way back. macOS is untouched: ⌘-V still does it, and
+  `^V` still reaches the app there.
+- **Size pre-check** — the client rejects anything over `MAX_ATTACHMENT_BYTES`
+  (10 MiB, mirrored from the daemon) *before* uploading, so a too-big file fails
+  instantly and legibly instead of after a long upload ending in a `413`. The
+  daemon still enforces the real limit; this is UX, not security.
+- **Upload then inject (in that order)** — `api.uploadAttachment` POSTs the raw
+  Blob with the filename as a `?name=` query param; only after the upload
+  resolves does the client send the placeholder over the **existing** WS input
+  frame (`{t:"i", d:"[attached file <relpath>] "}`, or `[pasted image …]` for an
+  `image/*` blob). Because the file is confirmed on the node before the path
+  appears, a slow or dropped link never leaves a dangling reference in the
+  prompt — this is what satisfies "works in all network conditions".
+- **Feedback** — a small non-intrusive overlay (`Uploading spec.pdf…` / an error
   for 4 s) rendered as a React sibling of the xterm mount, never written into
   the terminal (which a TUI would repaint over).
 - **Transport** — `postBlob` reuses `req`'s `Bearer` + `X-ASM-Relay-Key` auth
@@ -67,44 +146,67 @@ fallback.
 
 ### Daemon (`crates/daemon/src/api/paste.rs`)
 
-`POST /api/sessions/:id/paste`, raw image body:
+`POST /api/sessions/:id/paste?name=<filename>`, raw body of any type:
 
 - Auth is the router's standard bearer/loopback gate (the route lives under
   `/api`, so it inherits `require_auth` with no extra wiring).
-- Validates: session exists; body non-empty; `≤ 5 MiB` (matches Claude Code's
-  per-image limit — the route raises the transport `DefaultBodyLimit` a little
-  above this so an oversize upload gets a clean `413`, not a truncated read);
-  **magic-byte sniff** for PNG / JPEG / GIF / WebP (the client `Content-Type` is
-  never trusted).
-- Writes to `<session.working_directory>/.asm/pastes/<uuid>.<ext>` — always
-  reachable from the agent's cwd, even under a filesystem sandbox. The
-  destination is derived entirely from the server-side session record, so the
-  client cannot influence the path (**no traversal**).
-- Best-effort writes `<cwd>/.asm/.gitignore` = `*` so pastes never pollute git
-  status, without touching tracked files or git config (works for any worktree
-  layout).
+- Validates: session exists; body non-empty; `≤ 10 MiB` (`MAX_PASTE_BYTES` — the
+  route raises the transport `DefaultBodyLimit` a little above this so an
+  oversize upload gets a clean `413`, not a truncated read). **No type check**:
+  any bytes are storable.
+- Writes to `<session.working_directory>/.asm/pastes/<stem>-<uuid8>.<ext>` —
+  always reachable from the agent's cwd, even under a filesystem sandbox. The
+  **directory** is derived entirely from the server-side session record; only the
+  leaf name comes from the client, and `safe_stem_ext` reduces it to one safe
+  path component (**no traversal**).
+- `ext` comes from the client's filename when it has one, else from the
+  magic-byte sniff (a clipboard image is a bare blob with no name), else `bin`.
+  So `sniff_image_ext` survives as a *fallback*, not a gate — and stays shared
+  with the diff panel's preview endpoint, which still needs a real image check.
+- Best-effort writes `<cwd>/.asm/.gitignore` = `*` so attachments never pollute
+  git status, without touching tracked files or git config (works for any
+  worktree layout).
 - Returns `{ ok, path, relative_path, filename }`. The client injects
   `relative_path` (tidier; the agent runs in cwd).
 
 ## Security notes
 
 - Endpoint is authed like every other `/api` route.
-- Path is server-derived; magic-byte + size validated; extension from the
-  sniffed type, not the filename.
-- The image now traverses the relay in plaintext, same as all traffic today —
-  end-to-end TLS is still the pending **SEC-1** item.
+- The directory is server-derived; the client-supplied filename is sanitised to
+  a single path component and made unique with a uuid, so it can neither escape
+  `.asm/pastes/` nor clobber an earlier attachment.
+- Size (10 MiB) is the only bound on content, deliberately — see *From images to
+  any file*. The bytes are written to a file and never executed, parsed, or
+  served back.
+- The file traverses the relay in plaintext, same as all traffic today. Per the
+  2026-07-12 decision, the LAN journey is plaintext **by design** — encryption
+  for the off-LAN path is the relay's job (R5), not a daemon-terminated TLS
+  layer. See `docs/security-followups.md`.
 
 ## Verifying (don't redo the discovery)
 
 Two committed proofs, plus a one-off agent check:
 
-1. **Daemon + WS** — `node scripts/paste-test.mjs 127.0.0.1:<port> <cwd>`
-   (needs a running daemon). Covers upload → file on disk → `.gitignore` →
-   the shell reading the file at the returned path → 415/413/400 rejects.
+1. **Daemon + WS** — `node scripts/paste-test.mjs` (sandboxed by default; spawns
+   its own daemon). Covers upload → file on disk → `.gitignore` → the shell
+   reading the file at the returned path; PDF/ZIP/text attachments keeping their
+   stem and extension; a traversal filename collapsing into `.asm/pastes/`; and
+   the 413/400 rejects. The unnamed-PNG case exercises the magic-byte fallback.
 2. **Browser (📎 button)** — `scripts/attach-button-test.mjs` drives the real
    bundle in headless Chrome (button → picker → upload → placeholder echoes into
-   the terminal). Its header has the full recipe. General CDP technique: the
+   the terminal) for **both** a PNG (`[pasted image …]`) and a PDF
+   (`[attached file …]`), and asserts the input carries no `accept` filter. Its
+   header has the full recipe. General CDP technique: the
    `ui-repro-headless-chrome` note.
+2b. **Browser (clipboard image)** — `scripts/copy-paste-test.mjs` seeds a real
+   PNG onto Chrome's clipboard and presses the actual paste keys: T1 (Linux UA,
+   which is also Windows' key model) Ctrl-V and T2 (Mac UA) ⌘-V both have to
+   upload it. Two harness details make this faithful rather than decorative: the
+   edit command rides on the keydown (`commands: ["paste"]`) exactly as a real
+   browser delivers it, so a `preventDefault` from xterm suppresses the paste
+   just like in the wild; and the image is painted on a canvas, because Chrome
+   sanitizes clipboard images by decoding + re-encoding them (a hand-rolled byte
+   blob like testenv's `TINY_PNG` is rejected by `clipboard.write`).
 3. **Agent ingest** — the load-bearing claim (agent loads a path in the prompt)
    was proven with `claude -p "… /tmp/x.png …"` against a solid-colour PNG.
 
@@ -128,9 +230,15 @@ inventing another handle.
 ## Follow-ups (not done)
 
 - **Cleanup policy** — prune `.asm/pastes/` on session archive and/or a rolling
-  count/size cap (today pastes accumulate until the workspace is cleaned).
+  count/size cap (today attachments accumulate until the workspace is cleaned).
+  Now slightly more pressing: a 10 MiB zip is a bigger squatter than a
+  screenshot. Tracked as **IMG-2**.
+- **Multiple files at once** — the picker has no `multiple`, and paste/drop take
+  only the first file item. Dropping a folder or a multi-select still attaches
+  one file, silently. A loop over `dataTransfer.files` + one placeholder per
+  upload would do it.
 - **Per-agent capability hint** — e.g. show the 📎 affordance only for
-  image-capable agents, and optionally use `codex --image` semantics.
+  file-capable agents, and optionally use `codex --image` semantics.
 - **Camera capture on mobile** — the file input omits `capture`, so the OS lets
   the user choose gallery *or* camera; a dedicated "take photo" path could be
   added if wanted.

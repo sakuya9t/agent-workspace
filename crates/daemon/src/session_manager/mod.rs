@@ -8,6 +8,7 @@ use anyhow::{anyhow, bail, Result};
 use parking_lot::Mutex;
 use serde::Serialize;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 /// How long output must be silent before a *working* session is considered idle
@@ -21,17 +22,29 @@ const IDLE_AFTER: Duration = Duration::from_secs(4);
 /// the agent (see [`Interaction::submitted`]).
 const ECHO_WINDOW: Duration = Duration::from_millis(1000);
 
-use crate::backend::{BackendSession, BackendSpawnSpec, BackendStatus, HolderEntry, SessionBackend};
+/// How often a live session is checked for the agent's own conversation id, until
+/// one is found. An agent writes its transcript shortly *after* it starts, so this
+/// cannot be a single attempt at spawn — but once captured it is never re-derived,
+/// and the polling stops. See [`SessionManager::capture_native_id`].
+const CAPTURE_EVERY: Duration = Duration::from_secs(5);
+
+use crate::backend::{
+    BackendSession, BackendSpawnSpec, BackendStatus, HolderEntry, SessionBackend, StreamEnd,
+};
 use crate::db::Db;
 use crate::domain::{
     AttentionState, Session, SessionStatus, SessionSummary, Workspace, WorkspaceInstance,
 };
+use crate::plugins::usage::TranscriptContext;
 use crate::plugins::{attention, AgentContext, AgentPlugin, PluginRegistry};
 use crate::util::now_millis;
 use crate::workspace;
 
+mod fork;
 mod monitor;
 mod workspaces;
+
+pub use fork::ForkRequest;
 
 /// A destructive operation was refused because it would discard uncommitted or
 /// unmerged work. Carried as a typed error so the API can answer `409 Conflict`
@@ -73,6 +86,36 @@ pub struct CreateSessionRequest {
     pub base_ref: Option<String>,
     /// Selected agent-option toggles (see `AgentPlugin::options`).
     pub options: Vec<(String, bool)>,
+    /// An explicit model override (see [`AgentContext::model`]). `None` launches
+    /// with no model flag, so the agent uses its own configured default.
+    pub model: Option<String>,
+    /// Set when this session is a fork: how it inherits the origin's context.
+    /// Resolved by [`SessionManager::fork_session`] before the session exists,
+    /// and applied here once the working directory is known.
+    pub fork: Option<ForkPlan>,
+}
+
+/// A resolved decision about how a forked session picks up its origin's context.
+/// Built by [`SessionManager::fork_session`], consumed by `create_session`.
+#[derive(Debug, Clone)]
+pub struct ForkPlan {
+    /// Origin session id — persisted as `forked_from`, giving the UI a lineage.
+    pub origin_id: String,
+    pub seed: ForkSeed,
+}
+
+/// The two ways a fork inherits context. Every fork gets exactly one.
+#[derive(Debug, Clone)]
+pub enum ForkSeed {
+    /// The agent reloads the origin's *own* conversation, forking it so the
+    /// origin's transcript is never appended to. Full fidelity, no summarizing,
+    /// and only possible when the fork keeps the same agent.
+    Native { native_id: String },
+    /// The agent is pointed at a brief written into its working directory.
+    /// The path is handed over, never the text: a transcript typed into a TUI hits
+    /// bracketed-paste and input-length limits, and one passed in argv would be
+    /// readable by any process on the box via `/proc`.
+    Brief { markdown: String },
 }
 
 /// Per-session signal shared from the input path (the API's WebSocket handler)
@@ -104,6 +147,14 @@ pub struct SessionManager {
     worktree_root: PathBuf,
     /// Per-session interaction signals, keyed by session id (see [`Interaction`]).
     interactions: Mutex<HashMap<String, Arc<Interaction>>>,
+    /// Serializes reconcile passes. Startup runs one in the background while a
+    /// holder reconnect can fire another; without this, both could see the same
+    /// session as "alive in the holder, not in `live`" and adopt it twice.
+    /// Only ever taken on a blocking thread (a pass is a serial holder RPC).
+    reconcile_pass: Mutex<()>,
+    /// `false` until the startup reconcile pass has finished. See
+    /// [`Self::wait_until_ready`].
+    ready_tx: watch::Sender<bool>,
 }
 
 impl SessionManager {
@@ -120,6 +171,8 @@ impl SessionManager {
             live: Mutex::new(HashMap::new()),
             worktree_root,
             interactions: Mutex::new(HashMap::new()),
+            reconcile_pass: Mutex::new(()),
+            ready_tx: watch::channel(false).0,
         }
     }
 
@@ -171,13 +224,22 @@ impl SessionManager {
         // Resolve the working directory and (optionally) an isolated instance.
         let (resolved_cwd, instance) = self.resolve_workspace(&id, &req)?;
 
-        let ctx = AgentContext {
+        let mut ctx = AgentContext {
             command: req.command.clone(),
             extra_args: req.args.clone(),
             extra_env: req.env.clone(),
             options: req.options.clone(),
+            model: req.model.clone(),
         };
-        let launch = plugin.build_launch(&ctx)?;
+
+        // A fork's launch line differs from a fresh session's: either it resumes
+        // the origin's conversation natively, or it opens pointed at a brief we
+        // write into the working directory we just resolved. Both need the cwd,
+        // which is why this happens here and not in `fork_session`.
+        let launch = match &req.fork {
+            Some(plan) => self.fork_launch(&plugin, &mut ctx, plan, &resolved_cwd)?,
+            None => plugin.build_launch(&ctx)?,
+        };
 
         if launch.requires_approval && !req.approve_custom {
             bail!("launch requires explicit approval (custom command)");
@@ -214,6 +276,9 @@ impl SessionManager {
             updated_at: now,
             last_activity_at: now,
             risky,
+            // Captured later, by the monitor, while this session is alive.
+            agent_session_id: None,
+            forked_from: req.fork.as_ref().map(|f| f.origin_id.clone()),
         };
         self.db.insert_session(&session)?;
         if let Some(inst) = &instance {
@@ -235,12 +300,14 @@ impl SessionManager {
             Err(e) => {
                 let now = now_millis();
                 let _ = self.db.update_status(&id, SessionStatus::Failed, None, now);
-                let _ = self.db.set_attention(
-                    &id,
-                    AttentionState::Failed,
-                    Some("backend spawn failed"),
-                    now,
-                );
+                if plugin.tracks_attention() {
+                    let _ = self.db.set_attention(
+                        &id,
+                        AttentionState::Failed,
+                        Some("backend spawn failed"),
+                        now,
+                    );
+                }
                 return Err(e.context("backend failed to create session"));
             }
         };
@@ -319,6 +386,52 @@ impl SessionManager {
         n
     }
 
+    /// Has the startup reconcile pass finished? Surfaced on `/health` so a
+    /// supervisor or gateway can tell "up but still adopting" from "up".
+    pub fn is_ready(&self) -> bool {
+        *self.ready_tx.borrow()
+    }
+
+    /// Resolve once the startup reconcile pass has finished.
+    ///
+    /// The HTTP listener binds *before* that pass runs, so between bind and
+    /// ready a session the previous daemon left running is in the DB as
+    /// `running` but not yet in `live`. Any request that resolves a live handle
+    /// must wait here first — otherwise attaching to a perfectly healthy session
+    /// takes the not-live path and the client is served a dead, read-only
+    /// terminal. Callers should bound the wait (see `api::READY_WAIT`).
+    pub async fn wait_until_ready(&self) {
+        let mut rx = self.ready_tx.subscribe();
+        loop {
+            if *rx.borrow_and_update() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                return; // sender lives in `self`, so this is unreachable in practice
+            }
+        }
+    }
+
+    /// Run [`Self::startup_reconcile`] off the boot path, marking the manager
+    /// ready when it lands.
+    ///
+    /// Adoption is a serial holder round-trip per session, so it scales with how
+    /// many sessions survived: a restart with 7 live sessions spent 8s here,
+    /// during which the daemon had not yet bound its port and `start.sh`'s 6s
+    /// health check declared a perfectly healthy daemon dead. Reconciling behind
+    /// the listener keeps boot-to-`/health` flat regardless of session count.
+    pub fn spawn_startup_reconcile(self: &Arc<Self>) {
+        let mgr = self.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = mgr.startup_reconcile() {
+                tracing::error!("startup reconcile failed: {e:#}");
+            }
+            // Ready even when the pass failed: it is done, and making every
+            // attach wait on a pass that will not come back is strictly worse.
+            mgr.ready_tx.send_replace(true);
+        });
+    }
+
     /// Reconcile sessions left live in the DB after a restart.
     ///
     /// - In-process backend: the PTYs are gone, so those rows become `failed`.
@@ -326,7 +439,11 @@ impl SessionManager {
     ///   alive in the holder → **adopt** (re-attach, mark `running`); a real exit
     ///   record → `exited`/`failed`; absent from the holder → **`indeterminate`**
     ///   (the holder itself died, so no completion record exists).
-    pub async fn startup_reconcile(self: &Arc<Self>) -> Result<()> {
+    ///
+    /// Blocking (holder RPCs); [`Self::spawn_startup_reconcile`] is how the
+    /// daemon runs it.
+    pub fn startup_reconcile(self: &Arc<Self>) -> Result<()> {
+        let _pass = self.reconcile_pass.lock();
         if !self.backend.keep_sessions_on_shutdown() {
             let n = self.db.reconcile_orphans_on_startup(now_millis())?;
             if n > 0 {
@@ -347,66 +464,140 @@ impl SessionManager {
                 return Ok(());
             }
         };
+        self.reconcile_from_holder(holder)
+    }
+
+    /// Re-run reconciliation after the daemon↔asmux connection dropped and came
+    /// back (the supervisor has already re-attached the live sessions). A `list`
+    /// after any reconnect catches exits missed while detached
+    /// (`asmux-protocol.md` → Liveness). A transient `list` failure here is
+    /// *not* treated as "the holder is gone" (unlike startup): the sessions are
+    /// almost certainly fine, so we log and wait for the next reconnect.
+    ///
+    /// Blocking, and serialized against the startup pass — a reconnect during
+    /// startup adoption must queue behind it, not race it.
+    pub fn reconcile_after_reconnect(self: &Arc<Self>) -> Result<()> {
+        let _pass = self.reconcile_pass.lock();
+        match self.backend.holder_list() {
+            Ok(holder) => self.reconcile_from_holder(holder),
+            Err(e) => {
+                tracing::warn!("post-reconnect holder list failed ({e:#}); skipping reconcile");
+                Ok(())
+            }
+        }
+    }
+
+    /// The shared adopt-or-reconcile decision, run at startup and after every
+    /// reconnect. For each session the DB still has live:
+    ///
+    /// - **alive in the holder, already in `live`** → nothing to do (the
+    ///   supervisor re-attached it on reconnect).
+    /// - **alive in the holder, not in `live`** → adopt (the startup case).
+    /// - **a real exit record** → `exited`/`failed`; if the session was still
+    ///   live in `live` (it exited while we were detached), drive the normal exit
+    ///   path so the monitor writes its summary and clears it.
+    /// - **absent from the holder** → `indeterminate` (no completion record); a
+    ///   still-live one has its stream closed so its monitor stops.
+    fn reconcile_from_holder(self: &Arc<Self>, holder: Vec<HolderEntry>) -> Result<()> {
         let by_id: HashMap<String, HolderEntry> =
             holder.into_iter().map(|h| (h.id.clone(), h)).collect();
 
         let mut adopted = 0usize;
         let mut reconciled = 0usize;
         for id in self.db.live_session_ids()? {
-            let sess = self.db.get_session(&id)?;
-            let (rows, cols) = sess.as_ref().map(|s| (s.rows, s.cols)).unwrap_or((24, 80));
-            let created_at = sess.as_ref().map(|s| s.created_at).unwrap_or_else(now_millis);
-            let plugin = sess
-                .as_ref()
-                .and_then(|s| self.registry.get(&s.agent_plugin_id));
-
+            let in_live = self.live.lock().contains_key(&id);
             match by_id.get(&id) {
-                Some(entry) if entry.alive => match self.backend.adopt(&id, rows, cols) {
-                    Ok(Some(handle)) => {
-                        self.live.lock().insert(id.clone(), handle.clone());
-                        self.db
-                            .update_status(&id, SessionStatus::Running, None, now_millis())?;
-                        self.clone().spawn_monitor(id.clone(), handle, created_at, plugin.clone());
-                        adopted += 1;
-                        tracing::info!(session = %id, "adopted live holder session");
+                Some(entry) if entry.alive => {
+                    if in_live {
+                        continue; // already running; the supervisor re-attached it
                     }
-                    Ok(None) | Err(_) => {
-                        self.reconcile_indeterminate(&id)?;
-                        reconciled += 1;
+                    let sess = self.db.get_session(&id)?;
+                    let (rows, cols) = sess.as_ref().map(|s| (s.rows, s.cols)).unwrap_or((24, 80));
+                    let created_at =
+                        sess.as_ref().map(|s| s.created_at).unwrap_or_else(now_millis);
+                    let plugin = sess
+                        .as_ref()
+                        .and_then(|s| self.registry.get(&s.agent_plugin_id));
+                    match self.backend.adopt(&id, rows, cols) {
+                        Ok(Some(handle)) => {
+                            self.live.lock().insert(id.clone(), handle.clone());
+                            self.db
+                                .update_status(&id, SessionStatus::Running, None, now_millis())?;
+                            self.clone().spawn_monitor(
+                                id.clone(),
+                                handle,
+                                created_at,
+                                plugin.clone(),
+                            );
+                            adopted += 1;
+                            tracing::info!(session = %id, "adopted live holder session");
+                        }
+                        Ok(None) | Err(_) => {
+                            self.reconcile_indeterminate(&id)?;
+                            reconciled += 1;
+                        }
                     }
-                },
+                }
                 Some(entry) => {
                     // The holder has a real completion record.
-                    let (status, code) = if entry.exit_signal != 0 {
-                        (SessionStatus::Failed, None)
+                    if in_live {
+                        // Exited while we were detached: drive the normal exit
+                        // path so the monitor finalizes (summary + `live` removal).
+                        self.backend.end_session_stream(
+                            &id,
+                            StreamEnd::Exited {
+                                code: entry.exit_code,
+                                signal: entry.exit_signal,
+                            },
+                        );
                     } else {
-                        (SessionStatus::Exited, Some(entry.exit_code))
-                    };
-                    self.db.update_status(&id, status, code, now_millis())?;
+                        let (status, code) = if entry.exit_signal != 0 {
+                            (SessionStatus::Failed, None)
+                        } else {
+                            (SessionStatus::Exited, Some(entry.exit_code))
+                        };
+                        self.db.update_status(&id, status, code, now_millis())?;
+                    }
                     reconciled += 1;
                 }
                 None => {
-                    // Absent from the holder: the holder died → outcome unknown.
+                    // Absent from the holder: it died → outcome unknown. Close a
+                    // still-live stream so its monitor stops, then mark the row.
+                    if in_live {
+                        self.backend.end_session_stream(&id, StreamEnd::Vanished);
+                        self.live.lock().remove(&id);
+                    }
                     self.reconcile_indeterminate(&id)?;
                     reconciled += 1;
                 }
             }
         }
-        tracing::info!("startup reconcile: adopted {adopted}, reconciled {reconciled} session(s)");
+        tracing::info!("reconcile: adopted {adopted}, reconciled {reconciled} session(s)");
         Ok(())
     }
 
-    /// Mark a session `indeterminate` with the acmux-style advisory.
+    /// Mark a session `indeterminate` with the acmux-style advisory. The
+    /// advisory badge only applies to agents whose sessions we classify at
+    /// all; for a non-tracking agent (plain shell) the `indeterminate` status
+    /// already says the daemon doesn't know, and judging the outcome is the
+    /// user's job either way.
     fn reconcile_indeterminate(&self, id: &str) -> Result<()> {
         let now = now_millis();
         self.db
             .update_status(id, SessionStatus::Indeterminate, None, now)?;
-        self.db.set_attention(
-            id,
-            AttentionState::LikelyBlocked,
-            Some("no completion record — the session holder exited while this was running; check the preserved output before assuming it finished"),
-            now,
-        )?;
+        let tracks = self
+            .db
+            .get_session(id)?
+            .and_then(|s| self.registry.get(&s.agent_plugin_id))
+            .is_none_or(|p| p.tracks_attention());
+        if tracks {
+            self.db.set_attention(
+                id,
+                AttentionState::LikelyBlocked,
+                Some("no completion record — the session holder exited while this was running; check the preserved output before assuming it finished"),
+                now,
+            )?;
+        }
         Ok(())
     }
 
@@ -694,6 +885,15 @@ mod tests {
         holder_list_fails: bool,
         /// Whether `adopt()` yields a live handle (`Some`) or gives up (`None`).
         adopt_ok: bool,
+        /// Signalled on entry to `adopt()`, so a test can assert on the state the
+        /// daemon serves *while* a pass is still running.
+        adopt_entered: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+        /// Stand in for the real cost of adoption (a holder round-trip per
+        /// session — seconds, for a large set).
+        adopt_delay: Duration,
+        /// Records `end_session_stream` calls as `(id, "exited"|"vanished")` so the
+        /// reconnect-reconcile branches can be asserted without a real holder.
+        end_calls: Arc<Mutex<Vec<(String, String)>>>,
     }
 
     impl SessionBackend for MockBackend {
@@ -718,7 +918,20 @@ mod tests {
             _rows: u16,
             _cols: u16,
         ) -> Result<Option<Arc<dyn BackendSession>>> {
+            if let Some(tx) = &self.adopt_entered {
+                let _ = tx.send(());
+            }
+            std::thread::sleep(self.adopt_delay);
             Ok(self.adopt_ok.then(mock_session))
+        }
+        fn end_session_stream(&self, id: &str, outcome: StreamEnd) {
+            let kind = match outcome {
+                StreamEnd::Exited { .. } => "exited",
+                StreamEnd::Vanished => "vanished",
+            };
+            self.end_calls
+                .lock()
+                .push((id.to_string(), kind.to_string()));
         }
     }
 
@@ -743,10 +956,14 @@ mod tests {
     /// Seed a session row already marked `running` (as if a prior daemon left it
     /// live), so `startup_reconcile` finds it via `live_session_ids()`.
     fn insert_running(db: &Db, id: &str) {
+        insert_running_agent(db, id, "shell");
+    }
+
+    fn insert_running_agent(db: &Db, id: &str, agent: &str) {
         let now = now_millis();
         db.insert_session(&Session {
             id: id.to_string(),
-            agent_plugin_id: "shell".into(),
+            agent_plugin_id: agent.into(),
             command: "sh".into(),
             args: vec![],
             env: vec![],
@@ -763,6 +980,8 @@ mod tests {
             updated_at: now,
             last_activity_at: now,
             risky: false,
+            agent_session_id: None,
+            forked_from: None,
         })
         .unwrap();
     }
@@ -792,6 +1011,8 @@ mod tests {
             create_branch: false,
             base_ref: None,
             options: vec![],
+            model: None,
+            fork: None,
         }
     }
 
@@ -856,7 +1077,7 @@ mod tests {
         let (manager, dir) = test_manager();
         insert_running(&manager.db, "s-native");
 
-        manager.startup_reconcile().await.unwrap();
+        manager.startup_reconcile().unwrap();
 
         let s = manager.get_session("s-native").unwrap().unwrap();
         assert_eq!(s.status, SessionStatus::Failed);
@@ -874,13 +1095,57 @@ mod tests {
         let (manager, dir) = test_manager_with(backend);
         insert_running(&manager.db, "s-adopt");
 
-        manager.startup_reconcile().await.unwrap();
+        manager.startup_reconcile().unwrap();
 
         let s = manager.get_session("s-adopt").unwrap().unwrap();
         assert_eq!(s.status, SessionStatus::Running, "adopted → running");
         assert!(
             manager.live_handle("s-adopt").is_some(),
             "adopted handle re-attached into the live map"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn startup_reconcile_runs_behind_the_listener_and_gates_live_lookups() {
+        // Adoption is serial holder I/O, so it must not sit on the boot path: the
+        // daemon binds, then adopts. The cost of that is a window where a
+        // survivor is `running` in the DB but not yet in `live` — and an attach
+        // landing there would take the not-live path and serve a dead, read-only
+        // terminal for a session that is perfectly alive. So: never block the
+        // boot, always block the live lookup.
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            holder: vec![holder_entry("s-slow", true, 0, 0)],
+            adopt_ok: true,
+            adopt_entered: Some(entered_tx),
+            adopt_delay: Duration::from_millis(300),
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_with(backend);
+        insert_running(&manager.db, "s-slow");
+
+        manager.spawn_startup_reconcile();
+
+        // Mid-pass (the mock is parked inside `adopt`): the daemon is already
+        // serving — this is what keeps boot-to-`/health` flat no matter how many
+        // sessions survived — but it does not yet claim to be ready.
+        entered_rx.recv().await.unwrap();
+        assert!(!manager.is_ready(), "the pass must not run on the boot path");
+        assert!(manager.live_handle("s-slow").is_none(), "not adopted yet");
+
+        // A live-session request parks here rather than reading that empty map.
+        manager.wait_until_ready().await;
+
+        assert!(manager.is_ready());
+        assert!(
+            manager.live_handle("s-slow").is_some(),
+            "once the pass lands, the survivor is live and an attach streams it"
+        );
+        assert_eq!(
+            manager.get_session("s-slow").unwrap().unwrap().status,
+            SessionStatus::Running
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -897,7 +1162,7 @@ mod tests {
         let (manager, dir) = test_manager_with(backend);
         insert_running(&manager.db, "s-noadopt");
 
-        manager.startup_reconcile().await.unwrap();
+        manager.startup_reconcile().unwrap();
 
         let s = manager.get_session("s-noadopt").unwrap().unwrap();
         assert_eq!(s.status, SessionStatus::Indeterminate);
@@ -921,7 +1186,7 @@ mod tests {
         insert_running(&manager.db, "s-exit");
         insert_running(&manager.db, "s-signal");
 
-        manager.startup_reconcile().await.unwrap();
+        manager.startup_reconcile().unwrap();
 
         let exited = manager.get_session("s-exit").unwrap().unwrap();
         assert_eq!(exited.status, SessionStatus::Exited);
@@ -935,19 +1200,27 @@ mod tests {
     #[tokio::test]
     async fn holder_absent_entry_is_indeterminate() {
         // The session is gone from the holder (the holder itself died), so no
-        // completion record exists → indeterminate, flagged for the user.
+        // completion record exists → indeterminate. The advisory badge flags a
+        // tracked agent's session for the user; a shell (non-tracking) gets the
+        // indeterminate status but never a badge — its outcome is the user's to
+        // judge either way.
         let backend = Arc::new(MockBackend {
             keep_on_shutdown: true,
             ..Default::default()
         });
         let (manager, dir) = test_manager_with(backend);
-        insert_running(&manager.db, "s-absent");
+        insert_running_agent(&manager.db, "s-absent", "claude");
+        insert_running(&manager.db, "s-absent-shell");
 
-        manager.startup_reconcile().await.unwrap();
+        manager.startup_reconcile().unwrap();
 
         let s = manager.get_session("s-absent").unwrap().unwrap();
         assert_eq!(s.status, SessionStatus::Indeterminate);
         assert_eq!(s.attention_state, AttentionState::LikelyBlocked);
+
+        let sh = manager.get_session("s-absent-shell").unwrap().unwrap();
+        assert_eq!(sh.status, SessionStatus::Indeterminate);
+        assert_eq!(sh.attention_state, AttentionState::None, "shells carry no badge");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -963,7 +1236,7 @@ mod tests {
         insert_running(&manager.db, "s-a");
         insert_running(&manager.db, "s-b");
 
-        manager.startup_reconcile().await.unwrap();
+        manager.startup_reconcile().unwrap();
 
         for id in ["s-a", "s-b"] {
             assert_eq!(
@@ -971,6 +1244,96 @@ mod tests {
                 SessionStatus::Indeterminate
             );
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- reconcile-after-reconnect branches ----
+    //
+    // Unlike startup, on a reconnect the live sessions are already in `self.live`
+    // (the supervisor re-attached them). `reconcile_from_holder` must leave the
+    // survivors alone and only finalize the ones a fresh `list` shows gone.
+
+    /// Put a still-live session into `self.live` (as the supervisor's re-attach
+    /// leaves it) and seed a matching running DB row.
+    fn insert_live(manager: &Arc<SessionManager>, id: &str) {
+        insert_running(&manager.db, id);
+        manager.live.lock().insert(id.to_string(), mock_session());
+    }
+
+    #[tokio::test]
+    async fn reconnect_leaves_live_survivor_running() {
+        // Holder still reports it alive AND it's already live → no-op.
+        let end_calls = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            adopt_ok: false, // adopt must NOT be called for an already-live session
+            end_calls: end_calls.clone(),
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_with(backend);
+        insert_live(&manager, "s-live");
+
+        manager
+            .reconcile_from_holder(vec![holder_entry("s-live", true, 0, 0)])
+            .unwrap();
+
+        assert_eq!(
+            manager.get_session("s-live").unwrap().unwrap().status,
+            SessionStatus::Running
+        );
+        assert!(manager.live_handle("s-live").is_some());
+        assert!(end_calls.lock().is_empty(), "survivor is not finalized");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn reconnect_dead_entry_in_live_drives_exit_path() {
+        // Exited while detached: reconcile drives the normal exit path (the
+        // monitor writes the summary), so it must call end_session_stream(Exited).
+        let end_calls = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            end_calls: end_calls.clone(),
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_with(backend);
+        insert_live(&manager, "s-exit");
+
+        manager
+            .reconcile_from_holder(vec![holder_entry("s-exit", false, 7, 0)])
+            .unwrap();
+
+        assert_eq!(
+            *end_calls.lock(),
+            vec![("s-exit".to_string(), "exited".to_string())]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn reconnect_absent_in_live_is_vanished_indeterminate() {
+        // The holder no longer knows it (crash/replace): close the stream and
+        // mark the row indeterminate, removing it from the live map.
+        let end_calls = Arc::new(Mutex::new(Vec::new()));
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            end_calls: end_calls.clone(),
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_with(backend);
+        insert_live(&manager, "s-gone");
+
+        manager.reconcile_from_holder(vec![]).unwrap();
+
+        assert_eq!(
+            *end_calls.lock(),
+            vec![("s-gone".to_string(), "vanished".to_string())]
+        );
+        assert!(manager.live_handle("s-gone").is_none(), "removed from live");
+        assert_eq!(
+            manager.get_session("s-gone").unwrap().unwrap().status,
+            SessionStatus::Indeterminate
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1106,6 +1469,133 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Archiving a session that ran on a branch the *user* already had must
+    /// reclaim the worktree we made for it and leave the branch standing. This
+    /// regressed once: teardown inferred "we own this branch" from the isolation
+    /// mode, so a session started on `main` deleted `main` on archive.
+    #[tokio::test]
+    async fn archive_keeps_a_preexisting_branch_it_only_borrowed() {
+        let (manager, dir) = test_manager();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+
+        // `main` exists but is not the repo's checked-out branch, so the session
+        // gets a managed worktree with `main` checked out inside it (rather than
+        // sharing the source checkout).
+        git_in(&repo, &["branch", "main"]);
+        git_in(&repo, &["checkout", "-q", "-b", "other"]);
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+
+        let mut req = ws_req(&ws.id);
+        req.branch = Some("main".into());
+        req.create_branch = false;
+        let s = manager.create_session(req).unwrap();
+        let inst = manager.get_instance_for_session(&s.id).unwrap().unwrap();
+        assert_eq!(inst.branch.as_deref(), Some("main"));
+        assert_eq!(inst.isolation, "worktree");
+        assert!(inst.owns_worktree, "we created this worktree");
+        assert!(!inst.owns_branch, "`main` was the user's, not ours");
+
+        manager.stop_session(&s.id).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        // Archive succeeds and takes the worktree — but `main` survives.
+        let archived = manager.archive_session(&s.id, false).unwrap();
+        assert_eq!(archived.status, SessionStatus::Archived);
+        assert!(!Path::new(&inst.path).exists(), "worktree reclaimed");
+        assert!(
+            workspace::branch_exists(&repo, "main"),
+            "archiving a session must never delete a branch it did not create"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `force` widens what we may *discard*, never what we *own*. Forcing the
+    /// archive of a session on a borrowed branch — even one carrying unmerged
+    /// commits, which is what the `-D` path would silently drop — still keeps it.
+    #[tokio::test]
+    async fn forced_archive_still_keeps_a_borrowed_branch() {
+        let (manager, dir) = test_manager();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+        git_in(&repo, &["branch", "release"]);
+        git_in(&repo, &["checkout", "-q", "-b", "other"]);
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+
+        let mut req = ws_req(&ws.id);
+        req.branch = Some("release".into());
+        req.create_branch = false;
+        let s = manager.create_session(req).unwrap();
+        let inst = manager.get_instance_for_session(&s.id).unwrap().unwrap();
+        let wt = Path::new(&inst.path);
+
+        // Unmerged commit + uncommitted change: both `force` triggers at once.
+        git_in(wt, &["commit", "-q", "--allow-empty", "-m", "shipped"]);
+        std::fs::write(wt.join("dirty.txt"), "wip").unwrap();
+
+        manager.stop_session(&s.id).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let archived = manager.archive_session(&s.id, true).unwrap();
+        assert_eq!(archived.status, SessionStatus::Archived);
+        assert!(!wt.exists(), "forced archive reclaims our worktree");
+        assert!(
+            workspace::branch_exists(&repo, "release"),
+            "force discards our work, it must not delete the user's branch"
+        );
+        // The commit made on `release` is still there.
+        let log = git_in(&repo, &["log", "-1", "--format=%s", "release"]);
+        assert_eq!(log.trim(), "shipped");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A session dropped into a worktree the user created themselves owns
+    /// nothing: archiving releases the claim and leaves the directory and its
+    /// branch untouched.
+    #[tokio::test]
+    async fn archive_leaves_a_worktree_the_user_made() {
+        let (manager, dir) = test_manager();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+
+        // The user's own worktree, on their own branch — nothing to do with us.
+        let theirs = dir.join("their-worktree");
+        git_in(
+            &repo,
+            &["worktree", "add", "-q", "-b", "release", theirs.to_str().unwrap()],
+        );
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+
+        let mut req = ws_req(&ws.id);
+        req.branch = Some("release".into());
+        req.create_branch = false;
+        let s = manager.create_session(req).unwrap();
+        let inst = manager.get_instance_for_session(&s.id).unwrap().unwrap();
+        assert_eq!(inst.isolation, "shared");
+        assert_eq!(Path::new(&inst.path), theirs.as_path());
+        assert!(!inst.owns_worktree && !inst.owns_branch);
+
+        manager.stop_session(&s.id).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        manager.archive_session(&s.id, true).unwrap();
+        assert!(theirs.is_dir(), "the user's worktree is not ours to remove");
+        assert!(workspace::branch_exists(&repo, "release"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     // ---- keystroke echo vs. real work (idle-prompt accuracy) ----
 
     fn mock_handle() -> Arc<dyn BackendSession> {
@@ -1194,6 +1684,26 @@ mod tests {
     }
 
     #[test]
+    fn shell_output_is_never_classified() {
+        // Shells opt out of attention tracking (`tracks_attention` = false): the
+        // user drives the terminal themselves, so even output that would read as
+        // an approval gate for an agent must stay unclassified. Only the
+        // activity timestamp is recorded.
+        let (manager, dir) = test_manager();
+        let shell = manager.registry.get("shell").unwrap();
+        let handle = mock_handle();
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::None);
+        manager.on_output(
+            "sid", &handle, b"Proceed? (y/n)", Some(&shell), &mut tail, &mut last_write,
+            &mut last_attn, &mut false, 0, false,
+        );
+        assert_eq!(last_attn, AttentionState::None);
+        assert!(last_write > 0, "activity must still be recorded");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn claude_screen_prompt_blocks_via_on_output() {
         // End-to-end wiring: the Claude plugin opts into screen-based detection,
         // so `on_output` must classify from the handle's rendered screen (not the
@@ -1209,6 +1719,44 @@ mod tests {
         manager.on_output(
             "sid", &handle, b"\x1b[35B\xe2\x97\x8f", Some(&claude), &mut tail,
             &mut last_write, &mut last_attn, &mut false, 0, false,
+        );
+        assert_eq!(last_attn, AttentionState::ApprovalNeeded);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn codex_turn_complete_bell_reads_as_activity_via_on_output() {
+        // The reported bug, end-to-end: Codex rings the terminal bell when a turn
+        // finishes. The plugin opts out of the bell heuristic and classifies from
+        // the screen, so a finished turn (no approval menu) must read as activity
+        // — settling to idle — even though the byte chunk carried a real bell.
+        let (manager, dir) = test_manager();
+        let codex = manager.registry.get("codex").unwrap();
+        let screen = "\u{25cf} Committed as ee1d352 \u{2014} done.\n\u{2500} Worked for 10m 19s \u{2500}\u{2500}\n\u{203a} ";
+        let handle = mock_handle_with_screen(screen);
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::Activity);
+        manager.on_output(
+            "sid", &handle, b"done.\x07", Some(&codex), &mut tail, &mut last_write,
+            &mut last_attn, &mut false, 0, false,
+        );
+        assert_eq!(last_attn, AttentionState::Activity);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn codex_approval_screen_blocks_via_on_output() {
+        // The other half: a real Codex approval menu on screen must read as a
+        // block, so the session is flagged for the user.
+        let (manager, dir) = test_manager();
+        let codex = manager.registry.get("codex").unwrap();
+        let screen = " Would you like to run the following command?\n \u{203a} 1. Yes, proceed (y)\n   2. No, and tell Codex what to do differently (esc)\n Press enter to confirm or esc to cancel";
+        let handle = mock_handle_with_screen(screen);
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::Activity);
+        manager.on_output(
+            "sid", &handle, b"\x1b[2K", Some(&codex), &mut tail, &mut last_write,
+            &mut last_attn, &mut false, 0, false,
         );
         assert_eq!(last_attn, AttentionState::ApprovalNeeded);
         let _ = std::fs::remove_dir_all(dir);
@@ -1258,6 +1806,67 @@ mod tests {
         let sig = Interaction::default();
         let mut last_attn = AttentionState::Activity;
         manager.on_idle("sid", &handle, Some(&claude), &mut last_attn, &sig);
+        assert_eq!(last_attn, AttentionState::Idle);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- still-working settle (stays working, does not go idle) ----
+
+    #[test]
+    fn codex_idle_settle_waiting_on_sub_agent_stays_working() {
+        // The reported bug, end-to-end: Codex is blocked in `wait_agent` — nothing
+        // to do itself, so the PTY goes quiet and the silence timer fires — but the
+        // turn is still in flight. The settle must read the screen and hold the
+        // session at Activity instead of calling it idle.
+        let (manager, dir) = test_manager();
+        let codex = manager.registry.get("codex").unwrap();
+        let screen = "\
+\u{2022} Waiting for agents\n\
+\u{25e6} Working (49s \u{2022} esc to interrupt) \u{b7} 1 background terminal running \u{b7} /ps to view\n\
+\u{203a} Run /review on my current changes";
+        let handle = mock_handle_with_screen(screen);
+        let sig = Interaction::default();
+        let mut last_attn = AttentionState::Activity;
+        manager.on_idle("sid", &handle, Some(&codex), &mut last_attn, &sig);
+        assert_eq!(last_attn, AttentionState::Activity);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn codex_idle_settle_with_background_terminal_stays_working() {
+        // The other half: the turn ended, but the background terminal it started
+        // is still running — quiet, yet not done, so it must not settle to idle.
+        let (manager, dir) = test_manager();
+        let codex = manager.registry.get("codex").unwrap();
+        let screen = "\
+\u{2022} Started it.\n\
+\u{2500} Worked for 5m 50s \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\
+  1 background terminal running \u{b7} /ps to view \u{b7} /stop to close\n\
+\u{203a} Run /review on my current changes";
+        let handle = mock_handle_with_screen(screen);
+        let sig = Interaction::default();
+        let mut last_attn = AttentionState::Activity;
+        manager.on_idle("sid", &handle, Some(&codex), &mut last_attn, &sig);
+        assert_eq!(last_attn, AttentionState::Activity);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn codex_idle_settle_after_finished_turn_reads_as_idle() {
+        // The guard on the two above: with nothing in flight and nothing left
+        // running, a finished Codex turn must still settle to idle — otherwise the
+        // session would never hand back to the user.
+        let (manager, dir) = test_manager();
+        let codex = manager.registry.get("codex").unwrap();
+        let screen = "\
+\u{2022} Ran sleep 25\n\
+\u{2022} Command completed successfully.\n\
+\u{203a} Run /review on my current changes\n\
+  gpt-5.6-sol xhigh \u{b7} ~/dev/agent-workspace";
+        let handle = mock_handle_with_screen(screen);
+        let sig = Interaction::default();
+        let mut last_attn = AttentionState::Activity;
+        manager.on_idle("sid", &handle, Some(&codex), &mut last_attn, &sig);
         assert_eq!(last_attn, AttentionState::Idle);
         let _ = std::fs::remove_dir_all(dir);
     }

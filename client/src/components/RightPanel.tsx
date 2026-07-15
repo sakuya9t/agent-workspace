@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
-import { api, ChangedFile, Commit, Session } from "../api";
+import { api, BaseCommit, ChangedFile, Commit, Session } from "../api";
 import { Target } from "../connectionStore";
 import { buildVscodeLaunch, launchVscode, vscodeReachable, VscodeLaunch } from "../vscode";
 import { relTime } from "../i18n/time";
@@ -138,8 +138,19 @@ export function RightPanel({ target, session }: Props) {
     qc.invalidateQueries({ queryKey: ["scmlog", base, session?.id] });
   };
 
+  // Named `fetchRemotes`, not `fetch`, so it can't shadow the global.
+  const fetchRemotes = useMutation({
+    mutationFn: () => api.scmFetch(target!, session!.id),
+    onSuccess: refreshScm,
+  });
+
   const pull = useMutation({
     mutationFn: () => api.scmPull(target!, session!.id),
+    onSuccess: refreshScm,
+  });
+
+  const push = useMutation({
+    mutationFn: () => api.scmPush(target!, session!.id),
     onSuccess: refreshScm,
   });
 
@@ -159,31 +170,55 @@ export function RightPanel({ target, session }: Props) {
       setMergeTarget("");
       refreshScm();
     },
-    onError: (e) => {
-      if ((e as { status?: number }).status === 409) {
-        alert(t("rightPanel.mergeConflictPrompt", { message: (e as Error).message }));
-      }
-    },
   });
 
-  // Pull/rebase/merge share one result/error area, so starting one clears the
-  // others' stale output.
+  // `attached` here means the managed worktree currently holds its recorded
+  // branch. Detaching leaves the files and HEAD in place, but releases Git's
+  // branch lock so the source checkout can temporarily deploy/verify it.
+  const branchAttachment = useMutation({
+    mutationFn: (attached: boolean) =>
+      attached
+        ? api.scmAttachBranch(target!, session!.id)
+        : api.scmDetachBranch(target!, session!.id),
+    onSuccess: refreshScm,
+  });
+
+  // Every source-control operation shares one result/error area, so starting any
+  // one of them clears the others' stale output.
+  const scmOps = [fetchRemotes, pull, push, rebase, merge, branchAttachment];
+  const resetScmOps = () => scmOps.forEach((op) => op.reset());
+  const startFetch = () => {
+    resetScmOps();
+    fetchRemotes.mutate();
+  };
   const startPull = () => {
-    rebase.reset();
-    merge.reset();
+    resetScmOps();
     pull.mutate();
   };
+  const startPush = () => {
+    resetScmOps();
+    push.mutate();
+  };
   const startRebase = (onto: string) => {
-    pull.reset();
-    merge.reset();
+    resetScmOps();
     rebase.mutate(onto);
   };
   const startMerge = (targetBranch: string) => {
-    pull.reset();
-    rebase.reset();
+    resetScmOps();
     merge.mutate(targetBranch);
   };
-  const scmBusy = pull.isPending || rebase.isPending || merge.isPending;
+  const startBranchAttachment = (attached: boolean) => {
+    resetScmOps();
+    branchAttachment.mutate(attached);
+  };
+  const scmBusy = scmOps.some((op) => op.isPending);
+
+  const recordedBranch = instance?.branch ?? null;
+  const canToggleBranchAttachment =
+    !!recordedBranch &&
+    (instance?.isolation === "worktree" || instance?.isolation === "shared") &&
+    (!!scm?.detached || scm?.branch === recordedBranch);
+  const branchIsAttached = !!recordedBranch && scm?.branch === recordedBranch;
 
   // Don't carry an open picker or a previous session's SCM output onto the next
   // session (this panel is reused, not remounted, across selections).
@@ -192,9 +227,7 @@ export function RightPanel({ target, session }: Props) {
     setRebaseOnto("");
     setMergeOpen(false);
     setMergeTarget("");
-    pull.reset();
-    rebase.reset();
-    merge.reset();
+    resetScmOps();
   }, [session?.id, base]);
 
   if (!session || !target) {
@@ -350,12 +383,125 @@ export function RightPanel({ target, session }: Props) {
         <div className="section-title with-branch">
           <span>{t("rightPanel.scmHeader")}</span>
           {scm?.is_repo && (
-            <span className="branch-pill mono">
-              {scm.detached ? t("rightPanel.detached") : scm.branch}
-              {scm.head ? ` · ${scm.head}` : ""}
+            <span className="branch-controls">
+              <span className="branch-pill mono">
+                {scm.detached && recordedBranch
+                  ? t("rightPanel.detachedFrom", { branch: recordedBranch })
+                  : scm.detached
+                    ? t("rightPanel.detached")
+                    : scm.branch}
+                {scm.head ? ` · ${scm.head}` : ""}
+              </span>
+              {canToggleBranchAttachment && (
+                <button
+                  className="icon-btn branch-attachment-btn"
+                  disabled={scmBusy}
+                  onClick={() => startBranchAttachment(!branchIsAttached)}
+                  title={t(
+                    branchIsAttached
+                      ? "rightPanel.detachBranchTitle"
+                      : "rightPanel.attachBranchTitle",
+                    { branch: recordedBranch },
+                  )}
+                  aria-label={t(
+                    branchIsAttached
+                      ? "rightPanel.detachBranchTitle"
+                      : "rightPanel.attachBranchTitle",
+                    { branch: recordedBranch },
+                  )}
+                >
+                  <span
+                    className={`action-icon action-icon-git-${
+                      branchIsAttached ? "detach" : "attach"
+                    }`}
+                    aria-hidden="true"
+                  />
+                </button>
+              )}
             </span>
           )}
         </div>
+
+        {scm?.is_repo && (scm.remotes.length > 0 || scm.base) && (
+          <div className="scm-refs">
+            {scm.remotes.map((r) => {
+              const ref = `${r.remote}/${r.branch}`;
+              return (
+                <div className="scm-ref" key={r.remote}>
+                  <span
+                    className={"ref-tag" + (r.upstream ? " upstream" : "")}
+                    title={t("rightPanel.remoteTitle", { ref })}
+                  >
+                    {r.remote}
+                  </span>
+                  <span className="mono ref-hash">{r.head}</span>
+                  {/* The remote-side name, but only when it isn't the local one —
+                      an upstream may track a differently-named branch. */}
+                  <span className="ref-note dim">{r.branch === scm.branch ? "" : r.branch}</span>
+                  <span className="ref-counts">
+                    {r.ahead > 0 && (
+                      <span
+                        className="ref-count ahead"
+                        title={t("rightPanel.remoteAhead", { count: r.ahead, ref })}
+                      >
+                        ↑{r.ahead}
+                      </span>
+                    )}
+                    {r.behind > 0 && (
+                      <span
+                        className="ref-count behind"
+                        title={t("rightPanel.remoteBehind", { count: r.behind, ref })}
+                      >
+                        ↓{r.behind}
+                      </span>
+                    )}
+                  </span>
+                </div>
+              );
+            })}
+
+            {scm.base && (
+              <div className="scm-ref">
+                <span
+                  className="ref-tag base"
+                  title={t(
+                    scm.base.kind === "spawned"
+                      ? "rightPanel.baseSpawnedTitle"
+                      : "rightPanel.baseRebasedTitle",
+                    { branch: scm.branch },
+                  )}
+                >
+                  {t("rightPanel.baseTag")}
+                </span>
+                <span className="mono ref-hash">{scm.base.short}</span>
+                {/* Name the base by a ref that still points at it — "master" says
+                    far more than a hash. Once they've all moved on, the commit's
+                    own subject is what's left to identify it by. */}
+                <span
+                  className="ref-note dim"
+                  title={scm.base.refs.join(", ") || scm.base.subject}
+                >
+                  {t(
+                    scm.base.kind === "spawned"
+                      ? "rightPanel.baseSpawnedFrom"
+                      : "rightPanel.baseRebasedOnto",
+                    { ref: scm.base.refs[0] || scm.base.subject },
+                  )}
+                </span>
+                {scm.base.ahead > 0 && (
+                  <span className="ref-counts">
+                    <span
+                      className="ref-count ahead"
+                      title={t("rightPanel.baseAhead", { count: scm.base.ahead })}
+                    >
+                      +{scm.base.ahead}
+                    </span>
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        )}
 
         {!scm?.is_repo && (
           <div className="dim small">{t("rightPanel.notRepo", { cmd: "git init" })}</div>
@@ -388,43 +534,65 @@ export function RightPanel({ target, session }: Props) {
           <>
             <div className="section-title with-actions">
               <span>{t("rightPanel.historyHeader")}</span>
-              {!scm.detached && (
-                <span className="scm-actions">
-                  <button
-                    className="icon-btn"
-                    disabled={scmBusy}
-                    onClick={startPull}
-                    title={t("rightPanel.pullTitle")}
-                    aria-label={t("rightPanel.pullTitle")}
-                  >
-                    ↓
-                  </button>
-                  <button
-                    className={"icon-btn" + (rebaseOpen ? " active" : "")}
-                    disabled={scmBusy}
-                    onClick={() => {
-                      setMergeOpen(false);
-                      setRebaseOpen((o) => !o);
-                    }}
-                    title={t("rightPanel.rebaseTitle")}
-                    aria-label={t("rightPanel.rebaseTitle")}
-                  >
-                    ⎇
-                  </button>
-                  <button
-                    className={"icon-btn" + (mergeOpen ? " active" : "")}
-                    disabled={scmBusy}
-                    onClick={() => {
-                      setRebaseOpen(false);
-                      setMergeOpen((o) => !o);
-                    }}
-                    title={t("rightPanel.mergeTitle")}
-                    aria-label={t("rightPanel.mergeTitle")}
-                  >
-                    ⤴
-                  </button>
-                </span>
-              )}
+              <span className="scm-actions">
+                {/* Fetch only reads the remotes, so unlike the rest it is just as
+                    valid on a detached HEAD as on a branch. */}
+                <button
+                  className="icon-btn"
+                  disabled={scmBusy}
+                  onClick={startFetch}
+                  title={t("rightPanel.fetchTitle")}
+                  aria-label={t("rightPanel.fetchTitle")}
+                >
+                  <span className="action-icon action-icon-git-fetch" aria-hidden="true" />
+                </button>
+                {!scm.detached && (
+                  <>
+                    <button
+                      className="icon-btn"
+                      disabled={scmBusy}
+                      onClick={startPull}
+                      title={t("rightPanel.pullTitle")}
+                      aria-label={t("rightPanel.pullTitle")}
+                    >
+                      <span className="action-icon action-icon-git-pull" aria-hidden="true" />
+                    </button>
+                    <button
+                      className="icon-btn"
+                      disabled={scmBusy}
+                      onClick={startPush}
+                      title={t("rightPanel.pushTitle")}
+                      aria-label={t("rightPanel.pushTitle")}
+                    >
+                      <span className="action-icon action-icon-git-push" aria-hidden="true" />
+                    </button>
+                    <button
+                      className={"icon-btn" + (rebaseOpen ? " active" : "")}
+                      disabled={scmBusy}
+                      onClick={() => {
+                        setMergeOpen(false);
+                        setRebaseOpen((o) => !o);
+                      }}
+                      title={t("rightPanel.rebaseTitle")}
+                      aria-label={t("rightPanel.rebaseTitle")}
+                    >
+                      <span className="action-icon action-icon-git-rebase" aria-hidden="true" />
+                    </button>
+                    <button
+                      className={"icon-btn" + (mergeOpen ? " active" : "")}
+                      disabled={scmBusy}
+                      onClick={() => {
+                        setRebaseOpen(false);
+                        setMergeOpen((o) => !o);
+                      }}
+                      title={t("rightPanel.mergeTitle")}
+                      aria-label={t("rightPanel.mergeTitle")}
+                    >
+                      <span className="action-icon action-icon-git-merge" aria-hidden="true" />
+                    </button>
+                  </>
+                )}
+              </span>
             </div>
 
             {rebaseOpen && !scm.detached && (
@@ -530,39 +698,175 @@ export function RightPanel({ target, session }: Props) {
             {scmBusy && (
               <div className="dim small">{t("rightPanel.scmRunning")}</div>
             )}
+            {fetchRemotes.error && (
+              <ScmOpNotice
+                status="error"
+                title={t("rightPanel.fetchFailed")}
+                summary={scmErrorSummary(fetchRemotes.error)}
+                details={scmErrorDetails(fetchRemotes.error)}
+                onDismiss={fetchRemotes.reset}
+              />
+            )}
             {pull.error && (
-              <ScmOpNotice className="error" text={String(pull.error)} onDismiss={pull.reset} />
+              <ScmOpNotice
+                status="error"
+                title={t("rightPanel.pullFailed")}
+                summary={scmErrorSummary(pull.error)}
+                details={scmErrorDetails(pull.error)}
+                onDismiss={pull.reset}
+              />
+            )}
+            {push.error && (
+              <ScmOpNotice
+                status="error"
+                title={t("rightPanel.pushFailed")}
+                summary={scmErrorSummary(push.error)}
+                details={scmErrorDetails(push.error)}
+                onDismiss={push.reset}
+              />
             )}
             {rebase.error && (
-              <ScmOpNotice className="error" text={String(rebase.error)} onDismiss={rebase.reset} />
+              <ScmOpNotice
+                status="error"
+                title={t("rightPanel.rebaseFailed")}
+                summary={scmErrorSummary(rebase.error)}
+                details={scmErrorDetails(rebase.error)}
+                onDismiss={rebase.reset}
+              />
             )}
             {merge.error && (
-              <ScmOpNotice className="error" text={String(merge.error)} onDismiss={merge.reset} />
+              <ScmOpNotice
+                status="error"
+                title={t("rightPanel.mergeFailed")}
+                summary={
+                  (merge.error as { status?: number }).status === 409
+                    ? t("rightPanel.mergeConflictSummary")
+                    : scmErrorSummary(merge.error)
+                }
+                details={scmErrorDetails(merge.error)}
+                onDismiss={merge.reset}
+              />
+            )}
+            {branchAttachment.error && (
+              <ScmOpNotice
+                status="error"
+                title={t(
+                  branchAttachment.variables
+                    ? "rightPanel.attachBranchFailed"
+                    : "rightPanel.detachBranchFailed",
+                )}
+                summary={scmErrorSummary(branchAttachment.error)}
+                details={scmErrorDetails(branchAttachment.error)}
+                onDismiss={branchAttachment.reset}
+              />
+            )}
+            {/* A fetch that found nothing new succeeds with *empty* output, so the
+                truthiness check the other ops use would swallow the result. */}
+            {fetchRemotes.data !== undefined && (
+              <ScmOpNotice
+                status="success"
+                title={t("rightPanel.fetchComplete")}
+                summary={
+                  fetchRemotes.data.trim()
+                    ? t("rightPanel.fetchSuccess")
+                    : t("rightPanel.fetchUpToDate")
+                }
+                details={fetchRemotes.data}
+                onDismiss={fetchRemotes.reset}
+              />
             )}
             {pull.data && (
               <ScmOpNotice
-                className="scm-op-result mono small dim"
-                text={pull.data}
+                status="success"
+                title={t("rightPanel.pullComplete")}
+                summary={
+                  pull.data.toLowerCase().includes("already up to date")
+                    ? t("rightPanel.pullUpToDate", {
+                        branch: scm.branch ?? t("rightPanel.currentBranch"),
+                      })
+                    : t("rightPanel.pullSuccess", {
+                        branch: scm.branch ?? t("rightPanel.currentBranch"),
+                      })
+                }
+                details={pull.data}
                 onDismiss={pull.reset}
+              />
+            )}
+            {push.data && (
+              <ScmOpNotice
+                status="success"
+                title={t("rightPanel.pushComplete")}
+                summary={
+                  push.data.toLowerCase().includes("up-to-date") ||
+                  push.data.toLowerCase().includes("up to date")
+                    ? t("rightPanel.pushUpToDate", {
+                        branch: scm.branch ?? t("rightPanel.currentBranch"),
+                      })
+                    : t("rightPanel.pushSuccess", {
+                        branch: scm.branch ?? t("rightPanel.currentBranch"),
+                      })
+                }
+                details={push.data}
+                onDismiss={push.reset}
               />
             )}
             {rebase.data && (
               <ScmOpNotice
-                className="scm-op-result mono small dim"
-                text={rebase.data}
+                status="success"
+                title={t("rightPanel.rebaseComplete")}
+                summary={
+                  rebase.data.toLowerCase().includes("up to date")
+                    ? t("rightPanel.rebaseUpToDate", {
+                        branch: scm.branch ?? t("rightPanel.currentBranch"),
+                        target: rebase.variables,
+                      })
+                    : t("rightPanel.rebaseSuccess", {
+                        branch: scm.branch ?? t("rightPanel.currentBranch"),
+                        target: rebase.variables,
+                      })
+                }
+                details={rebase.data}
                 onDismiss={rebase.reset}
               />
             )}
             {merge.data && (
               <ScmOpNotice
-                className="scm-op-result mono small dim"
-                text={merge.data}
+                status="success"
+                title={t("rightPanel.mergeComplete")}
+                summary={t("rightPanel.mergeSuccess", {
+                  branch: scm.branch ?? t("rightPanel.currentBranch"),
+                  target: merge.variables,
+                })}
+                details={merge.data}
                 onDismiss={merge.reset}
+              />
+            )}
+            {branchAttachment.data && (
+              <ScmOpNotice
+                status="success"
+                title={t(
+                  branchAttachment.variables
+                    ? "rightPanel.attachBranchComplete"
+                    : "rightPanel.detachBranchComplete",
+                )}
+                summary={t(
+                  branchAttachment.variables
+                    ? "rightPanel.attachBranchSuccess"
+                    : "rightPanel.detachBranchSuccess",
+                  { branch: branchAttachment.data },
+                )}
+                details=""
+                onDismiss={branchAttachment.reset}
               />
             )}
 
             {commits && commits.length > 0 ? (
-              <CommitGraph commits={commits} head={scm.head} onSelect={setCommitTarget} />
+              <CommitGraph
+                commits={commits}
+                head={scm.head}
+                base={scm.base}
+                onSelect={setCommitTarget}
+              />
             ) : (
               <div className="dim small">
                 {commits ? t("rightPanel.noCommits") : t("rightPanel.loadingHistory")}
@@ -598,15 +902,17 @@ export function RightPanel({ target, session }: Props) {
  * Simplified single-lane commit graph for the MVP (per the architecture doc's
  * "closest history model"): a vertical rail with one dot per commit, newest at
  * the top. Merge commits (>1 parent) get a hollow dot; the HEAD commit is
- * highlighted.
+ * highlighted and the branch's base commit is tagged.
  */
 function CommitGraph({
   commits,
   head,
+  base,
   onSelect,
 }: {
   commits: Commit[];
   head: string | null;
+  base: BaseCommit | null;
   onSelect: (hash: string) => void;
 }) {
   const { t } = useTranslation();
@@ -615,6 +921,7 @@ function CommitGraph({
       {commits.map((c, i) => {
         const merge = c.parents.length > 1;
         const isHead = !!head && c.short === head;
+        const isBase = !!base && c.hash === base.hash;
         return (
           <div
             className="commit-row"
@@ -635,6 +942,7 @@ function CommitGraph({
               <div className="commit-subject">
                 {c.subject || t("rightPanel.noMessage")}
                 {isHead && <span className="head-pill">HEAD</span>}
+                {isBase && <span className="base-pill">{t("rightPanel.baseTag")}</span>}
               </div>
               <div className="commit-meta">
                 <span className="mono">{c.short}</span>
@@ -649,24 +957,44 @@ function CommitGraph({
 }
 
 /**
- * A source-control op message (pull/rebase/merge result or error) with a dismiss
- * control. These three share one area and otherwise linger until the next op or a
- * session switch, so `onDismiss` clears the underlying mutation via its reset(),
- * which drops the message from the UI.
+ * Compact source-control outcome with raw Git output available on demand. These
+ * notices linger until the next operation/session or until explicitly dismissed.
  */
 function ScmOpNotice({
-  text,
-  className,
+  status,
+  title,
+  summary,
+  details,
   onDismiss,
 }: {
-  text: string;
-  className: string;
+  status: "success" | "error";
+  title: string;
+  summary: string;
+  details: string;
   onDismiss: () => void;
 }) {
   const { t } = useTranslation();
+  const trimmedDetails = details.trim();
+  const showDetails = trimmedDetails.length > 0 && trimmedDetails !== summary.trim();
   return (
-    <div className={`scm-op-notice ${className}`}>
-      <span className="scm-op-text">{text}</span>
+    <div
+      className={`scm-op-notice scm-op-${status}`}
+      role={status === "error" ? "alert" : "status"}
+      aria-live={status === "error" ? "assertive" : "polite"}
+    >
+      <span className="scm-op-status" aria-hidden="true">
+        {status === "success" ? "✓" : "!"}
+      </span>
+      <div className="scm-op-copy">
+        <div className="scm-op-title">{title}</div>
+        <div className="scm-op-summary">{summary}</div>
+        {showDetails && (
+          <details className="scm-op-details">
+            <summary>{t("rightPanel.showGitDetails")}</summary>
+            <pre>{trimmedDetails}</pre>
+          </details>
+        )}
+      </div>
       <button
         className="scm-op-dismiss"
         onClick={onDismiss}
@@ -677,6 +1005,17 @@ function ScmOpNotice({
       </button>
     </div>
   );
+}
+
+function scmErrorDetails(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** Keep the actionable first line visible; the complete command output stays expandable. */
+function scmErrorSummary(error: unknown): string {
+  const details = scmErrorDetails(error).trim();
+  const firstLine = details.split(/\r?\n/, 1)[0] || details;
+  return firstLine.length > 180 ? `${firstLine.slice(0, 177)}…` : firstLine;
 }
 
 function Field({ label, value, mono }: { label: string; value: string; mono?: boolean }) {

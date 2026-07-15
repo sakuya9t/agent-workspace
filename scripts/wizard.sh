@@ -107,17 +107,18 @@ choose_connectivity() {
   local mode="$1" c
   if [ "$mode" = restart ]; then
     menu c "What should this restart do?" \
-      "Just reload the daemon — keep current settings & live sessions" \
+      "Just reload the daemon — keep current settings & live sessions (a bundled relay stays up; revived if it died)" \
       "Switch to: direct on the LAN (network clients connect here)" \
       "Switch to: behind NAT (register out to a relay)"
     case "$c" in 1) ROLE=reload ;; 2) ROLE=lan ;; 3) ROLE=nat ;; esac
   else
     menu c "How will clients reach this host?" \
-      "Local only — you'll use the client on THIS machine (loopback)" \
-      "Direct on the LAN — clients on your network connect to this host" \
-      "Relay host — this reachable box relays to private / NAT'd nodes" \
-      "Behind NAT — this host can't accept inbound, so it dials OUT to a relay"
-    case "$c" in 1) ROLE=local ;; 2) ROLE=lan ;; 3) ROLE=relayhost ;; 4) ROLE=nat ;; esac
+      "Local only — daemon only; you'll use the client on THIS machine (loopback)" \
+      "Direct on the LAN — daemon only; clients on your network connect to this host" \
+      "Relay host — daemon + relay: sessions run here AND private / NAT'd nodes relay through it" \
+      "Relay only — no sessions here; this box just relays for private / NAT'd nodes" \
+      "Behind NAT — daemon only; this host can't accept inbound, so it dials OUT to a relay"
+    case "$c" in 1) ROLE=local ;; 2) ROLE=lan ;; 3) ROLE=relayhost ;; 4) ROLE=relayonly ;; 5) ROLE=nat ;; esac
   fi
 
   FLAGS=()
@@ -132,6 +133,12 @@ choose_connectivity() {
       prompt_required RELAY_KEY "Relay access key (shared secret nodes & clients present)"
       prompt_port RELAY_PORT "Relay port (private nodes register here)" "4700"
       FLAGS=(--bind "0.0.0.0:$DAEMON_PORT" --relay --relay-key "$RELAY_KEY")
+      [ "$RELAY_PORT" != "4700" ] && FLAGS+=(--relay-bind "0.0.0.0:$RELAY_PORT")
+      ;;
+    relayonly)
+      prompt_required RELAY_KEY "Relay access key (shared secret nodes & clients present)"
+      prompt_port RELAY_PORT "Relay port (private nodes register here)" "4700"
+      FLAGS=(--relay-only --relay-key "$RELAY_KEY")
       [ "$RELAY_PORT" != "4700" ] && FLAGS+=(--relay-bind "0.0.0.0:$RELAY_PORT")
       ;;
     nat)
@@ -160,7 +167,7 @@ post_tips() {
       ;;
   esac
   case "$ROLE" in
-    relayhost)
+    relayhost | relayonly)
       title "Point a NAT'd node at this relay"
       log "on each private node, run its own wizard and pick “Behind NAT”, or:"
       note "scripts/start.sh --register ws://$(this_ip):$RELAY_PORT --relay-key $RELAY_KEY"

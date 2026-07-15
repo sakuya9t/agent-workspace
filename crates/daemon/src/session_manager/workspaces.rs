@@ -64,6 +64,16 @@ impl SessionManager {
                                 } else {
                                     (existing_path, Some(name.to_string()), "shared")
                                 };
+                                // Inherit ownership from whoever created this
+                                // worktree rather than claiming it by virtue of
+                                // sharing it. A worktree we made stays reclaimable
+                                // by the last session out; one the user made (no
+                                // instance on record) is never ours to remove, and
+                                // its branch never ours to delete.
+                                let (owns_worktree, owns_branch) = self
+                                    .db
+                                    .instance_ownership_at_path(&path)?
+                                    .unwrap_or((false, false));
                                 let inst = WorkspaceInstance {
                                     id: Uuid::new_v4().to_string(),
                                     workspace_id: ws.id.clone(),
@@ -73,6 +83,8 @@ impl SessionManager {
                                     isolation: isolation.into(),
                                     status: "active".into(),
                                     created_at: now,
+                                    owns_worktree,
+                                    owns_branch,
                                 };
                                 return Ok((path, Some(inst)));
                             }
@@ -84,9 +96,21 @@ impl SessionManager {
                             workspace::BranchSpec::New { name, base }
                         }
                         Some(name) => workspace::BranchSpec::Existing { name },
-                        None => workspace::BranchSpec::Auto { name: &auto },
+                        // `base` is "HEAD" unless the caller set one. A fork onto
+                        // a new branch names no branch (so it gets the unique
+                        // `asm-session/<id>` form, which the orphan sweep and
+                        // archive-time branch cleanup already understand) but does
+                        // set `base_ref` to the origin's branch — so it starts from
+                        // the origin's work rather than from the repo's HEAD.
+                        None => workspace::BranchSpec::Auto { name: &auto, base },
                     };
+                    // `Existing` checks out a branch the user already had (`main`,
+                    // `release`, a feature branch). We create the worktree for it,
+                    // so that is ours to remove — but the branch is only borrowed,
+                    // and archiving must never delete it.
+                    let creates_branch = !matches!(spec, workspace::BranchSpec::Existing { .. });
                     let branch = workspace::create_worktree(&root, &instance_path, spec)?;
+                    let owns_branch = creates_branch && branch.is_some();
                     let path = instance_path.to_string_lossy().into_owned();
                     let inst = WorkspaceInstance {
                         id: Uuid::new_v4().to_string(),
@@ -97,10 +121,13 @@ impl SessionManager {
                         isolation: "worktree".into(),
                         status: "active".into(),
                         created_at: now,
+                        owns_worktree: true,
+                        owns_branch,
                     };
                     Ok((path, Some(inst)))
                 } else {
-                    // Direct source checkout (git override) or plain folder.
+                    // Direct source checkout (git override) or plain folder: we
+                    // created neither the directory nor any branch.
                     let isolation = if ws.is_git { "direct" } else { "plain" };
                     let inst = WorkspaceInstance {
                         id: Uuid::new_v4().to_string(),
@@ -111,6 +138,8 @@ impl SessionManager {
                         isolation: isolation.into(),
                         status: "active".into(),
                         created_at: now,
+                        owns_worktree: false,
+                        owns_branch: false,
                     };
                     Ok((ws.root_path, Some(inst)))
                 }
@@ -211,6 +240,34 @@ impl SessionManager {
 
     pub fn get_instance_for_session(&self, session_id: &str) -> Result<Option<WorkspaceInstance>> {
         self.db.get_instance_for_session(session_id)
+    }
+
+    /// Toggle whether an isolated session worktree holds its recorded branch.
+    /// The branch name remains in the instance record while detached so the UI
+    /// can safely attach the same branch again after external verification.
+    pub fn set_instance_branch_attached(&self, session_id: &str, attached: bool) -> Result<String> {
+        let inst = self
+            .db
+            .get_instance_for_session(session_id)?
+            .ok_or_else(|| anyhow!("no workspace instance for session"))?;
+        if inst.status != "active" {
+            bail!("workspace instance is no longer active");
+        }
+        if inst.isolation != "worktree" && inst.isolation != "shared" {
+            bail!("only isolated Git worktrees can detach from a branch");
+        }
+        let branch = inst
+            .branch
+            .as_deref()
+            .ok_or_else(|| anyhow!("this worktree has no recorded branch to reattach"))?;
+        let path = Path::new(&inst.path);
+
+        if attached {
+            workspace::attach_branch(path, branch)?;
+        } else {
+            workspace::detach_branch(path, branch)?;
+        }
+        Ok(branch.to_string())
     }
 
     /// Remove a session's managed worktree. Guards against dirty worktrees and
@@ -318,10 +375,12 @@ impl SessionManager {
     }
 
     /// Archive a finished session. Unlike a plain "finished" session (which stays
-    /// in history with its branch kept), archiving is the "throw this away" step:
-    /// it removes the session's managed worktree and deletes its branch, then
-    /// marks the record `archived` (dropped from the history view). Refuses to
-    /// discard uncommitted or unmerged work unless `force` — see `discard_instance`.
+    /// in history with its worktree kept), archiving is the "throw this away"
+    /// step: it reclaims what the session created — its managed worktree, and its
+    /// branch if we made that branch — then marks the record `archived` (dropped
+    /// from the history view). A session that ran on a pre-existing branch keeps
+    /// that branch. Refuses to discard uncommitted or unmerged work unless
+    /// `force` — see `discard_instance`.
     pub fn archive_session(&self, id: &str, force: bool) -> Result<Session> {
         let s = self
             .db
@@ -338,12 +397,21 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("session vanished"))
     }
 
-    /// Tear down a session's managed worktree and delete its branch, reclaiming
-    /// both. A no-op for ad-hoc sessions and direct/plain instances (which share
-    /// the source checkout and own no branch). Guards against data loss unless
-    /// `force`: a dirty worktree or an unmerged branch raises [`NeedsForce`] so
-    /// the caller can confirm before anything is removed. The unmerged check runs
-    /// before the worktree is touched, so a refusal leaves everything intact.
+    /// Tear down whatever this session's instance *created* — its managed
+    /// worktree, its branch — and reclaim it. A no-op for ad-hoc sessions and
+    /// direct/plain instances (which share the source checkout and own nothing).
+    ///
+    /// What gets removed is decided by the ownership recorded at creation, never
+    /// by isolation: a session can be handed a branch that already existed
+    /// (`main`, `release`) or dropped into a worktree the user made themselves,
+    /// and archiving such a session must leave both standing. Only what we
+    /// created is ours to delete; anything else we merely release our claim on.
+    ///
+    /// Guards against data loss unless `force`: a dirty worktree or an unmerged
+    /// branch raises [`NeedsForce`] so the caller can confirm before anything is
+    /// removed. Both checks run before the worktree is touched, so a refusal
+    /// leaves everything intact. `force` discards *our* work — it never widens
+    /// what we own.
     fn discard_instance(&self, session_id: &str, force: bool) -> Result<()> {
         let Some(inst) = self.db.get_instance_for_session(session_id)? else {
             return Ok(()); // ad-hoc session: nothing managed to remove
@@ -374,16 +442,22 @@ impl SessionManager {
             return Ok(());
         }
 
+        let owns_worktree = inst.owns_worktree;
+        let branch = inst.branch.as_deref().filter(|_| inst.owns_branch);
+
         // Refuse to silently discard work unless forced. Both guards surface as
-        // `NeedsForce` (→ HTTP 409) so the client can confirm and retry.
+        // `NeedsForce` (→ HTTP 409) so the client can confirm and retry. Neither
+        // fires for a resource we are not going to touch: uncommitted changes in
+        // a worktree we won't remove are in no danger, so there is nothing to
+        // confirm.
         if !force {
-            if active && workspace::worktree_is_dirty(inst_path) {
+            if active && owns_worktree && workspace::worktree_is_dirty(inst_path) {
                 return Err(NeedsForce(
                     "worktree has uncommitted changes; archiving would discard them".into(),
                 )
                 .into());
             }
-            if let Some(branch) = inst.branch.as_deref() {
+            if let Some(branch) = branch {
                 if workspace::branch_exists(root, branch)
                     && !workspace::branch_is_merged(root, branch)
                 {
@@ -397,11 +471,13 @@ impl SessionManager {
 
         // Safe (or forced): drop the worktree first (a branch checked out in a
         // worktree cannot be deleted), then the branch itself.
-        if active {
+        if active && owns_worktree {
             workspace::remove_worktree(root, inst_path, force)?;
+        }
+        if active {
             self.db.set_instance_status(&inst.id, "released")?;
         }
-        if let Some(branch) = inst.branch.as_deref() {
+        if let Some(branch) = branch {
             if workspace::branch_exists(root, branch) {
                 workspace::delete_branch(root, branch, force)?;
             }

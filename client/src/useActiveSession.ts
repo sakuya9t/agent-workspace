@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { ActiveRef, useUiStore } from "./store";
 import { Target, targetOf } from "./connectionStore";
 import { DaemonState, useDaemonStates } from "./useDaemons";
@@ -62,6 +63,17 @@ export function useActiveSession(): ActiveSession {
   );
   const target = activeState ? targetOf(activeState.daemon) : undefined;
   const live = activeSession ? isLive(activeSession.status) : false;
+
+  // Archiving discards the worktree and drops the session from every list, so a
+  // client parked on it is left staring at a shell that no longer has a backing
+  // tree (the transcript and git actions 404/409 from here on). Clear the
+  // selection so the shells fall back to the list, exactly as a takeover does.
+  // Keyed off the poll rather than the archiving click, so *every* client
+  // viewing the session leaves — not just the one that pressed the button.
+  const archived = activeSession?.status === "archived";
+  useEffect(() => {
+    if (archived) useUiStore.getState().setActive(null);
+  }, [archived]);
 
   return { states, reachable, totalLive, blocked, active, activeState, activeSession, target, live };
 }

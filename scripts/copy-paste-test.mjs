@@ -2,39 +2,48 @@
 // real built client in headless Chrome via raw CDP (no puppeteer installed).
 // Companion to attach-button-test.mjs. Three personas, all against a shell
 // session with SGR mouse reporting enabled (i.e. behaving like an agent TUI):
-//   T1  Linux UA, secure origin (daemon-served bundle on 127.0.0.1):
-//       shift+drag select, Ctrl-Shift-C chord (+"Copied" receipt, no SIGINT
-//       leak), native paste, plain Ctrl-V stays ^V, right-click copy+clear
+//   T1  Linux UA, secure origin (daemon-served bundle on 127.0.0.1) — stands in
+//       for Windows too, which shares its key model (no ⌘): shift+drag select,
+//       Ctrl-Shift-C chord (+"Copied" receipt, no SIGINT leak), Ctrl-V pastes
+//       text AND an image (and no longer forwards ^V), Ctrl-Shift-V pastes text,
+//       right-click copy+clear
 //   T2  Mac UA emulation, secure origin: shift+drag AND option+drag select
-//       under mouse reporting, native ⌘-C copy event, ⌘-V paste
+//       under mouse reporting, native ⌘-C copy event, ⌘-V pastes text + image
 //   T3  Linux UA, INSECURE origin (LAN IP via vite --host): execCommand
-//       fallback with focus retention, native paste without clipboard API
+//       fallback with focus retention, Ctrl-V paste without the clipboard API
 //
-//   node scripts/copy-paste-test.mjs <daemonBase> <insecureUrl> <cwd> <chromePort>
+//   cd client && npm run build         # once, to produce client/dist
+//   node scripts/copy-paste-test.mjs   # sandboxed: runs T1 + T2
 //
-// Full recipe:
-//   (cd client && npm run build)
-//   D=/tmp/asm-cp; mkdir -p $D/{data,cfg,rt,cwd,chrome}
-//   ASM_BIND=127.0.0.1:4671 ASM_DATA_DIR=$D/data ASM_CONFIG_DIR=$D/cfg \
-//     ASM_RUNTIME_DIR=$D/rt ASM_STATIC_DIR=$PWD/client/dist ASM_BACKEND=native \
-//     ASM_ASMUX_AUTOSPAWN=0 ./target/debug/asm-daemon &
-//   # vite bound to the LAN gives an INSECURE origin while its /api+ws proxy
-//   # reaches the daemon from loopback (so no device pairing is needed)
-//   (cd client && ASM_DAEMON=http://127.0.0.1:4671 npx vite --port 5199 --host 0.0.0.0) &
-//   google-chrome --headless=new --disable-gpu --no-sandbox --disable-dev-shm-usage \
-//     --remote-debugging-port=9335 --user-data-dir=$D/chrome about:blank &
-//   node scripts/copy-paste-test.mjs 127.0.0.1:4671 http://<LAN-IP>:5199/ $D/cwd 9335
+// T1/T2 are fully sandboxed: the daemon (serving the bundle), Chrome, and the
+// session are all spawned here in a tmpdir. They used to need a hand-started
+// daemon on :4671 and four argv — see scripts/lib/testenv.mjs.
+//
+// T3 needs a genuinely INSECURE origin, which means a second server on a LAN IP
+// (vite --host) — not something a sandbox can conjure. It is therefore opt-in;
+// pass the URL to run it:
+//
+//   (cd client && ASM_DAEMON=http://127.0.0.1:<port> npx vite --port 5199 --host 0.0.0.0) &
+//   node scripts/copy-paste-test.mjs http://<LAN-IP>:5199/
+//
+// (For T3, point vite's ASM_DAEMON at the sandbox daemon's port, which this
+// script prints on startup.)
 //
 // Chrome-harness gotchas encoded below: Network.setCacheDisabled (a cached
 // index.html silently runs a stale bundle after rebuilds), and auto-accepting
 // Page.javascriptDialogOpening (an unanswered confirm() — e.g. the session
 // take-over prompt — blocks every same-process Runtime.evaluate forever).
 
-const daemonBase = process.argv[2] ?? "127.0.0.1:4671";
-const insecureUrl = process.argv[3] ?? "http://192.168.0.159:5199/";
-const cwd = process.argv[4];
-const chromePort = process.argv[5] ?? "9335";
-const secureUrl = `http://${daemonBase}/`;
+import { existsSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+
+import { createSandbox, sleep } from "./lib/testenv.mjs";
+
+const insecureUrl = process.argv[2] ?? null; // opt-in: T3 needs a LAN/vite origin
+const sb = await createSandbox("asm-cp");
+let daemonBase; // set in main(), once the sandbox daemon is up
+let secureUrl;
+const cwd = sb.cwd;
 
 let failures = 0;
 const check = (name, cond, extra) => {
@@ -42,19 +51,6 @@ const check = (name, cond, extra) => {
   if (!cond) failures++;
   return cond;
 };
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function browserWs() {
-  for (let i = 0; i < 40; i++) {
-    try {
-      const r = await fetch(`http://127.0.0.1:${chromePort}/json/version`);
-      const j = await r.json();
-      if (j.webSocketDebuggerUrl) return j.webSocketDebuggerUrl;
-    } catch {}
-    await sleep(250);
-  }
-  throw new Error("chrome devtools endpoint never came up");
-}
 
 function makeConn(wsUrl) {
   const ws = new WebSocket(wsUrl);
@@ -102,7 +98,21 @@ const MAC_UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
 
 async function main() {
-  const conn = makeConn(await browserWs());
+  // Sandbox: a daemon serving the built bundle, plus its own Chrome. We build our
+  // own CDP client (not sb.startChrome()) because this test needs console-log
+  // capture and dialog auto-accept — see makeConn above.
+  await sb.startAppDaemon();
+  daemonBase = sb.base;
+  secureUrl = `${sb.http}/`;
+  console.log(`sandbox daemon on ${daemonBase}  (cwd: ${cwd})`);
+  if (!insecureUrl) {
+    console.log("T3 skipped: no insecure origin given. To run it, start vite on the LAN with");
+    console.log(`  (cd client && ASM_DAEMON=http://${daemonBase} npx vite --port 5199 --host 0.0.0.0)`);
+    console.log("then re-run with:  node scripts/copy-paste-test.mjs http://<LAN-IP>:5199/");
+  }
+
+  const { wsUrl } = await sb.launchChrome();
+  const conn = makeConn(wsUrl);
   await conn.ready;
 
   // Clipboard read/write permission for the secure "reader" origin.
@@ -120,6 +130,21 @@ async function main() {
   const clipSeed = async (text) => {
     await reader.S("Page.bringToFront");
     await reader.eval(`navigator.clipboard.writeText(${JSON.stringify(text)})`);
+  };
+  // An image on the clipboard, as "Copy image" in a browser leaves one. Painted
+  // on a canvas because Chrome sanitizes clipboard images by decoding and
+  // re-encoding them — a hand-rolled byte blob (testenv's TINY_PNG) is rejected.
+  const clipSeedImage = async () => {
+    await reader.S("Page.bringToFront");
+    await reader.eval(`(async () => {
+      const c = document.createElement('canvas');
+      c.width = c.height = 32;
+      const g = c.getContext('2d');
+      g.fillStyle = 'magenta';
+      g.fillRect(0, 0, 32, 32);
+      const blob = await new Promise((res) => c.toBlob(res, 'image/png'));
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+    })()`);
   };
 
   // one live shell session, reused by every tab (attach supersedes cleanly)
@@ -163,20 +188,37 @@ async function main() {
     const clip1 = await clipRead();
     check("T1 Ctrl-Shift-C copied selection", /MARK1SEC/.test(clip1), clip1);
 
-    // paste: native paste command lands in the pty stream
+    // paste: Ctrl-V is THE paste gesture here (no ⌘ key on Windows/Linux), so it
+    // must reach the browser uncancelled — and must not also send ^V.
     await clipSeed("PASTE1-ZZ9");
     await t.S("Page.bringToFront");
     await focusTerm(t);
-    await key(t, { type: "keyDown", modifiers: 4, key: "v", code: "KeyV", windowsVirtualKeyCode: 86, commands: ["paste"] });
-    await key(t, { type: "keyUp", modifiers: 4, key: "v", code: "KeyV", windowsVirtualKeyCode: 86 });
+    await ctrlV(t);
     await sleep(400);
-    check("T1 native paste reached the session input", await sentHas(t, "PASTE1-ZZ9"));
+    check("T1 Ctrl-V pasted text into the session input", await sentHas(t, "PASTE1-ZZ9"));
+    check("T1 Ctrl-V no longer forwards ^V to the app", !(await sentHas(t, "\\u0016")));
 
-    // plain Ctrl+V stays ^V (0x16) to the app
-    await key(t, { type: "keyDown", modifiers: 2, key: "v", code: "KeyV", windowsVirtualKeyCode: 86 });
-    await key(t, { type: "keyUp", modifiers: 2, key: "v", code: "KeyV", windowsVirtualKeyCode: 86 });
-    await sleep(200);
-    check("T1 plain Ctrl+V forwards ^V to app", await sentHas(t, "\\u0016"));
+    // Ctrl-Shift-V keeps working for text (Chrome's paste-as-plain-text).
+    await clipSeed("PASTE1-SHIFT");
+    await t.S("Page.bringToFront");
+    await focusTerm(t);
+    await ctrlShiftV(t);
+    await sleep(400);
+    check("T1 Ctrl-Shift-V still pastes text", await sentHas(t, "PASTE1-SHIFT"));
+
+    // The regression that shipped: an IMAGE on the clipboard. Only a native
+    // browser paste carries the file item, and on Windows/Linux Ctrl-V is the
+    // only gesture that can produce one — xterm used to eat it (no paste event
+    // at all), and Ctrl-Shift-V is paste-as-plain-text, which strips the image.
+    const before = pastesOnDisk().length;
+    await clipSeedImage();
+    await t.S("Page.bringToFront");
+    await focusTerm(t);
+    await ctrlV(t);
+    await sleep(1000); // upload → inject round-trip
+    check("T1 Ctrl-V uploaded the clipboard image", pastesOnDisk().length === before + 1, pastesOnDisk().join());
+    check("T1 Ctrl-V injected the [pasted image …] path", await sentHas(t, "pasted image .asm/pastes/"));
+    await killLine(t); // drop the injected placeholder before the right-click checks
 
     // right-click: copies, clears selection (so next right-click = browser menu).
     // The mouse travels to the click point first, like a real hand does.
@@ -278,20 +320,33 @@ async function main() {
       clipRC,
     );
 
-    // ⌘-V paste
+    // ⌘-V paste — text, then an image (the macOS path that always worked; it is
+    // the reference behaviour Ctrl-V now matches, so it must not regress)
     await clipSeed("PASTE2-QQ7");
     await t.S("Page.bringToFront");
     await focusTerm(t);
-    await key(t, { type: "keyDown", modifiers: 4, key: "v", code: "KeyV", windowsVirtualKeyCode: 86, commands: ["paste"] });
-    await key(t, { type: "keyUp", modifiers: 4, key: "v", code: "KeyV", windowsVirtualKeyCode: 86 });
+    await cmdV(t);
     await sleep(400);
     check("T2 ⌘-V paste reached the session input", await sentHas(t, "PASTE2-QQ7"));
+
+    const before2 = pastesOnDisk().length;
+    await clipSeedImage();
+    await t.S("Page.bringToFront");
+    await focusTerm(t);
+    await cmdV(t);
+    await sleep(1000);
+    check("T2 ⌘-V uploaded the clipboard image", pastesOnDisk().length === before2 + 1, pastesOnDisk().join());
+    check("T2 ⌘-V injected the [pasted image …] path", await sentHas(t, "pasted image .asm/pastes/"));
     await t.close();
   }
 
   // ============ T3: Linux persona, INSECURE origin (LAN IP via vite) ============
-  console.log("\n--- T3: insecure origin (execCommand fallback) ---");
-  {
+  // Opt-in: a real insecure origin needs a second server on a LAN IP, which the
+  // sandbox cannot fabricate. Without it we skip rather than silently "pass".
+  if (!insecureUrl) {
+    console.log("\n--- T3: SKIPPED (no insecure origin given) ---");
+  } else {
+    console.log("\n--- T3: insecure origin (execCommand fallback) ---");
     const t = await openTab(conn, insecureUrl, null);
     await attachTerminal(t, "MARK3LAN");
     check("T3 insecure context (no navigator.clipboard)", await t.eval(`!navigator.clipboard`));
@@ -316,10 +371,9 @@ async function main() {
     await clipSeed("PASTE3-KK5");
     await t.S("Page.bringToFront");
     await focusTerm(t);
-    await key(t, { type: "keyDown", modifiers: 4, key: "v", code: "KeyV", windowsVirtualKeyCode: 86, commands: ["paste"] });
-    await key(t, { type: "keyUp", modifiers: 4, key: "v", code: "KeyV", windowsVirtualKeyCode: 86 });
+    await ctrlV(t);
     await sleep(400);
-    check("T3 native paste works on insecure origin", await sentHas(t, "PASTE3-KK5"));
+    check("T3 Ctrl-V paste works on insecure origin", await sentHas(t, "PASTE3-KK5"));
     await t.close();
   }
 
@@ -332,7 +386,7 @@ async function main() {
   await reader.close();
   conn.ws.close();
   console.log(failures ? `\n${failures} FAILURE(S)` : "\nALL PASS");
-  process.exit(failures ? 1 : 0);
+  return failures === 0;
 }
 
 // ---------- helpers ----------
@@ -379,6 +433,34 @@ async function waitFor(tab, expr, ms = 12000) {
 
 async function key(tab, params) {
   await tab.S("Input.dispatchKeyEvent", params);
+}
+
+// The paste gestures, as a real browser delivers them: the edit command rides on
+// the keydown, and Chrome runs it only if nothing preventDefault()s that keydown
+// — which is exactly how xterm used to swallow Ctrl-V. Sending the same
+// `commands` here is what makes these tests faithful rather than decorative.
+// Ctrl-Shift-V is "paste and match style": Chrome hands the page a plain-text-
+// only clipboardData, so an image on the clipboard arrives stripped — the reason
+// it cannot be the image-paste gesture. (modifiers: 2 Ctrl, 4 Meta, 8 Shift)
+const ctrlV = (tab) => pasteKey(tab, 2, ["paste"]);
+const cmdV = (tab) => pasteKey(tab, 4, ["paste"]);
+const ctrlShiftV = (tab) => pasteKey(tab, 10, ["pasteAndMatchStyle"]);
+
+async function pasteKey(tab, modifiers, commands) {
+  await key(tab, { type: "keyDown", modifiers, key: "v", code: "KeyV", windowsVirtualKeyCode: 86, commands });
+  await key(tab, { type: "keyUp", modifiers, key: "v", code: "KeyV", windowsVirtualKeyCode: 86 });
+}
+
+/** ^U — kill whatever a test left on the prompt line (e.g. an injected path). */
+async function killLine(tab) {
+  await key(tab, { type: "keyDown", modifiers: 2, key: "u", code: "KeyU", windowsVirtualKeyCode: 85 });
+  await key(tab, { type: "keyUp", modifiers: 2, key: "u", code: "KeyU", windowsVirtualKeyCode: 85 });
+}
+
+/** Images the client has uploaded into the session's cwd so far. */
+function pastesOnDisk() {
+  const dir = join(cwd, ".asm", "pastes");
+  return existsSync(dir) ? readdirSync(dir) : [];
 }
 
 async function typeText(tab, s) {
@@ -497,7 +579,13 @@ async function sentHas(tab, needle) {
   return await tab.eval(`window.__sent.some(f => f.includes(${JSON.stringify(needle)}))`);
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+main()
+  .then((pass) => {
+    sb.cleanup();
+    process.exit(pass ? 0 : 1);
+  })
+  .catch((e) => {
+    console.error(e);
+    sb.cleanup();
+    process.exit(1);
+  });

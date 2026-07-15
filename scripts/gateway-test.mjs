@@ -38,6 +38,7 @@ import { mkdtempSync, rmSync, existsSync, openSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { hermeticChildEnv } from "./lib/testenv.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const DAEMON = join(ROOT, "target", "debug", "asm-daemon");
@@ -68,7 +69,8 @@ const procs = [];
 function startProc(name, bin, env) {
   const log = openSync(join(tmp, `${name}.log`), "a");
   const child = spawn(bin, [], {
-    env: { ...process.env, ...env },
+    // Never inherit the dev host's ASM_*/ASMUX_* — they point at the live install.
+    env: hermeticChildEnv(env),
     stdio: ["ignore", log, log],
   });
   procs.push({ name, child });
@@ -190,6 +192,7 @@ async function main() {
     ASM_RELAY_BIND: `127.0.0.1:${RELAY_PORT}`,
     ASM_RELAY_KEYS: KEY,
     ASM_RELAY_LOG: "info",
+    ASM_RUNTIME_DIR: join(tmp, "relay-run"),
   });
   await waitHttp(`${RELAY_HTTP}/nodes?relay_key=${KEY}`, 10000);
   check("relay up", true, RELAY_HTTP);

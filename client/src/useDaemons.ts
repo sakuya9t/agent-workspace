@@ -1,5 +1,5 @@
 import { keepPreviousData, useQueries } from "@tanstack/react-query";
-import { api, Health, Session, Workspace } from "./api";
+import { api, Health, PluginInfo, Session, Workspace } from "./api";
 import { DaemonConn, targetOf, useConnStore } from "./connectionStore";
 
 export interface DaemonBundle {
@@ -59,4 +59,32 @@ export function useDaemonStates(): DaemonState[] {
     error: results[i].error,
     isLoading: results[i].isLoading,
   }));
+}
+
+/**
+ * Which agents each connected daemon has installed, keyed by daemon id — used to
+ * decide whether a session can be forked at all (there must be an agent to fork
+ * into).
+ *
+ * Kept off the 1.5s session poll deliberately: the set of installed binaries does
+ * not change while you work, and polling it at that rate would be pure waste. The
+ * query key matches the new-session dialog's, so the two share one request per
+ * host.
+ */
+export function useDaemonPlugins(): Record<string, PluginInfo[]> {
+  const daemons = useConnStore((s) => s.daemons);
+  const results = useQueries({
+    queries: daemons.map((d) => ({
+      queryKey: ["plugins", targetOf(d).baseUrl],
+      queryFn: () => api.listPlugins(targetOf(d)),
+      enabled: d.connected,
+      staleTime: 5 * 60_000,
+      retry: false,
+    })),
+  });
+  const byDaemon: Record<string, PluginInfo[]> = {};
+  daemons.forEach((d, i) => {
+    if (results[i].data) byDaemon[d.id] = results[i].data as PluginInfo[];
+  });
+  return byDaemon;
 }

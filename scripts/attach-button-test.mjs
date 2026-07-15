@@ -1,158 +1,129 @@
-// Headless-Chrome verification of the 📎 attach-image button, driving the real
-// built client bundle served by the daemon. Companion to `paste-test.mjs`
-// (which proves the daemon + WS path deterministically); this proves the
-// browser wiring: button → file picker → upload → path injected into the PTY.
+// Headless-Chrome verification of the 📎 attach button, driving the real built
+// client bundle served by the daemon. Companion to `paste-test.mjs` (which
+// proves the daemon + WS path deterministically); this proves the browser wiring:
+// button → file picker → upload → path injected into the PTY.
 //
-//   node scripts/attach-button-test.mjs <base host:port> <cwd> <pngPath> <chromePort>
+// Covers BOTH attachment kinds, because the picker takes any file now: a PNG
+// (which injects the `[pasted image …]` placeholder) and a PDF (which injects
+// `[attached file …]`). The PDF round is the one that would have been impossible
+// before — the input carried `accept="image/*"` and the change handler dropped
+// non-images on the floor without a word.
 //
-// Full recipe (see also docs/image-paste.md → "Verifying"):
-//   # 1. build the client bundle
-//   (cd client && npm run build)
-//   # 2. start a THROWAWAY daemon serving the bundle — NOT on 4600, which is
-//   #    usually the real running daemon; pick a free port and set ASM_STATIC_DIR
-//   D=/tmp/asm-btn; mkdir -p $D/{data,cfg,rt,cwd,chrome}
-//   printf 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' | base64 -d > $D/shot.png
-//   ASM_BIND=127.0.0.1:4671 ASM_DATA_DIR=$D/data ASM_CONFIG_DIR=$D/cfg \
-//     ASM_RUNTIME_DIR=$D/rt ASM_STATIC_DIR=$PWD/client/dist ASM_BACKEND=native \
-//     ASM_ASMUX_AUTOSPAWN=0 ./target/debug/asm-daemon &
-//   # 3. create a live session in $D/cwd (POST /api/sessions {agent_plugin_id:"shell", cwd})
-//   # 4. launch headless chrome with a debug port
-//   google-chrome --headless=new --disable-gpu --no-sandbox --disable-dev-shm-usage \
-//     --remote-debugging-port=9334 --user-data-dir=$D/chrome about:blank &
-//   # 5. node scripts/attach-button-test.mjs 127.0.0.1:4671 $D/cwd $D/shot.png 9334
+//   cd client && npm run build          # once, to produce client/dist
+//   node scripts/attach-button-test.mjs # sandboxed: daemon + chrome + session
 //
-// Requires: the app served same-origin (the default `local` daemon has
-// baseUrl="" so loopback trust means no token). The session tree is expanded by
-// default, so `.session-row` is directly clickable. Node 18+ (global fetch/WS).
+// It used to require a five-step manual ritual (build the bundle, hand-start a
+// throwaway daemon on :4671 with ASM_STATIC_DIR, create a session by curl, launch
+// chrome with a debug port, then pass four argv). All of that is now
+// `createSandbox()` — see scripts/lib/testenv.mjs. Skipped rituals are how a test
+// ends up pointed at the real daemon, which is what cost six sessions on
+// 2026-07-12.
+//
+// The app is served same-origin on loopback (baseUrl="" ⇒ loopback trust ⇒ no
+// token). The session tree is expanded by default, so `.session-row` is directly
+// clickable. Node 18+ (global fetch/WS).
 
 import fs from "node:fs";
+import { join } from "node:path";
+import { createSandbox, checker, sleep, TINY_PNG } from "./lib/testenv.mjs";
 
-const [base, cwd, pngPath, chromePort] = [
-  process.argv[2] ?? "127.0.0.1:4671",
-  process.argv[3],
-  process.argv[4],
-  process.argv[5] ?? "9334",
-];
-const appUrl = `http://${base}/`;
-
-let failures = 0;
-const check = (name, cond, extra) => {
-  console.log(`${cond ? "PASS" : "FAIL"}  ${name}${extra ? "  " + extra : ""}`);
-  if (!cond) failures++;
-  return cond;
-};
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function browserWs() {
-  for (let i = 0; i < 40; i++) {
-    try {
-      const r = await fetch(`http://127.0.0.1:${chromePort}/json/version`);
-      const j = await r.json();
-      if (j.webSocketDebuggerUrl) return j.webSocketDebuggerUrl;
-    } catch {
-      /* not up yet */
-    }
-    await sleep(250);
-  }
-  throw new Error("chrome devtools endpoint never came up");
-}
-
-function makeConn(wsUrl) {
-  const ws = new WebSocket(wsUrl);
-  const pending = new Map();
-  let idc = 1;
-  ws.onmessage = (ev) => {
-    const m = JSON.parse(ev.data);
-    if (m.id && pending.has(m.id)) {
-      const { resolve, reject } = pending.get(m.id);
-      pending.delete(m.id);
-      m.error ? reject(new Error(JSON.stringify(m.error))) : resolve(m.result);
-    }
-  };
-  const ready = new Promise((res) => (ws.onopen = res));
-  const send = (method, params = {}, sessionId) =>
-    new Promise((resolve, reject) => {
-      const id = idc++;
-      pending.set(id, { resolve, reject });
-      ws.send(JSON.stringify({ id, method, params, sessionId }));
-    });
-  return { ws, ready, send };
-}
+const { check, report } = checker();
+const sb = await createSandbox("asm-btn");
 
 async function main() {
-  const conn = makeConn(await browserWs());
-  await conn.ready;
+  await sb.startAppDaemon();
 
-  // Open the app in a fresh tab and attach a flat CDP session to it.
-  const { targetId } = await conn.send("Target.createTarget", { url: appUrl });
-  const { sessionId } = await conn.send("Target.attachToTarget", { targetId, flatten: true });
-  const S = (method, params) => conn.send(method, params, sessionId);
-  await S("Runtime.enable");
-  await S("DOM.enable");
-  await S("Page.enable");
+  // A live session for the UI to attach to, in the sandbox cwd.
+  const { session } = await sb.api("/api/sessions", {
+    method: "POST",
+    body: JSON.stringify({ agent_plugin_id: "shell", cwd: sb.cwd }),
+  });
+  check("session created for the UI", session.status === "running", session.id.slice(0, 8));
 
-  const evalJs = async (expr) => {
-    const { result } = await S("Runtime.evaluate", {
-      expression: expr,
-      returnByValue: true,
-      awaitPromise: true,
-    });
-    return result.value;
-  };
-  const waitFor = async (expr, ms = 12000) => {
-    const t0 = Date.now();
-    while (Date.now() - t0 < ms) {
-      if (await evalJs(expr)) return true;
-      await sleep(300);
-    }
-    return false;
-  };
+  const pngPath = join(sb.tmp, "shot.png");
+  fs.writeFileSync(pngPath, TINY_PNG);
+  const pdfPath = join(sb.tmp, "spec.pdf");
+  fs.writeFileSync(pdfPath, "%PDF-1.4\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n");
+
+  const chrome = await sb.startChrome();
+  const page = await chrome.openPage(`${sb.http}/`);
+  const { S, evalJs, waitFor } = page;
 
   // The tree is expanded by default, so the session row is directly present.
   check("session row rendered", await waitFor("!!document.querySelector('.session-row')"));
   await evalJs("document.querySelector('.session-row').click()");
 
-  check("📎 attach button rendered when live", await waitFor("!!document.querySelector('.term-attach')"));
+  check(
+    "📎 attach button rendered when live",
+    await waitFor("!!document.querySelector('.term-attach')"),
+  );
   check(
     "attach button has an accessible label",
     await evalJs("document.querySelector('.term-attach')?.getAttribute('aria-label') || ''"),
   );
 
-  // Push a file into the hidden input the way a real picker would, then fire the
-  // change event React listens for.
-  const { result } = await S("Runtime.evaluate", {
-    expression: "document.querySelector('.terminal-host input[type=file]')",
-  });
-  check("hidden file input present", !!result.objectId);
-  if (result.objectId) {
-    await S("DOM.setFileInputFiles", { objectId: result.objectId, files: [pngPath] });
-    await evalJs(
-      "document.querySelector('.terminal-host input[type=file]').dispatchEvent(new Event('change',{bubbles:true}))",
-    );
-  }
-
-  await sleep(2500); // let the upload + WS injection complete
-
-  const pasteDir = `${cwd}/.asm/pastes`;
-  const stored = fs.existsSync(pasteDir)
-    ? fs.readdirSync(pasteDir).filter((f) => f.endsWith(".png"))
-    : [];
-  check("button uploaded a PNG to the daemon", stored.length >= 1, stored.join(","));
-
-  const termText = await evalJs("document.querySelector('.terminal-host')?.innerText || ''");
+  // The picker must offer every file type — an `accept` filter here is exactly
+  // what used to make a PDF unselectable in the OS dialog.
   check(
-    "placeholder echoed into the terminal",
-    /pasted image/.test(termText),
-    termText.replace(/\s+/g, " ").slice(0, 120),
+    "file input has no accept filter",
+    (await evalJs(
+      "document.querySelector('.terminal-host input[type=file]')?.getAttribute('accept') ?? 'NONE'",
+    )) === "NONE",
   );
 
-  await conn.send("Target.closeTarget", { targetId }).catch(() => {});
-  conn.ws.close();
-  console.log(failures ? `\n${failures} FAILURE(S)` : "\nALL PASS");
-  process.exit(failures ? 1 : 0);
+  const pasteDir = `${sb.cwd}/.asm/pastes`;
+  const SEL = ".terminal-host input[type=file]";
+
+  // Push a file into the hidden input the way a real picker would, then fire the
+  // change event React listens for.
+  const pick = async (path) => {
+    const { result } = await S("Runtime.evaluate", { expression: `document.querySelector('${SEL}')` });
+    if (!result.objectId) return false;
+    await S("DOM.setFileInputFiles", { objectId: result.objectId, files: [path] });
+    await evalJs(`document.querySelector('${SEL}').dispatchEvent(new Event('change',{bubbles:true}))`);
+    await sleep(2500); // let the upload + WS injection complete
+    return true;
+  };
+  const storedWith = (ext) =>
+    fs.existsSync(pasteDir) ? fs.readdirSync(pasteDir).filter((f) => f.endsWith(ext)) : [];
+  const termText = () => evalJs("document.querySelector('.terminal-host')?.innerText || ''");
+
+  // --- round 1: an image, the original behaviour ---
+  check("hidden file input present", await pick(pngPath));
+  check("button uploaded a PNG to the daemon", storedWith(".png").length >= 1);
+  check(
+    "image placeholder echoed into the terminal",
+    /pasted image/.test(await termText()),
+    (await termText()).replace(/\s+/g, " ").slice(0, 120),
+  );
+
+  // --- round 2: a PDF, the newly-allowed kind ---
+  await pick(pdfPath);
+  const pdfs = storedWith(".pdf");
+  check("button uploaded a PDF to the daemon", pdfs.length >= 1, pdfs.join(","));
+  check(
+    "PDF keeps its original stem in the stored name",
+    pdfs.some((f) => f.startsWith("spec-")),
+    pdfs.join(","),
+  );
+  check(
+    "file placeholder echoed into the terminal",
+    /attached file/.test(await termText()),
+    (await termText()).replace(/\s+/g, " ").slice(0, 160),
+  );
+
+  await chrome.send("Target.closeTarget", { targetId: page.targetId }).catch(() => {});
+  chrome.ws.close();
+  return report("the 📎 button uploads and injects both an image and a PDF");
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+main()
+  .then((pass) => {
+    sb.cleanup();
+    process.exit(pass ? 0 : 1);
+  })
+  .catch((e) => {
+    console.error(e);
+    sb.cleanup();
+    process.exit(1);
+  });

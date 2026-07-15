@@ -1,12 +1,30 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Trans, useTranslation } from "react-i18next";
-import { api } from "../api";
+import { api, type PluginInfo } from "../api";
 import { daemonLabel, localTarget, targetOf, useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
 import { DirectoryPicker } from "./DirectoryPicker";
 
 type SessionTarget = { kind: "workspace"; id: string } | { kind: "path" };
+
+/**
+ * The agents a session can be forked into. Forking hands a conversation to an
+ * agent, so a shell (no conversation to give it, and it would run a seed prompt
+ * as a script) and `custom_command` (unknown by definition) are not candidates.
+ *
+ * When none of these is installed on a host, its sessions cannot be forked and
+ * the Fork action is disabled — see `canForkInto`.
+ */
+export const FORKABLE_AGENTS = ["claude", "codex", "opencode"];
+
+/** Sentinel dropdown value that reveals the free-text model field. */
+const CUSTOM_MODEL = "__custom__";
+
+/** Whether this host has any agent a session could be forked into. */
+export function canForkInto(plugins: PluginInfo[] | undefined): boolean {
+  return (plugins ?? []).some((p) => p.available && FORKABLE_AGENTS.includes(p.id));
+}
 
 export function NewSessionDialog() {
   const { t } = useTranslation();
@@ -25,6 +43,10 @@ export function NewSessionDialog() {
   const [command, setCommand] = useState("");
   const [approve, setApprove] = useState(false);
   const [agentOptions, setAgentOptions] = useState<Record<string, boolean>>({});
+  // Model override for the launch. "" = the agent's own default (no flag);
+  // CUSTOM_MODEL = type a model id in `customModel`; otherwise a listed model id.
+  const [model, setModel] = useState<string>("");
+  const [customModel, setCustomModel] = useState<string>("");
   const [directCheckout, setDirectCheckout] = useState(false);
   const [branchMode, setBranchMode] = useState<"auto" | "new" | "existing">("auto");
   const [branchName, setBranchName] = useState("");
@@ -33,6 +55,12 @@ export function NewSessionDialog() {
   const [wsName, setWsName] = useState("");
   const [wsPath, setWsPath] = useState("");
   const [picking, setPicking] = useState<null | "cwd" | "wsPath">(null);
+  const [sameBranch, setSameBranch] = useState(false);
+
+  // Fork mode. A fork inherits the origin's place, so the dialog collapses to the
+  // two choices a fork actually has: which agent, and same branch or a new one.
+  const forkSource = useUiStore((s) => s.forkSource);
+  const isFork = forkSource != null;
 
   // Opened from a workspace's "+": daemon and workspace are fixed — derive them
   // straight from the presets (not state) so the lock can't be bypassed.
@@ -55,7 +83,14 @@ export function NewSessionDialog() {
     setBaseRef("");
     setExistingBranch("");
     setAgentOptions({});
-  }, [show, presetDaemonId, presetWorkspaceId]);
+    setModel("");
+    setCustomModel("");
+    // A fork defaults to the origin's own agent (the common case — and the only
+    // one that can carry the whole conversation) and to a branch of its own,
+    // which is the only choice that's safe while the origin is still running.
+    setSameBranch(false);
+    if (forkSource) setPluginId(forkSource.agentPluginId);
+  }, [show, presetDaemonId, presetWorkspaceId, forkSource]);
 
   const { data: plugins } = useQuery({
     queryKey: ["plugins", conn.baseUrl],
@@ -63,20 +98,56 @@ export function NewSessionDialog() {
     enabled: show,
   });
 
+  // The selected agent's models, resolved per-host. Kept off the plugins list
+  // because it can be slow (opencode shells out to enumerate), so it is only
+  // fetched for the agent actually in front of the user, and cached per agent.
+  const { data: modelInfo } = useQuery({
+    queryKey: ["models", conn.baseUrl, pluginId],
+    queryFn: () => api.listModels(conn, pluginId),
+    enabled: show,
+    staleTime: 5 * 60_000,
+  });
+  const modelSupported = !!modelInfo?.supported;
+  const isCustomModel = model === CUSTOM_MODEL;
+
+  // Switching agents resets the model choice: a Claude alias means nothing to
+  // Codex, and each agent has its own default to fall back to.
+  useEffect(() => {
+    setModel("");
+    setCustomModel("");
+  }, [pluginId]);
+
   // Only offer agents whose binary is installed on the selected host. The daemon
   // detects this per-host (`available`); `custom_command` has no binary to detect
   // but is always available since the user supplies the command.
-  const shownPlugins = (plugins ?? []).filter(
-    (p) => p.available || p.id === "custom_command",
+  //
+  // A fork narrows this to the coding agents: forking exists to hand a
+  // *conversation* to an agent, and a shell or an arbitrary command has no way to
+  // receive one. `FORKABLE_AGENTS` is also what gates the Fork action itself — if
+  // none of them is installed, there is nothing to fork into.
+  const shownPlugins = (plugins ?? []).filter((p) =>
+    isFork
+      ? p.available && FORKABLE_AGENTS.includes(p.id)
+      : p.available || p.id === "custom_command",
   );
 
   // Keep the selection valid: if the current agent isn't offered on this host
   // (e.g. after switching daemons), fall back to the first one that is.
+  //
+  // In fork mode the fallback is the *origin's* agent, not merely the first in
+  // the list. Opening the fork dialog always trips this branch — the default
+  // `pluginId` is "shell", which fork mode never offers — so a plain
+  // `shownPlugins[0]` here silently overwrites the origin's agent with whichever
+  // agent happens to sort first, and every fork would quietly default to changing
+  // agent (and so to a summary instead of the full conversation).
   useEffect(() => {
     if (shownPlugins.length && !shownPlugins.some((p) => p.id === pluginId)) {
-      setPluginId(shownPlugins[0].id);
+      const origin = forkSource?.agentPluginId;
+      const fallback =
+        origin && shownPlugins.some((p) => p.id === origin) ? origin : shownPlugins[0].id;
+      setPluginId(fallback);
     }
-  }, [shownPlugins, pluginId]);
+  }, [shownPlugins, pluginId, forkSource]);
   const { data: workspaces } = useQuery({
     queryKey: ["workspaces", conn.baseUrl],
     queryFn: () => api.listWorkspaces(conn),
@@ -161,6 +232,21 @@ export function NewSessionDialog() {
       for (const o of plugin?.options ?? []) {
         effectiveOptions[o.key] = agentOptions[o.key] ?? o.default;
       }
+      // "" / whitespace = the agent's own default (send nothing, launch no flag).
+      const effModel = (isCustomModel ? customModel : model).trim() || undefined;
+
+      // A fork inherits its origin's daemon, workspace and place, so none of the
+      // resolution below applies: the daemon works all of that out from the
+      // origin. This call can take tens of seconds — it may run an agent
+      // headlessly to write the handoff brief — which is why the button says so.
+      if (forkSource) {
+        return api.forkSession(conn, forkSource.sessionId, {
+          agent_plugin_id: pluginId,
+          same_branch: sameBranch,
+          options: effectiveOptions,
+          model: effModel,
+        });
+      }
 
       // Resolve where to run. A workspace is used directly; a raw directory is
       // auto-registered as a workspace (reusing one with the same root) so it is
@@ -193,6 +279,7 @@ export function NewSessionDialog() {
         approve_custom: approve,
         direct_checkout: useDirect,
         options: effectiveOptions,
+        model: effModel,
         ...branchArgs,
       });
     },
@@ -215,31 +302,51 @@ export function NewSessionDialog() {
     (branchMode === "new" && branchName.trim().length > 0) ||
     (branchMode === "existing" && (existingBranch || defaultBranch).length > 0);
 
+  // A fork carries the whole conversation only when it stays on the origin's
+  // agent *and* that agent kept a resumable conversation. Anything else — a
+  // different agent, or an origin whose conversation was never captured — carries
+  // a written summary instead. Saying which up front matters: one is lossless and
+  // instant, the other takes a moment and is a summary.
+  const forkCarriesConversation =
+    isFork && forkSource.hasConversation && pluginId === forkSource.agentPluginId;
+
+  // Picking "Custom…" but leaving the field blank isn't a valid model choice.
+  const modelOk = !modelSupported || !isCustomModel || customModel.trim().length > 0;
+
   const canSubmit =
-    (target.kind === "workspace" ? !!activeWs : cwd.trim().length > 0) &&
-    (!isCustom || (command.trim().length > 0 && approve)) &&
-    branchOk &&
-    !create.isPending;
+    modelOk &&
+    (isFork
+      ? !create.isPending
+      : (target.kind === "workspace" ? !!activeWs : cwd.trim().length > 0) &&
+        (!isCustom || (command.trim().length > 0 && approve)) &&
+        branchOk &&
+        !create.isPending);
 
   return (
     <div className="modal-backdrop" onClick={() => setShow(false)}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <div className="modal-title">{t("newSession.title")}</div>
+        <div className="modal-title">
+          {isFork ? t("fork.title", { name: forkSource.title }) : t("newSession.title")}
+        </div>
 
-        <label className="form-label">{t("newSession.daemonLabel")}</label>
-        <select
-          className="input"
-          value={effDaemonId}
-          disabled={lockedWs}
-          onChange={(e) => setDaemonId(e.target.value)}
-        >
-          {daemons.map((d) => (
-            <option key={d.id} value={d.id}>
-              {daemonLabel(d)}
-              {d.baseUrl ? ` (${d.baseUrl})` : ""}
-            </option>
-          ))}
-        </select>
+        {!isFork && (
+          <>
+            <label className="form-label">{t("newSession.daemonLabel")}</label>
+            <select
+              className="input"
+              value={effDaemonId}
+              disabled={lockedWs}
+              onChange={(e) => setDaemonId(e.target.value)}
+            >
+              {daemons.map((d) => (
+                <option key={d.id} value={d.id}>
+                  {daemonLabel(d)}
+                  {d.baseUrl ? ` (${d.baseUrl})` : ""}
+                </option>
+              ))}
+            </select>
+          </>
+        )}
 
         <label className="form-label">{t("newSession.agentLabel")}</label>
         <select className="input" value={pluginId} onChange={(e) => setPluginId(e.target.value)}>
@@ -251,6 +358,37 @@ export function NewSessionDialog() {
         </select>
         {selectedPlugin?.binary_path && (
           <div className="dim small mono">{selectedPlugin.binary_path}</div>
+        )}
+
+        {modelSupported && (
+          <>
+            <label className="form-label">{t("newSession.modelLabel")}</label>
+            <select
+              className="input"
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+            >
+              <option value="">
+                {modelInfo?.default
+                  ? t("newSession.modelDefaultNamed", { model: modelInfo.default })
+                  : t("newSession.modelDefault")}
+              </option>
+              {modelInfo?.models.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label}
+                </option>
+              ))}
+              <option value={CUSTOM_MODEL}>{t("newSession.modelCustom")}</option>
+            </select>
+            {isCustomModel && (
+              <input
+                className="input mono"
+                placeholder={t("newSession.modelCustomPlaceholder")}
+                value={customModel}
+                onChange={(e) => setCustomModel(e.target.value)}
+              />
+            )}
+          </>
         )}
 
         {selectedPlugin?.options?.map((o) => (
@@ -271,7 +409,46 @@ export function NewSessionDialog() {
           </label>
         ))}
 
-        {!lockedWs && (
+        {isFork && (
+          <>
+            <label className="form-label">{t("fork.placeLabel")}</label>
+            <label
+              className={"checkbox" + (sameBranch && forkSource.live ? " danger" : "")}
+              title={t("fork.sameBranchHelp")}
+            >
+              <input
+                type="checkbox"
+                checked={sameBranch}
+                disabled={!forkSource.branch}
+                onChange={(e) => setSameBranch(e.target.checked)}
+              />
+              <span>
+                {forkSource.branch
+                  ? t("fork.sameBranch", { branch: forkSource.branch })
+                  : t("fork.noBranch")}
+              </span>
+            </label>
+            <div className="dim small">
+              {sameBranch
+                ? t("fork.sameBranchHint")
+                : t("fork.newBranchHint", { branch: forkSource.branch ?? "" })}
+            </div>
+
+            {/* Two live agents editing one directory will overwrite each other.
+                We allow it — sometimes it is what you want — but never quietly. */}
+            {sameBranch && forkSource.live && (
+              <div className="warn small">{t("fork.liveSameBranchWarning")}</div>
+            )}
+
+            <div className="dim small">
+              {forkCarriesConversation
+                ? t("fork.carriesConversation")
+                : t("fork.carriesSummary")}
+            </div>
+          </>
+        )}
+
+        {!isFork && !lockedWs && (
           <>
             <label className="form-label">{t("newSession.runInLabel")}</label>
             <div className="seg">
@@ -297,7 +474,7 @@ export function NewSessionDialog() {
           </>
         )}
 
-        {target.kind === "path" && (
+        {!isFork && target.kind === "path" && (
           <>
             <label className="form-label">
               {t("newSession.workingDirOn", { daemon: daemon && daemonLabel(daemon) })}
@@ -317,7 +494,7 @@ export function NewSessionDialog() {
           </>
         )}
 
-        {target.kind === "workspace" && (
+        {!isFork && target.kind === "workspace" && (
           <>
             <label className="form-label">{t("newSession.workspaceLabel")}</label>
             <select
@@ -542,7 +719,17 @@ export function NewSessionDialog() {
             {t("common.cancel")}
           </button>
           <button className="btn primary" disabled={!canSubmit} onClick={() => create.mutate()}>
-            {create.isPending ? t("newSession.starting") : t("newSession.start")}
+            {isFork
+              ? create.isPending
+                ? // A fork that has to summarize runs an agent headlessly and can
+                  // take tens of seconds. Say what it's doing rather than look hung.
+                  forkCarriesConversation
+                  ? t("fork.forking")
+                  : t("fork.summarizing")
+                : t("fork.start")
+              : create.isPending
+                ? t("newSession.starting")
+                : t("newSession.start")}
           </button>
         </div>
       </div>

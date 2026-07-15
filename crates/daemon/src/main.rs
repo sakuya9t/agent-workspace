@@ -7,6 +7,7 @@ mod domain;
 mod plugins;
 mod session_manager;
 mod source_control;
+mod summarize;
 mod util;
 mod workspace;
 
@@ -20,7 +21,7 @@ use anyhow::{bail, Context, Result};
 use asm_relay::agent::ResolvedDownstream;
 
 use api::AppState;
-use backend::asmux_client::AsmuxClient;
+use backend::asmux_client::{AsmuxClient, ReconnectEvent};
 use backend::native::NativePtyBackend;
 use backend::sidecar::SidecarBackend;
 use backend::SessionBackend;
@@ -81,6 +82,9 @@ async fn main() -> Result<()> {
 
     // Select the session backend. The out-of-process holder (asmux) is what makes
     // sessions survive a daemon restart; the native in-process backend does not.
+    // For the holder backend, the client's reconnect stream drives a `list`
+    // reconcile after every reconnect (catches exits missed while detached).
+    let mut reconnect_rx: Option<tokio::sync::broadcast::Receiver<ReconnectEvent>> = None;
     let backend: Arc<dyn SessionBackend> = match config.backend {
         BackendKind::Native => {
             tracing::info!("session backend: native (in-process PTYs; do not survive restart)");
@@ -97,16 +101,38 @@ async fn main() -> Result<()> {
                 holder_pid = client.server_pid,
                 "session backend: asmux holder (sessions survive daemon restart)"
             );
+            // Subscribe before the reconcile consumer spawns so a reconnect
+            // during startup is buffered, not lost.
+            reconnect_rx = Some(client.reconnect_events());
             Arc::new(SidecarBackend::new(client, db.events(), db.clone()))
         }
     };
 
     let manager = Arc::new(SessionManager::new(db, registry, backend, worktree_root));
 
-    // Reconcile sessions left live by a previous run: adopt survivors from the
-    // holder, or mark them failed/indeterminate. (Native marks them `failed`.)
-    if let Err(e) = manager.startup_reconcile().await {
-        tracing::error!("startup reconcile failed: {e:#}");
+    // Re-reconcile after each daemon↔asmux reconnect (the supervisor has already
+    // re-attached the live sessions; this catches exits missed while detached).
+    // A pass is blocking holder I/O, so it runs on a blocking thread; the
+    // manager serializes it against the startup pass.
+    if let Some(mut rx) = reconnect_rx {
+        let mgr = manager.clone();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ReconnectEvent::Connected) => {
+                        let mgr = mgr.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Err(e) = mgr.reconcile_after_reconnect() {
+                                tracing::warn!("post-reconnect reconcile failed: {e:#}");
+                            }
+                        })
+                        .await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
     }
 
     let state = AppState {
@@ -129,6 +155,15 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("binding {}", config.bind))?;
     tracing::info!("listening on http://{}", config.bind);
+
+    // Only now reconcile the sessions a previous run left live: adopt survivors
+    // from the holder, or mark them failed/indeterminate. (Native marks them
+    // `failed`.) This runs *behind* the bound listener because adoption is one
+    // serial holder round-trip per session — with 7 live sessions it took 8s,
+    // and doing it first meant `/health` did not answer until it finished, so a
+    // supervisor's health check timed out on a daemon that was fine. Requests
+    // that need a live session wait for the pass (see `api::READY_WAIT`).
+    manager.spawn_startup_reconcile();
 
     // Connect-info exposes the peer address so auth can trust loopback. The
     // primary listener stamps `Primary`, so genuine loopback here is trusted.
@@ -315,15 +350,57 @@ fn probe_health(url: &str) -> Option<(String, String)> {
     Some((node_id, label))
 }
 
+/// Poll the holder socket until something answers, or `wait` elapses.
+async fn wait_for_asmux(socket: &std::path::Path, wait: Duration) -> bool {
+    use tokio::net::UnixStream;
+
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        if UnixStream::connect(socket).await.is_ok() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Ensure the asmux holder is reachable, auto-spawning it (detached) if the
 /// socket is dead and autospawn is enabled.
+///
+/// This *waits* rather than probing once. A single connect attempt fails the
+/// daemon's whole boot the instant the holder is slow (peer container still
+/// starting) or briefly absent — which is how a missing socket became a hard,
+/// silent boot failure on 2026-07-12 (two dead boots, and not one ERROR line in
+/// the log, because `bail!` from `main` only prints a bare `Error:` to stderr).
 async fn ensure_asmux(config: &Config) -> Result<()> {
     use tokio::net::UnixStream;
 
     if UnixStream::connect(&config.asmux_socket).await.is_ok() {
         return Ok(());
     }
+
     if !config.asmux_autospawn {
+        // The holder is somebody else's job (peer container, service script).
+        // Give it a chance to appear instead of dying on the first refusal.
+        tracing::warn!(
+            socket = %config.asmux_socket.display(),
+            wait_ms = config.asmux_wait.as_millis() as u64,
+            "asmux holder not answering yet (ASM_ASMUX_AUTOSPAWN=0); waiting for it"
+        );
+        if wait_for_asmux(&config.asmux_socket, config.asmux_wait).await {
+            tracing::info!("asmux holder appeared; continuing");
+            return Ok(());
+        }
+        tracing::error!(
+            socket = %config.asmux_socket.display(),
+            "no asmux holder at this socket and ASM_ASMUX_AUTOSPAWN=0, so the daemon cannot start. \
+             Either the holder is not running, or it is running but its socket was unlinked (an \
+             orphan: `asmux probe` says not-Live while its pid is alive). Recover with \
+             `scripts/start.sh`, which detects both, or set ASM_ASMUX_AUTOSPAWN=1 to let the daemon \
+             spawn one."
+        );
         bail!(
             "asmux socket {} is unavailable and ASM_ASMUX_AUTOSPAWN=0",
             config.asmux_socket.display()
@@ -350,13 +427,15 @@ async fn ensure_asmux(config: &Config) -> Result<()> {
     cmd.spawn()
         .with_context(|| format!("spawning asmux binary at {}", bin.display()))?;
 
-    // Wait for the socket to come up.
-    for _ in 0..50 {
-        if UnixStream::connect(&config.asmux_socket).await.is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    if wait_for_asmux(&config.asmux_socket, config.asmux_wait).await {
+        return Ok(());
     }
+    tracing::error!(
+        socket = %config.asmux_socket.display(),
+        bin = %bin.display(),
+        "spawned asmux but it never listened. If a live holder already owns this socket it refuses \
+         to displace it (by design) — check the asmux log."
+    );
     bail!(
         "asmux did not start listening at {}",
         config.asmux_socket.display()

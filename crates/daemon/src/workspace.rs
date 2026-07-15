@@ -26,9 +26,12 @@ pub fn init_repo(root: &Path) -> Result<()> {
 
 /// How a managed worktree's branch is chosen.
 pub enum BranchSpec<'a> {
-    /// Create a fresh app-managed branch off HEAD; on name collision fall back
-    /// to a detached HEAD so session creation never blocks.
-    Auto { name: &'a str },
+    /// Create a fresh app-managed branch starting at `base` (`"HEAD"` for an
+    /// ordinary new session; a fork passes the origin's branch, so the fork
+    /// starts from the work it is forking rather than from the repo's HEAD). On
+    /// name collision, fall back to a detached worktree so session creation never
+    /// blocks.
+    Auto { name: &'a str, base: &'a str },
     /// Create a new branch `name` starting at `base` (a branch, tag, or commit).
     New { name: &'a str, base: &'a str },
     /// Check out an existing branch `name` in the new worktree.
@@ -50,12 +53,12 @@ pub fn create_worktree(
         .ok_or_else(|| anyhow!("non-UTF8 worktree path"))?;
 
     match spec {
-        BranchSpec::Auto { name } => {
-            if git(root, &["worktree", "add", "-b", name, path_str, "HEAD"]).is_ok() {
+        BranchSpec::Auto { name, base } => {
+            if git(root, &["worktree", "add", "-b", name, path_str, base]).is_ok() {
                 return Ok(Some(name.to_string()));
             }
             // Branch name may collide; fall back to a detached worktree.
-            git(root, &["worktree", "add", "--detach", path_str, "HEAD"])
+            git(root, &["worktree", "add", "--detach", path_str, base])
                 .map_err(|e| anyhow!("worktree add failed: {e}"))?;
             Ok(None)
         }
@@ -159,6 +162,57 @@ pub fn worktree_for_branch(root: &Path, branch: &str) -> Result<Option<(String, 
         .map(|(i, wt)| (wt.path.clone(), i == 0)))
 }
 
+/// Detach a managed worktree from its recorded branch without changing its
+/// files. This releases Git's one-worktree-per-branch lock so another checkout
+/// (for example, the source checkout used for production verification) can
+/// temporarily switch to the branch.
+pub fn detach_branch(instance_path: &Path, branch: &str) -> Result<()> {
+    match current_branch(instance_path).as_deref() {
+        None => return Ok(()),
+        Some(current) if current == branch => {}
+        Some(current) => bail!(
+            "worktree is on `{current}`, not its recorded branch `{branch}`; refusing to detach it"
+        ),
+    }
+
+    // Switching to the current commit changes only HEAD. Git leaves staged,
+    // unstaged, and untracked work exactly where it is.
+    git(instance_path, &["switch", "--detach", "HEAD"])?;
+    Ok(())
+}
+
+/// Reattach a detached managed worktree to its recorded branch. Git performs
+/// the safety checks: if another worktree still has the branch checked out, or
+/// if switching would overwrite local changes, this fails without modifying
+/// the worktree.
+pub fn attach_branch(instance_path: &Path, branch: &str) -> Result<()> {
+    match current_branch(instance_path).as_deref() {
+        Some(current) if current == branch => return Ok(()),
+        Some(current) => bail!(
+            "worktree is on `{current}`, not detached; refusing to attach `{branch}`"
+        ),
+        None => {}
+    }
+
+    if !branch_exists(instance_path, branch) {
+        bail!("recorded branch `{branch}` no longer exists");
+    }
+    let branch_ref = format!("refs/heads/{branch}");
+    let head_is_contained = Command::new("git")
+        .args(["merge-base", "--is-ancestor", "HEAD", &branch_ref])
+        .current_dir(instance_path)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !head_is_contained {
+        bail!(
+            "detached HEAD has commits that are not on `{branch}`; preserve them before reattaching"
+        );
+    }
+    git(instance_path, &["switch", "--no-guess", branch])?;
+    Ok(())
+}
+
 /// Drop registrations for worktrees whose directories no longer exist.
 pub fn prune_worktrees(root: &Path) -> Result<()> {
     git(root, &["worktree", "prune"])?;
@@ -197,4 +251,128 @@ pub fn branch_is_merged(root: &Path, branch: &str) -> bool {
 pub fn delete_branch(root: &Path, branch: &str, force: bool) -> Result<()> {
     git(root, &["branch", if force { "-D" } else { "-d" }, branch])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn test_repo(label: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("asm-{label}-{}", uuid::Uuid::new_v4()));
+        let worktree = std::env::temp_dir().join(format!(
+            "asm-{label}-worktree-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-b", "main"]).unwrap();
+        git(&root, &["config", "user.email", "asm-tests@example.invalid"]).unwrap();
+        git(&root, &["config", "user.name", "ASM Tests"]).unwrap();
+        fs::write(root.join("tracked.txt"), "initial\n").unwrap();
+        git(&root, &["add", "tracked.txt"]).unwrap();
+        git(&root, &["commit", "-m", "initial"]).unwrap();
+        git(&root, &["branch", "feature/deploy-me"]).unwrap();
+        create_worktree(
+            &root,
+            &worktree,
+            BranchSpec::Existing {
+                name: "feature/deploy-me",
+            },
+        )
+        .unwrap();
+        (root, worktree)
+    }
+
+    #[test]
+    fn detach_releases_branch_and_attach_claims_it_again_without_losing_changes() {
+        let (root, worktree) = test_repo("branch-attachment");
+        fs::write(worktree.join("tracked.txt"), "staged\n").unwrap();
+        git(&worktree, &["add", "tracked.txt"]).unwrap();
+        fs::write(worktree.join("tracked.txt"), "staged\nunstaged\n").unwrap();
+        fs::write(worktree.join("local.txt"), "keep me\n").unwrap();
+        let dirty_state = git(
+            &worktree,
+            &["status", "--porcelain", "--untracked-files=all"],
+        )
+        .unwrap();
+
+        detach_branch(&worktree, "feature/deploy-me").unwrap();
+        assert_eq!(current_branch(&worktree), None);
+        assert_eq!(
+            git(
+                &worktree,
+                &["status", "--porcelain", "--untracked-files=all"],
+            )
+            .unwrap(),
+            dirty_state
+        );
+
+        // Detaching releases Git's branch lock, so the source checkout can use
+        // the feature branch while production is being verified.
+        git(&root, &["switch", "feature/deploy-me"]).unwrap();
+        let error = attach_branch(&worktree, "feature/deploy-me")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already checked out"), "{error}");
+
+        // Verification may advance the branch. Reattaching is still safe when
+        // the session's detached commit is an ancestor of the new branch tip.
+        fs::write(root.join("verified.txt"), "verified\n").unwrap();
+        git(&root, &["add", "verified.txt"]).unwrap();
+        git(&root, &["commit", "-m", "verified deployment"]).unwrap();
+        git(&root, &["switch", "main"]).unwrap();
+        attach_branch(&worktree, "feature/deploy-me").unwrap();
+        assert_eq!(current_branch(&worktree).as_deref(), Some("feature/deploy-me"));
+        assert_eq!(
+            git(
+                &worktree,
+                &["status", "--porcelain", "--untracked-files=all"],
+            )
+            .unwrap(),
+            dirty_state
+        );
+        assert_eq!(
+            fs::read_to_string(worktree.join("verified.txt")).unwrap(),
+            "verified\n"
+        );
+
+        remove_worktree(&root, &worktree, true).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detach_refuses_a_different_checked_out_branch() {
+        let (root, worktree) = test_repo("branch-attachment-wrong-branch");
+        git(&worktree, &["switch", "-c", "other"]).unwrap();
+
+        let error = detach_branch(&worktree, "feature/deploy-me")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not its recorded branch"), "{error}");
+        assert_eq!(current_branch(&worktree).as_deref(), Some("other"));
+
+        remove_worktree(&root, &worktree, true).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn attach_refuses_to_abandon_commits_made_while_detached() {
+        let (root, worktree) = test_repo("branch-attachment-detached-commit");
+        detach_branch(&worktree, "feature/deploy-me").unwrap();
+        fs::write(worktree.join("detached.txt"), "important\n").unwrap();
+        git(&worktree, &["add", "detached.txt"]).unwrap();
+        git(&worktree, &["commit", "-m", "detached work"]).unwrap();
+
+        let detached_head = git(&worktree, &["rev-parse", "HEAD"]).unwrap();
+        let error = attach_branch(&worktree, "feature/deploy-me")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("preserve them before reattaching"), "{error}");
+        assert_eq!(current_branch(&worktree), None);
+        assert_eq!(git(&worktree, &["rev-parse", "HEAD"]).unwrap(), detached_head);
+
+        remove_worktree(&root, &worktree, true).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 }

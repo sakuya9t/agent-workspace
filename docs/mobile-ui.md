@@ -48,6 +48,22 @@ PHONE_MQ = (max-width: 599px), ((max-height: 599px) and (pointer: coarse))
   listener). Crossing the boundary (rotation, resize) swaps shells live; all
   state lives in stores/queries, so nothing is lost.
 
+### Layout class ≠ input class
+
+`PHONE_MQ` answers "how much room is there", **not** "what is this driven with".
+A tablet is desktop-*shaped* and finger-*driven*, and anything keyed off
+`useIsPhone()` alone silently assumes those two go together. They don't, and the
+gap is exactly one device wide: the iPad took the desktop shell (so it never saw
+the phone key bar) and had no keyboard (so it could never press ⌘-C / Ctrl-V) —
+leaving it, for a while, the one client that could select text but not copy it.
+
+So there is a second, independent hook (`useIsTouch()` = `(pointer: coarse)`) for
+input-class questions. `pointer` (not `any-pointer`) describes the **primary**
+pointer, which is what makes it the right test: a touchscreen laptop reports a
+*fine* primary pointer and keeps its key chords, so it must not be handed
+touch-only controls. Reach for `useIsTouch()` whenever the question is "can this
+user press a key / hover", and for `useIsPhone()` only when it is "will this fit".
+
 ## Mobile information architecture
 
 Two screens plus one sheet. The session list is home; the terminal is a
@@ -73,10 +89,12 @@ rendered by the same `SessionList` component. Mobile CSS only:
 - Rows ≥ 44 px tall (tree nodes today are ~30 px).
 - `tree-add` +/× buttons 20 px → 36 px square.
 - `btn.tiny` min-height 32 px.
-- Long-press is not required anywhere; every action is already an explicit
-  visible button (stop/archive/connect/+/×), which is why the tree ports
-  cleanly to touch. Hover-only `title` tooltips degrade silently; all critical
-  info (status, attention, path basename, rel-time) is already visible text.
+- Long-press is not required anywhere *in the tree*; every action is already an
+  explicit visible button (stop/archive/connect/+/×), which is why the tree ports
+  cleanly to touch. (The terminal is the one place a long-press carries meaning —
+  it starts a selection; see "Touch gestures" below.) Hover-only `title` tooltips
+  degrade silently; all critical info (status, attention, path basename,
+  rel-time) is already visible text.
 
 Tap a session row → same takeover confirm as desktop → navigates to the
 Terminal screen.
@@ -102,11 +120,159 @@ Terminal screen.
   | `^C` | `\x03` | dedicated because it's the most common chord |
   | `↑ ↓ ← →` | `\x1b[A/B/C/D` | history, TUI menus |
   | `⌨` | focus xterm textarea | summon/dismiss keyboard (iOS needs a gesture) |
-  | `Paste` | `clipboard.readText()` → input | long-press paste is flaky in xterm; needs secure context, which the relay path has |
+  | `Paste` | `clipboard.readText()` → input, else the paste sheet | long-press paste is flaky in xterm; the read needs a secure context, which a phone does **not** have (below) |
 
   `TerminalView` grows an optional `onReady(handle)` prop exposing
   `write(data)`/`focus()` so the key bar can inject input through the same
   WS send path as typed keys.
+
+- **Paste without a clipboard read** (fixed 2026-07-12,
+  `scripts/mobile-paste-test.mjs`). `navigator.clipboard.readText()` exists only
+  in a **secure context**, and the daemon and the relay both serve plain HTTP
+  (relay TLS is still open — see `docs/security-followups.md`). So on a phone
+  there was no clipboard to read and `Paste` did nothing at all, in silence.
+
+  Two things kept this hidden. A dev machine reaches the client on **localhost,
+  which _is_ a secure context** — so the identical code works in Chrome's device
+  emulation and fails on the device. And `Copy` went on working next to it,
+  because copying falls back to `execCommand("copy")`; only *reading* has no
+  fallback (`document.execCommand("paste")` is denied to web content in every
+  browser).
+
+  The fix is the one clipboard path that needs neither a secure context nor a
+  permission: a **`paste` event** carries its own `clipboardData`, since the OS
+  hands the text over precisely because the user chose to paste. So when
+  `canReadClipboard()` is false, `Paste` opens `PasteSheet` — a focused textarea
+  to paste *into* — and forwards what lands there to the pty. The gesture stays
+  the platform's own (iOS: long-press → Paste). The check must be **synchronous**
+  inside the click handler: `await` first and the user gesture is spent, and iOS
+  will not raise the keyboard for the sheet.
+
+  When the relay does get TLS, the read path lights up on its own and the sheet
+  becomes the fallback it was written to be.
+
+- **Touch gestures** (added 2026-07-12, `scripts/touch-select-test.mjs`):
+
+  | Gesture | Does |
+  |---|---|
+  | Drag | Scrolls — the same from anywhere, over text or over blank space |
+  | Long-press (450 ms) | Selects the word under the finger (short vibrate) |
+  | Drag, still held | Extends the selection cell-by-cell, forward or backward; holding near the top/bottom edge auto-scrolls so a selection can outrun one screenful |
+  | Tap | Dismisses the selection |
+
+  Then `Copy` on the key bar puts it on the clipboard — or, on a tablet, the
+  `⧉` button below.
+
+- **Clipboard buttons on the terminal** (added 2026-07-13,
+  `scripts/touch-clipboard-test.mjs`): the terminal's bottom-right action row is
+  `[⧉ copy] [📋 paste] [📎 attach]`, with the clipboard pair rendered only when
+  `useIsTouch() && !useIsPhone()`.
+
+  That predicate is the whole feature. A phone already has Copy/Paste on the key
+  bar docked above its keyboard, and a mouse user has ⌘-C / Ctrl-Shift-C; both
+  would only be cluttered by a second pair. What was left over was the tablet —
+  desktop shell, no key bar, no keyboard — which had **no way to copy or paste at
+  all**, even though the long-press selection gesture above worked there the whole
+  time. The buttons reuse the paths that already existed (`useTerminalPaste()` is
+  shared with the key bar, so the secure-context dance is written once; `Copy`
+  flashes the same `.paste-status` receipt as Ctrl-Shift-C).
+
+  `Copy` with an empty selection says *"Select some text first"* rather than
+  no-oping: it is the one copy path reachable without a selection (the key chords
+  and the context menu all guard on `hasSelection()`), and on a tablet — where
+  selecting means a long-press drag that is easy to miss — a button that does
+  nothing at all reads as a broken button.
+
+  **Testing gotcha.** Chrome's `Emulation.setEmulatedMedia` does **not** support
+  the `pointer` media feature — it silently no-ops, and every touch assertion
+  passes for the wrong reason. Only `setDeviceMetricsOverride({mobile: true})` +
+  `setTouchEmulationEnabled` actually flips `(pointer: coarse)`, so the test
+  asserts the media query itself before trusting anything downstream.
+
+  Two things make this more than "listen for `touchmove`":
+
+  1. **xterm has no touch selection at all.** Its selection service is
+     mouse-only and `.xterm` carries `user-select: none`, so neither xterm nor
+     the browser will select a cell from a fingertip. The gesture is synthesized
+     and pushed through xterm's *own* selection model via `term.select()` —
+     which is why every existing copy path (the key bar's `Copy`,
+     `getSelection()`, right-click, Ctrl-Shift-C) works on it unchanged, and why
+     the selection is cell-accurate rather than scraped out of the DOM.
+  2. **The gesture rides on pointer events, not touch events.** The DOM renderer
+     *replaces* a row's `<span>`s when that row repaints. A touch whose
+     `touchstart` landed on one of those spans gets retargeted to a node that is
+     no longer in the tree, so its `touchmove`s silently stop reaching any
+     listener — no `touchcancel`, just nothing. Since scrolling repaints rows,
+     a drag beginning on **text** scrolled exactly one row and then died, while a
+     drag beginning on **blank space** (whose target is the row `<div>` — which
+     xterm recycles rather than replaces) scrolled normally. `setPointerCapture`
+     pins the gesture to the container, so what becomes of the element under the
+     finger stops mattering.
+
+  **Capture is best-effort, and the selection never depends on it.** It is only
+  defined for an *active* pointer, and the long-press timer fires outside any
+  pointer event handler — Blink allows a capture from there, other engines need
+  not, and an exception used to escape `beginSelect()` **before** it selected
+  anything. So the word is selected first, the capture is attempted in a
+  `try`/`catch`, and the next `pointermove` retries it from a handler no engine
+  objects to.
+
+  **Debugging this on a real phone.** `scripts/touch-select-test.mjs` drives
+  headless Chrome, and Chrome's device-emulation mode is not a phone: it
+  synthesizes pointer events from a mouse and runs none of a real device's
+  gesture recognizers, so it will pass a gesture that iOS kills. An iPhone is
+  also the one browser we cannot instrument from Linux (Safari's Web Inspector
+  needs a Mac). So load the client with **`?gesturelog=1`** (`gestureLog.ts`) and
+  the raw event stream plus the gesture layer's own decisions paint onto an
+  overlay you can read — and copy — on the device:
+
+  ```
+     0 pointerdown touch#2 37,99 span conn=1     ← do pointer events arrive at all?
+   452 ▸select 0,2 "SELECTME"                    ← did the long press land (450 ms)?
+   716 ▸up gesture=select
+  ```
+
+  What to look for: a `pointercancel` **before** 450 ms is the engine claiming
+  the touch for a gesture of its own; `conn=0` is the renderer detaching the
+  target out from under the finger; `▸capture-failed` names a refused
+  `setPointerCapture`; no overlay at all means the phone is running a stale
+  bundle.
+
+- **Jump to latest output** (added 2026-07-13, `scripts/term-jump-test.mjs`): a
+  round `↓` pill (`.term-jump`) floats over the terminal *only* while the view
+  has left the live tail, the way a chat app's jump-to-newest does. A phone has
+  no wheel and no scrollbar, so the only way back was a reverse drag — and for a
+  TUI that owns its own scroll, one drag per screenful, indefinitely.
+
+  The design is entirely about serving the **two scroll models** that share this
+  terminal (diagnosed in [`terminal-scrollback.md`](terminal-scrollback.md)) with
+  one affordance:
+
+  | | Who scrolls | "Am I at the end?" | The way back |
+  |---|---|---|---|
+  | **codex, shell, ended-session replay** (normal buffer) | xterm's viewport | `viewportY < baseY` — exact | `scrollToBottom()` |
+  | **claude** (alt screen + mouse reporting) | the app | *unknowable* — nothing in xterm's buffer moves | give the app back its wheel |
+
+  The second row is the whole problem. Claude takes the wheel as **mouse
+  reports** and redraws its window from its own transcript, so xterm scrolls
+  nothing, knows nothing, and a viewport-based pill would never appear at all.
+  The only place the app's offset is observable is the reports *leaving* for it —
+  so `TerminalView` counts the net wheel-UP reports the app is holding
+  (`triggerMouseEvent`, which it already wraps for the selection guard) and the
+  pill hands them back as wheel-DOWNs. The app clamps at its own bottom, so
+  **overshoot is free** — which is precisely what lets a merely approximate
+  counter (a stale one, after the app auto-followed new output) stay correct. The
+  burst is collected and sent as one WS frame / one pty write rather than one per
+  report.
+
+  A TUI in the alternate screen that does *not* take the wheel (vim, less) is
+  deliberately left out: its wheel becomes ↑/↓ keys the app may interpret however
+  it likes, so neither model can say where "the end" is. The counter stays 0 and
+  the pill never appears — better than appearing and lying.
+
+  Phone-only, and a deliberate parity break in mobile's favor (the desktop has a
+  wheel and a scrollbar). Live sessions *and* read-only replays, so it sits in the
+  terminal body rather than the key bar, which ended sessions don't get.
 
 - **Soft-keyboard geometry:** viewport meta gains
   `interactive-widget=resizes-content` (Android); an `useVisualViewportHeight`
@@ -165,6 +331,7 @@ desktop (select session on load).
 | Stop / archive / takeover confirm / attention ack | Identical (row buttons + row tap) |
 | Terminal + status header + View usage | Terminal screen + header buttons |
 | Keyboard input incl. Esc/Ctrl/arrows | Soft keyboard + key bar (new) |
+| Scrolling back: wheel + scrollbar | Drag, + a jump-to-latest pill (new — parity break in mobile's favor) |
 | Right panel: VS Code, fields, cleanup, summary | Details sheet, same component (VS Code hidden — see below) |
 | SCM: status, changed files, diff, pull, rebase, commit graph, commit detail | Details sheet, same components; modals as sheets |
 | New session / new workspace / directory picker / connection & relay manage / usage | Same dialogs as full-screen sheets |

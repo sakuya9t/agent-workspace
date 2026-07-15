@@ -39,6 +39,18 @@ export interface Session {
   risky: boolean;
   /** Whether a live client is currently attached (for takeover prompts). */
   attached?: boolean;
+  /** The agent's own name for the session (best-effort; absent on old daemons). */
+  title?: string | null;
+  /** Branch held by the session's workspace instance, for the info popover. */
+  branch?: string | null;
+  /** Origin session id when this session was forked from another; null otherwise. */
+  forked_from?: string | null;
+  /**
+   * Whether the agent kept a conversation the daemon could resume. A fork onto
+   * the same agent then carries the whole conversation; otherwise it carries a
+   * written summary. (Absent on old daemons.)
+   */
+  has_agent_conversation?: boolean;
 }
 
 export interface AgentOption {
@@ -57,6 +69,24 @@ export interface PluginInfo {
   binary_path: string | null;
   supported_on_this_platform: boolean;
   options: AgentOption[];
+}
+
+/** One selectable model for an agent. `id` is passed to the agent's model flag. */
+export interface AgentModel {
+  id: string;
+  label: string;
+}
+
+/**
+ * The models a client can pick for one agent (new-session / fork dropdown),
+ * resolved per-host. `models` may be empty for a `supported` agent that can't
+ * enumerate them (the dropdown then offers just the default and a free-text
+ * "Custom…"). `default` is the agent's currently configured model, preselected.
+ */
+export interface PluginModels {
+  supported: boolean;
+  models: AgentModel[];
+  default: string | null;
 }
 
 export interface SessionSummary {
@@ -104,6 +134,26 @@ export interface ChangedFile {
   orig_path: string | null;
 }
 
+/** One remote's tip for the current branch, as of the last fetch. */
+export interface RemoteBranch {
+  remote: string;
+  branch: string;
+  head: string;
+  ahead: number;
+  behind: number;
+  upstream: boolean;
+}
+
+/** The commit the current branch was spawned at, or last rebased onto. */
+export interface BaseCommit {
+  hash: string;
+  short: string;
+  subject: string;
+  kind: "spawned" | "rebased";
+  refs: string[];
+  ahead: number;
+}
+
 export interface ScmStatus {
   is_repo: boolean;
   provider: string;
@@ -111,6 +161,8 @@ export interface ScmStatus {
   head: string | null;
   detached: boolean;
   changed_files: ChangedFile[];
+  remotes: RemoteBranch[];
+  base: BaseCommit | null;
 }
 
 export interface Commit {
@@ -214,6 +266,27 @@ export interface CreateSessionBody {
   base_ref?: string;
   /** Selected agent-option toggles (e.g. permission-skipping flags), keyed by option key. */
   options?: Record<string, boolean>;
+  /** Model override; omit (or empty) to start with the agent's own default. */
+  model?: string;
+}
+
+/**
+ * A fork inherits its origin's daemon, workspace and working directory, so none
+ * of those are here. The only two choices a fork has are which agent to hand the
+ * work to, and where it runs relative to the origin's branch.
+ */
+export interface ForkSessionBody {
+  /** The agent to fork into — the origin's own, or a different one. */
+  agent_plugin_id: string;
+  /**
+   * Continue on the origin's branch, sharing its worktree, instead of branching
+   * off it into a new one. Safe once the origin has stopped; while it is still
+   * running this puts two agents in one directory.
+   */
+  same_branch?: boolean;
+  options?: Record<string, boolean>;
+  /** Model override for the fork; omit to use the target agent's own default. */
+  model?: string;
 }
 
 export interface BranchList {
@@ -294,9 +367,10 @@ async function req<T>(t: Target, path: string, init?: RequestInit): Promise<T> {
 }
 
 /**
- * POST raw binary (e.g. a pasted image Blob) and parse a JSON reply. Mirrors
- * `req`'s auth handling but sends the Blob as-is — fetch derives the multipart
- * boundary-free `Content-Type` from the Blob, so we don't force JSON.
+ * POST raw binary (e.g. an attached file or a pasted image Blob) and parse a
+ * JSON reply. Mirrors `req`'s auth handling but sends the Blob as-is — fetch
+ * derives the multipart boundary-free `Content-Type` from the Blob, so we don't
+ * force JSON.
  */
 async function postBlob<T>(t: Target, path: string, blob: Blob): Promise<T> {
   const headers: Record<string, string> = {
@@ -341,12 +415,56 @@ async function getBlob(t: Target, path: string): Promise<Blob> {
   return res.blob();
 }
 
-/** Where a stored paste landed on the daemon host. */
-export interface PastedImage {
+/** A file the daemon offers for download, with the name it chose for it. */
+export interface Download {
+  blob: Blob;
+  /** From `Content-Disposition`; null if the daemon didn't name the file. */
+  filename: string | null;
+}
+
+/**
+ * GET a file to save. Like `getBlob`, but keeps the daemon's filename: the
+ * transcript endpoint picks the extension (`.md` for a rendered conversation,
+ * `.log` when it can only serve the raw stream), so the client can't derive it.
+ */
+async function getDownload(t: Target, path: string): Promise<Download> {
+  const headers: Record<string, string> = {};
+  if (t.token) headers["Authorization"] = `Bearer ${t.token}`;
+  if (t.relayKey) headers["X-ASM-Relay-Key"] = t.relayKey;
+
+  let res: Response;
+  try {
+    res = await fetch(baseOf(t.baseUrl) + path, { headers });
+  } catch {
+    throw unreachableError(t.baseUrl);
+  }
+  if (!res.ok) {
+    const { msg } = await errorMessage(res);
+    throw Object.assign(new Error(msg), { status: res.status });
+  }
+  return { blob: await res.blob(), filename: contentDispositionName(res) };
+}
+
+/** The `filename="…"` of a `Content-Disposition` header, if it carries one. */
+export function contentDispositionName(res: Response): string | null {
+  const cd = res.headers.get("Content-Disposition");
+  const m = cd?.match(/filename="([^"]+)"/);
+  return m ? m[1] : null;
+}
+
+/** Where a stored attachment landed on the daemon host. */
+export interface StoredAttachment {
   path: string;
   relative_path: string;
   filename: string;
 }
+
+/**
+ * Largest attachment the daemon will store (`MAX_PASTE_BYTES`). Mirrored here so
+ * the client can reject an oversize file instantly with a clear message instead
+ * of uploading it just to collect a 413. The daemon still enforces it.
+ */
+export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 
 /**
  * Enroll a device against a specific daemon; returns its device token. When the
@@ -400,14 +518,33 @@ export const api = {
   health: (t: Target) => req<Health>(t, "/health"),
   listPlugins: (t: Target) =>
     req<{ plugins: PluginInfo[] }>(t, "/api/plugins").then((r) => r.plugins),
+  /** The selectable models for one agent on this host (new-session / fork dropdown). */
+  listModels: (t: Target, pluginId: string) =>
+    req<{ models: PluginModels }>(t, `/api/plugins/${pluginId}/models`).then((r) => r.models),
   listSessions: (t: Target) =>
     req<{ sessions: Session[] }>(t, "/api/sessions").then((r) => r.sessions),
   getSummary: (t: Target, id: string) =>
     req<{ summary: SessionSummary }>(t, `/api/sessions/${id}/summary`).then((r) => r.summary),
+  /**
+   * Full conversation as a raw terminal transcript (ANSI included), as a Blob so
+   * the browser can save it. No delta — always the complete recorded stream.
+   */
+  sessionTranscript: (t: Target, id: string) =>
+    getDownload(t, `/api/sessions/${id}/transcript`),
   sessionUsage: (t: Target, id: string) =>
     req<{ usage: SessionUsage }>(t, `/api/sessions/${id}/usage`).then((r) => r.usage),
   createSession: (t: Target, body: CreateSessionBody) =>
     req<{ session: Session }>(t, "/api/sessions", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }).then((r) => r.session),
+  /**
+   * Fork a session into a new one carrying its context. Slow by nature — the
+   * daemon may run an agent headlessly to write the handoff brief — so callers
+   * should show progress rather than assume this returns promptly.
+   */
+  forkSession: (t: Target, id: string, body: ForkSessionBody) =>
+    req<{ session: Session }>(t, `/api/sessions/${id}/fork`, {
       method: "POST",
       body: JSON.stringify(body),
     }).then((r) => r.session),
@@ -460,10 +597,26 @@ export const api = {
     ).then((r) => r.commit),
   scmBranches: (t: Target, id: string) =>
     req<BranchList>(t, `/api/sessions/${id}/scm/branches`),
+  scmFetch: (t: Target, id: string) =>
+    req<{ output: string }>(t, `/api/sessions/${id}/scm/fetch`, { method: "POST" }).then(
+      (r) => r.output,
+    ),
   scmPull: (t: Target, id: string) =>
     req<{ output: string }>(t, `/api/sessions/${id}/scm/pull`, { method: "POST" }).then(
       (r) => r.output,
     ),
+  scmPush: (t: Target, id: string) =>
+    req<{ output: string }>(t, `/api/sessions/${id}/scm/push`, { method: "POST" }).then(
+      (r) => r.output,
+    ),
+  scmDetachBranch: (t: Target, id: string) =>
+    req<{ branch: string; attached: false }>(t, `/api/sessions/${id}/scm/detach-branch`, {
+      method: "POST",
+    }).then((r) => r.branch),
+  scmAttachBranch: (t: Target, id: string) =>
+    req<{ branch: string; attached: true }>(t, `/api/sessions/${id}/scm/attach-branch`, {
+      method: "POST",
+    }).then((r) => r.branch),
   scmRebase: (t: Target, id: string, onto: string) =>
     req<{ output: string }>(t, `/api/sessions/${id}/scm/rebase`, {
       method: "POST",
@@ -515,11 +668,18 @@ export const api = {
       (r) => r.enrollment_token,
     ),
   /**
-   * Upload a pasted/dropped image; the daemon stores it under the session's
-   * working directory and returns the path to inject into the terminal.
+   * Upload a pasted/dropped/picked attachment of any type; the daemon stores it
+   * under the session's working directory and returns the path to inject into
+   * the terminal. `name` is advisory — it only shapes the stored filename (the
+   * daemon sanitises it and picks the directory itself). A clipboard image is a
+   * bare Blob with no name, so it's optional.
    */
-  pasteImage: (t: Target, id: string, blob: Blob) =>
-    postBlob<PastedImage>(t, `/api/sessions/${id}/paste`, blob),
+  uploadAttachment: (t: Target, id: string, blob: Blob, name?: string) =>
+    postBlob<StoredAttachment>(
+      t,
+      `/api/sessions/${id}/paste` + (name ? `?name=${encodeURIComponent(name)}` : ""),
+      blob,
+    ),
 };
 
 export function streamUrl(t: Target, id: string): string {

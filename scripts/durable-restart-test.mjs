@@ -3,8 +3,8 @@
 //
 //   node scripts/durable-restart-test.mjs
 //
-// It orchestrates everything itself:
-//   1. start asmux (the holder) on a private socket
+// It orchestrates everything itself, inside a sandbox (scripts/lib/testenv.mjs):
+//   1. start asmux (the holder) on a PRIVATE socket
 //   2. start daemon #1 with ASM_BACKEND=sidecar
 //   3. create a shell session, run a marker command, confirm it is running
 //   4. SIGTERM daemon #1 (the holder keeps the PTY alive)
@@ -12,153 +12,41 @@
 //   6. assert the session was ADOPTED: still `running`, screen reconstructed
 //      (marker present), and still accepting input (a second marker echoes back)
 //
+// History: this test once inherited the dev host's ambient ASMUX_SOCK, so its
+// asmux unlinked and rebound the REAL holder's socket — orphaning six live prod
+// sessions. It now takes its socket from the sandbox, which cannot resolve to
+// the real one, and asmux itself refuses to displace a live holder.
+//
 // Requires the built binaries (`cargo build`) and Node 18+ (global WebSocket).
 
-import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, existsSync, openSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync } from "node:fs";
+import { createSandbox, checker, sleep } from "./lib/testenv.mjs";
 
-const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const DAEMON = join(ROOT, "target", "debug", "asm-daemon");
-const ASMUX = join(ROOT, "target", "debug", "asmux");
-const PORT = 4700 + (process.pid % 150);
-const BASE = `127.0.0.1:${PORT}`;
-const HTTP = `http://${BASE}`;
+const { check, report } = checker();
+const sb = await createSandbox("asm-dur");
 
-let failures = 0;
-function check(name, cond, extra) {
-  const ok = !!cond;
-  console.log(`${ok ? "PASS" : "FAIL"}  ${name}${extra ? "  " + extra : ""}`);
-  if (!ok) failures++;
-  return ok;
-}
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-const tmp = mkdtempSync(join(tmpdir(), "asm-dur-"));
-const runDir = join(tmp, "run");
-const dataDir = join(tmp, "data");
-const sock = join(runDir, "asmux.sock");
-const procs = [];
-
-function startProc(name, bin, env) {
-  const log = openSync(join(tmp, `${name}.log`), "a");
-  const child = spawn(bin, [], {
-    env: { ...process.env, ...env },
-    stdio: ["ignore", log, log],
-    detached: name === "asmux", // holder gets its own group; it must outlive the daemon
-  });
-  procs.push({ name, child });
-  return child;
-}
-
-async function waitHealth(timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`${HTTP}/health`);
-      if (res.ok) return await res.json();
-    } catch {
-      /* not up yet */
-    }
-    await sleep(150);
-  }
-  throw new Error("daemon /health did not come up");
-}
-
-async function j(path, init) {
-  const res = await fetch(HTTP + path, {
-    ...init,
-    headers: { "content-type": "application/json", ...(init?.headers ?? {}) },
-  });
-  if (!res.ok) throw new Error(`${path} -> ${res.status} ${await res.text()}`);
-  return res.json();
-}
-
-function wsCollect(id) {
-  const ws = new WebSocket(`ws://${BASE}/api/sessions/${id}/stream`);
-  ws.binaryType = "arraybuffer";
-  const state = { buf: "", ws };
-  ws.onmessage = (ev) => {
-    state.buf +=
-      typeof ev.data === "string" ? ev.data : Buffer.from(ev.data).toString("utf8");
-  };
-  return state;
-}
-
-function daemonEnv() {
-  return {
-    ASM_BIND: BASE,
-    ASM_DATA_DIR: dataDir,
-    ASM_RUNTIME_DIR: runDir,
-    ASM_BACKEND: "sidecar",
-    ASM_ASMUX_AUTOSPAWN: "0", // we manage the holder ourselves for determinism
-    ASM_LOG: "info,asm_daemon=debug",
-  };
-}
-
-function stop(name) {
-  const p = procs.find((x) => x.name === name && !x.child.killed);
-  if (!p) return;
-  try {
-    process.kill(p.child.pid, "SIGTERM");
-  } catch {
-    /* already gone */
-  }
-}
-
-async function waitExit(name, timeoutMs) {
-  const p = procs.find((x) => x.name === name);
-  if (!p) return;
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (p.child.exitCode !== null || p.child.signalCode !== null) return;
-    await sleep(50);
-  }
-}
-
-function cleanup() {
-  for (const { child } of procs) {
-    try {
-      process.kill(child.pid, "SIGKILL");
-    } catch {
-      /* gone */
-    }
-  }
-  try {
-    rmSync(tmp, { recursive: true, force: true });
-  } catch {
-    /* best effort */
-  }
-}
+// Both daemons drive the holder rather than in-process PTYs.
+const SIDECAR = { ASM_BACKEND: "sidecar", ASM_ASMUX_AUTOSPAWN: "0" };
 
 async function main() {
-  if (!existsSync(DAEMON) || !existsSync(ASMUX)) {
-    console.error(`missing binaries; run \`cargo build\` first\n  ${DAEMON}\n  ${ASMUX}`);
-    process.exit(2);
-  }
+  // 1. the holder, on the sandbox's private socket
+  await sb.startAsmux();
+  check("holder (asmux) socket up", existsSync(sb.socket), sb.socket);
 
-  // 1. the holder
-  startProc("asmux", ASMUX, { ASM_RUNTIME_DIR: runDir, ASM_LOG: "info" });
-  for (let i = 0; i < 40 && !existsSync(sock); i++) await sleep(100);
-  check("holder (asmux) socket up", existsSync(sock), sock);
-
-  // 2. daemon #1
-  startProc("daemon1", DAEMON, daemonEnv());
-  const health = await waitHealth(10000);
+  // 2. daemon #1, driving that holder
+  const health = await sb.startDaemon("daemon1", SIDECAR);
   check("daemon1 up on sidecar backend", health.backend === "asmux-sidecar", health.backend);
 
   // 3. create a shell session + run a marker
-  const { session } = await j("/api/sessions", {
+  const { session } = await sb.api("/api/sessions", {
     method: "POST",
-    body: JSON.stringify({ agent_plugin_id: "shell", cwd: tmp }),
+    body: JSON.stringify({ agent_plugin_id: "shell", cwd: sb.cwd }),
   });
   check("session created running", session.status === "running", session.id.slice(0, 8));
   const id = session.id;
 
   const marker = "DURABLE-" + Math.random().toString(36).slice(2, 8).toUpperCase();
-  const c1 = wsCollect(id);
+  const c1 = sb.ws(id);
   await new Promise((res) => (c1.ws.onopen = res));
   await sleep(500);
   c1.ws.send(JSON.stringify({ t: "i", d: `echo ${marker}\r` }));
@@ -166,28 +54,48 @@ async function main() {
   c1.ws.close();
   check("live output shows marker (pre-restart)", c1.buf.includes(marker));
 
+  // 3b. Cold-stitch discriminator: emit a marker, then MORE than the 2 MiB
+  // holder ring of filler, so that marker is evicted from the ring. Only the
+  // exact cold-stitch adopt (seed vt100 + history from the daemon's SQLite cold
+  // history) can reconstruct it after restart — plain ring-replay cannot.
+  const coldMarker = "COLD-" + Math.random().toString(36).slice(2, 8).toUpperCase();
+  const cf = sb.ws(id);
+  await new Promise((res) => (cf.ws.onopen = res));
+  await sleep(300);
+  cf.ws.send(JSON.stringify({ t: "i", d: `echo ${coldMarker}\r` }));
+  await sleep(500);
+  // ~2.65 MiB (52000 lines * 51 bytes) — well past the 2 MiB default ring.
+  const filler = "".padEnd(50, ".");
+  cf.ws.send(JSON.stringify({ t: "i", d: `yes ${filler} | head -n 52000\r` }));
+  await sleep(4500); // let it all emit AND flush to cold history
+  cf.ws.close();
+
   // 4. kill daemon #1 — the holder must keep the PTY alive
-  stop("daemon1");
-  await waitExit("daemon1", 5000);
+  sb.stop("daemon1");
+  await sb.waitExit("daemon1", 5000);
   check("daemon1 exited", true);
-  check("holder still alive after daemon exit", existsSync(sock));
+  check("holder still alive after daemon exit", existsSync(sb.socket));
 
   // 5. daemon #2 on the same data dir + holder socket
-  startProc("daemon2", DAEMON, daemonEnv());
-  await waitHealth(10000);
+  await sb.startDaemon("daemon2", SIDECAR);
 
   // 6. the durability assertions
-  const after = await j(`/api/sessions/${id}`);
+  const after = await sb.api(`/api/sessions/${id}`);
   check(
     "session ADOPTED as running after restart",
     after.session.status === "running",
     `status=${after.session.status}`,
   );
 
-  const c2 = wsCollect(id);
+  const c2 = sb.ws(id);
   await new Promise((res) => (c2.ws.onopen = res));
-  await sleep(700);
+  await sleep(1200);
   check("screen reconstructed after restart (marker present)", c2.buf.includes(marker));
+  check(
+    "cold-stitch preserved history beyond the 2 MiB ring",
+    c2.buf.includes(coldMarker),
+    coldMarker,
+  );
 
   // prove it is genuinely alive, not just a replayed corpse
   const marker2 = "ALIVE-" + Math.random().toString(36).slice(2, 8).toUpperCase();
@@ -197,18 +105,18 @@ async function main() {
   check("session still accepts input after restart", c2.buf.includes(marker2), marker2);
 
   // clean stop
-  await j(`/api/sessions/${id}/stop`, { method: "POST" }).catch(() => {});
+  await sb.api(`/api/sessions/${id}/stop`, { method: "POST" }).catch(() => {});
 
-  console.log(failures === 0 ? "\nALL PASS — sessions survive daemon restart" : `\n${failures} FAILURE(S)`);
+  return report("sessions survive daemon restart");
 }
 
 main()
-  .then(() => {
-    cleanup();
-    process.exit(failures === 0 ? 0 : 1);
+  .then((pass) => {
+    sb.cleanup();
+    process.exit(pass ? 0 : 1);
   })
   .catch((e) => {
     console.error(e);
-    cleanup();
+    sb.cleanup();
     process.exit(2);
   });
