@@ -359,6 +359,26 @@ impl Db {
         rows.next().transpose().map_err(Into::into)
     }
 
+    /// Every active workspace instance for `workspace_id`, newest first. Backs the
+    /// workspace branch-overview's session→branch grouping (the sessions table has
+    /// no branch column; `workspace_instances.branch` is the sole link). Covered by
+    /// `idx_instances_workspace`.
+    pub fn list_active_instances_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<WorkspaceInstance>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, workspace_id, session_id, path, branch, isolation, status, created_at,
+                    owns_worktree, owns_branch
+             FROM workspace_instances
+             WHERE workspace_id = ?1 AND status = 'active'
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([workspace_id], row_to_instance)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
     /// The `(owns_worktree, owns_branch)` flags recorded for the newest instance
     /// at `path`, or `None` if no session has ever run there. Ownership belongs
     /// to the resource rather than to whoever is currently sharing it, so a

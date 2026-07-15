@@ -1949,6 +1949,106 @@ body.col-resizing iframe {
   margin-top: 14px;
 }
 
+/* ---- workspace branch management ---- */
+/* The (i) on a workspace row opens a dialog (unlike the session-row info popover),
+   so it reads as clickable rather than the help cursor .info-btn defaults to. */
+.tree-actions .info-btn {
+  cursor: pointer;
+}
+.branch-modal {
+  width: 640px;
+}
+.branch-modal .modal-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.branch-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: min(60vh, 560px);
+  overflow-y: auto;
+  margin: 4px 0 2px;
+}
+.branch-row {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--panel-2);
+}
+.branch-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.branch-name {
+  font-weight: 600;
+  word-break: break-all;
+}
+.branch-tag {
+  flex: none;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--dim);
+}
+.branch-tag.current {
+  color: var(--accent);
+  border-color: var(--accent-2);
+}
+.branch-tag.warn {
+  color: #ff9e64;
+  border-color: #6b4a2e;
+}
+.branch-meta {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 5px;
+  font-size: 12px;
+}
+.branch-base {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.branch-commit {
+  margin-top: 4px;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.branch-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+.branch-picker {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.branch-picker .input {
+  min-width: 160px;
+  padding: 3px 6px;
+}
+.branch-foot {
+  margin-top: 10px;
+}
+.btn.tiny.danger {
+  color: #f7768e;
+  border-color: #5a2b34;
+}
+
 /* ---- session usage ---- */
 .usage-link {
   color: var(--accent);

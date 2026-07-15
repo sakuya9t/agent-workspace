@@ -62,6 +62,24 @@ pub fn router(state: AppState) -> Router {
             post(cleanup_workspace_worktrees),
         )
         .route("/api/workspaces/:id/branches", get(list_workspace_branches))
+        .route(
+            "/api/workspaces/:id/branches/overview",
+            get(workspace_branch_overview),
+        )
+        // Branch names contain `/` (`asm-session/…`), so the branch travels in the
+        // JSON body rather than as a `:name` path segment.
+        .route(
+            "/api/workspaces/:id/branches/delete",
+            post(delete_workspace_branch),
+        )
+        .route(
+            "/api/workspaces/:id/branches/merge",
+            post(merge_workspace_branches),
+        )
+        .route(
+            "/api/workspaces/:id/branches/rebase",
+            post(rebase_workspace_branches),
+        )
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:id", get(get_session))
         .route("/api/sessions/:id/summary", get(get_summary))
@@ -288,6 +306,93 @@ async fn list_workspace_branches(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let (branches, head) = state.manager.list_workspace_branches(&id)?;
     Ok(Json(json!({ "branches": branches, "head": head })))
+}
+
+/// Rich per-branch overview for the workspace branch-management dialog. Git-heavy
+/// (per-branch reflog + rev-list), so it runs on a blocking thread.
+async fn workspace_branch_overview(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let overview = tokio::task::spawn_blocking(move || state.manager.workspace_branch_overview(&id))
+        .await
+        .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("task join: {e}")))??;
+    Ok(Json(json!({ "overview": overview })))
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteBranchBody {
+    branch: String,
+    #[serde(default)]
+    force: bool,
+}
+
+async fn delete_workspace_branch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<DeleteBranchBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let DeleteBranchBody { branch, force } = body;
+    let res = tokio::task::spawn_blocking(move || {
+        state.manager.delete_workspace_branch(&id, &branch, force)
+    })
+    .await
+    .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("task join: {e}")))?;
+    match res {
+        Ok(()) => Ok(Json(json!({ "ok": true }))),
+        // Unmerged branch: 409 so the client can confirm and retry with force.
+        Err(e) if e.downcast_ref::<crate::session_manager::NeedsForce>().is_some() => {
+            Err(AppError(StatusCode::CONFLICT, format!("{e:#}")))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MergeBranchesBody {
+    source: String,
+    target: String,
+}
+
+async fn merge_workspace_branches(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<MergeBranchesBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let MergeBranchesBody { source, target } = body;
+    let res = tokio::task::spawn_blocking(move || {
+        state.manager.merge_workspace_branches(&id, &source, &target)
+    })
+    .await
+    .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("task join: {e}")))?;
+    match res {
+        Ok(output) => Ok(Json(json!({ "output": output }))),
+        // A conflicting merge is aborted; 409 so the client shows "resolve manually".
+        Err(e) if e.downcast_ref::<crate::source_control::MergeConflict>().is_some() => {
+            Err(AppError(StatusCode::CONFLICT, format!("{e:#}")))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RebaseBranchBody {
+    branch: String,
+    onto: String,
+}
+
+async fn rebase_workspace_branches(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RebaseBranchBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let RebaseBranchBody { branch, onto } = body;
+    let output = tokio::task::spawn_blocking(move || {
+        state.manager.rebase_workspace_branch(&id, &branch, &onto)
+    })
+    .await
+    .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("task join: {e}")))??;
+    Ok(Json(json!({ "output": output })))
 }
 
 async fn get_session_workspace(

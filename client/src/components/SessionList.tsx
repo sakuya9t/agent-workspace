@@ -40,6 +40,7 @@ export function SessionList() {
   const setActive = useUiStore((s) => s.setActive);
   const openNewSession = useUiStore((s) => s.openNewSession);
   const openNewWorkspace = useUiStore((s) => s.openNewWorkspace);
+  const openBranchManager = useUiStore((s) => s.openBranchManager);
   const openFork = useUiStore((s) => s.openFork);
   const setShowConnection = useUiStore((s) => s.setShowConnection);
   const updateDaemon = useConnStore((s) => s.updateDaemon);
@@ -330,6 +331,16 @@ export function SessionList() {
           )}
           <div className="tree-actions">
             {sessions.length > 0 && <span className="tree-badge">{sessions.length}</span>}
+            {w.is_git && (
+              <button
+                className="info-btn"
+                title={t("sessionList.branchesTitle")}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openBranchManager(daemonId, w.id);
+                }}
+              />
+            )}
             <button
               className="tree-add"
               title={t("sessionList.newSessionTitle")}

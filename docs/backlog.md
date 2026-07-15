@@ -72,6 +72,22 @@ pick it up**.
 
 ## Already done (context, do not re-plan)
 
+- **Workspace branch management (2026-07-15).** A workspace-level git branch view,
+  opened from an **(i)** icon next to each Git workspace in the tree
+  (`SessionList.tsx` `.tree-actions`, gated on `is_git`), rendered by a new global
+  `BranchManagerDialog`. For every local branch it shows (1) the sessions attached
+  to it (from `workspace_instances.branch`, the sole session→branch link — new
+  `db.list_active_instances_for_workspace`), (2) how far it is ahead of **its base**
+  — the *same* reflog-derived `BaseCommit` the right panel shows, so `base_commit`
+  was generalized to be branch-relative (not HEAD-relative) — and (3) how many of
+  its commits are **merged nowhere else** (new `source_control::unmerged_commit_count`
+  = `rev-list <branch> ^<every other ref>`). Management: **delete** (guarded — refused
+  while checked out in a worktree; 409+force for unmerged), **merge** and **rebase**
+  of arbitrary branches (new `source_control::{merge_branches,rebase_branch}` reuse
+  the existing temp-worktree + abort/cleanup machinery; both refuse a branch a *live*
+  session sits on). Endpoints `GET /api/workspaces/:id/branches/overview` +
+  `POST …/branches/{delete,merge,rebase}` (branch in the body — names contain `/`).
+  Proof: `scripts/branch-mgmt-test.mjs` (23 checks) + Rust units in `source_control.rs`.
 - **Fork a session (2026-07-14)** — [`fork-session.md`](fork-session.md).
   Continue a session's work in a new one, on its branch or a branch off it, with
   its context. **This landed row REC**: forking a *stopped* session onto its own

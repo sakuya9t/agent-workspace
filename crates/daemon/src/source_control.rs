@@ -511,7 +511,7 @@ impl SourceControl for GitSourceControl {
         let merge_dir = match workspace::worktree_for_branch(cwd, target)? {
             Some((path, _)) => PathBuf::from(path),
             None => {
-                let path = temp_merge_worktree_path(target);
+                let path = temp_op_worktree_path("merge", target);
                 let path_str = path_arg(&path)?;
                 git(cwd, &["worktree", "add", path_str, target]).map_err(|e| {
                     anyhow!("could not create temporary worktree for `{target}`: {e}")
@@ -831,7 +831,12 @@ fn ahead_behind(cwd: &Path, refname: &str) -> Option<(u32, u32)> {
 /// what we read. Entries come newest-first and the first match wins, which is
 /// exactly why a rebase supersedes the spawn point: the branch is no longer
 /// based where it started.
-fn base_commit(cwd: &Path, branch: &str) -> Option<BaseCommit> {
+///
+/// Everything is computed relative to `branch` itself (never HEAD), so this is
+/// correct for any local branch from any worktree of the repo — the right-panel
+/// status path calls it for the checked-out branch (where `branch == HEAD`), and
+/// the workspace branch-overview calls it for every branch at once.
+pub(crate) fn base_commit(cwd: &Path, branch: &str) -> Option<BaseCommit> {
     if guard_branch(branch).is_err() {
         return None;
     }
@@ -862,13 +867,13 @@ fn base_commit(cwd: &Path, branch: &str) -> Option<BaseCommit> {
     // A `git reset` moves a branch without writing a base-establishing entry, so
     // the one we just found can describe history the branch no longer sits on.
     // Report a base only when the branch is genuinely built on top of it.
-    if !git_ok(cwd, &["merge-base", "--is-ancestor", &hash, "HEAD"]) {
+    if !git_ok(cwd, &["merge-base", "--is-ancestor", &hash, branch]) {
         return None;
     }
 
     let meta = git(cwd, &["show", "-s", "--format=%h%x1f%s", &hash]).ok()?;
     let (short, subject) = meta.trim_end().split_once('\u{1f}')?;
-    let ahead = git(cwd, &["rev-list", "--count", &format!("{hash}..HEAD")])
+    let ahead = git(cwd, &["rev-list", "--count", &format!("{hash}..{branch}")])
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
@@ -903,6 +908,198 @@ fn base_commit(cwd: &Path, branch: &str) -> Option<BaseCommit> {
         refs,
         ahead,
     })
+}
+
+/// Number of commits reachable from `branch` but from no *other* ref — the work
+/// that would be lost if the branch were deleted, i.e. commits that have been
+/// merged nowhere else. The branch's own same-named remote-tracking ref
+/// (`origin/<branch>`) is treated as the same line of history (a backup, not a
+/// merge elsewhere) and does not count. With no other refs at all, every commit
+/// on the branch is unmerged.
+pub(crate) fn unmerged_commit_count(cwd: &Path, branch: &str) -> u32 {
+    if guard_branch(branch).is_err() {
+        return 0;
+    }
+    let Ok(refs_out) = git(
+        cwd,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    ) else {
+        return 0;
+    };
+    let own_head = format!("refs/heads/{branch}");
+    let own_remote_suffix = format!("/{branch}");
+    let others: Vec<String> = refs_out
+        .lines()
+        .map(str::trim)
+        .filter(|r| !r.is_empty() && *r != own_head)
+        // Skip the branch's own remote-tracking ref (refs/remotes/<remote>/<branch>):
+        // pushing is backup, not a merge into another line of work.
+        .filter(|r| !(r.starts_with("refs/remotes/") && r.ends_with(&own_remote_suffix)))
+        .map(String::from)
+        .collect();
+
+    // `git rev-list --count <branch> ^other1 ^other2 …`. All the `^refs` come
+    // straight from git, and `branch` is guarded, so nothing here is injectable.
+    let mut args: Vec<String> = vec!["rev-list".into(), "--count".into(), branch.to_string()];
+    args.extend(others.iter().map(|r| format!("^{r}")));
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    git(cwd, &arg_refs)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Merge `source` into `target` (both local branches) from the repo at `root` —
+/// the workspace-level counterpart to [`GitSourceControl::merge_to_branch`], in
+/// which neither branch need be the checked-out one. `source` is read as a
+/// committed ref, so it needs no worktree; `target` is merged into inside its own
+/// worktree (an existing one, else a temporary one removed afterwards). A
+/// conflicting merge is aborted so no worktree is left dirty.
+pub(crate) fn merge_branches(root: &Path, source: &str, target: &str) -> Result<String> {
+    guard_branch(source)?;
+    guard_branch(target)?;
+    if source == target {
+        bail!("cannot merge a branch into itself");
+    }
+    let (branches, _head) = GitSourceControl.branches(root)?;
+    if !branches.iter().any(|b| b == source) {
+        bail!("unknown branch: {source}");
+    }
+    if !branches.iter().any(|b| b == target) {
+        bail!("unknown branch: {target}");
+    }
+
+    let mut temp_path = None;
+    let merge_dir = match workspace::worktree_for_branch(root, target)? {
+        Some((path, _)) => PathBuf::from(path),
+        None => {
+            let path = temp_op_worktree_path("merge", target);
+            let path_str = path_arg(&path)?;
+            git(root, &["worktree", "add", path_str, target]).map_err(|e| {
+                anyhow!("could not create temporary worktree for `{target}`: {e}")
+            })?;
+            temp_path = Some(path.clone());
+            path
+        }
+    };
+
+    if let Err(e) = ensure_clean_worktree(&merge_dir, &format!("target branch `{target}`")) {
+        cleanup_temp_worktree(root, temp_path.as_deref());
+        return Err(e);
+    }
+
+    let out = match git_output(&merge_dir, &["merge", "--no-edit", source]) {
+        Ok(out) => out,
+        Err(e) => {
+            cleanup_temp_worktree(root, temp_path.as_deref());
+            return Err(e);
+        }
+    };
+    let output = combined_output(&out);
+    if out.status.success() {
+        let message = if output.trim().is_empty() {
+            format!("Merged {source} into {target}.")
+        } else {
+            format!("Merged {source} into {target}.\n{output}")
+        };
+        if let Err(e) = remove_temp_worktree(root, temp_path.as_deref()) {
+            return Ok(format!(
+                "{message}\n\nWarning: could not remove temporary worktree: {e:#}"
+            ));
+        }
+        return Ok(message);
+    }
+
+    let had_conflicts = has_unmerged_paths(&merge_dir) || output.contains("CONFLICT");
+    let _ = git_output(&merge_dir, &["merge", "--abort"]);
+    cleanup_temp_worktree(root, temp_path.as_deref());
+    if had_conflicts {
+        return Err(MergeConflict {
+            source_branch: source.to_string(),
+            target: target.to_string(),
+            output,
+        }
+        .into());
+    }
+    bail!(
+        "git merge {source} into {target} failed (merge aborted): {}",
+        output.trim()
+    );
+}
+
+/// Rebase local branch `branch` onto `onto` in the repo at `root` — the
+/// workspace-level counterpart to [`GitSourceControl::rebase`], in which the
+/// branch need not be checked out. If it already has a worktree the rebase runs
+/// there; otherwise a temporary worktree is created for it and removed afterwards.
+/// Any failure aborts the rebase so no worktree is left mid-rebase.
+pub(crate) fn rebase_branch(root: &Path, branch: &str, onto: &str) -> Result<String> {
+    guard_branch(branch)?;
+    guard_branch(onto)?;
+    if branch == onto {
+        bail!("cannot rebase a branch onto itself");
+    }
+    let (branches, _head) = GitSourceControl.branches(root)?;
+    if !branches.iter().any(|b| b == branch) {
+        bail!("unknown branch: {branch}");
+    }
+    if !branches.iter().any(|b| b == onto) {
+        bail!("unknown branch: {onto}");
+    }
+
+    let mut temp_path = None;
+    let dir = match workspace::worktree_for_branch(root, branch)? {
+        Some((path, _)) => PathBuf::from(path),
+        None => {
+            let path = temp_op_worktree_path("rebase", branch);
+            let path_str = path_arg(&path)?;
+            git(root, &["worktree", "add", path_str, branch]).map_err(|e| {
+                anyhow!("could not create temporary worktree for `{branch}`: {e}")
+            })?;
+            temp_path = Some(path.clone());
+            path
+        }
+    };
+
+    if let Err(e) = ensure_clean_worktree(&dir, &format!("branch `{branch}`")) {
+        cleanup_temp_worktree(root, temp_path.as_deref());
+        return Err(e);
+    }
+
+    match git_output(&dir, &["rebase", onto]) {
+        Ok(out) if out.status.success() => {
+            let output = combined_output(&out);
+            let message = format!("Rebased {branch} onto {onto}.");
+            if let Err(e) = remove_temp_worktree(root, temp_path.as_deref()) {
+                return Ok(format!(
+                    "{message}\n\nWarning: could not remove temporary worktree: {e:#}"
+                ));
+            }
+            Ok(if output.trim().is_empty() {
+                message
+            } else {
+                format!("{message}\n{output}")
+            })
+        }
+        Ok(out) => {
+            let output = combined_output(&out);
+            let _ = git_output(&dir, &["rebase", "--abort"]);
+            cleanup_temp_worktree(root, temp_path.as_deref());
+            bail!(
+                "git rebase {branch} onto {onto} failed (rebase aborted): {}",
+                output.trim()
+            );
+        }
+        Err(e) => {
+            let _ = git_output(&dir, &["rebase", "--abort"]);
+            cleanup_temp_worktree(root, temp_path.as_deref());
+            Err(e)
+        }
+    }
 }
 
 /// The commit a rebase reflog entry landed the branch on. Covers the plain,
@@ -991,8 +1188,8 @@ fn has_unmerged_paths(cwd: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn temp_merge_worktree_path(target: &str) -> PathBuf {
-    let safe_target: String = target
+fn temp_op_worktree_path(op: &str, branch: &str) -> PathBuf {
+    let safe_branch: String = branch
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
@@ -1007,7 +1204,7 @@ fn temp_merge_worktree_path(target: &str) -> PathBuf {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     std::env::temp_dir().join(format!(
-        "asm-merge-{safe_target}-{}-{now}",
+        "asm-{op}-{safe_branch}-{}-{now}",
         std::process::id()
     ))
 }
@@ -1400,6 +1597,145 @@ mod tests {
             "feature"
         );
         let _ = fs::remove_dir_all(&main_wt);
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    fn worktree_count(repo: &Path) -> usize {
+        git_test(repo, &["worktree", "list", "--porcelain"])
+            .matches("worktree ")
+            .count()
+    }
+
+    #[test]
+    fn base_commit_is_branch_relative_not_head_relative() {
+        let repo = test_repo("base-branch-rel");
+        write_file(&repo, "a.txt", "a\n");
+        commit_all(&repo, "A");
+        let a = git_test(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+        // `feature` branches off A and adds two commits.
+        git_test(&repo, &["checkout", "-b", "feature"]);
+        write_file(&repo, "b.txt", "b\n");
+        commit_all(&repo, "B");
+        write_file(&repo, "c.txt", "c\n");
+        commit_all(&repo, "C");
+        // Move HEAD back to main: the base must be computed against `feature`, not
+        // the checked-out HEAD, so it must still resolve to A with ahead=2.
+        git_test(&repo, &["checkout", "main"]);
+
+        let base = base_commit(&repo, "feature").expect("feature has a recorded base");
+        assert_eq!(base.hash, a);
+        assert_eq!(base.kind, BaseKind::Spawned);
+        assert_eq!(base.ahead, 2);
+        // `main` still names the base, so it hasn't moved on (not stale).
+        assert!(base.refs.iter().any(|r| r == "main"));
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn unmerged_commit_count_flags_work_that_lives_nowhere_else() {
+        let repo = test_repo("unmerged");
+        write_file(&repo, "a.txt", "a\n");
+        commit_all(&repo, "A");
+        git_test(&repo, &["checkout", "-b", "feature"]);
+        write_file(&repo, "b.txt", "b\n");
+        commit_all(&repo, "B");
+        write_file(&repo, "c.txt", "c\n");
+        commit_all(&repo, "C");
+        git_test(&repo, &["checkout", "main"]);
+
+        // B and C exist only on feature — two commits merged nowhere.
+        assert_eq!(unmerged_commit_count(&repo, "feature"), 2);
+        // main's only commit (A) is also on feature, so main has nothing unique.
+        assert_eq!(unmerged_commit_count(&repo, "main"), 0);
+
+        // Once feature is merged into main, its commits live there too.
+        merge_branches(&repo, "feature", "main").unwrap();
+        assert_eq!(unmerged_commit_count(&repo, "feature"), 0);
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn unmerged_commit_count_counts_all_of_a_lone_branch() {
+        // A branch that is the repo's only ref has all its work merged nowhere.
+        let repo = test_repo("unmerged-lone");
+        write_file(&repo, "a.txt", "a\n");
+        commit_all(&repo, "A");
+        write_file(&repo, "b.txt", "b\n");
+        commit_all(&repo, "B");
+        assert_eq!(unmerged_commit_count(&repo, "main"), 2);
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn merge_branches_into_a_bare_target_uses_a_temp_worktree() {
+        let repo = test_repo("merge-bare-target");
+        write_file(&repo, "a.txt", "a\n");
+        commit_all(&repo, "A");
+        // topic branches off main and is the checked-out branch; main is left with
+        // no worktree, so merging into it must go through a temporary one.
+        git_test(&repo, &["checkout", "-b", "topic"]);
+        write_file(&repo, "t.txt", "t\n");
+        commit_all(&repo, "topic work");
+
+        let out = merge_branches(&repo, "topic", "main").unwrap();
+        assert!(out.contains("Merged topic into main."));
+        assert_eq!(git_test(&repo, &["show", "main:t.txt"]), "t\n");
+        // The temporary worktree was cleaned up: only the main worktree remains.
+        assert_eq!(worktree_count(&repo), 1);
+        // The checked-out branch is untouched.
+        assert_eq!(
+            git_test(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "topic"
+        );
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn merge_branches_conflict_aborts_and_cleans_up() {
+        let repo = test_repo("merge-branches-conflict");
+        write_file(&repo, "f.txt", "base\n");
+        commit_all(&repo, "A");
+        git_test(&repo, &["branch", "topic"]);
+        write_file(&repo, "f.txt", "main\n");
+        commit_all(&repo, "main edit");
+        git_test(&repo, &["checkout", "topic"]);
+        write_file(&repo, "f.txt", "topic\n");
+        commit_all(&repo, "topic edit");
+
+        // HEAD=topic, main has no worktree → temp worktree, conflicting merge.
+        let err = merge_branches(&repo, "topic", "main").unwrap_err();
+        assert!(err.downcast_ref::<MergeConflict>().is_some());
+        // main is unchanged and no worktree was left behind.
+        assert_eq!(git_test(&repo, &["show", "main:f.txt"]), "main\n");
+        assert_eq!(worktree_count(&repo), 1);
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn rebase_branch_replays_a_bare_branch_onto_advanced_base() {
+        let repo = test_repo("rebase-bare");
+        write_file(&repo, "a.txt", "a\n");
+        commit_all(&repo, "A");
+        // feature branches off A with its own commit; main then advances.
+        git_test(&repo, &["checkout", "-b", "feature"]);
+        write_file(&repo, "f.txt", "f\n");
+        commit_all(&repo, "feature work");
+        git_test(&repo, &["checkout", "main"]);
+        write_file(&repo, "m.txt", "m\n");
+        commit_all(&repo, "main advance");
+
+        // feature is not checked out (HEAD=main) → temp-worktree rebase.
+        let out = rebase_branch(&repo, "feature", "main").unwrap();
+        assert!(out.contains("Rebased feature onto main."));
+        // feature now carries main's advance beneath its own work.
+        assert_eq!(git_test(&repo, &["show", "feature:m.txt"]), "m\n");
+        assert_eq!(git_test(&repo, &["show", "feature:f.txt"]), "f\n");
+        assert_eq!(worktree_count(&repo), 1);
+        // The checked-out branch is untouched.
+        assert_eq!(
+            git_test(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "main"
+        );
         let _ = fs::remove_dir_all(repo);
     }
 

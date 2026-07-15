@@ -9,6 +9,7 @@ import { MobileShell } from "./components/MobileShell";
 import { NewSessionDialog } from "./components/NewSessionDialog";
 import { NewWorkspaceDialog } from "./components/NewWorkspaceDialog";
 import { ConnectionDialog } from "./components/ConnectionDialog";
+import { BranchManagerDialog } from "./components/BranchManagerDialog";
 
 /**
  * Root: pick the shell for the device class, then render the shared dialogs
@@ -40,6 +41,7 @@ export function App() {
       <NewSessionDialog />
       <NewWorkspaceDialog />
       <ConnectionDialog />
+      <BranchManagerDialog />
     </>
   );
 }

@@ -294,6 +294,39 @@ export interface BranchList {
   head: string | null;
 }
 
+/** The branch tip's short hash / subject / commit time, for display. */
+export interface BranchCommitMeta {
+  short: string;
+  subject: string;
+  timestamp: number;
+}
+
+/** One branch's row in the workspace branch-management overview. */
+export interface BranchOverview {
+  name: string;
+  /** The workspace repo's current (checked-out) branch. */
+  is_current: boolean;
+  /** Ids of active sessions whose worktree sits on this branch. */
+  session_ids: string[];
+  /** How many of `session_ids` are live right now. */
+  live_count: number;
+  /** Where the branch is based + how far it advanced (same as the right panel). */
+  base: BaseCommit | null;
+  /** Commits merged onto no other ref — work lost if the branch is deleted. */
+  unmerged_commits: number;
+  /** Worktree path holding this branch, if any (deletion is blocked while set). */
+  checked_out_path: string | null;
+  /** Whether ASM created this branch (advisory). */
+  owns_branch: boolean;
+  last_commit: BranchCommitMeta | null;
+}
+
+export interface WorkspaceBranches {
+  is_git: boolean;
+  head: string | null;
+  branches: BranchOverview[];
+}
+
 /** Where a client-side VS Code should connect to reach a session's workspace. */
 export interface VscodeTarget {
   path: string;
@@ -648,6 +681,26 @@ export const api = {
     }).then((r) => r.workspace),
   workspaceBranches: (t: Target, id: string) =>
     req<BranchList>(t, `/api/workspaces/${id}/branches`),
+  workspaceBranchOverview: (t: Target, id: string) =>
+    req<{ overview: WorkspaceBranches }>(
+      t,
+      `/api/workspaces/${id}/branches/overview`,
+    ).then((r) => r.overview),
+  deleteWorkspaceBranch: (t: Target, id: string, branch: string, force = false) =>
+    req<{ ok: boolean }>(t, `/api/workspaces/${id}/branches/delete`, {
+      method: "POST",
+      body: JSON.stringify({ branch, force }),
+    }),
+  mergeWorkspaceBranches: (t: Target, id: string, source: string, target: string) =>
+    req<{ output: string }>(t, `/api/workspaces/${id}/branches/merge`, {
+      method: "POST",
+      body: JSON.stringify({ source, target }),
+    }).then((r) => r.output),
+  rebaseWorkspaceBranch: (t: Target, id: string, branch: string, onto: string) =>
+    req<{ output: string }>(t, `/api/workspaces/${id}/branches/rebase`, {
+      method: "POST",
+      body: JSON.stringify({ branch, onto }),
+    }).then((r) => r.output),
   sessionWorkspace: (t: Target, id: string) =>
     req<{ instance: WorkspaceInstance | null }>(t, `/api/sessions/${id}/workspace`).then(
       (r) => r.instance,
