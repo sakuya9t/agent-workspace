@@ -12,7 +12,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
 use crate::config::Config;
-use crate::plugins::current_platform;
+use crate::plugins::{current_platform, PluginModels};
 use crate::session_manager::{CreateSessionRequest, ForkRequest, SessionManager};
 use crate::source_control::SourceControl;
 use crate::util::now_millis;
@@ -53,6 +53,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/devices/:id/revoke", post(auth::revoke_device))
         .route("/api/fs/list", get(fs::list))
         .route("/api/plugins", get(list_plugins))
+        .route("/api/plugins/:id/models", get(list_plugin_models))
         .route("/api/workspaces", get(list_workspaces).post(add_workspace))
         .route("/api/workspaces/:id", delete(remove_workspace))
         .route("/api/workspaces/:id/init-git", post(init_workspace_git))
@@ -198,6 +199,25 @@ fn hostname() -> String {
 
 async fn list_plugins(State(state): State<AppState>) -> Json<serde_json::Value> {
     Json(json!({ "plugins": state.manager.registry().describe() }))
+}
+
+/// The models a client can pick for one agent, for the new-session / fork
+/// dropdown. Kept off `/api/plugins` because it can be slow — opencode shells out
+/// to `opencode models` — so it is only paid when the dialog needs it. Runs on a
+/// blocking thread for the same reason.
+async fn list_plugin_models(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let plugin = state
+        .manager
+        .registry()
+        .get(&id)
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, format!("unknown agent plugin `{id}`")))?;
+    let models = tokio::task::spawn_blocking(move || PluginModels::describe(plugin.as_ref()))
+        .await
+        .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("models task: {e}")))?;
+    Ok(Json(json!({ "models": models })))
 }
 
 async fn list_workspaces(
@@ -375,6 +395,16 @@ struct CreateSessionBody {
     base_ref: Option<String>,
     #[serde(default)]
     options: HashMap<String, bool>,
+    /// Model override; omit to start with the agent's own configured default.
+    #[serde(default)]
+    model: Option<String>,
+}
+
+/// Treat an empty or whitespace-only model string as "no override" — the client's
+/// "Default" dropdown entry sends `""`, which must launch with no model flag
+/// rather than pass an empty `--model` to the agent.
+fn normalize_model(model: Option<String>) -> Option<String> {
+    model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty())
 }
 
 async fn create_session(
@@ -396,6 +426,7 @@ async fn create_session(
         create_branch: body.create_branch,
         base_ref: body.base_ref,
         options: body.options.into_iter().collect(),
+        model: normalize_model(body.model),
         fork: None,
     };
     let session = state.manager.create_session(req)?;
@@ -413,6 +444,9 @@ struct ForkSessionBody {
     same_branch: bool,
     #[serde(default)]
     options: HashMap<String, bool>,
+    /// Model override for the fork; omit to use the target agent's own default.
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     rows: Option<u16>,
     #[serde(default)]
@@ -434,6 +468,7 @@ async fn fork_session(
     let req = ForkRequest {
         agent_plugin_id: body.agent_plugin_id,
         options: body.options.into_iter().collect(),
+        model: normalize_model(body.model),
         same_branch: body.same_branch,
         rows: body.rows.unwrap_or(24),
         cols: body.cols.unwrap_or(80),
@@ -695,7 +730,17 @@ impl From<anyhow::Error> for AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::needs_live_session;
+    use super::{needs_live_session, normalize_model};
+
+    #[test]
+    fn normalize_model_treats_blank_as_no_override() {
+        // The client's "Default" dropdown entry sends `""`; it must launch with
+        // no model flag, not an empty `--model`.
+        assert_eq!(normalize_model(None), None);
+        assert_eq!(normalize_model(Some("".into())), None);
+        assert_eq!(normalize_model(Some("   ".into())), None);
+        assert_eq!(normalize_model(Some("  sonnet ".into())).as_deref(), Some("sonnet"));
+    }
 
     #[test]
     fn gates_only_the_routes_that_resolve_a_live_handle() {

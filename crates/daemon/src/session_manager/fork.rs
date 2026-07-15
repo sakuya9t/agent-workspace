@@ -61,6 +61,9 @@ pub struct ForkRequest {
     /// The agent to fork *into* — the same one, or a different one.
     pub agent_plugin_id: String,
     pub options: Vec<(String, bool)>,
+    /// An explicit model override for the fork (see [`AgentContext::model`]).
+    /// `None` = launch the fork with no model flag.
+    pub model: Option<String>,
     /// Continue on the origin's own branch, in its worktree, rather than branching
     /// off it into a new one.
     pub same_branch: bool,
@@ -164,6 +167,7 @@ impl SessionManager {
             create_branch: false,
             base_ref,
             options: req.options,
+            model: req.model,
             fork: Some(ForkPlan {
                 origin_id: origin.id.clone(),
                 seed,

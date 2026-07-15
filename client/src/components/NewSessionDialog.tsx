@@ -18,6 +18,9 @@ type SessionTarget = { kind: "workspace"; id: string } | { kind: "path" };
  */
 export const FORKABLE_AGENTS = ["claude", "codex", "opencode"];
 
+/** Sentinel dropdown value that reveals the free-text model field. */
+const CUSTOM_MODEL = "__custom__";
+
 /** Whether this host has any agent a session could be forked into. */
 export function canForkInto(plugins: PluginInfo[] | undefined): boolean {
   return (plugins ?? []).some((p) => p.available && FORKABLE_AGENTS.includes(p.id));
@@ -40,6 +43,10 @@ export function NewSessionDialog() {
   const [command, setCommand] = useState("");
   const [approve, setApprove] = useState(false);
   const [agentOptions, setAgentOptions] = useState<Record<string, boolean>>({});
+  // Model override for the launch. "" = the agent's own default (no flag);
+  // CUSTOM_MODEL = type a model id in `customModel`; otherwise a listed model id.
+  const [model, setModel] = useState<string>("");
+  const [customModel, setCustomModel] = useState<string>("");
   const [directCheckout, setDirectCheckout] = useState(false);
   const [branchMode, setBranchMode] = useState<"auto" | "new" | "existing">("auto");
   const [branchName, setBranchName] = useState("");
@@ -76,6 +83,8 @@ export function NewSessionDialog() {
     setBaseRef("");
     setExistingBranch("");
     setAgentOptions({});
+    setModel("");
+    setCustomModel("");
     // A fork defaults to the origin's own agent (the common case — and the only
     // one that can carry the whole conversation) and to a branch of its own,
     // which is the only choice that's safe while the origin is still running.
@@ -88,6 +97,25 @@ export function NewSessionDialog() {
     queryFn: () => api.listPlugins(conn),
     enabled: show,
   });
+
+  // The selected agent's models, resolved per-host. Kept off the plugins list
+  // because it can be slow (opencode shells out to enumerate), so it is only
+  // fetched for the agent actually in front of the user, and cached per agent.
+  const { data: modelInfo } = useQuery({
+    queryKey: ["models", conn.baseUrl, pluginId],
+    queryFn: () => api.listModels(conn, pluginId),
+    enabled: show,
+    staleTime: 5 * 60_000,
+  });
+  const modelSupported = !!modelInfo?.supported;
+  const isCustomModel = model === CUSTOM_MODEL;
+
+  // Switching agents resets the model choice: a Claude alias means nothing to
+  // Codex, and each agent has its own default to fall back to.
+  useEffect(() => {
+    setModel("");
+    setCustomModel("");
+  }, [pluginId]);
 
   // Only offer agents whose binary is installed on the selected host. The daemon
   // detects this per-host (`available`); `custom_command` has no binary to detect
@@ -204,6 +232,8 @@ export function NewSessionDialog() {
       for (const o of plugin?.options ?? []) {
         effectiveOptions[o.key] = agentOptions[o.key] ?? o.default;
       }
+      // "" / whitespace = the agent's own default (send nothing, launch no flag).
+      const effModel = (isCustomModel ? customModel : model).trim() || undefined;
 
       // A fork inherits its origin's daemon, workspace and place, so none of the
       // resolution below applies: the daemon works all of that out from the
@@ -214,6 +244,7 @@ export function NewSessionDialog() {
           agent_plugin_id: pluginId,
           same_branch: sameBranch,
           options: effectiveOptions,
+          model: effModel,
         });
       }
 
@@ -248,6 +279,7 @@ export function NewSessionDialog() {
         approve_custom: approve,
         direct_checkout: useDirect,
         options: effectiveOptions,
+        model: effModel,
         ...branchArgs,
       });
     },
@@ -278,12 +310,17 @@ export function NewSessionDialog() {
   const forkCarriesConversation =
     isFork && forkSource.hasConversation && pluginId === forkSource.agentPluginId;
 
-  const canSubmit = isFork
-    ? !create.isPending
-    : (target.kind === "workspace" ? !!activeWs : cwd.trim().length > 0) &&
-      (!isCustom || (command.trim().length > 0 && approve)) &&
-      branchOk &&
-      !create.isPending;
+  // Picking "Custom…" but leaving the field blank isn't a valid model choice.
+  const modelOk = !modelSupported || !isCustomModel || customModel.trim().length > 0;
+
+  const canSubmit =
+    modelOk &&
+    (isFork
+      ? !create.isPending
+      : (target.kind === "workspace" ? !!activeWs : cwd.trim().length > 0) &&
+        (!isCustom || (command.trim().length > 0 && approve)) &&
+        branchOk &&
+        !create.isPending);
 
   return (
     <div className="modal-backdrop" onClick={() => setShow(false)}>
@@ -321,6 +358,37 @@ export function NewSessionDialog() {
         </select>
         {selectedPlugin?.binary_path && (
           <div className="dim small mono">{selectedPlugin.binary_path}</div>
+        )}
+
+        {modelSupported && (
+          <>
+            <label className="form-label">{t("newSession.modelLabel")}</label>
+            <select
+              className="input"
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+            >
+              <option value="">
+                {modelInfo?.default
+                  ? t("newSession.modelDefaultNamed", { model: modelInfo.default })
+                  : t("newSession.modelDefault")}
+              </option>
+              {modelInfo?.models.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label}
+                </option>
+              ))}
+              <option value={CUSTOM_MODEL}>{t("newSession.modelCustom")}</option>
+            </select>
+            {isCustomModel && (
+              <input
+                className="input mono"
+                placeholder={t("newSession.modelCustomPlaceholder")}
+                value={customModel}
+                onChange={(e) => setCustomModel(e.target.value)}
+              />
+            )}
+          </>
         )}
 
         {selectedPlugin?.options?.map((o) => (

@@ -71,6 +71,24 @@ export interface PluginInfo {
   options: AgentOption[];
 }
 
+/** One selectable model for an agent. `id` is passed to the agent's model flag. */
+export interface AgentModel {
+  id: string;
+  label: string;
+}
+
+/**
+ * The models a client can pick for one agent (new-session / fork dropdown),
+ * resolved per-host. `models` may be empty for a `supported` agent that can't
+ * enumerate them (the dropdown then offers just the default and a free-text
+ * "Custom…"). `default` is the agent's currently configured model, preselected.
+ */
+export interface PluginModels {
+  supported: boolean;
+  models: AgentModel[];
+  default: string | null;
+}
+
 export interface SessionSummary {
   id: string;
   session_id: string;
@@ -248,6 +266,8 @@ export interface CreateSessionBody {
   base_ref?: string;
   /** Selected agent-option toggles (e.g. permission-skipping flags), keyed by option key. */
   options?: Record<string, boolean>;
+  /** Model override; omit (or empty) to start with the agent's own default. */
+  model?: string;
 }
 
 /**
@@ -265,6 +285,8 @@ export interface ForkSessionBody {
    */
   same_branch?: boolean;
   options?: Record<string, boolean>;
+  /** Model override for the fork; omit to use the target agent's own default. */
+  model?: string;
 }
 
 export interface BranchList {
@@ -496,6 +518,9 @@ export const api = {
   health: (t: Target) => req<Health>(t, "/health"),
   listPlugins: (t: Target) =>
     req<{ plugins: PluginInfo[] }>(t, "/api/plugins").then((r) => r.plugins),
+  /** The selectable models for one agent on this host (new-session / fork dropdown). */
+  listModels: (t: Target, pluginId: string) =>
+    req<{ models: PluginModels }>(t, `/api/plugins/${pluginId}/models`).then((r) => r.models),
   listSessions: (t: Target) =>
     req<{ sessions: Session[] }>(t, "/api/sessions").then((r) => r.sessions),
   getSummary: (t: Target, id: string) =>

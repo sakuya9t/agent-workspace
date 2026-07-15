@@ -24,6 +24,12 @@ pub struct AgentContext {
     pub extra_env: Vec<(String, String)>,
     /// Selected agent-option toggles (see `AgentPlugin::options`), keyed by option key.
     pub options: Vec<(String, bool)>,
+    /// An explicit model override for this launch, injected as the agent's model
+    /// flag (see [`AgentPlugin::model_args`]). `None` = start with no `--model`,
+    /// so the agent uses whatever it is configured to default to. Only ever set
+    /// when the user picked a model other than that default, so a mis-detected
+    /// default can never change how a session launches.
+    pub model: Option<String>,
 }
 
 impl AgentContext {
@@ -44,6 +50,26 @@ pub struct AgentOption {
     /// Render with a danger/warning affordance (disables the agent's guardrails).
     pub danger: bool,
     pub default: bool,
+}
+
+/// One model a user can pick for an agent in the new-session / fork dialog.
+/// `id` is what gets passed to the agent's model flag (a Claude alias like
+/// `sonnet`, a Codex model id, or an opencode `provider/model`); `label` is the
+/// human-facing name — often the same string, but a friendlier one when we have it.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentModel {
+    pub id: String,
+    pub label: String,
+}
+
+impl AgentModel {
+    /// A model whose id doubles as its display label.
+    fn plain(id: &str) -> Self {
+        AgentModel {
+            id: id.to_string(),
+            label: id.to_string(),
+        }
+    }
 }
 
 /// A resolved launch command produced by an agent plugin.
@@ -84,6 +110,39 @@ pub trait AgentPlugin: Send + Sync {
     /// Optional per-agent toggles surfaced in the new-session dialog (e.g. a
     /// permission-skipping flag). Empty by default.
     fn options(&self) -> Vec<AgentOption> {
+        Vec::new()
+    }
+
+    /// Whether this agent lets the user pick a model at launch, so the dialog
+    /// renders a model dropdown for it. Off for a plain shell and for
+    /// `custom_command` (whose model, if any, lives in the raw command).
+    fn supports_models(&self) -> bool {
+        false
+    }
+
+    /// Selectable models for the new-session / fork dropdown, in display order.
+    /// May be empty even when [`supports_models`](Self::supports_models) is true
+    /// (an agent whose models can't be enumerated offers only its detected default
+    /// plus a free-text "Custom…"). Called off the request path, so an agent that
+    /// has to shell out to list its models — opencode — may do so here.
+    fn models(&self) -> Vec<AgentModel> {
+        Vec::new()
+    }
+
+    /// The model this agent is currently configured to default to on *this* host,
+    /// read from the agent's own config. Preselected in the dropdown and shown as
+    /// its default entry; `None` when nothing is configured (the agent falls back
+    /// to its own built-in default). This is **display-only** — the default entry
+    /// launches with no model flag — so a stale or mis-parsed value here can never
+    /// change how a session actually starts.
+    fn detect_default_model(&self) -> Option<String> {
+        None
+    }
+
+    /// The argv fragment that pins this agent to `model`, e.g. `["--model", m]`
+    /// for Claude/opencode or `["-m", m]` for Codex. Empty = this agent has no
+    /// model selector, so the caller injects nothing.
+    fn model_args(&self, _model: &str) -> Vec<String> {
         Vec::new()
     }
 
@@ -256,6 +315,42 @@ pub struct PluginInfo {
     pub binary_path: Option<String>,
     pub supported_on_this_platform: bool,
     pub options: Vec<AgentOption>,
+}
+
+/// The set of models a client can choose for one agent, for the new-session /
+/// fork dropdown. Built per-host on request (see `GET /api/plugins/:id/models`).
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginModels {
+    /// Whether this agent offers a model dropdown at all. When false the client
+    /// renders no model control and `models`/`default` are empty.
+    pub supported: bool,
+    /// Enumerable models, in display order. May be empty for a supported agent
+    /// whose models can't be listed — the dropdown then offers just the detected
+    /// default and a free-text "Custom…".
+    pub models: Vec<AgentModel>,
+    /// The agent's currently configured default model on this host, preselected
+    /// in the dropdown. `None` = fall back to a generic "Default" entry.
+    pub default: Option<String>,
+}
+
+impl PluginModels {
+    /// Describe an agent's models by asking the plugin. Runs the plugin's
+    /// (possibly subprocess-backed) `models()` and config detection, so callers
+    /// run it off the async runtime.
+    pub fn describe(plugin: &dyn AgentPlugin) -> Self {
+        if !plugin.supports_models() {
+            return PluginModels {
+                supported: false,
+                models: Vec::new(),
+                default: None,
+            };
+        }
+        PluginModels {
+            supported: true,
+            models: plugin.models(),
+            default: plugin.detect_default_model(),
+        }
+    }
 }
 
 /// Static registry of built-in agent plugins.

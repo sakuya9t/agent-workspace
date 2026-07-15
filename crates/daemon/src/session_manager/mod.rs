@@ -86,6 +86,9 @@ pub struct CreateSessionRequest {
     pub base_ref: Option<String>,
     /// Selected agent-option toggles (see `AgentPlugin::options`).
     pub options: Vec<(String, bool)>,
+    /// An explicit model override (see [`AgentContext::model`]). `None` launches
+    /// with no model flag, so the agent uses its own configured default.
+    pub model: Option<String>,
     /// Set when this session is a fork: how it inherits the origin's context.
     /// Resolved by [`SessionManager::fork_session`] before the session exists,
     /// and applied here once the working directory is known.
@@ -226,6 +229,7 @@ impl SessionManager {
             extra_args: req.args.clone(),
             extra_env: req.env.clone(),
             options: req.options.clone(),
+            model: req.model.clone(),
         };
 
         // A fork's launch line differs from a fresh session's: either it resumes
@@ -1007,6 +1011,7 @@ mod tests {
             create_branch: false,
             base_ref: None,
             options: vec![],
+            model: None,
             fork: None,
         }
     }
