@@ -367,6 +367,10 @@
     "paste": "Paste",
     "copy": "Copy"
   },
+  "panel": {
+    "open": "Terminal controls",
+    "label": "Terminal controls"
+  },
   "pasteSheet": {
     "title": "Paste into the terminal",
     "hint": "Long-press here, choose Paste, and it goes straight to the terminal.",

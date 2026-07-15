@@ -254,6 +254,161 @@ body.col-resizing iframe {
   }
 }
 
+/* "Jump to latest" — floats over the terminal only while the view is scrolled
+   away from the live tail, the way a chat app's jump-to-newest does. Rendered by
+   both shells (MobileShell's pill, and TerminalView's own for iPad): a touch
+   device has no wheel and no scrollbar, so the tap is its only way home. Centred,
+   so it never lands under the bottom-right 📎 attach button. Anchors to the
+   `position: relative` parent — `.mobile-term-body` on phone, `.terminal-host`
+   on iPad. */
+.term-jump {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  font-size: 18px;
+  line-height: 1;
+  border-radius: 50%;
+  cursor: pointer;
+  color: var(--text);
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  box-shadow: 0 2px 10px rgb(0 0 0 / 45%);
+}
+.term-jump::before {
+  content: "↓";
+}
+.term-jump:active {
+  background: var(--panel);
+}
+
+/* iPad control panel (TermControlPanel.tsx) — the collapsible corner stand-in
+   for the phone's docked key bar. Collapsed: a lone toggle in the terminal's
+   bottom-right corner. Expanded: the full key grid, growing up and left from
+   that corner so it stays anchored and never runs off-screen. Both anchor to the
+   `position: relative` .terminal-host. */
+.term-panel-toggle {
+  position: absolute;
+  bottom: 10px;
+  right: 14px;
+  z-index: 6;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  line-height: 1;
+  border-radius: 10px;
+  cursor: pointer;
+  color: var(--text);
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  box-shadow: 0 2px 10px rgb(0 0 0 / 45%);
+}
+.term-panel-toggle::before {
+  content: "⌨";
+}
+.term-panel-toggle:active {
+  background: var(--panel);
+}
+.term-panel {
+  position: absolute;
+  bottom: 10px;
+  right: 14px;
+  z-index: 6;
+  max-width: min(92%, 360px);
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 8px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  box-shadow: 0 4px 18px rgb(0 0 0 / 50%);
+}
+.term-panel .kb {
+  flex: none;
+  min-width: 40px;
+  height: 38px;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  line-height: 1;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+  touch-action: manipulation;
+}
+.term-panel .kb:active {
+  background: var(--accent-2);
+}
+/* Ctrl latch: armed (outlined) vs locked (filled) — mirrors the phone key bar. */
+.term-panel .kb.on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.term-panel .kb.locked {
+  background: var(--accent-2);
+  color: var(--accent);
+}
+.term-panel .kb.up::before {
+  content: "↑";
+}
+.term-panel .kb.down::before {
+  content: "↓";
+}
+.term-panel .kb.left::before {
+  content: "←";
+}
+.term-panel .kb.right::before {
+  content: "→";
+}
+.term-panel .kb.kbd::before {
+  content: "⌨";
+  font-size: 16px;
+}
+.term-panel .kb.attach::before {
+  content: "📎";
+  font-size: 15px;
+}
+.term-panel-close {
+  flex: none;
+  width: 40px;
+  height: 38px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  line-height: 1;
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--text);
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+}
+.term-panel-close::before {
+  content: "✕";
+}
+.term-panel-close:active {
+  background: var(--accent-2);
+}
+
 /* sessions */
 .session-row {
   padding: 8px 12px;
@@ -1996,38 +2151,6 @@ body.col-resizing iframe {
   padding: 6px;
   background: #0b0e14;
 }
-/* "Jump to latest" — floats over the terminal only while the view is scrolled
-   away from the live tail (TerminalView.onScrollState), the way a chat app's
-   jump-to-newest does. Centred, so it never lands under the 📎 attach button.
-   Phone-only: a desktop has a wheel and a scrollbar. */
-.term-jump {
-  position: absolute;
-  left: 50%;
-  bottom: 14px;
-  transform: translateX(-50%);
-  z-index: 6;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 40px;
-  height: 40px;
-  padding: 0;
-  font-size: 18px;
-  line-height: 1;
-  border-radius: 50%;
-  cursor: pointer;
-  color: var(--text);
-  border: 1px solid var(--border);
-  background: var(--panel-2);
-  box-shadow: 0 2px 10px rgb(0 0 0 / 45%);
-}
-.term-jump::before {
-  content: "↓";
-}
-.term-jump:active {
-  background: var(--panel);
-}
-
 /* Details sheet — RightPanel over the still-mounted terminal. */
 .details-sheet-backdrop {
   position: fixed;

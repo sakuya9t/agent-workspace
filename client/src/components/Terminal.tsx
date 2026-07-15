@@ -11,6 +11,7 @@ import { useIsPhone } from "../useIsPhone";
 import { useIsTouch } from "../useIsTouch";
 import { useTerminalPaste } from "../useTerminalPaste";
 import { PasteSheet } from "./PasteSheet";
+import { TermControlPanel } from "./TermControlPanel";
 import i18n from "../i18n";
 
 /** WS close code the daemon uses when another client takes over the session. */
@@ -97,6 +98,23 @@ export function TerminalView({
   const copySelRef = useRef<() => void>(() => {});
   const isTouch = useIsTouch();
   const isPhone = useIsPhone();
+  // Scrolled back from the live tail. The phone shell reads this out through
+  // onScrollState to drive its own jump pill; we also keep it here so an iPad —
+  // touch on the DESKTOP shell, hence no wheel and no scrollbar — gets the same
+  // jump affordance (rendered below, gated `isTouch && !isPhone`). Fed by the
+  // scroll-state block inside the WS effect.
+  const [scrolledAway, setScrolledAway] = useState(false);
+
+  // The iPad control panel's Ctrl latch. The phone shell hands TerminalView a
+  // latch through ctrlRef; the desktop shell (an iPad) hands it none, so we own
+  // one here and feed it into the same soft-keyboard transform (see sendTyped).
+  // panelCtrlRef mirrors the state so the effect-local sendTyped can read it
+  // without becoming a dependency (which would rebuild the terminal).
+  const [panelCtrl, setPanelCtrl] = useState<CtrlLatch>("off");
+  const panelCtrlRef = useRef<CtrlLatch>("off");
+  panelCtrlRef.current = panelCtrl;
+  const cyclePanelCtrl = () =>
+    setPanelCtrl((c) => (c === "off" ? "armed" : c === "armed" ? "locked" : "off"));
   // Named to stay clear of the effect-local `onPaste` DOM listener below, which
   // handles a *native* paste event (images/files) rather than a button tap.
   const {
@@ -374,12 +392,21 @@ export function TerminalView({
         ws.send(JSON.stringify({ t: "i", d }));
       }
     };
-    // Soft-keyboard input honors the mobile Ctrl latch; an "armed" one-shot is
-    // consumed after a single key (key-bar buttons send raw and bypass this).
+    // Soft-keyboard input honors a Ctrl latch; an "armed" one-shot is consumed
+    // after a single key (bar/panel buttons send raw and bypass this). The phone
+    // shell owns the latch (ctrlRef); on the desktop shell (iPad) it's ours, fed
+    // from the control panel through panelCtrlRef.
     const sendTyped = (d: string) => {
-      const latch = ctrlRef?.current;
+      const latchRef = ctrlRef ?? panelCtrlRef;
+      const latch = latchRef.current;
       if (latch && latch !== "off") {
-        if (latch === "armed") onCtrlConsumedRef.current?.();
+        if (latch === "armed") {
+          if (ctrlRef) onCtrlConsumedRef.current?.();
+          else {
+            panelCtrlRef.current = "off"; // immediate, so a fast second key isn't caught
+            setPanelCtrl("off");
+          }
+        }
         sendRaw(toCtrl(d));
       } else {
         sendRaw(d);
@@ -802,7 +829,7 @@ export function TerminalView({
     /** Net wheel-UP reports the running app is holding, ≥ 0. Live sessions only:
      *  a replay's input goes nowhere, and its history can well re-arm mouse mode. */
     let wheelUp = 0;
-    let scrolledAway = false;
+    let reportedAway = false;
     let checkRaf: number | undefined;
 
     const atLiveTail = () => {
@@ -816,9 +843,10 @@ export function TerminalView({
       checkRaf = requestAnimationFrame(() => {
         checkRaf = undefined;
         const away = !atLiveTail();
-        if (away === scrolledAway) return;
-        scrolledAway = away;
-        onScrollStateRef.current?.(away);
+        if (away === reportedAway) return;
+        reportedAway = away;
+        onScrollStateRef.current?.(away); // the phone shell's jump pill
+        setScrolledAway(away); // our own iPad jump pill (rendered below)
       });
     };
 
@@ -912,6 +940,9 @@ export function TerminalView({
       mounted = false;
       handleRef.current = null;
       onReadyRef.current?.(null);
+      setScrolledAway(false); // the rebuilt terminal opens at its live tail
+      setPanelCtrl("off"); // don't carry a latch across a reconnect/relive
+
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
       if (errorTimerRef.current) window.clearTimeout(errorTimerRef.current);
       container.removeEventListener("mousedown", onMouseDownCapture, true);
@@ -964,48 +995,54 @@ export function TerminalView({
     <div className="terminal-host">
       <div className="terminal-mount" ref={containerRef} />
       {live && (
-        <div className="term-actions">
-          {/* Clipboard buttons for touch devices on the DESKTOP shell — iPads.
-              A phone already has Copy/Paste in the key bar docked above its
-              keyboard (so a second pair here would be redundant), and a mouse
-              user has ⌘-C / Ctrl-Shift-C. That leaves the tablet: desktop-shaped,
-              no key bar, no keyboard to press a chord on, and therefore — until
-              these buttons — no way to copy or paste at all. */}
-          {isTouch && !isPhone && (
-            <>
+        <>
+          {/* Attach as a standalone corner button for the phone key bar's users
+              and mouse desktop. On iPad it folds into the control panel below
+              (alongside Copy/Paste), so the terminal stays clean — the whole
+              point of the tablet redesign. The 📎 glyph is CSS, so there's no
+              bare string literal in JSX. */}
+          {!(isTouch && !isPhone) && (
+            <div className="term-actions">
               <button
                 type="button"
-                className="term-act term-copy"
-                title={i18n.t("terminal.copySelection")}
-                aria-label={i18n.t("terminal.copySelection")}
-                // Keep the tap from pulling focus out of the terminal: the
-                // selection we're about to read is the whole point of the button.
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => copySelRef.current()}
+                className="term-attach"
+                title={i18n.t("terminal.attachFile")}
+                aria-label={i18n.t("terminal.attachFile")}
+                onClick={() => fileInputRef.current?.click()}
               />
-              <button
-                type="button"
-                className="term-act term-paste"
-                title={i18n.t("terminal.pasteClipboard")}
-                aria-label={i18n.t("terminal.pasteClipboard")}
-                onClick={onPasteTapped}
-              />
-            </>
+            </div>
           )}
-          {/* Explicit attach affordance — the primary path on touch devices,
-              where clipboard-image paste is unreliable. The 📎 glyph is set in
-              CSS so there's no bare string literal in JSX. */}
-          <button
-            type="button"
-            className="term-attach"
-            title={i18n.t("terminal.attachFile")}
-            aria-label={i18n.t("terminal.attachFile")}
-            onClick={() => fileInputRef.current?.click()}
-          />
+          {/* iPad (touch on the DESKTOP shell): the collapsible TUI control panel
+              — the tablet's stand-in for the phone's docked key bar and the mouse
+              user's keyboard chords. Copy reads the selection; Paste and Attach
+              reuse the same paths the standalone buttons did. */}
+          {isTouch && !isPhone && (
+            <TermControlPanel
+              handleRef={handleRef}
+              ctrl={panelCtrl}
+              onCycleCtrl={cyclePanelCtrl}
+              onCopy={() => copySelRef.current()}
+              onPaste={onPasteTapped}
+              onAttach={() => fileInputRef.current?.click()}
+            />
+          )}
           {/* No `accept` — any file type is a valid attachment (PDF, zip, CSV,
-              …), bounded by size alone. */}
+              …), bounded by size alone. Shared by both attach affordances above. */}
           <input ref={fileInputRef} type="file" hidden onChange={onPickFile} />
-        </div>
+        </>
+      )}
+      {/* Jump back to the live tail — the iPad counterpart to the phone shell's
+          pill (MobileShell renders its own). A tablet takes the desktop shell but
+          has no wheel or scrollbar, so this is its only way home from a scroll.
+          Outside the `live` gate above: a replay's scrollback scrolls away too. */}
+      {isTouch && !isPhone && scrolledAway && (
+        <button
+          type="button"
+          className="term-jump"
+          onClick={() => handleRef.current?.scrollToEnd()}
+          aria-label={i18n.t("mobile.jumpToEnd")}
+          title={i18n.t("mobile.jumpToEnd")}
+        />
       )}
       {pasteSheet && <PasteSheet onSubmit={submitPaste} onClose={closePasteSheet} />}
       {pasteStatus && (
