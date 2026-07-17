@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 
 use crate::workspace;
@@ -131,6 +131,162 @@ pub struct MergeConflict {
     pub output: String,
 }
 
+/// Which git operation left the conflicts a [`ConflictResolver`] is asked to fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictOp {
+    Rebase,
+    Merge,
+}
+
+impl ConflictOp {
+    pub(crate) fn noun(self) -> &'static str {
+        match self {
+            ConflictOp::Rebase => "rebase",
+            ConflictOp::Merge => "merge",
+        }
+    }
+}
+
+/// What a [`ConflictResolver`] is told about the paused operation it must fix.
+#[derive(Debug, Clone)]
+pub struct ConflictContext {
+    pub operation: ConflictOp,
+    /// Paths git left unmerged — the files with conflict markers on disk,
+    /// relative to the worktree.
+    pub conflicted_paths: Vec<String>,
+}
+
+/// Resolves an in-progress merge/rebase conflict *in place*, inside `worktree`.
+///
+/// The git layer calls this instead of aborting on conflict: the implementation
+/// (an agent-driven resolver, [`crate::conflict_resolve`]) edits the conflicted
+/// files, and the git layer then re-checks the tree — staging exactly the listed
+/// paths, rejecting any leftover conflict markers, and only then continuing the
+/// operation. An `Err` (no capable agent, or the agent could not start) makes the
+/// git layer abort and fail, exactly as an unresolved conflict does today.
+pub trait ConflictResolver: Send + Sync {
+    fn resolve(&self, worktree: &Path, ctx: &ConflictContext) -> Result<()>;
+}
+
+/// The most conflicted commits we'll drive a resolver through in one rebase
+/// before giving up — a runaway guard, not a limit any real rebase should reach.
+const MAX_REBASE_STEPS: usize = 50;
+
+/// Paths git left unmerged (conflict markers on disk), relative to `cwd`.
+fn unmerged_paths(cwd: &Path) -> Vec<String> {
+    git(cwd, &["diff", "--name-only", "--diff-filter=U"])
+        .map(|out| {
+            out.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the staged content still carries conflict markers. Uses git's own
+/// detector (`diff --check`), filtered to its "conflict marker" finding so a
+/// stray whitespace warning doesn't read as an unresolved conflict.
+fn staged_has_conflict_markers(cwd: &Path) -> bool {
+    git_output(cwd, &["diff", "--cached", "--check"])
+        .map(|out| combined_output(&out).contains("conflict marker"))
+        .unwrap_or(false)
+}
+
+/// Whether a rebase is paused mid-flight in this worktree (its state dir exists).
+fn rebase_in_progress(cwd: &Path) -> bool {
+    ["rebase-merge", "rebase-apply"].iter().any(|dir| {
+        git(cwd, &["rev-parse", "--git-path", dir])
+            .map(|p| cwd.join(p.trim()).exists())
+            .unwrap_or(false)
+    })
+}
+
+/// Stage exactly the files the resolver was asked to fix — never `git add -A`, so
+/// anything an agent might leave in the worktree is not swept into the commit —
+/// then verify nothing is still unmerged and no conflict markers survived.
+fn stage_and_verify(cwd: &Path, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut args: Vec<&str> = vec!["add", "--"];
+    args.extend(paths.iter().map(String::as_str));
+    git(cwd, &args)?;
+    if !unmerged_paths(cwd).is_empty() {
+        bail!("conflicts remain unresolved after the agent ran");
+    }
+    if staged_has_conflict_markers(cwd) {
+        bail!("the agent left conflict markers in the resolved files");
+    }
+    Ok(())
+}
+
+/// Drive `resolver` through a conflicted merge in `merge_dir`, then finalize the
+/// merge commit. `Ok` means a clean resolution is committed; `Err` (leaving the
+/// caller to abort) means the resolver couldn't finish or left conflicts behind.
+fn resolve_merge(merge_dir: &Path, resolver: &dyn ConflictResolver) -> Result<()> {
+    let paths = unmerged_paths(merge_dir);
+    let ctx = ConflictContext {
+        operation: ConflictOp::Merge,
+        conflicted_paths: paths.clone(),
+    };
+    resolver
+        .resolve(merge_dir, &ctx)
+        .context("agent could not resolve the merge conflicts")?;
+    stage_and_verify(merge_dir, &paths)?;
+    // Finalize the merge unless the agent already committed it itself.
+    if git_ok(merge_dir, &["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]) {
+        git(merge_dir, &["commit", "--no-edit"]).context("committing the auto-resolved merge")?;
+    }
+    Ok(())
+}
+
+/// Drive `resolver` through a conflicted rebase in `dir`, replaying commit by
+/// commit until the rebase finishes. `Ok` means the rebase completed; `Err`
+/// (leaving the caller to abort) means a step couldn't be resolved or `git rebase
+/// --continue` failed for a reason other than the next commit conflicting.
+fn resolve_rebase(dir: &Path, resolver: &dyn ConflictResolver) -> Result<()> {
+    for _ in 0..MAX_REBASE_STEPS {
+        if !rebase_in_progress(dir) {
+            return Ok(());
+        }
+        let paths = unmerged_paths(dir);
+        if !paths.is_empty() {
+            let ctx = ConflictContext {
+                operation: ConflictOp::Rebase,
+                conflicted_paths: paths.clone(),
+            };
+            resolver
+                .resolve(dir, &ctx)
+                .context("agent could not resolve the rebase conflicts")?;
+            stage_and_verify(dir, &paths)?;
+        }
+        // A resolution that came out identical to the base leaves nothing staged;
+        // skip that commit rather than fail `--continue` with "nothing to commit".
+        let nothing_staged = git_ok(dir, &["diff", "--cached", "--quiet"]);
+        let step: &[&str] = if nothing_staged && paths.is_empty() {
+            bail!("rebase paused with no conflicts to resolve; leaving it to git");
+        } else if nothing_staged {
+            &["rebase", "--skip"]
+        } else {
+            // `core.editor=true` keeps `--continue` from opening an editor for a
+            // reworded commit message and hanging the daemon.
+            &["-c", "core.editor=true", "rebase", "--continue"]
+        };
+        let out = git_output(dir, step)?;
+        if !out.status.success() && unmerged_paths(dir).is_empty() && rebase_in_progress(dir) {
+            bail!(
+                "git {} failed: {}",
+                step.join(" "),
+                combined_output(&out).trim()
+            );
+        }
+        // Otherwise the loop re-checks: either the rebase finished, or the next
+        // commit conflicted and gets its own resolution pass.
+    }
+    bail!("rebase still had conflicts after {MAX_REBASE_STEPS} resolution steps");
+}
+
 /// Source-control plugin boundary. The Git provider is the MVP built-in;
 /// other VCS providers implement the same trait behind the same panel.
 pub trait SourceControl: Send + Sync {
@@ -164,13 +320,23 @@ pub trait SourceControl: Send + Sync {
     /// the branch has diverged it fails cleanly (the user can rebase instead).
     /// Returns git's combined stdout+stderr for display.
     fn pull(&self, cwd: &Path) -> Result<String>;
-    /// Rebase the current branch onto `onto` (a local branch). On any failure
-    /// (conflicts, dirty tree) the rebase is aborted so the worktree is left in
-    /// a clean, usable state rather than half-rebased.
-    fn rebase(&self, cwd: &Path, onto: &str) -> Result<String>;
-    /// Merge the current branch into `target` (a local branch). Failed merges
-    /// are aborted so conflict files are not left in either worktree.
-    fn merge_to_branch(&self, cwd: &Path, target: &str) -> Result<String>;
+    /// Rebase the current branch onto `onto` (a local branch). When a `resolver`
+    /// is given and the rebase hits conflicts, it is driven to resolve them in
+    /// place and the rebase continues; only if resolution can't finish (or no
+    /// resolver is given) is the rebase aborted so the worktree is left clean
+    /// rather than half-rebased. A dirty tree always aborts.
+    fn rebase(&self, cwd: &Path, onto: &str, resolver: Option<&dyn ConflictResolver>)
+        -> Result<String>;
+    /// Merge the current branch into `target` (a local branch). When a `resolver`
+    /// is given and the merge conflicts, it is driven to resolve them and the
+    /// merge is committed; otherwise (or if resolution can't finish) the merge is
+    /// aborted so conflict files are not left in either worktree.
+    fn merge_to_branch(
+        &self,
+        cwd: &Path,
+        target: &str,
+        resolver: Option<&dyn ConflictResolver>,
+    ) -> Result<String>;
     /// Push the current branch to `origin`, creating the remote branch and
     /// recording it as the upstream when it doesn't exist yet. Never forces:
     /// a diverged remote is rejected (non-fast-forward) and that error is
@@ -463,7 +629,12 @@ impl SourceControl for GitSourceControl {
         }
     }
 
-    fn rebase(&self, cwd: &Path, onto: &str) -> Result<String> {
+    fn rebase(
+        &self,
+        cwd: &Path,
+        onto: &str,
+        resolver: Option<&dyn ConflictResolver>,
+    ) -> Result<String> {
         if !self.detect(cwd) {
             bail!("not a git repository");
         }
@@ -482,9 +653,20 @@ impl SourceControl for GitSourceControl {
         if out.status.success() {
             return Ok(combined_output(&out));
         }
-        // A failed rebase (conflicts, or a dirty tree it refused to touch) can
-        // leave a rebase in progress; abort so the session's worktree returns
-        // to a clean state instead of a confusing half-rebased one.
+        // Conflicts leave a rebase in progress. Given a resolver, drive it to a
+        // finish; a dirty-tree refusal (no rebase in progress) skips straight to
+        // the abort below.
+        if let (Some(resolver), true) = (resolver, rebase_in_progress(cwd)) {
+            match resolve_rebase(cwd, resolver) {
+                Ok(()) => return Ok(format!("Rebased onto {onto} (conflicts auto-resolved).")),
+                Err(e) => {
+                    let _ = git_output(cwd, &["rebase", "--abort"]);
+                    bail!("git rebase onto {onto} failed; could not auto-resolve (rebase aborted): {e:#}");
+                }
+            }
+        }
+        // No resolver, or nothing to resolve: abort so the worktree returns to a
+        // clean state instead of a confusing half-rebased one.
         let _ = git_output(cwd, &["rebase", "--abort"]);
         bail!(
             "git rebase onto {onto} failed (rebase aborted): {}",
@@ -492,7 +674,12 @@ impl SourceControl for GitSourceControl {
         );
     }
 
-    fn merge_to_branch(&self, cwd: &Path, target: &str) -> Result<String> {
+    fn merge_to_branch(
+        &self,
+        cwd: &Path,
+        target: &str,
+        resolver: Option<&dyn ConflictResolver>,
+    ) -> Result<String> {
         if !self.detect(cwd) {
             bail!("not a git repository");
         }
@@ -549,9 +736,34 @@ impl SourceControl for GitSourceControl {
         }
 
         let had_conflicts = has_unmerged_paths(&merge_dir) || output.contains("CONFLICT");
-        let _ = git_output(&merge_dir, &["merge", "--abort"]);
-        cleanup_temp_worktree(cwd, temp_path.as_deref());
         if had_conflicts {
+            // Given a resolver, try to auto-resolve and commit before giving up.
+            if let Some(resolver) = resolver {
+                match resolve_merge(&merge_dir, resolver) {
+                    Ok(()) => {
+                        let message =
+                            format!("Merged {source} into {target} (conflicts auto-resolved).");
+                        if let Err(e) = remove_temp_worktree(cwd, temp_path.as_deref()) {
+                            return Ok(format!(
+                                "{message}\n\nWarning: could not remove temporary worktree: {e:#}"
+                            ));
+                        }
+                        return Ok(message);
+                    }
+                    Err(e) => {
+                        let _ = git_output(&merge_dir, &["merge", "--abort"]);
+                        cleanup_temp_worktree(cwd, temp_path.as_deref());
+                        return Err(MergeConflict {
+                            source_branch: source,
+                            target: target.to_string(),
+                            output: format!("{output}\ncould not auto-resolve: {e:#}"),
+                        }
+                        .into());
+                    }
+                }
+            }
+            let _ = git_output(&merge_dir, &["merge", "--abort"]);
+            cleanup_temp_worktree(cwd, temp_path.as_deref());
             return Err(MergeConflict {
                 source_branch: source,
                 target: target.to_string(),
@@ -559,6 +771,8 @@ impl SourceControl for GitSourceControl {
             }
             .into());
         }
+        let _ = git_output(&merge_dir, &["merge", "--abort"]);
+        cleanup_temp_worktree(cwd, temp_path.as_deref());
         bail!(
             "git merge {source} into {target} failed (merge aborted): {}",
             output.trim()
@@ -960,7 +1174,12 @@ pub(crate) fn unmerged_commit_count(cwd: &Path, branch: &str) -> u32 {
 /// committed ref, so it needs no worktree; `target` is merged into inside its own
 /// worktree (an existing one, else a temporary one removed afterwards). A
 /// conflicting merge is aborted so no worktree is left dirty.
-pub(crate) fn merge_branches(root: &Path, source: &str, target: &str) -> Result<String> {
+pub(crate) fn merge_branches(
+    root: &Path,
+    source: &str,
+    target: &str,
+    resolver: Option<&dyn ConflictResolver>,
+) -> Result<String> {
     guard_branch(source)?;
     guard_branch(target)?;
     if source == target {
@@ -1016,9 +1235,33 @@ pub(crate) fn merge_branches(root: &Path, source: &str, target: &str) -> Result<
     }
 
     let had_conflicts = has_unmerged_paths(&merge_dir) || output.contains("CONFLICT");
-    let _ = git_output(&merge_dir, &["merge", "--abort"]);
-    cleanup_temp_worktree(root, temp_path.as_deref());
     if had_conflicts {
+        if let Some(resolver) = resolver {
+            match resolve_merge(&merge_dir, resolver) {
+                Ok(()) => {
+                    let message =
+                        format!("Merged {source} into {target} (conflicts auto-resolved).");
+                    if let Err(e) = remove_temp_worktree(root, temp_path.as_deref()) {
+                        return Ok(format!(
+                            "{message}\n\nWarning: could not remove temporary worktree: {e:#}"
+                        ));
+                    }
+                    return Ok(message);
+                }
+                Err(e) => {
+                    let _ = git_output(&merge_dir, &["merge", "--abort"]);
+                    cleanup_temp_worktree(root, temp_path.as_deref());
+                    return Err(MergeConflict {
+                        source_branch: source.to_string(),
+                        target: target.to_string(),
+                        output: format!("{output}\ncould not auto-resolve: {e:#}"),
+                    }
+                    .into());
+                }
+            }
+        }
+        let _ = git_output(&merge_dir, &["merge", "--abort"]);
+        cleanup_temp_worktree(root, temp_path.as_deref());
         return Err(MergeConflict {
             source_branch: source.to_string(),
             target: target.to_string(),
@@ -1026,6 +1269,8 @@ pub(crate) fn merge_branches(root: &Path, source: &str, target: &str) -> Result<
         }
         .into());
     }
+    let _ = git_output(&merge_dir, &["merge", "--abort"]);
+    cleanup_temp_worktree(root, temp_path.as_deref());
     bail!(
         "git merge {source} into {target} failed (merge aborted): {}",
         output.trim()
@@ -1037,7 +1282,12 @@ pub(crate) fn merge_branches(root: &Path, source: &str, target: &str) -> Result<
 /// branch need not be checked out. If it already has a worktree the rebase runs
 /// there; otherwise a temporary worktree is created for it and removed afterwards.
 /// Any failure aborts the rebase so no worktree is left mid-rebase.
-pub(crate) fn rebase_branch(root: &Path, branch: &str, onto: &str) -> Result<String> {
+pub(crate) fn rebase_branch(
+    root: &Path,
+    branch: &str,
+    onto: &str,
+    resolver: Option<&dyn ConflictResolver>,
+) -> Result<String> {
     guard_branch(branch)?;
     guard_branch(onto)?;
     if branch == onto {
@@ -1087,6 +1337,25 @@ pub(crate) fn rebase_branch(root: &Path, branch: &str, onto: &str) -> Result<Str
         }
         Ok(out) => {
             let output = combined_output(&out);
+            if let (Some(resolver), true) = (resolver, rebase_in_progress(&dir)) {
+                match resolve_rebase(&dir, resolver) {
+                    Ok(()) => {
+                        let message =
+                            format!("Rebased {branch} onto {onto} (conflicts auto-resolved).");
+                        if let Err(e) = remove_temp_worktree(root, temp_path.as_deref()) {
+                            return Ok(format!(
+                                "{message}\n\nWarning: could not remove temporary worktree: {e:#}"
+                            ));
+                        }
+                        return Ok(message);
+                    }
+                    Err(e) => {
+                        let _ = git_output(&dir, &["rebase", "--abort"]);
+                        cleanup_temp_worktree(root, temp_path.as_deref());
+                        bail!("git rebase {branch} onto {onto} failed; could not auto-resolve (rebase aborted): {e:#}");
+                    }
+                }
+            }
             let _ = git_output(&dir, &["rebase", "--abort"]);
             cleanup_temp_worktree(root, temp_path.as_deref());
             bail!(
@@ -1524,7 +1793,7 @@ mod tests {
         write_file(&repo, "feature.txt", "feature\n");
         commit_all(&repo, "feature work");
 
-        let output = GitSourceControl.merge_to_branch(&repo, "main").unwrap();
+        let output = GitSourceControl.merge_to_branch(&repo, "main", None).unwrap();
 
         assert!(output.contains("Merged feature into main."));
         assert_eq!(git_test(&repo, &["show", "main:feature.txt"]), "feature\n");
@@ -1549,7 +1818,7 @@ mod tests {
         commit_all(&repo, "main edit");
         git_test(&repo, &["checkout", "feature"]);
 
-        let err = GitSourceControl.merge_to_branch(&repo, "main").unwrap_err();
+        let err = GitSourceControl.merge_to_branch(&repo, "main", None).unwrap_err();
 
         assert!(err.downcast_ref::<MergeConflict>().is_some());
         assert_eq!(git_test(&repo, &["show", "main:file.txt"]), "main\n");
@@ -1557,6 +1826,123 @@ mod tests {
             git_test(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
             "feature"
         );
+        assert_eq!(git_test(&repo, &["status", "--porcelain"]), "");
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    /// A stand-in for the agent resolver: writes fixed content to every
+    /// conflicted path, so the git-side resolve loop can be tested without a CLI.
+    struct FakeResolver {
+        content: String,
+    }
+    impl ConflictResolver for FakeResolver {
+        fn resolve(&self, worktree: &Path, ctx: &ConflictContext) -> Result<()> {
+            for p in &ctx.conflicted_paths {
+                fs::write(worktree.join(p), &self.content).unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    /// A resolver that "runs" but changes nothing, leaving the conflict markers in
+    /// place — the daemon must catch that and abort rather than commit markers.
+    struct NoopResolver;
+    impl ConflictResolver for NoopResolver {
+        fn resolve(&self, _worktree: &Path, _ctx: &ConflictContext) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn setup_merge_conflict(name: &str) -> PathBuf {
+        let repo = test_repo(name);
+        write_file(&repo, "file.txt", "base\n");
+        commit_all(&repo, "initial");
+        git_test(&repo, &["checkout", "-b", "feature"]);
+        write_file(&repo, "file.txt", "feature\n");
+        commit_all(&repo, "feature edit");
+        git_test(&repo, &["checkout", "main"]);
+        write_file(&repo, "file.txt", "main\n");
+        commit_all(&repo, "main edit");
+        git_test(&repo, &["checkout", "feature"]);
+        repo
+    }
+
+    #[test]
+    fn merge_to_branch_auto_resolves_and_commits() {
+        let repo = setup_merge_conflict("merge-autoresolve");
+        let resolver = FakeResolver {
+            content: "resolved\n".into(),
+        };
+
+        let output = GitSourceControl
+            .merge_to_branch(&repo, "main", Some(&resolver))
+            .unwrap();
+
+        assert!(output.contains("auto-resolved"), "output was: {output}");
+        // The merge landed on main with the resolver's content, no markers.
+        assert_eq!(git_test(&repo, &["show", "main:file.txt"]), "resolved\n");
+        // The source worktree is back on feature and clean.
+        assert_eq!(
+            git_test(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "feature"
+        );
+        assert_eq!(git_test(&repo, &["status", "--porcelain"]), "");
+        // No temp worktree was left behind.
+        assert_eq!(worktree_count(&repo), 1);
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn merge_to_branch_aborts_when_resolver_leaves_markers() {
+        let repo = setup_merge_conflict("merge-badresolve");
+
+        let err = GitSourceControl
+            .merge_to_branch(&repo, "main", Some(&NoopResolver))
+            .unwrap_err();
+
+        // A resolver that leaves markers is a failed resolution: the merge aborts
+        // and the target is untouched, exactly as an unresolvable conflict does.
+        assert!(err.downcast_ref::<MergeConflict>().is_some());
+        assert_eq!(git_test(&repo, &["show", "main:file.txt"]), "main\n");
+        assert_eq!(git_test(&repo, &["status", "--porcelain"]), "");
+        assert_eq!(worktree_count(&repo), 1);
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn rebase_auto_resolves_and_continues() {
+        let repo = setup_merge_conflict("rebase-autoresolve");
+        let resolver = FakeResolver {
+            content: "resolved\n".into(),
+        };
+
+        // On feature, rebasing onto main replays feature's commit and conflicts.
+        let output = GitSourceControl
+            .rebase(&repo, "main", Some(&resolver))
+            .unwrap();
+
+        assert!(output.contains("auto-resolved"), "output was: {output}");
+        assert_eq!(fs::read_to_string(repo.join("file.txt")).unwrap(), "resolved\n");
+        assert!(!rebase_in_progress(&repo), "rebase should be finished");
+        assert_eq!(git_test(&repo, &["status", "--porcelain"]), "");
+        // feature now sits on top of main's edit.
+        assert!(git_ok(&repo, &["merge-base", "--is-ancestor", "main", "HEAD"]));
+        let _ = fs::remove_dir_all(repo);
+    }
+
+    #[test]
+    fn rebase_aborts_when_resolver_leaves_markers() {
+        let repo = setup_merge_conflict("rebase-badresolve");
+        let before = git_test(&repo, &["rev-parse", "HEAD"]);
+
+        let err = GitSourceControl
+            .rebase(&repo, "main", Some(&NoopResolver))
+            .unwrap_err();
+
+        assert!(err.to_string().contains("could not auto-resolve"));
+        // Aborted cleanly: back where we started, no rebase in progress.
+        assert!(!rebase_in_progress(&repo));
+        assert_eq!(git_test(&repo, &["rev-parse", "HEAD"]), before);
         assert_eq!(git_test(&repo, &["status", "--porcelain"]), "");
         let _ = fs::remove_dir_all(repo);
     }
@@ -1578,7 +1964,7 @@ mod tests {
         write_file(&repo, "feature.txt", "feature\n");
         commit_all(&repo, "feature work");
 
-        let output = GitSourceControl.merge_to_branch(&repo, "main").unwrap();
+        let output = GitSourceControl.merge_to_branch(&repo, "main", None).unwrap();
 
         assert!(output.contains("Merged feature into main."));
         // The merge landed in main's live worktree, which stays checked out and
@@ -1649,7 +2035,7 @@ mod tests {
         assert_eq!(unmerged_commit_count(&repo, "main"), 0);
 
         // Once feature is merged into main, its commits live there too.
-        merge_branches(&repo, "feature", "main").unwrap();
+        merge_branches(&repo, "feature", "main", None).unwrap();
         assert_eq!(unmerged_commit_count(&repo, "feature"), 0);
         let _ = fs::remove_dir_all(repo);
     }
@@ -1677,7 +2063,7 @@ mod tests {
         write_file(&repo, "t.txt", "t\n");
         commit_all(&repo, "topic work");
 
-        let out = merge_branches(&repo, "topic", "main").unwrap();
+        let out = merge_branches(&repo, "topic", "main", None).unwrap();
         assert!(out.contains("Merged topic into main."));
         assert_eq!(git_test(&repo, &["show", "main:t.txt"]), "t\n");
         // The temporary worktree was cleaned up: only the main worktree remains.
@@ -1703,7 +2089,7 @@ mod tests {
         commit_all(&repo, "topic edit");
 
         // HEAD=topic, main has no worktree → temp worktree, conflicting merge.
-        let err = merge_branches(&repo, "topic", "main").unwrap_err();
+        let err = merge_branches(&repo, "topic", "main", None).unwrap_err();
         assert!(err.downcast_ref::<MergeConflict>().is_some());
         // main is unchanged and no worktree was left behind.
         assert_eq!(git_test(&repo, &["show", "main:f.txt"]), "main\n");
@@ -1725,7 +2111,7 @@ mod tests {
         commit_all(&repo, "main advance");
 
         // feature is not checked out (HEAD=main) → temp-worktree rebase.
-        let out = rebase_branch(&repo, "feature", "main").unwrap();
+        let out = rebase_branch(&repo, "feature", "main", None).unwrap();
         assert!(out.contains("Rebased feature onto main."));
         // feature now carries main's advance beneath its own work.
         assert_eq!(git_test(&repo, &["show", "feature:m.txt"]), "m\n");
@@ -1842,7 +2228,7 @@ mod tests {
         commit_all(&repo, "c3 on main");
         let onto = git_test(&repo, &["rev-parse", "HEAD"]).trim().to_string();
         git_test(&repo, &["checkout", "-q", "feature"]);
-        GitSourceControl.rebase(&repo, "main").unwrap();
+        GitSourceControl.rebase(&repo, "main", None).unwrap();
 
         let base = GitSourceControl.status(&repo).unwrap().base.expect("rebase base");
         assert_eq!(base.hash, onto);

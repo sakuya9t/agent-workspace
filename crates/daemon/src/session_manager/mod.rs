@@ -189,6 +189,13 @@ impl SessionManager {
         &self.registry
     }
 
+    /// A shared handle to the registry, for building an agent-driven conflict
+    /// resolver that must outlive a single call (it is moved into a blocking
+    /// task and borrowed by the git layer).
+    pub(crate) fn registry_arc(&self) -> Arc<PluginRegistry> {
+        self.registry.clone()
+    }
+
     pub fn backend_id(&self) -> &'static str {
         self.backend.id()
     }

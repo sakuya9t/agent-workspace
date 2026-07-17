@@ -98,6 +98,20 @@ pub struct HeadlessSpec {
     pub output_file: Option<PathBuf>,
 }
 
+/// A one-shot, non-interactive run of an agent CLI that edits files *in place* in
+/// its working directory, used to auto-resolve merge/rebase conflicts (see
+/// [`crate::conflict_resolve`]).
+///
+/// Unlike [`HeadlessSpec`], which the caller runs in a throwaway directory with
+/// tools forbidden, this runs in the *real conflicted worktree* with the agent's
+/// permission prompts bypassed — that is the whole point: the agent must be free
+/// to rewrite the conflicted files and the daemon then verifies the result.
+#[derive(Debug, Clone)]
+pub struct ConflictResolveSpec {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
 
 /// Compiled-in agent plugin. MVP uses static traits; no dynamic loading.
 pub trait AgentPlugin: Send + Sync {
@@ -282,6 +296,17 @@ pub trait AgentPlugin: Send + Sync {
         None
     }
 
+    /// A non-interactive run of this agent that resolves merge/rebase conflicts by
+    /// editing files in its working directory. `None` = this agent can't be driven
+    /// that way, so it can't auto-resolve conflicts.
+    ///
+    /// See [`ConflictResolveSpec`]: this runs in the real conflicted worktree with
+    /// permission prompts bypassed, so it must only ever be handed a directory the
+    /// caller is willing to let the agent rewrite.
+    fn conflict_resolver(&self, _prompt: &str) -> Option<ConflictResolveSpec> {
+        None
+    }
+
     /// How this agent takes an opening prompt on its launch line, so a forked
     /// session can start already pointed at its brief. Returns the argv to append
     /// for `prompt`, or `None` if the agent cannot be seeded this way.
@@ -369,6 +394,13 @@ impl PluginRegistry {
         Self {
             agents: builtin::all(),
         }
+    }
+
+    /// A registry with no agents — for tests that need the "no capable agent"
+    /// path without depending on which CLIs happen to be installed.
+    #[cfg(test)]
+    pub fn empty() -> Self {
+        Self { agents: Vec::new() }
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<dyn AgentPlugin>> {

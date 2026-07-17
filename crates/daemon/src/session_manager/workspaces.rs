@@ -414,8 +414,10 @@ impl SessionManager {
     }
 
     /// Merge `source` into `target` from a workspace's repo (neither need be the
-    /// checked-out branch). Conflicts abort cleanly and surface as `MergeConflict`
-    /// (→ 409).
+    /// checked-out branch). Conflicts are handed to an agent to auto-resolve;
+    /// only if that can't finish are they aborted and surfaced as `MergeConflict`
+    /// (→ 409). A workspace op belongs to no one session, so the resolver picks
+    /// any installed agent.
     pub fn merge_workspace_branches(
         &self,
         id: &str,
@@ -424,15 +426,20 @@ impl SessionManager {
     ) -> Result<String> {
         let root = self.git_workspace_root(id)?;
         self.ensure_branch_not_live(id, target)?;
-        crate::source_control::merge_branches(Path::new(&root), source, target)
+        let resolver =
+            crate::conflict_resolve::AgentConflictResolver::new(self.registry.clone(), None);
+        crate::source_control::merge_branches(Path::new(&root), source, target, Some(&resolver))
     }
 
     /// Rebase `branch` onto `onto` from a workspace's repo (the branch need not be
-    /// checked out). Failures abort cleanly and leave no worktree mid-rebase.
+    /// checked out). Conflicts are handed to an agent to auto-resolve; only if
+    /// that can't finish is the rebase aborted, leaving no worktree mid-rebase.
     pub fn rebase_workspace_branch(&self, id: &str, branch: &str, onto: &str) -> Result<String> {
         let root = self.git_workspace_root(id)?;
         self.ensure_branch_not_live(id, branch)?;
-        crate::source_control::rebase_branch(Path::new(&root), branch, onto)
+        let resolver =
+            crate::conflict_resolve::AgentConflictResolver::new(self.registry.clone(), None);
+        crate::source_control::rebase_branch(Path::new(&root), branch, onto, Some(&resolver))
     }
 
     pub fn init_workspace_git(&self, id: &str) -> Result<Workspace> {

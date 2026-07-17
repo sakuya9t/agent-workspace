@@ -2,6 +2,7 @@ mod api;
 mod auth;
 mod backend;
 mod config;
+mod conflict_resolve;
 mod db;
 mod domain;
 mod plugins;

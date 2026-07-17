@@ -20,6 +20,19 @@ async fn session_cwd(state: &AppState, id: &str) -> Result<PathBuf, AppError> {
     Ok(PathBuf::from(session.working_directory))
 }
 
+/// The session's working directory *and* its agent id — the latter so a conflict
+/// resolver can prefer the session's own agent to resolve its rebase/merge.
+async fn session_cwd_and_agent(state: &AppState, id: &str) -> Result<(PathBuf, String), AppError> {
+    let session = state
+        .manager
+        .get_session(id)?
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "no such session".into()))?;
+    Ok((
+        PathBuf::from(session.working_directory),
+        session.agent_plugin_id,
+    ))
+}
+
 async fn run_blocking<T, F>(f: F) -> Result<T, AppError>
 where
     T: Send + 'static,
@@ -269,16 +282,22 @@ pub struct RebaseBody {
     onto: String,
 }
 
-/// Rebase the session's current branch onto another local branch.
+/// Rebase the session's current branch onto another local branch. Conflicts are
+/// handed to the session's agent to auto-resolve before any abort.
 pub async fn rebase(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<RebaseBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let cwd = session_cwd(&state, &id).await?;
+    let (cwd, agent) = session_cwd_and_agent(&state, &id).await?;
     let scm = state.scm.clone();
+    let registry = state.manager.registry_arc();
     let onto = body.onto;
-    let output = run_blocking(move || scm.rebase(&cwd, &onto)).await?;
+    let output = run_blocking(move || {
+        let resolver = crate::conflict_resolve::AgentConflictResolver::new(registry, Some(agent));
+        scm.rebase(&cwd, &onto, Some(&resolver))
+    })
+    .await?;
     Ok(Json(json!({ "output": output })))
 }
 
@@ -287,18 +306,24 @@ pub struct MergeBody {
     target: String,
 }
 
-/// Merge the session's current branch into another local branch.
+/// Merge the session's current branch into another local branch. Conflicts are
+/// handed to the session's agent to auto-resolve; a `MergeConflict` now means the
+/// agent could not finish, not that no attempt was made.
 pub async fn merge(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<MergeBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let cwd = session_cwd(&state, &id).await?;
+    let (cwd, agent) = session_cwd_and_agent(&state, &id).await?;
     let scm = state.scm.clone();
+    let registry = state.manager.registry_arc();
     let target = body.target;
-    let result = tokio::task::spawn_blocking(move || scm.merge_to_branch(&cwd, &target))
-        .await
-        .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("task join: {e}")))?;
+    let result = tokio::task::spawn_blocking(move || {
+        let resolver = crate::conflict_resolve::AgentConflictResolver::new(registry, Some(agent));
+        scm.merge_to_branch(&cwd, &target, Some(&resolver))
+    })
+    .await
+    .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("task join: {e}")))?;
     match result {
         Ok(output) => Ok(Json(json!({ "output": output }))),
         Err(e) if e.downcast_ref::<MergeConflict>().is_some() => {

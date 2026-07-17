@@ -72,6 +72,21 @@ pick it up**.
 
 ## Already done (context, do not re-plan)
 
+- **Agent-driven conflict auto-resolution (2026-07-17).** A rebase/merge that hits
+  conflicts no longer aborts on the spot: the daemon points an agent at the
+  conflicted worktree (the session's own agent, else any installed
+  claude/codex/opencode — permission prompts bypassed) to resolve in place, then
+  stages exactly the conflicted files, rejects any leftover conflict markers via
+  `git diff --check`, and continues (`rebase --continue`/`--skip` in a bounded
+  loop, or the merge commit). Only an unresolvable conflict — or no capable agent —
+  aborts and fails as before (`MergeConflict` → 409). Covers all four paths:
+  session `scm/{rebase,merge}` and workspace `branches/{merge,rebase}`. New
+  `plugins::AgentPlugin::conflict_resolver` (+ `ConflictResolveSpec`),
+  `source_control::{ConflictResolver, ConflictContext, resolve_merge,
+  resolve_rebase}`, and `conflict_resolve::AgentConflictResolver`. Proof: Rust
+  units (a `FakeResolver` drives both loops; a marker-leaving resolver aborts) +
+  sandbox E2E (claude resolved a real merge, codex a real rebase — both preserved
+  each side, no markers, clean worktree).
 - **Workspace branch management (2026-07-15).** A workspace-level git branch view,
   opened from an **(i)** icon next to each Git workspace in the tree
   (`SessionList.tsx` `.tree-actions`, gated on `is_git`), rendered by a new global

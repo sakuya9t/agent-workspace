@@ -12,8 +12,8 @@ use super::fork;
 use super::title;
 use super::usage::{self, AgentUsage, TranscriptContext};
 use super::{
-    attention, find_in_path, AgentContext, AgentModel, AgentOption, AgentPlugin, HeadlessSpec,
-    LaunchSpec,
+    attention, find_in_path, AgentContext, AgentModel, AgentOption, AgentPlugin,
+    ConflictResolveSpec, HeadlessSpec, LaunchSpec,
 };
 use crate::domain::AttentionState;
 
@@ -194,6 +194,20 @@ impl AgentPlugin for CodexPlugin {
             output_file: Some(out.to_path_buf()),
         })
     }
+    fn conflict_resolver(&self, prompt: &str) -> Option<ConflictResolveSpec> {
+        // `exec` is codex's non-interactive mode; the bypass flag lets it edit the
+        // conflicted files and run git in the worktree without stopping to ask.
+        Some(ConflictResolveSpec {
+            command: self.detect_binary()?,
+            args: vec![
+                "exec".into(),
+                "--dangerously-bypass-approvals-and-sandbox".into(),
+                "--color".into(),
+                "never".into(),
+                prompt.to_string(),
+            ],
+        })
+    }
 }
 
 /// Claude Code CLI agent.
@@ -323,6 +337,18 @@ impl AgentPlugin for ClaudePlugin {
             output_file: None,
         })
     }
+    fn conflict_resolver(&self, prompt: &str) -> Option<ConflictResolveSpec> {
+        // `-p` runs headless; skip-permissions lets it rewrite the conflicted
+        // files and run git in the worktree without prompting.
+        Some(ConflictResolveSpec {
+            command: self.detect_binary()?,
+            args: vec![
+                "-p".into(),
+                prompt.to_string(),
+                "--dangerously-skip-permissions".into(),
+            ],
+        })
+    }
 }
 
 /// opencode CLI agent (the default `opencode` TUI in the session's cwd).
@@ -393,6 +419,14 @@ impl AgentPlugin for OpencodePlugin {
             command: self.detect_binary()?,
             args: vec!["run".into(), prompt.to_string()],
             output_file: None,
+        })
+    }
+    fn conflict_resolver(&self, prompt: &str) -> Option<ConflictResolveSpec> {
+        // `run` is opencode's non-interactive mode; `--auto` auto-approves the
+        // edits and git commands it needs to resolve the conflict in the worktree.
+        Some(ConflictResolveSpec {
+            command: self.detect_binary()?,
+            args: vec!["run".into(), "--auto".into(), prompt.to_string()],
         })
     }
 }
