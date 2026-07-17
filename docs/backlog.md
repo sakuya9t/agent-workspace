@@ -74,13 +74,16 @@ pick it up**.
 
 - **Agent-driven conflict auto-resolution (2026-07-17).** A rebase/merge that hits
   conflicts no longer aborts on the spot: the daemon points an agent at the
-  conflicted worktree (the session's own agent, else any installed
-  claude/codex/opencode — permission prompts bypassed) to resolve in place, then
+  conflicted worktree (permission prompts bypassed) to resolve in place, then
   stages exactly the conflicted files, rejects any leftover conflict markers via
   `git diff --check`, and continues (`rebase --continue`/`--skip` in a bounded
   loop, or the merge commit). Only an unresolvable conflict — or no capable agent —
   aborts and fails as before (`MergeConflict` → 409). Covers all four paths:
-  session `scm/{rebase,merge}` and workspace `branches/{merge,rebase}`. New
+  session `scm/{rebase,merge}` and workspace `branches/{merge,rebase}`. Gated on
+  the session being an **agent** session: a session op is bound to exactly its own
+  agent with no fallback, so a **shell** (or `custom_command`) session gets no
+  auto-resolve and its conflicts stay manual; only the workspace ops, which belong
+  to no session, use any installed claude/codex/opencode. New
   `plugins::AgentPlugin::conflict_resolver` (+ `ConflictResolveSpec`),
   `source_control::{ConflictResolver, ConflictContext, resolve_merge,
   resolve_rebase}`, and `conflict_resolve::AgentConflictResolver`. Proof: Rust

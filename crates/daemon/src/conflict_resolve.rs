@@ -45,39 +45,47 @@ const POLL: Duration = Duration::from_millis(200);
 /// Resolves git conflicts by running an agent CLI in the conflicted worktree.
 pub struct AgentConflictResolver {
     registry: Arc<PluginRegistry>,
-    /// The agent to prefer — the session's own, so a Claude session's conflicts
-    /// are resolved by Claude. `None` (workspace-level ops, which belong to no one
-    /// session) means "any installed agent that can".
-    preferred: Option<String>,
+    /// Which agent may resolve. `Some(id)` binds resolution to *exactly* that
+    /// agent — a session's own — with **no fallback**: a shell (or any non-agent,
+    /// e.g. `custom_command`) session names an agent that can't resolve, so
+    /// nothing does and its conflicts stay manual, exactly as before the feature.
+    /// It must never borrow some other installed agent to stand in. `None`
+    /// (workspace-level ops, which belong to no session) means "any installed
+    /// agent that can".
+    agent: Option<String>,
 }
 
 impl AgentConflictResolver {
-    pub fn new(registry: Arc<PluginRegistry>, preferred: Option<String>) -> Self {
-        Self {
-            registry,
-            preferred,
-        }
+    /// `agent` is the session's own plugin id for a session-scoped op, or `None`
+    /// for a workspace-level op that belongs to no session.
+    pub fn new(registry: Arc<PluginRegistry>, agent: Option<String>) -> Self {
+        Self { registry, agent }
     }
 
-    /// The agent that will resolve: the preferred one if it can, else the first
-    /// installed agent that can. Mirrors the fork summarizer's choice.
+    /// The agent that will resolve. Bound to a session's own agent, it is that
+    /// agent or nothing — a shell session never borrows another agent. Unbound
+    /// (workspace) ops take the first installed agent that can.
     fn pick(&self) -> Option<Arc<dyn AgentPlugin>> {
         let capable = |p: &Arc<dyn AgentPlugin>| {
             p.detect_binary().is_some() && p.conflict_resolver("probe").is_some()
         };
-        if let Some(pref) = &self.preferred {
-            if let Some(p) = self.registry.get(pref).filter(capable) {
-                return Some(p);
-            }
+        match &self.agent {
+            Some(id) => self.registry.get(id).filter(capable),
+            None => self.registry.agents().iter().find(|p| capable(p)).cloned(),
         }
-        self.registry.agents().iter().find(|p| capable(p)).cloned()
     }
 }
 
 impl ConflictResolver for AgentConflictResolver {
     fn resolve(&self, worktree: &Path, ctx: &ConflictContext) -> Result<()> {
-        let plugin = self.pick().ok_or_else(|| {
-            anyhow!("no installed agent can auto-resolve conflicts (need claude, codex or opencode)")
+        let plugin = self.pick().ok_or_else(|| match &self.agent {
+            // A session whose agent can't resolve — a shell session, above all.
+            Some(id) => anyhow!(
+                "this session's agent `{id}` can't auto-resolve conflicts; resolve them manually"
+            ),
+            None => anyhow!(
+                "no installed agent can auto-resolve conflicts (need claude, codex or opencode)"
+            ),
         })?;
         let prompt = prompt_for(ctx);
         let spec = plugin
@@ -202,6 +210,21 @@ mod tests {
             .resolve(Path::new("/nonexistent"), &ctx())
             .unwrap_err();
         assert!(err.to_string().contains("no installed agent"));
+    }
+
+    #[test]
+    fn a_shell_session_never_borrows_another_agent() {
+        // A shell (non-agent) session names `shell`, which can't resolve. Even with
+        // the real agents present in the builtins registry, resolution must NOT
+        // fall back to one of them — auto-resolve is simply unavailable, and the
+        // conflict stays manual. The message points at the session's own agent.
+        let registry = Arc::new(PluginRegistry::with_builtins());
+        let resolver = AgentConflictResolver::new(registry, Some("shell".into()));
+        let err = resolver
+            .resolve(Path::new("/nonexistent"), &ctx())
+            .unwrap_err();
+        assert!(err.to_string().contains("shell"), "message: {err}");
+        assert!(err.to_string().contains("manually"), "message: {err}");
     }
 
     #[test]
