@@ -89,6 +89,63 @@ pub async fn list(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct MkdirBody {
+    /// Absolute path of the directory to create the folder in.
+    parent: String,
+    /// Name of the new folder — a single path component, no separators.
+    name: String,
+}
+
+/// Create a folder inside an existing directory, so the picker can offer a
+/// "new folder" action like a native save dialog. Same trust model as `list`:
+/// the daemon user's own filesystem, gated by the API auth layer.
+pub async fn mkdir(
+    State(_state): State<AppState>,
+    Json(body): Json<MkdirBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let name = body.name.trim();
+    if name.is_empty() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "folder name is empty".into(),
+        ));
+    }
+    // One path component only: the picker names a folder, it doesn't build paths.
+    if name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            format!("invalid folder name: {name}"),
+        ));
+    }
+
+    let parent = PathBuf::from(&body.parent);
+    let canonical = std::fs::canonicalize(&parent).map_err(|e| {
+        AppError(
+            StatusCode::BAD_REQUEST,
+            format!("cannot resolve {}: {e}", parent.display()),
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err(AppError(
+            StatusCode::BAD_REQUEST,
+            format!("not a directory: {}", canonical.display()),
+        ));
+    }
+
+    let path = canonical.join(name);
+    std::fs::create_dir(&path).map_err(|e| {
+        let msg = if e.kind() == std::io::ErrorKind::AlreadyExists {
+            format!("already exists: {}", path.display())
+        } else {
+            format!("cannot create {}: {e}", path.display())
+        };
+        AppError(StatusCode::BAD_REQUEST, msg)
+    })?;
+
+    Ok(Json(json!({ "path": path.to_string_lossy() })))
+}
+
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))

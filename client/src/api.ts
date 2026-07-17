@@ -716,6 +716,11 @@ export const api = {
       t,
       `/api/fs/list?path=${encodeURIComponent(path)}&show_hidden=${showHidden}`,
     ),
+  fsMkdir: (t: Target, parent: string, name: string) =>
+    req<{ path: string }>(t, "/api/fs/mkdir", {
+      method: "POST",
+      body: JSON.stringify({ parent, name }),
+    }).then((r) => r.path),
   enrollmentToken: (t: Target) =>
     req<{ enrollment_token: string }>(t, "/api/auth/enrollment-token").then(
       (r) => r.enrollment_token,

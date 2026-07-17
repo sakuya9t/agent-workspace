@@ -52,6 +52,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/devices", get(auth::list_devices))
         .route("/api/auth/devices/:id/revoke", post(auth::revoke_device))
         .route("/api/fs/list", get(fs::list))
+        .route("/api/fs/mkdir", post(fs::mkdir))
         .route("/api/plugins", get(list_plugins))
         .route("/api/plugins/:id/models", get(list_plugin_models))
         .route("/api/workspaces", get(list_workspaces).post(add_workspace))

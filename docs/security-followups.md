@@ -69,10 +69,14 @@ fix through the daemon's own listener again.
   device browse the daemon host's directory tree (directories only, but
   arbitrary paths). Combined with workspace registration (any client can
   register any root) and `custom_command`, this is broad host access.
+  `/api/fs/mkdir` (the picker's "new folder" button) shares the trust model and
+  adds a write: any authed client can create a directory anywhere the daemon
+  user can (single path component, no traversal — but the parent is arbitrary).
 - **Guidance:** constrain browsing + workspace registration to a server-side
   configured set of allowed roots that a client cannot expand without host-side
   approval; treat "browse anywhere" as an explicit, host-granted capability.
   Enforce the workspace allowlist for the picker, not just for raw-cwd sessions.
+  The same allowed-roots check must gate `mkdir`'s parent.
 - **Related (image preview):** `GET /api/sessions/:id/scm/file` serves a changed
   file's raw bytes so the diff panel can show image previews. It is deliberately
   narrow: `guard_path` blocks `..`/absolute paths, the working-tree read is
