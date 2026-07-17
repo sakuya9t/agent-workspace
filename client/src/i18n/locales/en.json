@@ -309,6 +309,7 @@
     "noMessage": "(no message)",
     "noCommits": "No commits yet.",
     "loadingHistory": "Loading history…",
+    "commitTitle": "Ask the session agent to commit the changes",
     "fetchTitle": "Fetch every remote (refreshes the commits shown above; changes no branch)",
     "fetchComplete": "Fetch complete",
     "fetchFailed": "Fetch failed",

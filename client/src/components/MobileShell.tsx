@@ -95,6 +95,10 @@ export function MobileShell() {
     handleRef.current = h;
     if (!h) setScrolledAway(false); // terminal went away; so did its scroll
   }, []);
+  const commitChanges = useCallback(() => {
+    // Keep this identical to typing the request and pressing Enter in the TUI.
+    handleRef.current?.write("commit the changes\r");
+  }, []);
 
   // Track the visual viewport so the key bar stays above the soft keyboard.
   const vh = useVisualViewportHeight();
@@ -192,7 +196,11 @@ export function MobileShell() {
             onClick={(e) => e.stopPropagation()}
           >
             <button className="details-sheet-handle" onClick={back} aria-label={t("common.close")} />
-            <RightPanel target={target} session={activeSession} />
+            <RightPanel
+              target={target}
+              session={activeSession}
+              onCommitChanges={live ? commitChanges : undefined}
+            />
           </div>
         </div>
       )}

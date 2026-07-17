@@ -47,8 +47,8 @@ interface Props {
   target: Target;
   sessionId: string;
   live: boolean;
-  /** Mobile: receive an imperative handle when the terminal mounts, null on
-   *  unmount, so a key bar can inject input over the same WS path. */
+  /** Receive an imperative handle when the terminal mounts, and null on
+   *  unmount, so shell controls can inject input over the same WS path. */
   onReady?: (handle: TerminalHandle | null) => void;
   /** Mobile Ctrl latch, read on each typed key; when armed/locked the next
    *  soft-keyboard key is transformed to its control code. */
@@ -925,8 +925,8 @@ export function TerminalView({
 
     connect();
 
-    // Hand a fresh input handle to the shell (the mobile key bar reads it) and
-    // keep it for our own touch overlay.
+    // Hand a fresh input handle to the shell (the mobile key bar and Git commit
+    // action read it) and keep it for our own touch overlay.
     const handle: TerminalHandle = {
       write: sendRaw,
       focus: () => term.focus(),

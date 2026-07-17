@@ -1351,6 +1351,10 @@ body.col-resizing iframe {
   mask-image: url("/icons/actions/git-merge.png");
   -webkit-mask-image: url("/icons/actions/git-merge.png");
 }
+.action-icon-git-commit {
+  mask-image: url("/icons/actions/git-commit.png");
+  -webkit-mask-image: url("/icons/actions/git-commit.png");
+}
 .action-icon-git-rebase {
   mask-image: url("/icons/actions/git-rebase.png");
   -webkit-mask-image: url("/icons/actions/git-rebase.png");

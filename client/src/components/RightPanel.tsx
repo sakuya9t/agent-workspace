@@ -16,6 +16,8 @@ import { CommitModal } from "./CommitModal";
 interface Props {
   target: Target | undefined;
   session: Session | undefined;
+  /** Submit the same prompt a user would type into the live session TUI. */
+  onCommitChanges?: () => void;
 }
 
 type VscodeState =
@@ -39,7 +41,7 @@ const STATUS_COLOR: Record<string, string> = {
  * Right control-center panel: session metadata, the structural summary once a
  * session ends, and the Git changed-files list with click-to-diff.
  */
-export function RightPanel({ target, session }: Props) {
+export function RightPanel({ target, session, onCommitChanges }: Props) {
   const { t } = useTranslation();
   // On a phone there's no local VS Code for the vscode:// deep link to reach, so
   // the whole "Continue in VS Code" affordance is hidden (mobile shell only).
@@ -535,6 +537,19 @@ export function RightPanel({ target, session }: Props) {
             <div className="section-title with-actions">
               <span>{t("rightPanel.historyHeader")}</span>
               <span className="scm-actions">
+                {!scm.detached && (
+                  <button
+                    className="icon-btn"
+                    disabled={
+                      !onCommitChanges || scmBusy || scm.changed_files.length === 0
+                    }
+                    onClick={onCommitChanges}
+                    title={t("rightPanel.commitTitle")}
+                    aria-label={t("rightPanel.commitTitle")}
+                  >
+                    <span className="action-icon action-icon-git-commit" aria-hidden="true" />
+                  </button>
+                )}
                 {/* Fetch only reads the remotes, so unlike the rest it is just as
                     valid on a detached HEAD as on a branch. */}
                 <button
