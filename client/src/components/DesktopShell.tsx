@@ -5,7 +5,7 @@ import { daemonLabel } from "../connectionStore";
 import { useActiveSession } from "../useActiveSession";
 import { USAGE_AGENTS } from "../agents";
 import { statusLabel } from "../i18n/labels";
-import { TerminalHandle } from "../terminalTypes";
+import { TerminalHandle, submitPrompt } from "../terminalTypes";
 import { SessionList } from "./SessionList";
 import { TerminalView } from "./Terminal";
 import { RightPanel } from "./RightPanel";
@@ -33,8 +33,7 @@ export function DesktopShell() {
     terminalHandleRef.current = handle;
   }, []);
   const commitChanges = useCallback(() => {
-    // Keep this identical to typing the request and pressing Enter in the TUI.
-    terminalHandleRef.current?.write("commit the changes\r");
+    submitPrompt(terminalHandleRef.current, "commit the changes");
   }, []);
 
   // Fit the stored side-panel widths to the live viewport so the terminal keeps

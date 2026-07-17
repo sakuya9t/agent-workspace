@@ -5,7 +5,7 @@ import { daemonLabel } from "../connectionStore";
 import { useActiveSession } from "../useActiveSession";
 import { useVisualViewportHeight } from "../useVisualViewportHeight";
 import { USAGE_AGENTS } from "../agents";
-import { CtrlLatch, TerminalHandle } from "../terminalTypes";
+import { CtrlLatch, TerminalHandle, submitPrompt } from "../terminalTypes";
 import { statusLabel } from "../i18n/labels";
 import { SessionList } from "./SessionList";
 import { TerminalView } from "./Terminal";
@@ -96,8 +96,7 @@ export function MobileShell() {
     if (!h) setScrolledAway(false); // terminal went away; so did its scroll
   }, []);
   const commitChanges = useCallback(() => {
-    // Keep this identical to typing the request and pressing Enter in the TUI.
-    handleRef.current?.write("commit the changes\r");
+    submitPrompt(handleRef.current, "commit the changes");
   }, []);
 
   // Track the visual viewport so the key bar stays above the soft keyboard.
