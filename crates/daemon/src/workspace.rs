@@ -19,8 +19,43 @@ pub fn is_git_repo(root: &Path) -> bool {
 }
 
 /// `git init` a plain folder so it gains full change tracking.
+///
+/// Also creates an empty initial commit: a freshly-init'd repo has an unborn
+/// HEAD — the default branch does not exist yet and `git worktree add … HEAD`
+/// fails with "invalid reference: HEAD", so no session could ever start in the
+/// new workspace. The empty commit materializes the branch without touching
+/// any files already in the folder (they stay untracked, for the user to
+/// commit themselves).
 pub fn init_repo(root: &Path) -> Result<()> {
     git(root, &["init"])?;
+    if !head_exists(root) {
+        bootstrap_initial_commit(root)?;
+    }
+    Ok(())
+}
+
+/// Whether HEAD resolves to a commit (false in a freshly-init'd repo whose
+/// default branch is still unborn).
+fn head_exists(root: &Path) -> bool {
+    git(root, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_ok()
+}
+
+/// Create the empty initial commit that turns an unborn HEAD into a real
+/// branch. Uses the configured git identity when there is one and falls back
+/// to a daemon identity otherwise — `git commit` refuses to guess on hosts
+/// without a usable hostname-derived address.
+fn bootstrap_initial_commit(root: &Path) -> Result<()> {
+    let has_identity = matches!(
+        git(root, &["config", "user.email"]),
+        Ok(out) if !out.trim().is_empty()
+    );
+    let mut args: Vec<&str> = Vec::new();
+    if !has_identity {
+        args.extend(["-c", "user.name=ASM", "-c", "user.email=asm@localhost"]);
+    }
+    args.extend(["commit", "--allow-empty", "-m", "Initial commit"]);
+    git(root, &args)
+        .map_err(|e| anyhow!("could not create the repo's initial commit: {e}"))?;
     Ok(())
 }
 
@@ -51,6 +86,14 @@ pub fn create_worktree(
     let path_str = instance_path
         .to_str()
         .ok_or_else(|| anyhow!("non-UTF8 worktree path"))?;
+
+    // A repo with an unborn HEAD (init'd outside ASM, or by a daemon predating
+    // the initial-commit bootstrap in `init_repo`) can host no worktree at all:
+    // there is no commit for any base to resolve to. Repair it here so the
+    // session starts instead of failing with "invalid reference: HEAD".
+    if !head_exists(root) {
+        bootstrap_initial_commit(root)?;
+    }
 
     match spec {
         BranchSpec::Auto { name, base } => {
@@ -336,6 +379,48 @@ mod tests {
             fs::read_to_string(worktree.join("verified.txt")).unwrap(),
             "verified\n"
         );
+
+        remove_worktree(&root, &worktree, true).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn init_repo_births_the_default_branch_without_touching_files() {
+        let root = std::env::temp_dir().join(format!("asm-init-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("existing.txt"), "precious\n").unwrap();
+
+        init_repo(&root).unwrap();
+
+        // HEAD resolves, so the default branch exists and worktrees are possible.
+        assert!(head_exists(&root));
+        assert!(current_branch(&root).is_some());
+        // The bootstrap commit is empty: the user's files stay untracked.
+        let status = git(&root, &["status", "--porcelain", "--untracked-files=all"]).unwrap();
+        assert!(status.contains("?? existing.txt"), "{status}");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn create_worktree_repairs_an_unborn_repo() {
+        let root = std::env::temp_dir().join(format!("asm-unborn-{}", uuid::Uuid::new_v4()));
+        let worktree =
+            std::env::temp_dir().join(format!("asm-unborn-worktree-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        // A bare `git init` with no commit — the state that used to fail with
+        // "invalid reference: HEAD" when a session was created against it.
+        git(&root, &["init"]).unwrap();
+        assert!(!head_exists(&root));
+
+        let branch = create_worktree(
+            &root,
+            &worktree,
+            BranchSpec::Auto { name: "asm-session/test", base: "HEAD" },
+        )
+        .unwrap();
+        assert_eq!(branch.as_deref(), Some("asm-session/test"));
+        assert!(head_exists(&root));
 
         remove_worktree(&root, &worktree, true).unwrap();
         fs::remove_dir_all(root).unwrap();
