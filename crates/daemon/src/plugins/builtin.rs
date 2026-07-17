@@ -127,8 +127,9 @@ impl AgentPlugin for CodexPlugin {
     fn digest(&self, cx: &TranscriptContext) -> Option<String> {
         fork::codex_digest(cx)
     }
-    fn accepts_seed_prompt(&self) -> bool {
-        true
+    fn seed_prompt_args(&self, prompt: &str) -> Option<Vec<String>> {
+        // `codex <prompt>` — a bare positional is the opening message.
+        Some(vec![prompt.to_string()])
     }
     // `native_fork_requires_same_cwd` stays false: rollouts live under
     // `~/.codex/sessions/**` and are addressed by uuid, so unlike Claude, Codex
@@ -256,8 +257,9 @@ impl AgentPlugin for ClaudePlugin {
     fn digest(&self, cx: &TranscriptContext) -> Option<String> {
         fork::claude_digest(cx)
     }
-    fn accepts_seed_prompt(&self) -> bool {
-        true
+    fn seed_prompt_args(&self, prompt: &str) -> Option<Vec<String>> {
+        // `claude <prompt>` — a bare positional is the opening message.
+        Some(vec![prompt.to_string()])
     }
     // `~/.claude/projects/<encoded-cwd>/`: a resume from a different directory
     // looks in a different project and finds nothing.
@@ -374,8 +376,12 @@ impl AgentPlugin for OpencodePlugin {
     fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
         cli_launch(self, ctx, "auto_approve", "--auto")
     }
-    fn accepts_seed_prompt(&self) -> bool {
-        true
+    fn seed_prompt_args(&self, prompt: &str) -> Option<Vec<String>> {
+        // opencode's *positional* is a project directory, not a prompt — passing
+        // the brief there makes it `chdir` into the prompt text and die with
+        // "Failed to change directory to …". The opening message goes through the
+        // TUI's `--prompt` flag instead.
+        Some(vec!["--prompt".to_string(), prompt.to_string()])
     }
     // No `digest` / `native_session_id`: opencode keeps its conversation in a
     // SQLite db rather than a per-cwd transcript, so both need a schema read we
@@ -708,6 +714,22 @@ mod tests {
         // A plain shell has no model selector.
         assert!(ShellPlugin.model_args("x").is_empty());
         assert!(!ShellPlugin.supports_models());
+    }
+
+    #[test]
+    fn seed_prompt_encoding_is_per_agent() {
+        // Claude and Codex read a bare positional as the opening message.
+        assert_eq!(ClaudePlugin.seed_prompt_args("read the brief"), Some(vec!["read the brief".into()]));
+        assert_eq!(CodexPlugin.seed_prompt_args("read the brief"), Some(vec!["read the brief".into()]));
+        // opencode's positional is a project *directory*: a bare prompt would be
+        // taken as a path and the launch would die with "Failed to change
+        // directory to …", so its seed must go through `--prompt`.
+        assert_eq!(
+            OpencodePlugin.seed_prompt_args("read the brief"),
+            Some(vec!["--prompt".into(), "read the brief".into()])
+        );
+        // A shell must not be seeded at all — it would run the brief as a script.
+        assert_eq!(ShellPlugin.seed_prompt_args("read the brief"), None);
     }
 
     #[test]

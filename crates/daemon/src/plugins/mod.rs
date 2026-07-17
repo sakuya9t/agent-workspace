@@ -282,14 +282,20 @@ pub trait AgentPlugin: Send + Sync {
         None
     }
 
-    /// Whether this agent takes an opening prompt as a positional argument, so a
-    /// forked session can be launched already pointed at its brief.
+    /// How this agent takes an opening prompt on its launch line, so a forked
+    /// session can start already pointed at its brief. Returns the argv to append
+    /// for `prompt`, or `None` if the agent cannot be seeded this way.
     ///
-    /// **Off by default, and that default is load-bearing.** A shell would treat
+    /// **`None` by default, and that default is load-bearing.** A shell would treat
     /// a trailing argument as a *script to run*, so handing one a seed prompt
     /// would execute the brief instead of reading it.
-    fn accepts_seed_prompt(&self) -> bool {
-        false
+    ///
+    /// The encoding is per-agent, not universal: Claude and Codex read a bare
+    /// positional as the prompt, but opencode's positional is a *project
+    /// directory* — a prompt there is taken as a path and the launch dies with
+    /// "Failed to change directory to …", so it must go through `--prompt`.
+    fn seed_prompt_args(&self, _prompt: &str) -> Option<Vec<String>> {
+        None
     }
 
     /// Whether [`build_fork`](Self::build_fork) only finds the origin's

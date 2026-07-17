@@ -137,8 +137,12 @@ be readable by any process on the box via `/proc`. A pointer is bounded and safe
 and it degrades: if the agent ignores it, the context is still sitting in the
 worktree for a human.
 
-Only agents that take a positional prompt get one (`accepts_seed_prompt`). A shell
-would *execute* a trailing argument as a script rather than read it.
+Only agents that can be seeded on their launch line get one, and each encodes it
+its own way (`seed_prompt_args`): Claude and Codex read a bare positional as the
+opening message, but opencode's positional is a *project directory* — a prompt
+there is taken as a path and the launch dies with "Failed to change directory
+to …", so it goes through `--prompt`. A shell gets nothing: it would *execute* a
+trailing argument as a script rather than read it.
 
 ## Capturing the conversation id — while the session is alive
 

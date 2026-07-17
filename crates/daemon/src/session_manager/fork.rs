@@ -273,11 +273,12 @@ impl SessionManager {
             ForkSeed::Brief { markdown } => {
                 let rel = write_brief(Path::new(cwd), &plan.origin_id, markdown)?;
                 // A shell would run a trailing argument as a script rather than
-                // read it, so only agents that take an opening prompt get one. The
-                // brief is on disk either way, which is exactly what a shell needs:
-                // a file to `cat`.
-                if plugin.accepts_seed_prompt() {
-                    ctx.extra_args.push(seed_brief(&rel));
+                // read it, so only agents that take an opening prompt get one — and
+                // each encodes it its own way (see `seed_prompt_args`). The brief is
+                // on disk either way, which is exactly what a shell needs: a file to
+                // `cat`.
+                if let Some(seed_args) = plugin.seed_prompt_args(&seed_brief(&rel)) {
+                    ctx.extra_args.extend(seed_args);
                 }
                 plugin.build_launch(ctx)
             }
