@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
@@ -10,6 +11,7 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Notify;
+use tokio::time::{interval, MissedTickBehavior};
 
 use super::AppState;
 
@@ -17,6 +19,17 @@ use super::AppState;
 /// The client uses it to distinguish a takeover (don't reconnect) from a
 /// transient drop (do reconnect).
 pub const CLOSE_SUPERSEDED: u16 = 4001;
+
+/// How often the daemon pings an attached client to prove the socket is still
+/// live. Browsers auto-answer pings with pongs, so a healthy client keeps its
+/// attachment fresh without any app-level cooperation.
+const PING_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Release the attachment once this long passes with no frame at all from the
+/// client (not even a pong). Without it, a client that slept, backgrounded, or
+/// dropped its socket without a clean close leaves the session reading as
+/// "in use" until OS-level TCP keepalive reaps it — on the order of hours.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// Tracks the single live attacher per session (single-attacher with takeover):
 /// a new live attach supersedes the previous one, which is signalled to close.
@@ -117,6 +130,15 @@ async fn handle_live(
     let (snapshot, mut out_rx) = handle.attach();
     let (mut sender, mut receiver) = socket.split();
 
+    // Liveness clock for this attachment. The inbound loop stamps `last_seen`
+    // (ms since `start`) on every frame the client sends; the outbound task
+    // pings on an interval and tears the socket down once `IDLE_TIMEOUT` passes
+    // with no frame. That teardown is what releases the attachment when a client
+    // vanishes without a clean close — otherwise the session reads "in use"
+    // until TCP keepalive reaps the dead socket hours later.
+    let start = Instant::now();
+    let last_seen = Arc::new(AtomicU64::new(0));
+
     // Prime the client with the current terminal screen (ANSI repaint).
     if sender
         .send(Message::Binary(snapshot.repaint.to_vec()))
@@ -131,7 +153,11 @@ async fn handle_live(
     // takeover, close with the superseded code so the client won't reconnect.
     let handle_out = handle.clone();
     let cancel_out = cancel.clone();
+    let last_seen_out = last_seen.clone();
     let mut outbound = tokio::spawn(async move {
+        let mut ping = interval(PING_INTERVAL);
+        ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        ping.tick().await; // interval's first tick is immediate — skip it
         loop {
             tokio::select! {
                 biased;
@@ -143,6 +169,21 @@ async fn handle_live(
                         })))
                         .await;
                     break;
+                }
+                _ = ping.tick() => {
+                    // A live client refreshes `last_seen` (browsers auto-pong our
+                    // ping; input counts too). If nothing has for IDLE_TIMEOUT,
+                    // treat the client as gone and drop the socket so the inbound
+                    // loop below releases the attachment.
+                    let idle = start.elapsed().saturating_sub(Duration::from_millis(
+                        last_seen_out.load(Ordering::Relaxed),
+                    ));
+                    if idle >= IDLE_TIMEOUT {
+                        break;
+                    }
+                    if sender.send(Message::Ping(Vec::new())).await.is_err() {
+                        break;
+                    }
                 }
                 recv = out_rx.recv() => {
                     match recv {
@@ -173,6 +214,9 @@ async fn handle_live(
         tokio::select! {
             _ = &mut outbound => break,
             msg = receiver.next() => {
+                // Any frame (input, resize, or an auto-pong) proves the client
+                // is still there and refreshes the idle deadline above.
+                last_seen.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
                 match msg {
                     Some(Ok(Message::Binary(b))) => {
                         let _ = handle.send_input(&b);
