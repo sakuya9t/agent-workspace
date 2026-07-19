@@ -22,23 +22,37 @@ export interface TerminalHandle {
 export type CtrlLatch = "off" | "armed" | "locked";
 
 /**
+ * How long to wait after the text before sending the Enter.
+ *
+ * This has to clear the *Enter-suppression window* of the slowest agent TUI we
+ * drive, which is a longer bar than merely landing in a separate pty read.
+ * Codex names its window `PASTE_ENTER_SUPPRESS_WINDOW` — 120ms as of 0.144 — and
+ * Claude Code suppresses an Enter that arrives right behind a paste too. 250ms
+ * clears both with room to spare and still reads as instant.
+ */
+const ENTER_GAP_MS = 250;
+
+/**
  * Type a prompt into the live TUI and submit it, the way a user would.
  *
  * The Enter is a *separate* write, a beat after the text — never `text + "\r"`
- * in one go. Real typing reaches the pty as many discrete writes with Enter as
- * its own final event; a lone `write("…\r")` arrives as one pty read, and agent
- * TUIs (Claude Code among them) read a byte-burst that ends in a newline as a
- * paste, keeping the newline literal instead of submitting. That's why the text
- * lands in the prompt but only "sometimes" fires: submitting hinges on whether
- * the OS happened to split the `\r` into its own read. Sending Enter on its own,
- * after the burst window, makes it an unambiguous keypress every time.
+ * in one go. Agent TUIs coalesce a fast byte burst into a paste, and then
+ * deliberately keep a newline literal for a moment afterwards, so that pasting
+ * multi-line text can't submit itself halfway through. An Enter landing inside
+ * that window is inserted into the composer instead of sending it: the prompt
+ * sits in the input box with the cursor dropped to a fresh line.
+ *
+ * The gap therefore has to outlast that window, not just separate the writes.
+ * The old 100ms sat *inside* Codex's 120ms one, and only submitted when Codex's
+ * own ~8ms flush happened to retire the window first — a race a busy TUI loses.
+ * That's why the button worked against Claude Code but left Codex holding an
+ * unsent prompt.
  */
 export function submitPrompt(handle: TerminalHandle | null | undefined, text: string) {
   if (!handle) return;
   handle.write(text);
-  // Long enough to clear the TUI's paste/burst-coalescing window and a render
-  // frame, short enough to still read as instant. Reuse `handle` (not a fresh
-  // ref read) so the Enter targets the same terminal the text went to; if that
-  // terminal is gone, its write is a safe no-op (the WS is closed).
-  setTimeout(() => handle.write("\r"), 100);
+  // Reuse `handle` (not a fresh ref read) so the Enter targets the same terminal
+  // the text went to; if that terminal is gone, its write is a safe no-op (the
+  // WS is closed).
+  setTimeout(() => handle.write("\r"), ENTER_GAP_MS);
 }
