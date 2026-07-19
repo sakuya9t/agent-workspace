@@ -1,10 +1,9 @@
 //! Per-session monitor for [`SessionManager`] (RF-M4 split).
 //!
 //! The monitor task and its attention/idle/exit state machine: `spawn_monitor`
-//! (the select loop) plus `on_output` / `on_idle` / `on_exit`. Moved verbatim
-//! out of `mod.rs`; the logic is unchanged. `scan_bell`, `trim_tail`, the
-//! `Interaction` signal, the idle/echo consts, and `attention` arrive via
-//! `super::*`.
+//! (the select loop) plus `on_chunk` / `on_output` / `on_idle` / `on_exit`.
+//! `scan_bell`, `trim_tail`, the `Interaction` signal, the idle/echo consts, and
+//! `attention` arrive via `super::*`.
 
 use super::*;
 
@@ -78,24 +77,7 @@ impl SessionManager {
                     recv = out_rx.recv() => {
                         match recv {
                             Ok(bytes) => {
-                                // If the user viewed/answered since the last chunk,
-                                // drop a sticky *block* so fresh output reclassifies.
-                                // A plain idle prompt is left untouched here — its
-                                // keystroke echo must not read as work, which
-                                // `on_output` handles via the input timing below.
-                                if sig.reset.swap(false, Ordering::Relaxed)
-                                    && matches!(
-                                        last_attn,
-                                        AttentionState::LikelyBlocked
-                                            | AttentionState::ApprovalNeeded
-                                            | AttentionState::Error
-                                    )
-                                {
-                                    last_attn = AttentionState::None;
-                                }
-                                let last_input_ms = sig.last_input_ms.load(Ordering::Relaxed);
-                                let submitted = sig.submitted.load(Ordering::Relaxed);
-                                self.on_output(&id, &handle, &bytes, plugin.as_ref(), &mut tail, &mut last_activity_write, &mut last_attn, &mut in_osc, last_input_ms, submitted);
+                                self.on_chunk(&id, &handle, &bytes, plugin.as_ref(), &mut tail, &mut last_activity_write, &mut last_attn, &mut in_osc, &sig);
                             }
                             Err(RecvError::Lagged(_)) => { /* attention is best-effort */ }
                             Err(RecvError::Closed) => {
@@ -220,6 +202,59 @@ impl SessionManager {
         let _ = self.db.set_attention(id, state, Some(&reason), now_millis());
     }
 
+    /// One output chunk from the backend: resolve any pending view/answer signal
+    /// against what the chunk actually shows, then classify it (`on_output`).
+    ///
+    /// The signal ([`Interaction::reset`]) says the user viewed or answered the
+    /// session, so a sticky *block* must give way and let fresh output
+    /// reclassify. A plain idle prompt is left alone — its keystroke echo must
+    /// not read as work, which `on_output` handles via the input timing.
+    ///
+    /// The signal is **spent only once the session has actually left the blocked
+    /// state**, not on the first chunk to arrive after it. The first chunk an
+    /// agent emits in reply to a keystroke need not be the one that answers it:
+    /// Codex acknowledges an approval keypress with a *window-title* update
+    /// (`ESC ] 0 ; … BEL`) whose screen still carries the whole approval menu,
+    /// and only erases it a few milliseconds later. Consuming the signal on that
+    /// title-only chunk reclassified the unchanged screen straight back to
+    /// `ApprovalNeeded`, so the erase that followed hit the sticky rule with
+    /// nothing left to clear it — and the session sat "blocked" until the user
+    /// clicked away and back (the view [`ack`](SessionManager::acknowledge_attention)
+    /// being the only other thing that raises the signal).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn on_chunk(
+        &self,
+        id: &str,
+        handle: &Arc<dyn BackendSession>,
+        bytes: &[u8],
+        plugin: Option<&Arc<dyn AgentPlugin>>,
+        tail: &mut String,
+        last_write: &mut i64,
+        last_attn: &mut AttentionState,
+        in_osc: &mut bool,
+        sig: &Interaction,
+    ) {
+        let armed = sig.reset.load(Ordering::Relaxed);
+        if armed && last_attn.needs_user() {
+            *last_attn = AttentionState::None;
+        }
+        self.on_output(
+            id,
+            handle,
+            bytes,
+            plugin,
+            tail,
+            last_write,
+            last_attn,
+            in_osc,
+            sig.last_input_ms.load(Ordering::Relaxed),
+            sig.submitted.load(Ordering::Relaxed),
+        );
+        if armed && !last_attn.needs_user() {
+            sig.reset.store(false, Ordering::Relaxed);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn on_output(
         &self,
@@ -293,20 +328,17 @@ impl SessionManager {
         // they need you, then keep redrawing (TUIs) — plain redraw output (or a
         // still-running background shell's noise under a dead turn) must NOT
         // demote that back to "working". It clears when the user views or
-        // answers (which resets `last_attn` in the monitor loop).
-        let was_blocked = matches!(
-            *last_attn,
-            AttentionState::LikelyBlocked | AttentionState::ApprovalNeeded | AttentionState::Error
-        );
+        // answers (which resets `last_attn` in [`Self::on_chunk`]).
+        let previous = *last_attn;
+        let was_blocked = previous.needs_user();
         let attention = if raw == AttentionState::Activity && was_blocked {
-            *last_attn
+            previous
         } else {
             raw
         };
         *last_attn = attention;
 
-        // Debounce activity writes, but always flush a blocking/approval signal.
-        if attention != AttentionState::Activity || now - *last_write >= 400 {
+        if must_write(attention, previous, now, *last_write) {
             *last_write = now;
             let _ = self.db.update_activity(
                 id,
@@ -415,5 +447,83 @@ impl SessionManager {
 
         self.live.lock().remove(id);
         tracing::info!(session = %id, status = %status_to_write.as_str(), "session finalized");
+    }
+}
+
+/// How long two consecutive *activity* writes must be apart. A busy agent emits
+/// output many times a second and each chunk carries the same "still working"
+/// verdict, so writing every one of them is pure churn.
+const ACTIVITY_DEBOUNCE_MS: i64 = 400;
+
+/// Whether this chunk's verdict has to reach the database now, or can wait for
+/// the next one.
+///
+/// The debounce covers *repeats* of "still working" — never a state the badge
+/// would render differently. Anything that needs the user goes out at once, and
+/// so does any **change**, because a change is exactly what the client is
+/// watching for. That last clause is load-bearing rather than cosmetic:
+/// answering an approval resolves to `Activity` a millisecond or two after the
+/// block itself was written (Codex clears its approval menu one chunk after it
+/// acknowledges the keypress), so a plain time debounce would swallow the
+/// release and leave a stale "blocked" badge up until the agent happened to
+/// emit again — which, for a quiet turn, can be seconds or not at all.
+fn must_write(
+    attention: AttentionState,
+    previous: AttentionState,
+    now: i64,
+    last_write: i64,
+) -> bool {
+    attention != AttentionState::Activity
+        || attention != previous
+        || now - last_write >= ACTIVITY_DEBOUNCE_MS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_activity_is_debounced() {
+        // The case the debounce exists for: a busy agent redrawing many times a
+        // second, every chunk saying the same thing.
+        let now = 10_000;
+        assert!(!must_write(
+            AttentionState::Activity,
+            AttentionState::Activity,
+            now,
+            now - 50
+        ));
+        assert!(must_write(
+            AttentionState::Activity,
+            AttentionState::Activity,
+            now,
+            now - ACTIVITY_DEBOUNCE_MS
+        ));
+    }
+
+    #[test]
+    fn answering_a_block_flushes_immediately() {
+        // The reported bug's second half: the block was written microseconds ago
+        // (that write is what set `last_write`), and the chunk that releases it
+        // must not be debounced away — the badge is showing "blocked" until it
+        // lands.
+        let now = 10_000;
+        assert!(must_write(
+            AttentionState::Activity,
+            AttentionState::ApprovalNeeded,
+            now,
+            now - 2
+        ));
+    }
+
+    #[test]
+    fn a_block_always_flushes() {
+        let now = 10_000;
+        assert!(must_write(
+            AttentionState::ApprovalNeeded,
+            AttentionState::Activity,
+            now,
+            now,
+        ));
     }
 }

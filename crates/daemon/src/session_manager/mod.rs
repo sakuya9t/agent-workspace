@@ -1769,6 +1769,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    // ---- answering a block clears it (view/answer signal) ----
+
+    /// The Codex approval menu, exactly as captured from a live session.
+    const CODEX_APPROVAL_SCREEN: &str = " Would you like to run the following command?\n   $ cargo test --workspace\n \u{203a} 1. Yes, proceed (y)\n   2. No, and tell Codex what to do differently (esc)\n Press enter to confirm or esc to cancel";
+
+    #[test]
+    fn answering_a_codex_approval_clears_the_block() {
+        // The reported bug, replayed from a real capture (session 83ccfca5): the
+        // user pressed Enter on a Codex approval and the badge stayed "blocked"
+        // until they clicked to another session and back.
+        //
+        // Codex answers the keypress in *two* chunks, 2ms apart: first a
+        // window-title update alone — which leaves the approval menu fully
+        // rendered — and only then the erase that clears it. The view/answer
+        // signal used to be spent on the first chunk, whose unchanged screen
+        // reclassified straight back to `ApprovalNeeded`, so the erase hit the
+        // sticky rule with nothing left to release it.
+        let (manager, dir) = test_manager();
+        let codex = manager.registry.get("codex").unwrap();
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::ApprovalNeeded);
+        // The user pressed Enter: input noted, block pending release.
+        let sig = Interaction::default();
+        sig.reset.store(true, Ordering::Relaxed);
+        sig.last_input_ms.store(now_millis(), Ordering::Relaxed);
+        sig.submitted.store(true, Ordering::Relaxed);
+
+        // Chunk 1 — `ESC ] 0 ; ⠧ <title> BEL`: the menu is still on screen.
+        let titled = mock_handle_with_screen(CODEX_APPROVAL_SCREEN);
+        manager.on_chunk(
+            "sid", &titled, b"\x1b]0;\xe2\xa0\xa7 sid\x07", Some(&codex), &mut tail,
+            &mut last_write, &mut last_attn, &mut false, &sig,
+        );
+        assert_eq!(
+            last_attn,
+            AttentionState::ApprovalNeeded,
+            "the prompt is still rendered, so this chunk is still a block"
+        );
+
+        // Chunk 2 — `ESC[?2026h ESC[19;1H ESC[J`: the menu is gone, and the
+        // signal must still be live to release the sticky block.
+        let cleared = mock_handle_with_screen(
+            "\u{25e6} Working (3s \u{2022} esc to interrupt)\n\u{203a} Write tests for @filename",
+        );
+        manager.on_chunk(
+            "sid", &cleared, b"\x1b[?2026h\x1b[19;1H\x1b[J", Some(&codex), &mut tail,
+            &mut last_write, &mut last_attn, &mut false, &sig,
+        );
+        assert_eq!(last_attn, AttentionState::Activity);
+        assert!(
+            !sig.reset.load(Ordering::Relaxed),
+            "leaving the blocked state spends the signal"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn redraw_after_the_signal_is_spent_stays_sticky() {
+        // The guard on the above: once the block *has* been released, the signal
+        // is gone and the sticky rule is back on duty — a later approval must not
+        // be demoted by the redraw noise that follows it.
+        let (manager, dir) = test_manager();
+        let codex = manager.registry.get("codex").unwrap();
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::ApprovalNeeded);
+        let sig = Interaction::default(); // no view, no answer
+
+        // A spinner repaint under a live approval menu: still blocked.
+        let handle = mock_handle_with_screen(CODEX_APPROVAL_SCREEN);
+        manager.on_chunk(
+            "sid", &handle, b"\x1b[2K", Some(&codex), &mut tail, &mut last_write,
+            &mut last_attn, &mut false, &sig,
+        );
+        assert_eq!(last_attn, AttentionState::ApprovalNeeded);
+
+        // Codex scrolled the menu off on its own (no answer from the user): the
+        // sticky rule holds the block until the user actually deals with it.
+        let scrolled = mock_handle_with_screen("\u{203a} Write tests for @filename");
+        manager.on_chunk(
+            "sid", &scrolled, b"\x1b[2K", Some(&codex), &mut tail, &mut last_write,
+            &mut last_attn, &mut false, &sig,
+        );
+        assert_eq!(last_attn, AttentionState::ApprovalNeeded);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     // ---- stalled-on-error settle (working -> error, not idle) ----
 
     #[test]

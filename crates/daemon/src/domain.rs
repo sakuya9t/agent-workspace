@@ -106,6 +106,18 @@ impl AttentionState {
             _ => AttentionState::None,
         }
     }
+
+    /// The agent is waiting on the user — a blocking prompt, an approval gate,
+    /// or a turn that died mid-flight. These are the states the monitor keeps
+    /// *sticky* (redraw noise must not demote them) and the client badges as
+    /// "needs attention"; the two definitions have to agree, so this is the
+    /// server-side twin of the client's `needsAttention` (`client/src/status.ts`).
+    pub fn needs_user(self) -> bool {
+        matches!(
+            self,
+            AttentionState::LikelyBlocked | AttentionState::ApprovalNeeded | AttentionState::Error
+        )
+    }
 }
 
 /// Persisted session record (subset of the full architecture model for MVP).
