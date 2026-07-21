@@ -12,13 +12,11 @@ import { useIsTouch } from "../useIsTouch";
 import { useTerminalPaste } from "../useTerminalPaste";
 import { PasteSheet } from "./PasteSheet";
 import { TermControlPanel } from "./TermControlPanel";
+import { formatBytes } from "../format";
 import i18n from "../i18n";
 
 /** WS close code the daemon uses when another client takes over the session. */
 const CLOSE_SUPERSEDED = 4001;
-
-/** Size for a human, only ever used on the attachment limit (always MB-scale). */
-const formatBytes = (n: number) => `${(n / (1024 * 1024)).toFixed(1)} MB`;
 
 /** Map a single typed character to its control byte (Ctrl-A → \x01, etc.); pass
  *  anything else (multi-char sequences, non-mappable keys) through untouched. */

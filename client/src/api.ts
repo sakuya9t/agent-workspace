@@ -738,6 +738,24 @@ export const api = {
       `/api/sessions/${id}/paste` + (name ? `?name=${encodeURIComponent(name)}` : ""),
       blob,
     ),
+  /**
+   * Upload a file into the session's workspace, under `uploads/`. Unlike
+   * `uploadAttachment`, the stored name is the one given — no uuid — so the path
+   * stays predictable and the agent can find the file by listing the directory
+   * instead of being handed a path.
+   *
+   * That makes a name collision meaningful, so the daemon refuses one with `409`
+   * rather than overwriting: the caller's cue to confirm a replace and retry
+   * with `force`. A directory in the way comes back `400`, since no confirm
+   * would make that retry succeed.
+   */
+  uploadToWorkspace: (t: Target, id: string, blob: Blob, name: string, force = false) =>
+    postBlob<StoredAttachment>(
+      t,
+      `/api/sessions/${id}/upload?name=${encodeURIComponent(name)}` +
+        (force ? "&force=true" : ""),
+      blob,
+    ),
 };
 
 export function streamUrl(t: Target, id: string): string {

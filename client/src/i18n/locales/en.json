@@ -276,6 +276,18 @@
     "seconds": "{{count}}s",
     "cleanupWorktree": "clean up worktree",
     "force": "force",
+    "upload": {
+      "button": "Upload files",
+      "hint": "or drop them here",
+      "title": "Copy files into this session's workspace, under uploads/",
+      "dropHint": "Drop files to upload into uploads/",
+      "busy": "Uploading {{name}} ({{index}}/{{total}})…",
+      "done_one": "Uploaded to",
+      "done_other": "Uploaded {{count}} files to",
+      "confirmReplace": "{{name}} already exists in uploads/. Replace it?",
+      "failed": "Couldn't upload {{name}}: {{message}}",
+      "tooLarge": "{{name}} is too large: {{size}} (max {{max}})"
+    },
     "summaryHeader": "Session summary",
     "scmHeader": "Source control",
     "detached": "detached",

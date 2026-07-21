@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { DragEvent, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
-import { api, BaseCommit, ChangedFile, Commit, Session } from "../api";
+import { api, BaseCommit, ChangedFile, Commit, MAX_ATTACHMENT_BYTES, Session } from "../api";
 import { Target } from "../connectionStore";
+import { formatBytes } from "../format";
 import { buildVscodeLaunch, launchVscode, vscodeReachable, VscodeLaunch } from "../vscode";
 import { relTime } from "../i18n/time";
 import { attentionLabel, instanceStatusLabel, isolationLabel, statusLabel } from "../i18n/labels";
@@ -25,6 +26,12 @@ type VscodeState =
   | { phase: "launching" }
   | { phase: "opened"; launch: VscodeLaunch }
   | { phase: "not-installed"; launch: VscodeLaunch }
+  | { phase: "error"; message: string };
+
+type UploadState =
+  | { phase: "idle" }
+  | { phase: "busy"; message: string }
+  | { phase: "done"; paths: string[] }
   | { phase: "error"; message: string };
 
 const STATUS_COLOR: Record<string, string> = {
@@ -100,6 +107,108 @@ export function RightPanel({ target, session, onCommitChanges }: Props) {
     } catch (e) {
       setVscode({ phase: "error", message: String(e) });
     }
+  };
+
+  // Upload a file into the session's workspace, so the agent can reach it by
+  // listing `uploads/` rather than needing a path pasted into the prompt.
+  const [upload, setUpload] = useState<UploadState>({ phase: "idle" });
+  const [dropping, setDropping] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  // dragenter/dragleave fire for every child element the pointer crosses, so a
+  // plain boolean flickers as the cursor moves over the panel's contents. Count
+  // the enters instead and only clear when the last one is matched.
+  const dragDepth = useRef(0);
+  useEffect(() => {
+    setUpload({ phase: "idle" });
+    setDropping(false);
+    dragDepth.current = 0;
+  }, [session?.id, base]);
+
+  /**
+   * Upload files one at a time. Sequential rather than parallel so the progress
+   * line names a single file and — more importantly — so two replace prompts can
+   * never race each other for the user's attention.
+   */
+  const uploadFiles = async (files: File[]) => {
+    if (!files.length || !target || !session) return;
+    const stored: string[] = [];
+    for (const [i, file] of files.entries()) {
+      // Pre-check the cap the daemon enforces anyway, so an oversize file fails
+      // instantly and legibly instead of after a long upload ending in a 413.
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        setUpload({
+          phase: "error",
+          message: t("rightPanel.upload.tooLarge", {
+            name: file.name,
+            size: formatBytes(file.size),
+            max: formatBytes(MAX_ATTACHMENT_BYTES),
+          }),
+        });
+        return;
+      }
+      setUpload({
+        phase: "busy",
+        message: t("rightPanel.upload.busy", {
+          name: file.name,
+          index: i + 1,
+          total: files.length,
+        }),
+      });
+      try {
+        let result;
+        try {
+          result = await api.uploadToWorkspace(target, session.id, file, file.name);
+        } catch (e) {
+          // 409 is the daemon declining to clobber an existing file. Anything
+          // else — including a directory in the way (400) — is a real failure.
+          if ((e as { status?: number }).status !== 409) throw e;
+          if (!confirm(t("rightPanel.upload.confirmReplace", { name: file.name }))) continue;
+          result = await api.uploadToWorkspace(target, session.id, file, file.name, true);
+        }
+        stored.push(result.relative_path);
+      } catch (e) {
+        setUpload({
+          phase: "error",
+          message: t("rightPanel.upload.failed", {
+            name: file.name,
+            message: (e as Error).message,
+          }),
+        });
+        return;
+      }
+    }
+    // Every replace was declined: say nothing rather than claim a success.
+    setUpload(stored.length ? { phase: "done", paths: stored } : { phase: "idle" });
+    // An upload lands inside the checkout, so it shows up as an untracked file.
+    qc.invalidateQueries({ queryKey: ["scm", base, session.id] });
+  };
+
+  // Only engage for an actual file drag — dragging selected text or a link
+  // across the panel must not light up a drop target that would reject it.
+  const isFileDrag = (e: DragEvent) => e.dataTransfer.types.includes("Files");
+
+  const onDragEnter = (e: DragEvent) => {
+    if (!isFileDrag(e)) return;
+    dragDepth.current += 1;
+    setDropping(true);
+  };
+  const onDragLeave = (e: DragEvent) => {
+    if (!isFileDrag(e)) return;
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDropping(false);
+  };
+  const onDragOver = (e: DragEvent) => {
+    if (!isFileDrag(e)) return;
+    // Without this the browser refuses the drop and navigates to the file.
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  };
+  const onDrop = (e: DragEvent) => {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    dragDepth.current = 0;
+    setDropping(false);
+    void uploadFiles(Array.from(e.dataTransfer.files));
   };
 
   const { data: summary } = useQuery({
@@ -246,7 +355,16 @@ export function RightPanel({ target, session, onCommitChanges }: Props) {
   return (
     <div className="panel right">
       <div className="panel-header">{t("rightPanel.header")}</div>
-      <div className="panel-body details">
+      {/* The whole panel is the drop target, not just the button's row: a
+          6px-tall strip is a miserable thing to aim a dragged file at. */}
+      <div
+        className={"panel-body details" + (dropping ? " dropping" : "")}
+        onDragEnter={onDragEnter}
+        onDragLeave={onDragLeave}
+        onDragOver={onDragOver}
+        onDrop={onDrop}
+      >
+        {dropping && <div className="drop-hint">{t("rightPanel.upload.dropHint")}</div>}
         {!isPhone && (
           <>
             <button
@@ -323,6 +441,41 @@ export function RightPanel({ target, session, onCommitChanges }: Props) {
           mono
         />
         <Field label={t("rightPanel.fieldDirectory")} value={session.working_directory} mono />
+        {/* Sits directly under the path it writes into, so "where does this go?"
+            is answered by the layout rather than by the help text. */}
+        <div className="upload-row">
+          <button
+            className="btn tiny"
+            disabled={upload.phase === "busy"}
+            onClick={() => fileInputRef.current?.click()}
+            title={t("rightPanel.upload.title")}
+          >
+            {t("rightPanel.upload.button")}
+          </button>
+          {/* There is no drag-and-drop on a phone, so don't offer it there. */}
+          {!isPhone && <span className="dim small">{t("rightPanel.upload.hint")}</span>}
+        </div>
+        {/* No `accept` — any file type is worth handing an agent, bounded by
+            size alone; `multiple` because collecting a few files at once is the
+            normal case for this action. */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          hidden
+          onChange={(e) => {
+            void uploadFiles(Array.from(e.target.files ?? []));
+            e.target.value = ""; // let the same file be picked again next time
+          }}
+        />
+        {upload.phase === "busy" && <div className="dim small upload-result">{upload.message}</div>}
+        {upload.phase === "done" && (
+          <div className="dim small upload-result">
+            {t("rightPanel.upload.done", { count: upload.paths.length })}
+            <div className="mono">{upload.paths.join(", ")}</div>
+          </div>
+        )}
+        {upload.phase === "error" && <div className="error upload-result">{upload.message}</div>}
         {instance && (
           <>
             <Field

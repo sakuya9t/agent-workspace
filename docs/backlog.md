@@ -167,6 +167,16 @@ pick it up**.
   allowlist is gone and size is the only bound. Design + as-built:
   [`image-paste.md`](image-paste.md); proofs `scripts/paste-test.mjs` + a
   headless-Chrome click-through of the 📎 button (PNG *and* PDF).
+- Workspace upload (2026-07-21): an "Upload files" button + panel-wide drop zone
+  in Details copies files to `<cwd>/uploads/<name>` (`POST
+  /api/sessions/:id/upload`), so the agent finds them by listing a directory
+  instead of needing a path pasted into the prompt. Keeps the user's filename —
+  no uuid — which makes a collision meaningful, so the daemon answers `409` and
+  the client confirms before replacing; a forced replace unlinks first so a
+  planted symlink can't be written through. Design + as-built:
+  [`image-paste.md`](image-paste.md) → *Workspace upload*; proofs
+  `scripts/workspace-upload-test.mjs` (22 checks) +
+  `scripts/workspace-upload-ui-test.mjs` (15 checks, headless Chrome).
 - Code-quality cleanup pass (2026-07-06, zero functional change): shared
   backend snapshot/attach helpers, one git runner + `current_branch`, one CLI
   `build_launch` helper, db.rs idiom alignment, client `api.ts` error/URL
@@ -316,7 +326,7 @@ pick it up**.
 | M4-C | Holder hardening **Stage C**: soft-reboot (hash drift + confirm), orphan surfacing/adopt UI, `purge`, metadata RPCs, `readBuffer`, periodic `(snapshot, cursor)` store (bounds cold-stitch replay cost). *(Slow-attacher drop + resync — previously listed here — landed with Stage A.)* | **P2/P3** | M4 A/B (done) | durable-sessions.md → M4 Stage C |
 | MOB-PWA | Mobile UI phase 4: **iOS `apple-mobile-web-app-*` meta tags only** — the web manifest, maskable icons, apple-touch-icon and theme-color already shipped in `f7c7640` | **P3** (was P2; mostly done) | MOB (done) | mobile-ui.md → Packaging path |
 | MOB-PUSH | Web Push for attention states | **P3** | MOB (done); RF-WSPROTO (server→client frame type); daemon push plumbing (relay as carrier) | mobile-ui.md → Follow-ups |
-| IMG-2 | Attachment follow-ups: `.asm/pastes/` cleanup policy (more pressing now that a 10 MiB zip can land there), multi-file select/drop, per-agent capability hint | **P3** | attachments + 📎 button (done) | image-paste.md → Follow-ups |
+| IMG-2 | Attachment follow-ups: `.asm/pastes/` cleanup policy (more pressing now that a 10 MiB zip can land there), multi-file select/drop **on the 📎/paste path** (the Details-panel workspace upload already takes several at once), per-agent capability hint | **P3** | attachments + 📎 button (done) | image-paste.md → Follow-ups |
 | RF-ERR | Typed daemon error → HTTP status mapping (RelayError-style) | **P2** | — (pair with SEC-2 or RF-REC) | refactoring-plan.md → RF-ERR |
 | RF-GATE | Build gate & test safety net: react-hooks + recommended eslint, minimal CI, HTTP-router test harness, `MockHolder`, asmux e2e for readBuffer/detach/backpressure/takeover, `generated.rs` drift check, migration-ladder test + `user_version` guard | **P1/P2** | — (before REC ideally; before M4-C wiring definitely) | refactoring-plan.md → §6.4 |
 | RF-OPS | **Truthful health, deadlines and task supervision:** liveness/readiness probes for DB writer + holder; cancellation tree for background tasks; blocking-work boundary; child/client request deadlines; jittered reconnect; structured reliability metrics | **P2** | minimal RF-GATE; Git deadline implementation shares RF-REC | refactoring-plan.md → §7.3 |

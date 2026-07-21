@@ -100,6 +100,14 @@ pub fn router(state: AppState) -> Router {
             post(paste::upload)
                 .layer(axum::extract::DefaultBodyLimit::max(paste::MAX_PASTE_BYTES + 512 * 1024)),
         )
+        .route(
+            "/api/sessions/:id/upload",
+            // Same two-tier limit as `paste`, for the same reason: the transport
+            // cap sits above the enforced one so the handler answers an oversize
+            // upload with a clean 413.
+            post(paste::upload_workspace)
+                .layer(axum::extract::DefaultBodyLimit::max(paste::MAX_PASTE_BYTES + 512 * 1024)),
+        )
         .route("/api/sessions/:id/ack", post(ack_attention))
         .route("/api/sessions/:id/vscode-target", get(vscode_target))
         .route("/api/sessions/:id/stream", get(ws::stream))
@@ -860,6 +868,9 @@ mod tests {
         assert!(!needs_live_session("/api/sessions"));
         assert!(!needs_live_session("/api/sessions/abc"));
         assert!(!needs_live_session("/api/sessions/abc/transcript"));
+        // A workspace upload only reads the session record and writes a file —
+        // no `live` handle — so it must not be parked behind adoption either.
+        assert!(!needs_live_session("/api/sessions/abc/upload"));
         assert!(!needs_live_session("/api/sessions/abc/scm/status"));
         assert!(!needs_live_session("/health"));
     }

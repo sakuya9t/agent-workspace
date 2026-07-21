@@ -10,6 +10,11 @@ Windows/Linux could deliver an image to the page. Fixed by taking Ctrl-V from
 xterm (see *Which key actually pastes*, below), and covered by the personas in
 `scripts/copy-paste-test.mjs` so it can't silently regress again.
 
+2026-07-21: added a second, complementary verb — **workspace upload**, a Details-panel
+button that copies files to `<cwd>/uploads/<name>` under their real names so an
+agent can find them by listing a directory rather than being handed a path. See
+*Workspace upload*, below; the attachment behaviour described here is unchanged.
+
 2026-07-12: **widened from images to any file type, ≤ 10 MiB.** An agent gets as
 much out of a PDF, a zip, or a CSV as it does out of a screenshot, and the
 transport was never image-specific — only the validation was. The magic-byte
@@ -218,6 +223,80 @@ Gotchas worth remembering:
   is same-origin, so loopback trust means no token in the browser.
 - The session tree is **expanded by default** (`collapsed` starts empty), so a
   `.session-row` is directly clickable — no expand step needed.
+
+## Workspace upload (2026-07-21)
+
+Status: **implemented** (daemon endpoint + Details-panel button and drop zone).
+Verified by `scripts/workspace-upload-test.mjs` (22 checks) and
+`scripts/workspace-upload-ui-test.mjs` (15 checks, headless Chrome).
+
+The attachment path above answers "let the agent *see* this file, once". It does
+not answer "put this file **in my workspace**" — and that gap was real: the only
+way to get a file onto the node was to paste it into a live terminal and let the
+client inject a `.asm/pastes/<stem>-<uuid8>.<ext>` path. A user who wants to hand
+a session a dataset, a spec, or a log bundle and then *talk about it by name* had
+nowhere to put it.
+
+`POST /api/sessions/:id/upload?name=<filename>[&force=true]` is that second verb.
+Same transport, same 10 MiB cap, same `safe_stem_ext` sanitiser — three
+deliberate differences:
+
+| | `/paste` (attachment) | `/upload` (workspace) |
+| --- | --- | --- |
+| lands in | `.asm/pastes/` (self-ignoring) | `uploads/` — **visible, not git-ignored** |
+| stored name | `<stem>-<uuid8>.<ext>` | the client's name, **verbatim** |
+| collision | impossible, by construction | `409` → client confirms → `force=true` |
+| how the agent finds it | path injected into the prompt | `ls uploads/` |
+
+### Why each difference
+
+- **Visible, not ignored.** An uploaded file is working material the user may
+  well want to commit; an attachment is a one-shot reference that should never
+  reach the repo. So `uploads/` deliberately does *not* get the `.asm/` treatment
+  and does show up in `git status`.
+- **The exact name, no uuid.** A predictable path is the entire feature — it is
+  what lets the user say "read `uploads/spec.pdf`" or the agent discover the file
+  by listing the directory. That makes `safe_stem_ext` load-bearing here in a way
+  it isn't for a paste, since the uuid is no longer there as a second line of
+  defence. Note one wrinkle the paste path never had: an extension-less name is a
+  *real* name, so `Makefile` must not become `Makefile.bin` — the sniffed-extension
+  fallback applies only when there is no usable name at all.
+- **409, not overwrite and not uniquify.** Keeping the name means collisions are
+  now possible, and `uploads/` sits inside the user's checkout — a silent
+  overwrite could destroy source. Silently uniquifying would be worse than
+  useless: it hands back a name the user didn't ask for, which is exactly the
+  predictability the feature exists to provide. So the daemon refuses and the
+  client turns the `409` into a "Replace `spec.pdf`?" prompt, reusing the
+  confirm-and-retry-with-force idiom already used for branch delete and archive.
+  A *directory* in the way is a `400` instead, because no confirm makes that
+  retry succeed — offering the prompt would just loop.
+
+### Security notes
+
+Everything from the paste path carries over (server-derived directory,
+sanitised single-component leaf name, size as the only content bound, authed
+like every other `/api` route), plus one new consideration the paste path was
+immune to:
+
+- **A forced replace unlinks before writing.** `fs::write` follows symlinks, and
+  an agent running in this very session could have left `uploads/spec.pdf` as a
+  symlink to anywhere the daemon user can reach. Removing the entry first means
+  a replace can only ever create a regular file at that path. The existence
+  check uses `symlink_metadata` rather than `exists` for the same reason — a
+  dangling symlink reports as absent to `exists` but still occupies the name.
+  Asserted end-to-end in `workspace-upload-test.mjs` ("the symlink target was
+  NOT written through").
+
+### Client
+
+The button lives in the Details panel directly under the **Directory** field, so
+the layout answers "where does this go?" without help text. The whole panel body
+is the drop target — a button-height strip is a miserable thing to aim a dragged
+file at — and lights up with an inset dashed outline while a file drag is over
+it (`dragenter`/`dragleave` are depth-counted, since they fire for every child
+the pointer crosses). The picker carries `multiple` and no `accept`; uploads run
+**sequentially** so the progress line names one file and, more importantly, so
+two replace prompts can never race for the user's attention.
 
 ## Reusable seam
 

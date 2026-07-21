@@ -1281,6 +1281,32 @@ body.col-resizing iframe {
   margin: 4px 0 10px;
 }
 
+/* Upload into the session workspace. The panel body is the drop target, so the
+   affordance is an inset outline on the whole column rather than a box around
+   the button — a dragged file can be aimed anywhere in Details. */
+.details.dropping {
+  outline: 2px dashed var(--accent);
+  outline-offset: -6px;
+}
+.upload-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 10px;
+  flex-wrap: wrap;
+}
+/* Match `.field`'s bottom gap so the upload result reads as its own row rather
+   than running into the field that follows it. */
+.upload-result {
+  margin-bottom: 10px;
+}
+.drop-hint {
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
 /* source control */
 .scm-actions {
   display: flex;
