@@ -123,7 +123,18 @@ async fn handle_live(
     // Register as the sole attacher; supersede any previous one.
     let conn_id = state.attachments.next_id();
     let cancel = Arc::new(Notify::new());
-    if let Some(prev) = state.attachments.attach(&id, conn_id, cancel.clone()) {
+    let superseded = state.attachments.attach(&id, conn_id, cancel.clone());
+    // The "in use" badge is driven by this attachment, so when it is wrong the
+    // only way to tell a late close from a socket that died some other way is a
+    // record of when it was taken and why it was given back. Cheap: a handful of
+    // lines per attach, and `asm_daemon=debug` is on by default.
+    tracing::debug!(
+        session = %id,
+        conn = conn_id,
+        took_over = superseded.is_some(),
+        "ws attach"
+    );
+    if let Some(prev) = superseded {
         prev.notify_one();
     }
 
@@ -146,6 +157,14 @@ async fn handle_live(
         .is_err()
     {
         state.attachments.release(&id, conn_id);
+        tracing::debug!(
+            session = %id,
+            conn = conn_id,
+            reason = "snapshot send failed",
+            held_ms = start.elapsed().as_millis() as u64,
+            idle_ms = 0,
+            "ws release"
+        );
         return;
     }
 
@@ -154,6 +173,8 @@ async fn handle_live(
     let handle_out = handle.clone();
     let cancel_out = cancel.clone();
     let last_seen_out = last_seen.clone();
+    // Returns why it stopped, so the release log can name the cause rather than
+    // just the fact.
     let mut outbound = tokio::spawn(async move {
         let mut ping = interval(PING_INTERVAL);
         ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -168,7 +189,7 @@ async fn handle_live(
                             reason: "superseded by another client".into(),
                         })))
                         .await;
-                    break;
+                    return "superseded";
                 }
                 _ = ping.tick() => {
                     // A live client refreshes `last_seen` (browsers auto-pong our
@@ -179,17 +200,17 @@ async fn handle_live(
                         last_seen_out.load(Ordering::Relaxed),
                     ));
                     if idle >= IDLE_TIMEOUT {
-                        break;
+                        return "idle timeout";
                     }
                     if sender.send(Message::Ping(Vec::new())).await.is_err() {
-                        break;
+                        return "ping send failed";
                     }
                 }
                 recv = out_rx.recv() => {
                     match recv {
                         Ok(bytes) => {
                             if sender.send(Message::Binary(bytes.to_vec())).await.is_err() {
-                                break;
+                                return "output send failed";
                             }
                         }
                         Err(RecvError::Lagged(_)) => {
@@ -199,10 +220,10 @@ async fn handle_live(
                                 .await
                                 .is_err()
                             {
-                                break;
+                                return "repaint send failed";
                             }
                         }
-                        Err(RecvError::Closed) => break,
+                        Err(RecvError::Closed) => return "session output closed",
                     }
                 }
             }
@@ -210,9 +231,12 @@ async fn handle_live(
     });
 
     // Inbound: terminal input and resize from this client.
-    loop {
+    let reason: &'static str = loop {
         tokio::select! {
-            _ = &mut outbound => break,
+            done = &mut outbound => break match done {
+                Ok(r) => r,
+                Err(_) => "outbound task died",
+            },
             msg = receiver.next() => {
                 // Any frame (input, resize, or an auto-pong) proves the client
                 // is still there and refreshes the idle deadline above.
@@ -234,16 +258,46 @@ async fn handle_live(
                             Err(_) => { /* ignore malformed control frames */ }
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => break,
+                    // Split apart deliberately: a close frame means the client
+                    // said goodbye, a bare stream end or a recv error means the
+                    // socket died under us. Which one it was is the whole
+                    // question when a session reads "in use" after the user
+                    // already navigated away.
+                    Some(Ok(Message::Close(_))) => break "client close frame",
+                    None => break "client stream ended",
                     Some(Ok(_)) => { /* ping/pong/other */ }
-                    Some(Err(_)) => break,
+                    Some(Err(e)) => {
+                        tracing::debug!(session = %id, conn = conn_id, error = %e, "ws recv error");
+                        break "recv error";
+                    }
                 }
             }
         }
-    }
+    };
 
     outbound.abort();
+    let held = start.elapsed();
+    // How long the client had been silent when the socket ended. Near zero means
+    // it left cleanly; a large value means it had already gone and only the
+    // transport noticed later — which is the difference between "the client
+    // never told us" and "we were slow to act on being told".
+    //
+    // Read it against `held_ms`: a client that sends nothing has no `last_seen`
+    // until our first ping draws a pong, so on an attachment shorter than
+    // PING_INTERVAL the two are equal by construction and `idle_ms` says
+    // nothing. It only carries information once `held_ms` exceeds one ping.
+    let idle_ms = held
+        .saturating_sub(Duration::from_millis(last_seen.load(Ordering::Relaxed)))
+        .as_millis() as u64;
     state.attachments.release(&id, conn_id);
+    tracing::debug!(
+        session = %id,
+        conn = conn_id,
+        reason,
+        held_ms = held.as_millis() as u64,
+        idle_ms,
+        "ws release"
+    );
 }
 
 /// Exited session: replay persisted output as a diagnostic history frame.

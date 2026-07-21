@@ -479,6 +479,44 @@ If the daemon starts before the holder (peer containers, service ordering), it
 now **waits** for it — `ASM_ASMUX_WAIT_MS` (default 15000) — instead of dying on
 the first refused connect, and logs at ERROR when it truly gives up.
 
+### Diagnosing a stale "in use" badge
+
+The badge is driven by whether the daemon holds an open `/stream` WebSocket for
+that session — nothing is cached client-side, and the session list is polled
+every 1.5s, so a badge that lingers means the *attachment* lingered. The daemon
+logs every attachment's whole life at DEBUG (on by default —
+`info,asm_daemon=debug`), in `~/.local/share/asm/logs/asm-daemon.log`:
+
+```bash
+grep 'ws attach\|ws release\|ws recv error' ~/.local/share/asm/logs/asm-daemon.log
+```
+
+```text
+ws attach  session=46ca420b… conn=1 took_over=false
+ws release session=46ca420b… conn=1 reason="client close frame" held_ms=601 idle_ms=0
+```
+
+`reason` is what tells you where a stale badge came from:
+
+| `reason` | what happened |
+| --- | --- |
+| `client close frame` | the client said goodbye — the normal path, releases instantly |
+| `client stream ended` | the socket ended with no close frame (client killed, network dropped it) |
+| `recv error` | the transport failed; the preceding `ws recv error` line carries the cause (e.g. `Connection reset without closing handshake`) |
+| `idle timeout` | no frame — not even a pong — for `IDLE_TIMEOUT`; the client vanished silently and the heartbeat reaped it ~40–55s later |
+| `superseded` | another client took over; the new attach logs `took_over=true` |
+| `session output closed` | the session itself ended |
+
+`held_ms` is how long the attachment was held. Read `idle_ms` against it: a
+client that sends nothing has no `last_seen` until our first ping draws a pong,
+so on an attachment shorter than `PING_INTERVAL` (15s) the two are equal by
+construction and `idle_ms` carries no information.
+
+The useful discrimination when a badge outlived a navigation: `client close
+frame` with a large `held_ms` means the goodbye arrived late (a network
+problem), while `recv error` or `client stream ended` means it never arrived and
+the socket died some other way.
+
 ### Running against a real daemon (attended)
 
 Some scripts accept a `host:port` to smoke an already-running daemon. This is
