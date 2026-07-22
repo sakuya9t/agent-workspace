@@ -3155,6 +3155,20 @@ body.col-resizing iframe {
   border-color: var(--accent);
 }
 
+/* This has to follow `.paste-sheet { width: 420px }`: that desktop width is
+   declared after the generic phone modal rule and would otherwise win the
+   cascade, pushing 30px past each side of a 390px phone viewport. */
+@media (max-width: 599px), (max-height: 599px) and (pointer: coarse) {
+  .paste-sheet {
+    width: 100vw;
+    max-width: 100%;
+  }
+  .paste-sheet-input {
+    min-width: 0;
+    max-width: 100%;
+  }
+}
+
 /* Touch-gesture tracer (`?gesturelog=1`, see gestureLog.ts). Debug-only, and it
    must not become part of the gesture it watches: the panel ignores touches, so a
    press falls through to the terminal underneath it, and only the copy chip takes

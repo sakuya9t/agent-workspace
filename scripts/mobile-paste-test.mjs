@@ -144,6 +144,20 @@ async function main() {
   );
   await tapKey(plain, "Paste");
   check("insecure: Paste opens the fallback sheet rather than failing silently", await sheetIsOpen(plain));
+  const sheetBounds = await plain.evalJs(`(() => {
+    const rect = (selector) => {
+      const r = document.querySelector(selector)?.getBoundingClientRect();
+      return r && { left: r.left, right: r.right, width: r.width };
+    };
+    return { viewport: window.innerWidth, sheet: rect('.paste-sheet'), input: rect('.paste-sheet-input') };
+  })()`);
+  check(
+    "insecure: paste sheet and input stay inside the phone viewport",
+    [sheetBounds.sheet, sheetBounds.input].every(
+      (r) => r && r.left >= -0.5 && r.right <= sheetBounds.viewport + 0.5,
+    ),
+    JSON.stringify(sheetBounds),
+  );
   check(
     "insecure: the sheet's input is focused, so the keyboard rises with it",
     await plain.evalJs("document.activeElement === document.querySelector('.paste-sheet-input')"),
