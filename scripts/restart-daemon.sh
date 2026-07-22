@@ -15,7 +15,8 @@
 # daemon's own exports). Passing any daemon flag re-specifies that config as a
 # whole instead. A bundled relay recorded on this box is left running (its
 # connections survive the daemon reload); if it died, it is rebuilt and revived
-# with its recorded settings.
+# with its recorded settings. A recorded managed Vite UI also stays running (or
+# is revived if it died), and follows the daemon if its bind address changes.
 #
 # Options (the ASM_* env vars still work as fallbacks):
 #   --bind ADDR          daemon listen address (default 127.0.0.1:4600)
@@ -23,6 +24,9 @@
 #   --runtime-dir DIR    sockets/pidfiles dir (default $XDG_RUNTIME_DIR/asm)
 #   --label NAME         this node's label (default: hostname)
 #   --release            rebuild/run the release profile
+#   --ui / --no-ui       enable (the default) or disable managed Vite
+#   --ui-host HOST       UI listen host (default 127.0.0.1; implies --ui)
+#   --ui-port PORT       UI listen port (default 5273; implies --ui)
 #
 #   Register this (NAT'd) daemon OUTBOUND to a relay — no relay runs here:
 #   --register URL       relay to register to, e.g. ws://relay-host:4700
@@ -36,7 +40,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=_asm_common.sh
 source "$HERE/_asm_common.sh"
 
-usage() { err "usage: restart-daemon.sh [--bind ADDR] [--data-dir DIR] [--runtime-dir DIR] [--label NAME] [--release] [--register URL --relay-key KEY]"; }
+usage() { err "usage: restart-daemon.sh [--bind ADDR] [--data-dir DIR] [--runtime-dir DIR] [--label NAME] [--release] [--ui|--no-ui] [--ui-host HOST] [--ui-port PORT] [--register URL --relay-key KEY]"; }
 
 asm_parse_args "$@" || { usage; exit 2; }
 [ "${ASM_SHOW_HELP:-0}" = 1 ] && { usage; exit 0; }
@@ -44,6 +48,12 @@ asm_configure
 
 # A flagless restart keeps what's running: re-load the daemon config recorded at
 # its launch, plus any bundled relay recorded on this box (see _asm_common.sh).
+ui_load_recorded_config
+if ui_only; then
+  err "this installation is in UI-only mode, so there is no daemon to restart"
+  err "use scripts/start.sh to start/revive the UI gateway"
+  exit 2
+fi
 daemon_load_recorded_config
 relay_load_recorded_config
 
@@ -85,6 +95,7 @@ stop_one asm-daemon "$DAEMON_PIDFILE"
 # "up" and "sessions are back" are now two distinct moments — wait for the second
 # one before claiming it.
 start_daemon
+sync_ui
 if wait_reconciled; then
   log "daemon restarted — sessions re-adopted from the holder."
 else

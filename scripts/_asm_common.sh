@@ -24,13 +24,29 @@ _need() { # _need FLAG VALUE — fail if the flag was given no value
   return 2
 }
 
+_bool() { # _bool FLAG VALUE — print 1/0 for a supported boolean spelling
+  case "${2:-}" in
+    1|true|yes|on)  printf '1' ;;
+    0|false|no|off) printf '0' ;;
+    *) err "option $1 expects true or false"; return 2 ;;
+  esac
+}
+
+_port() { # _port FLAG VALUE — validate a TCP port before doing an expensive build
+  if [[ "${2:-}" =~ ^[0-9]+$ ]] && [ "$2" -ge 1 ] && [ "$2" -le 65535 ]; then
+    return 0
+  fi
+  err "option $1 expects a port between 1 and 65535"
+  return 2
+}
+
 # Translate flags into the ASM_* env vars the binaries read (env stays the
 # fallback: a flag only overrides when given). Collects any non-flag args into
 # ASM_POSITIONAL and sets ASM_SHOW_HELP. Returns non-zero on a bad flag.
 asm_parse_args() {
   ASM_POSITIONAL=()
   ASM_SHOW_HELP=0
-  local key="" want_relay=0 reconfig=0
+  local key="" want_relay=0 reconfig=0 ui_reconfig=0 ui_value
   while [ $# -gt 0 ]; do
     case "$1" in
       --bind)         _need "$1" "${2:-}" || return 2; export ASM_BIND="$2"; reconfig=1; shift 2 ;;
@@ -43,6 +59,14 @@ asm_parse_args() {
       --relay-bind)   _need "$1" "${2:-}" || return 2; export ASM_RELAY_BIND="$2"; want_relay=1; shift 2 ;;
       --relay-key)    _need "$1" "${2:-}" || return 2; key="$2"; shift 2 ;;
       --register)     _need "$1" "${2:-}" || return 2; export ASM_RELAY_URL="$2"; reconfig=1; shift 2 ;;
+      --ui|--run-ui)  export ASM_RUN_UI=1 ASM_UI_ONLY=0; unset ASM_UI_DAEMON ASM_UI_DAEMON_TOKEN; ui_reconfig=1; shift ;;
+      --no-ui)        export ASM_RUN_UI=0 ASM_UI_ONLY=0; unset ASM_UI_DAEMON ASM_UI_DAEMON_TOKEN; ui_reconfig=1; shift ;;
+      --run-ui=*)     ui_value="$(_bool --run-ui "${1#*=}")" || return 2; export ASM_RUN_UI="$ui_value" ASM_UI_ONLY=0; unset ASM_UI_DAEMON ASM_UI_DAEMON_TOKEN; ui_reconfig=1; shift ;;
+      --ui-only)      export ASM_RUN_UI=1 ASM_UI_ONLY=1; ui_reconfig=1; shift ;;
+      --ui-daemon)    _need "$1" "${2:-}" || return 2; export ASM_UI_DAEMON="$2" ASM_RUN_UI=1 ASM_UI_ONLY=1; ui_reconfig=1; shift 2 ;;
+      --ui-daemon-token) _need "$1" "${2:-}" || return 2; export ASM_UI_DAEMON_TOKEN="$2" ASM_RUN_UI=1 ASM_UI_ONLY=1; ui_reconfig=1; shift 2 ;;
+      --ui-host)      _need "$1" "${2:-}" || return 2; export ASM_UI_HOST="$2" ASM_RUN_UI=1; ui_reconfig=1; shift 2 ;;
+      --ui-port)      _need "$1" "${2:-}" || return 2; _port "$1" "$2" || return 2; export ASM_UI_PORT="$2" ASM_RUN_UI=1; ui_reconfig=1; shift 2 ;;
       -h|--help)      ASM_SHOW_HELP=1; shift ;;
       --)             shift; while [ $# -gt 0 ]; do ASM_POSITIONAL+=("$1"); shift; done ;;
       --*)            err "unknown option: $1"; return 2 ;;
@@ -67,6 +91,7 @@ asm_parse_args() {
   # describe this command line, not persisted config, never an env fallback.
   export ASM_DAEMON_RECONFIG="$reconfig"
   export ASM_RELAY_RECONFIG="$want_relay"
+  export ASM_UI_RECONFIG="$ui_reconfig"
   return 0
 }
 
@@ -84,6 +109,20 @@ asm_configure() {
   export ASM_BIND="${ASM_BIND:-127.0.0.1:4600}"
   # Relay default bind is 0.0.0.0 so both LAN clients and nodes dialing out reach it.
   export ASM_RELAY_BIND="${ASM_RELAY_BIND:-0.0.0.0:4700}"
+  case "${ASM_RUN_UI:-1}" in
+    1|true|yes|on)  export ASM_RUN_UI=1 ;;
+    0|false|no|off) export ASM_RUN_UI=0 ;;
+    *) err "ASM_RUN_UI expects true or false"; return 2 ;;
+  esac
+  case "${ASM_UI_ONLY:-0}" in
+    1|true|yes|on)  export ASM_UI_ONLY=1 ;;
+    0|false|no|off) export ASM_UI_ONLY=0 ;;
+    *) err "ASM_UI_ONLY expects true or false"; return 2 ;;
+  esac
+  export ASM_UI_HOST="${ASM_UI_HOST:-${ASM_CLIENT_HOST:-127.0.0.1}}"
+  export ASM_UI_PORT="${ASM_UI_PORT:-5273}"
+  export ASM_UI_DAEMON="${ASM_UI_DAEMON:-}"
+  export ASM_UI_DAEMON_TOKEN="${ASM_UI_DAEMON_TOKEN:-}"
 
   # Packaged web client: if a build exists (client/dist), serve it straight from
   # the daemon so a box without npm/vite still gets a browser UI at ASM_BIND —
@@ -106,6 +145,11 @@ asm_configure() {
   RELAY_PIDFILE="$ASM_RUNTIME_DIR/asm-relay.pid"
   # Same for the bundled relay: bind|keys|relay-only, recorded by start_relay.
   RELAY_STATE_FILE="$ASM_RUNTIME_DIR/asm-relay.reg"
+  UI_PIDFILE="$ASM_RUNTIME_DIR/asm-ui.pid"
+  # enabled|host|port|daemon-bind|ui-only|proxy-url|proxy-token. Recorded
+  # independently because Vite can stay up while the daemon is rebuilt.
+  UI_STATE_FILE="$ASM_RUNTIME_DIR/asm-ui.reg"
+  UI_BIN="$ROOT/client/node_modules/.bin/vite"
 
   mkdir -p "$ASM_DATA_DIR" "$ASM_RUNTIME_DIR" "$LOG_DIR"
 }
@@ -209,6 +253,147 @@ relay_load_recorded_config() {
   export ASM_RELAY_KEYS="$keys"
   if [ -n "$bind" ]; then export ASM_RELAY_BIND="$bind"; fi
   if [ "${ASM_DAEMON_RECONFIG:-0}" = 0 ]; then export ASM_RELAY_ONLY="${only:-0}"; fi
+}
+
+# UI side (enabled|host|port|daemon-bind|ui-only|proxy-url|proxy-token). As with
+# daemon config, explicit UI flags win; otherwise a flagless start restores the
+# last selection and revives Vite if it died. The first four fields preserve
+# compatibility with UI records created before UI-only gateway mode existed.
+ui_load_recorded_config() {
+  if [ "${ASM_UI_RECONFIG:-0}" = 1 ]; then return 0; fi
+  local rec enabled host port daemon_bind only daemon token
+  rec="$(cat "$UI_STATE_FILE" 2>/dev/null || true)"
+  if [ -z "$rec" ]; then return 0; fi
+  IFS='|' read -r enabled host port daemon_bind only daemon token <<<"$rec" || true
+  export ASM_RUN_UI="${enabled:-0}"
+  if [ -n "$host" ]; then export ASM_UI_HOST="$host"; fi
+  if [ -n "$port" ]; then export ASM_UI_PORT="$port"; fi
+  if [ -n "$daemon_bind" ]; then export ASM_BIND="$daemon_bind"; fi
+  export ASM_UI_ONLY="${only:-0}"
+  export ASM_UI_DAEMON="${daemon:-}"
+  export ASM_UI_DAEMON_TOKEN="${token:-}"
+}
+
+ui_enabled() { [ "${ASM_RUN_UI:-0}" = 1 ]; }
+ui_only() { [ "${ASM_UI_ONLY:-0}" = 1 ]; }
+
+ui_reg_signature() {
+  printf '%s|%s|%s|%s|%s|%s|%s' \
+    "${ASM_RUN_UI:-0}" "${ASM_UI_HOST:-}" "${ASM_UI_PORT:-}" "${ASM_BIND:-}" \
+    "${ASM_UI_ONLY:-0}" "${ASM_UI_DAEMON:-}" "${ASM_UI_DAEMON_TOKEN:-}"
+}
+
+record_ui_state() {
+  # This record may contain a gateway bearer token. Tighten permissions even
+  # when replacing a state file created by an older version under a broad umask.
+  (
+    umask 077
+    ui_reg_signature > "$UI_STATE_FILE"
+    chmod 600 "$UI_STATE_FILE"
+  )
+}
+
+# Turn a wildcard listen host into an address curl/the proxy can dial locally.
+ui_local_host() {
+  case "${1:-}" in
+    0.0.0.0|true|'*') printf '127.0.0.1' ;;
+    ::|'[::]')         printf '[::1]' ;;
+    *)                 printf '%s' "$1" ;;
+  esac
+}
+
+ui_url() {
+  printf 'http://%s:%s' "$(ui_local_host "$ASM_UI_HOST")" "$ASM_UI_PORT"
+}
+
+ui_daemon_url() {
+  local bind_host_port="$ASM_BIND"
+  if [ -n "${ASM_UI_DAEMON:-}" ]; then
+    printf '%s' "${ASM_UI_DAEMON%/}"
+    return 0
+  fi
+  case "$bind_host_port" in
+    0.0.0.0:*) bind_host_port="127.0.0.1:${bind_host_port#*:}" ;;
+    \[::\]:*)  bind_host_port="[::1]:${bind_host_port#*]:}" ;;
+  esac
+  printf 'http://%s' "$bind_host_port"
+}
+
+wait_ui() {
+  local i
+  command -v curl >/dev/null 2>&1 || { sleep 0.8; pid_alive "$UI_PIDFILE"; return; }
+  for i in $(seq 1 100); do
+    pid_alive "$UI_PIDFILE" || return 1
+    if curl -sf "$(ui_url)" >/dev/null 2>&1; then return 0; fi
+    sleep 0.1
+  done
+  return 1
+}
+
+# Start the Vite development UI as a detached, directly-managed process. Calling
+# the local Vite executable (rather than leaving npm as an extra parent) makes
+# the pidfile identify the server we need to stop. Its proxy follows ASM_BIND.
+start_ui() {
+  local want recorded
+  want="$(ui_reg_signature)"
+  recorded="$(cat "$UI_STATE_FILE" 2>/dev/null || true)"
+  if pid_alive "$UI_PIDFILE"; then
+    if [ "$want" != "$recorded" ]; then
+      log "web UI already running (pid $(cat "$UI_PIDFILE")) — config changed, restarting it"
+      stop_one asm-ui "$UI_PIDFILE"
+    else
+      log "web UI already running (pid $(cat "$UI_PIDFILE"))  $(ui_url)"
+      return 0
+    fi
+  fi
+
+  if [ -n "${ASM_UI_DAEMON:-}" ]; then
+    case "$ASM_UI_DAEMON" in
+      http://*|https://*) : ;;
+      *) err "--ui-daemon expects an http:// or https:// URL"; return 2 ;;
+    esac
+  fi
+  if ! [[ "$ASM_UI_PORT" =~ ^[0-9]+$ ]] || [ "$ASM_UI_PORT" -lt 1 ] || [ "$ASM_UI_PORT" -gt 65535 ]; then
+    err "UI port must be between 1 and 65535 (got: $ASM_UI_PORT)"
+    return 2
+  fi
+  command -v node >/dev/null 2>&1 || {
+    err "managed UI needs Node.js; install Node 20+ or pass --no-ui for daemon-only/packaged UI"
+    return 1
+  }
+  [ -x "$UI_BIN" ] || {
+    err "missing $UI_BIN — install client dependencies first: (cd client && npm install)"
+    return 1
+  }
+
+  log "starting Vite web UI on $ASM_UI_HOST:$ASM_UI_PORT..."
+  (
+    cd "$ROOT/client"
+    ASM_DAEMON="$(ui_daemon_url)" ASM_DAEMON_TOKEN="$ASM_UI_DAEMON_TOKEN" \
+      ASM_CLIENT_HOST="$ASM_UI_HOST" \
+      nohup "$UI_BIN" --host "$ASM_UI_HOST" --port "$ASM_UI_PORT" --strictPort \
+      >>"$LOG_DIR/asm-ui.log" 2>&1 </dev/null &
+    echo $! > "$UI_PIDFILE"
+  )
+  record_ui_state
+  if wait_ui; then
+    log "web UI up (pid $(cat "$UI_PIDFILE"))  $(ui_url)"
+  else
+    err "web UI did not come up; see $LOG_DIR/asm-ui.log"
+    rm -f "$UI_PIDFILE"
+    return 1
+  fi
+}
+
+# Apply the desired UI state. A recorded/explicit enabled state starts or revives
+# it; only an explicit disabling flag stops a live managed UI.
+sync_ui() {
+  if ui_enabled; then
+    start_ui
+  elif [ "${ASM_UI_RECONFIG:-0}" = 1 ]; then
+    stop_one asm-ui "$UI_PIDFILE"
+    record_ui_state
+  fi
 }
 
 wait_relay() {

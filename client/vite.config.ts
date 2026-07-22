@@ -4,6 +4,13 @@ import { createDaemonAwareLogger, respondDaemonDown } from "./vite.proxy-log";
 
 // Proxy API + WebSocket traffic to the local daemon during development.
 const daemon = process.env.ASM_DAEMON ?? "http://127.0.0.1:4600";
+// UI-only gateways may proxy to an off-host daemon, where loopback trust does
+// not apply. Inject an enrolled device token server-side for both HTTP and the
+// WebSocket upgrade, keeping it out of browser storage and URLs.
+const daemonToken = process.env.ASM_DAEMON_TOKEN;
+const daemonAuth = daemonToken
+  ? { headers: { Authorization: `Bearer ${daemonToken}` } }
+  : {};
 
 // Host the dev server binds to. Default `true` = all interfaces (0.0.0.0 + ::),
 // so the React client is reachable from other machines on the LAN — point a
@@ -34,11 +41,13 @@ export default defineConfig({
         target: daemon,
         changeOrigin: true,
         ws: true,
+        ...daemonAuth,
         configure: respondDaemonDown(daemon),
       },
       "/health": {
         target: daemon,
         changeOrigin: true,
+        ...daemonAuth,
         configure: respondDaemonDown(daemon),
       },
     },

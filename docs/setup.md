@@ -54,7 +54,7 @@ cargo run -p asm-daemon
 **Easiest — guided wizard.** Don't want to remember flags? Run:
 
 ```bash
-scripts/wizard.sh   # start / restart / stop, and how clients reach this host
+scripts/wizard.sh   # choose UI, relay/connectivity, then start / restart / stop
 ```
 
 It asks a few plain questions, then shows the exact `start.sh` /
@@ -65,10 +65,11 @@ learn the flags as you go.
 background under `$ASM_DATA_DIR/logs`, and manage the lifecycle):
 
 ```bash
-scripts/start.sh            # build + start the holder and the daemon (sidecar)
+scripts/start.sh            # holder + daemon + local Vite UI (all detached)
+scripts/start.sh --no-ui    # opt out of managed Vite
 scripts/status.sh           # what's running + /health
 scripts/restart-daemon.sh   # restart only the daemon — sessions survive (adopt)
-scripts/stop.sh             # stop both (stop.sh daemon|asmux for just one)
+scripts/stop.sh             # stop all (stop.sh daemon|asmux|ui|relay for one)
 scripts/token.sh            # print this host's device-enrollment token
 ```
 
@@ -78,10 +79,11 @@ a component has launched, its settings are recorded (`asm-daemon.reg` /
 `restart-daemon.sh` keeps those recorded settings — including a `0.0.0.0` bind, a
 `--register`, and relay-only-ness — rather than reverting to defaults, and the
 recording beats inherited `ASM_*` env (shells inside an asm session inherit the
-daemon's own exports). Pass flags to actually change settings; an explicit
-`stop.sh` clears the component's recording. The rest of this section is the
-manual equivalent, for when you want the processes in the foreground or wired
-into your own supervisor.
+daemon's own exports). The managed UI has its own `asm-ui.reg` state, so a
+flagless start/restart revives it too. Pass flags to actually change settings;
+an explicit `stop.sh` clears the component's recording. The rest of this section
+is the manual equivalent, for when you want the processes in the foreground or
+wired into your own supervisor.
 
 Build both binaries first — `cargo run -p asm-daemon` only builds the asmux
 *library*, not the `asmux` holder binary:
@@ -155,7 +157,9 @@ pkill -TERM asmux                 # then stop the holder
 ```
 
 Environment overrides: `ASM_BIND`, `ASM_DATA_DIR`, `ASM_CONFIG_DIR`,
-`ASM_RUNTIME_DIR`, `ASM_STATIC_DIR`, `ASM_LOG`, and for the holder:
+`ASM_RUNTIME_DIR`, `ASM_STATIC_DIR`, `ASM_LOG`; managed Vite uses `ASM_RUN_UI`,
+`ASM_UI_HOST`, `ASM_UI_PORT`, `ASM_UI_ONLY`, `ASM_UI_DAEMON`, and
+`ASM_UI_DAEMON_TOKEN`; and for the holder:
 `ASM_BACKEND` (`native`|`sidecar`), `ASM_ASMUX_AUTOSPAWN` (`0` disables
 auto-spawn), `ASM_ASMUX_BIN` (explicit holder binary path), `ASMUX_SOCK` (holder
 socket path), `ASMUX_MEMORY_LIMIT` (holder ring-memory cap, bytes).
@@ -179,15 +183,49 @@ no Node toolchain on the serving host**. On a headless server without Node, copy
 a `client/dist/` built elsewhere and start with:
 
 ```bash
-ASM_STATIC_DIR=/path/to/client/dist scripts/start.sh
+ASM_STATIC_DIR=/path/to/client/dist scripts/start.sh --no-ui
 ```
 
 Set `ASM_STATIC_DIR=` (empty) to disable packaged serving. If you build
 `client/dist` while the daemon is already running, `scripts/restart-daemon.sh`
 picks it up.
 
-**Dev (live reload).** The Vite dev server proxies `/api` and `/health` to the
-daemon — needs Node/npm on your workstation:
+**Dev (live reload, default).** The Vite dev server proxies `/api` and `/health`
+to the daemon. The service scripts detach and manage it alongside the daemon,
+so it survives an SSH logout (requires Node and `client/node_modules`, which
+`scripts/setup.sh` installs when Node is available):
+
+```bash
+scripts/start.sh                              # UI on 127.0.0.1:5273
+scripts/start.sh --ui-host 0.0.0.0           # expose UI on a trusted LAN
+scripts/start.sh --ui-port 8080              # custom port; implies --ui
+scripts/start.sh --no-ui                     # stop and disable managed Vite
+scripts/status.sh                            # reports daemon, holder, UI, relay
+```
+
+`--run-ui=true` and `--run-ui=false` are accepted as explicit boolean aliases.
+The selection is recorded, so later flagless `start.sh` and
+`restart-daemon.sh` runs preserve it. UI output goes to
+`$ASM_DATA_DIR/logs/asm-ui.log`; `scripts/stop.sh ui` stops only Vite.
+
+**UI-only gateway.** To serve the web client without running a local daemon,
+session holder, relay, or agent/SSH layer:
+
+```bash
+scripts/start.sh --ui-only
+scripts/start.sh --ui-only --ui-daemon http://machine:4600
+scripts/start.sh --ui-only --ui-daemon http://machine:4600 \
+  --ui-daemon-token DEVICE_BEARER_TOKEN --ui-host 0.0.0.0
+```
+
+Without `--ui-daemon`, the client shell still starts and users can add daemons
+or relays from **manage**. With a target, same-origin HTTP and WebSocket traffic
+is proxied to that daemon. Off-host daemons normally require an enrolled device
+bearer token; it is stored in the runtime UI state file and injected by Vite,
+never sent to browser storage or placed in the WebSocket URL. The state file is
+written with owner-only (`0600`) permissions.
+
+You can still run Vite manually in the foreground on a development workstation:
 
 ```bash
 cd client

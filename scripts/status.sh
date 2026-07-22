@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Show what the asm service scripts are running.
+# Show which relay, holder, daemon, and managed Vite UI processes are running.
 #
 #   scripts/status.sh
 #   scripts/status.sh --data-dir DIR --runtime-dir DIR   # a non-default install
@@ -16,6 +16,7 @@ asm_configure
 # 0.0.0.0-bound daemon shows a loopback URL and a stopped relay isn't mentioned.
 daemon_load_recorded_config
 relay_load_recorded_config
+ui_load_recorded_config
 
 if pid_alive "$RELAY_PIDFILE"; then
   log "relay   RUNNING  pid=$(cat "$RELAY_PIDFILE")  http://$ASM_RELAY_BIND"
@@ -43,4 +44,16 @@ if pid_alive "$DAEMON_PIDFILE"; then
   fi
 else
   log "daemon  stopped"
+fi
+
+if pid_alive "$UI_PIDFILE"; then
+  if ui_only; then
+    log "web UI  RUNNING  pid=$(cat "$UI_PIDFILE")  $(ui_url) → $(ui_daemon_url) (UI-only gateway)"
+  else
+    log "web UI  RUNNING  pid=$(cat "$UI_PIDFILE")  $(ui_url) → $(ui_daemon_url) (Vite)"
+  fi
+elif ui_enabled; then
+  log "web UI  stopped  (enabled; proxy target $(ui_daemon_url); scripts/start.sh will revive it)"
+elif [ -f "$UI_STATE_FILE" ]; then
+  log "web UI  disabled"
 fi

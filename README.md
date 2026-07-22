@@ -83,12 +83,16 @@ New machine? One idempotent script installs the toolchain and does a first build
 
 ```bash
 scripts/setup.sh          # prerequisites + debug build
-scripts/start.sh          # start the daemon (+ asmux holder), serve the client
+scripts/start.sh          # daemon + holder + persistent local Vite UI
+scripts/start.sh --no-ui  # opt out of managed Vite
 ```
 
-Then open the daemon's address (`http://127.0.0.1:4600` by default). For the guided
-wizard, durable-session flags, remote/relay connectivity, the HTTP API, and tests,
-see **[`docs/setup.md`](docs/setup.md)**.
+Open Vite at `http://127.0.0.1:5273`. Use `--ui-host 0.0.0.0` to expose it on a
+trusted LAN. `--ui-only` runs that web gateway without a local daemon, holder,
+relay, or agent/SSH session layer; optionally point its same-origin proxy at a
+daemon with `--ui-daemon http://host:4600`. For guided UI/relay/connectivity
+choices, durable-session flags, the HTTP API, and tests, see
+**[`docs/setup.md`](docs/setup.md)**.
 
 ## Layout
 

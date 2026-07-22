@@ -98,6 +98,17 @@ run_script() {
 
 # ── connectivity → flags ──────────────────────────────────────────────────
 FLAGS=(); ROLE=""; RELAY_KEY=""; RELAY_URL=""; DAEMON_PORT="4600"; RELAY_PORT="4700"
+UI_WANTED=0; UI_HOST="127.0.0.1"; UI_PORT="5273"
+UI_DAEMON=""; UI_DAEMON_TOKEN=""
+
+# Defaults for a restart should reflect the last wizard/script selection.
+RECORDED_UI_ENABLED=1; RECORDED_UI_HOST="127.0.0.1"; RECORDED_UI_PORT="5273"
+if [ -f "$UI_STATE_FILE" ]; then
+  IFS='|' read -r RECORDED_UI_ENABLED RECORDED_UI_HOST RECORDED_UI_PORT _ < "$UI_STATE_FILE" || true
+  RECORDED_UI_ENABLED="${RECORDED_UI_ENABLED:-0}"
+  RECORDED_UI_HOST="${RECORDED_UI_HOST:-127.0.0.1}"
+  RECORDED_UI_PORT="${RECORDED_UI_PORT:-5273}"
+fi
 
 this_ip() { local ip; ip="$(hostname -I 2>/dev/null | awk '{print $1}')"; printf '%s' "${ip:-<this-host-ip>}"; }
 client_relay_url() { case "$1" in ws://*) printf 'http://%s' "${1#ws://}" ;; wss://*) printf 'https://%s' "${1#wss://}" ;; *) printf '%s' "$1" ;; esac; }
@@ -113,17 +124,27 @@ choose_connectivity() {
     case "$c" in 1) ROLE=reload ;; 2) ROLE=lan ;; 3) ROLE=nat ;; esac
   else
     menu c "How will clients reach this host?" \
-      "Local only — daemon only; you'll use the client on THIS machine (loopback)" \
-      "Direct on the LAN — daemon only; clients on your network connect to this host" \
+      "Local only — daemon + default loopback UI on THIS machine" \
+      "UI-only gateway — web client here, but no local daemon, holder, or SSH/session layer" \
+      "Direct on the LAN — daemon + UI; clients on your network connect to this host" \
       "Relay host — daemon + relay: sessions run here AND private / NAT'd nodes relay through it" \
       "Relay only — no sessions here; this box just relays for private / NAT'd nodes" \
-      "Behind NAT — daemon only; this host can't accept inbound, so it dials OUT to a relay"
-    case "$c" in 1) ROLE=local ;; 2) ROLE=lan ;; 3) ROLE=relayhost ;; 4) ROLE=relayonly ;; 5) ROLE=nat ;; esac
+      "Behind NAT — daemon + local UI; this host dials OUT to a relay"
+    case "$c" in 1) ROLE=local ;; 2) ROLE=uionly ;; 3) ROLE=lan ;; 4) ROLE=relayhost ;; 5) ROLE=relayonly ;; 6) ROLE=nat ;; esac
   fi
 
   FLAGS=()
   case "$ROLE" in
     reload | local) : ;;  # defaults — no connectivity flags
+    uionly)
+      FLAGS=(--ui-only)
+      prompt UI_DAEMON "Daemon URL to proxy as the same-origin target (blank for client shell only)"
+      if [ -n "$UI_DAEMON" ]; then
+        FLAGS+=(--ui-daemon "$UI_DAEMON")
+        prompt UI_DAEMON_TOKEN "Enrolled device bearer token (blank if target trusts this gateway)"
+        [ -n "$UI_DAEMON_TOKEN" ] && FLAGS+=(--ui-daemon-token "$UI_DAEMON_TOKEN")
+      fi
+      ;;
     lan)
       prompt_port DAEMON_PORT "Port for network clients to connect to" "4600"
       FLAGS=(--bind "0.0.0.0:$DAEMON_PORT")
@@ -148,16 +169,87 @@ choose_connectivity() {
       ;;
   esac
 
-  if yesno "Build/run the release profile (faster; for real use)?" n; then FLAGS+=(--release); fi
+  choose_ui "$mode"
+  if [ "$ROLE" != uionly ] && yesno "Build/run the release profile (faster; for real use)?" n; then FLAGS+=(--release); fi
+}
+
+# UI is independent of relay topology: any host that runs a daemon can also run
+# a detached Vite server. Relay-only hosts have no daemon/API to proxy to.
+choose_ui() {
+  local mode="$1" enabled_default=n network_default=n
+  if [ "$ROLE" = relayonly ]; then
+    UI_WANTED=0
+    FLAGS+=(--no-ui)
+    note "No web UI will run on this relay-only host (there is no local daemon)."
+    return 0
+  fi
+
+  if [ "$ROLE" != uionly ]; then
+    if [ "$mode" = start ] || [ "$RECORDED_UI_ENABLED" = 1 ]; then enabled_default=y; fi
+    if ! yesno "Run the live-reload web UI as a managed background service?" "$enabled_default"; then
+      UI_WANTED=0
+      FLAGS+=(--no-ui)
+      return 0
+    fi
+  fi
+
+  UI_WANTED=1
+  if [ "$mode" = restart ] && [ "$RECORDED_UI_ENABLED" = 1 ]; then
+    UI_PORT="$RECORDED_UI_PORT"
+    UI_HOST="$RECORDED_UI_HOST"
+  else
+    UI_PORT="5273"
+    UI_HOST="127.0.0.1"
+  fi
+  prompt_port UI_PORT "Web UI port" "$UI_PORT"
+
+  case "$ROLE" in
+    lan|relayhost) network_default=y ;;
+    reload)
+      case "$UI_HOST" in 127.0.0.1|localhost|::1|'[::1]') : ;; *) network_default=y ;; esac
+      ;;
+  esac
+  if yesno "Make the web UI reachable from other machines on this network?" "$network_default"; then
+    UI_HOST="0.0.0.0"
+  else
+    UI_HOST="127.0.0.1"
+  fi
+  if [ "$ROLE" = uionly ]; then
+    FLAGS+=(--ui-host "$UI_HOST" --ui-port "$UI_PORT")
+  else
+    FLAGS+=(--ui --ui-host "$UI_HOST" --ui-port "$UI_PORT")
+  fi
 }
 
 # ── post-run guidance, tailored to the role ───────────────────────────────
 post_tips() {
+  if [ "$UI_WANTED" = 1 ]; then
+    local display_host="$UI_HOST"
+    [ "$display_host" = "0.0.0.0" ] && display_host="$(this_ip)"
+    title "Web UI"
+    log "Vite is managed in the background and survives SSH logout:"
+    note "open  http://$display_host:$UI_PORT"
+    note "check/stop it:  scripts/status.sh  ·  scripts/stop.sh ui"
+  fi
   case "$ROLE" in
+    uionly)
+      title "UI-only gateway"
+      if [ -n "$UI_DAEMON" ]; then
+        note "same-origin API/WebSocket proxy:  $UI_DAEMON"
+      else
+        note "client shell only — add daemons or relays from manage in the UI"
+      fi
+      note "no daemon, holder, relay, or agent/SSH session layer runs on this host"
+      ;;
     local)
-      title "Next"
-      log "open the web client — this host shows up as “This machine”:"
-      note "cd client && npm run dev"
+      if [ "$UI_WANTED" != 1 ]; then
+        title "Web UI"
+        if [ -f "$ROOT/client/dist/index.html" ]; then
+          note "packaged UI:  http://127.0.0.1:$DAEMON_PORT"
+        else
+          note "no UI selected; enable it later with:  scripts/start.sh --ui --ui-host 127.0.0.1"
+        fi
+      fi
       ;;
     lan | relayhost)
       title "Enrolling a client on the network"
@@ -206,13 +298,15 @@ do_restart() {
 do_stop() {
   local c
   menu c "Stop what?" \
-    "Everything — daemon, session holder, and relay  (LIVE SESSIONS END)" \
-    "Just the daemon — sessions stay alive in the holder" \
+    "Everything — UI, daemon, session holder, and relay  (LIVE SESSIONS END)" \
+    "Just the daemon — sessions and UI stay alive" \
+    "Just the web UI" \
     "Just the relay — connected nodes / clients drop"
   case "$c" in
     1) run_script stop.sh all ;;
     2) run_script stop.sh daemon ;;
-    3) run_script stop.sh relay ;;
+    3) run_script stop.sh ui ;;
+    4) run_script stop.sh relay ;;
   esac
 }
 
