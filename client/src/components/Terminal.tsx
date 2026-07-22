@@ -18,6 +18,8 @@ import i18n from "../i18n";
 /** WS close code the daemon uses when another client takes over the session. */
 const CLOSE_SUPERSEDED = 4001;
 
+type StreamState = "loading" | "ready" | "reconnecting";
+
 /** Map a single typed character to its control byte (Ctrl-A → \x01, etc.); pass
  *  anything else (multi-char sequences, non-mappable keys) through untouched. */
 function toCtrl(s: string): string {
@@ -102,6 +104,11 @@ export function TerminalView({
   // jump affordance (rendered below, gated `isTouch && !isPhone`). Fed by the
   // scroll-state block inside the WS effect.
   const [scrolledAway, setScrolledAway] = useState(false);
+  // A newly mounted xterm is visually indistinguishable from a dead session
+  // until its first snapshot arrives. Keep that adoption/attach interval
+  // explicit; after a successful paint, later disconnects use a compact badge
+  // so existing terminal contents remain visible while the socket reconnects.
+  const [streamState, setStreamState] = useState<StreamState>("loading");
 
   // The iPad control panel's Ctrl latch. The phone shell hands TerminalView a
   // latch through ctrlRef; the desktop shell (an iPad) hands it none, so we own
@@ -322,6 +329,8 @@ export function TerminalView({
     let mounted = true;
     let ws: WebSocket | null = null;
     let reconnectTimer: number | undefined;
+    let hasPainted = false;
+    setStreamState("loading");
 
     const sendResize = () => {
       if (live && ws && ws.readyState === WebSocket.OPEN) {
@@ -351,6 +360,8 @@ export function TerminalView({
         sendResize();
       };
       socket.onmessage = (ev) => {
+        hasPainted = true;
+        setStreamState("ready");
         if (typeof ev.data === "string") term.write(ev.data);
         else term.write(new Uint8Array(ev.data as ArrayBuffer));
       };
@@ -360,6 +371,7 @@ export function TerminalView({
           // takeover ping-pong). Show why, then clear the selection so the
           // session can be reclaimed from the sidebar (which prompts again).
           term.write("\r\n\x1b[33m[" + i18n.t("terminal.takenOver") + "]\x1b[0m\r\n");
+          setStreamState("ready");
           reconnectTimer = window.setTimeout(() => {
             if (mounted) useUiStore.getState().setActive(null);
           }, 1800);
@@ -367,6 +379,7 @@ export function TerminalView({
         }
         if (mounted && live) {
           // Transient loss: reconnect; the snapshot repaints current state.
+          setStreamState(hasPainted ? "reconnecting" : "loading");
           reconnectTimer = window.setTimeout(connect, 1000);
         }
       };
@@ -992,6 +1005,19 @@ export function TerminalView({
   return (
     <div className="terminal-host">
       <div className="terminal-mount" ref={containerRef} />
+      {streamState === "loading" && (
+        <div className="terminal-loading" role="status" aria-live="polite">
+          <span className="terminal-loading-spinner" aria-hidden="true" />
+          <span className="terminal-loading-title">{i18n.t("terminal.loading")}</span>
+          <span className="terminal-loading-hint">{i18n.t("terminal.loadingHint")}</span>
+        </div>
+      )}
+      {streamState === "reconnecting" && (
+        <div className="terminal-reconnecting" role="status" aria-live="polite">
+          <span className="terminal-loading-spinner small" aria-hidden="true" />
+          {i18n.t("terminal.reconnecting")}
+        </div>
+      )}
       {live && (
         <>
           {/* Attach as a standalone corner button for the phone key bar's users

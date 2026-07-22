@@ -61,10 +61,53 @@ async function main() {
   check("shared session tree present in home", await waitFor("!!document.querySelector('.session-row')"));
 
   // 2. Tap a session → full-screen terminal + key bar.
+  // Hold the first WS frame long enough to observe the state users see while a
+  // restarted daemon is still adopting sessions. CDP's generic network latency
+  // does not reliably delay loopback WebSockets, so wrap just this page's next
+  // socket and queue its messages for a beat.
+  await evalJs(`(() => {
+    const NativeWebSocket = window.WebSocket;
+    window.WebSocket = class DelayedFirstFrameWebSocket extends NativeWebSocket {
+      constructor(...args) {
+        super(...args);
+        window.__asmTerminalSocket = this;
+      }
+      set onmessage(handler) {
+        this._asmOnMessage = handler;
+        if (!handler) {
+          super.onmessage = null;
+          return;
+        }
+        let released = false;
+        let queued = [];
+        super.onmessage = (event) => {
+          if (released) {
+            handler.call(this, event);
+            return;
+          }
+          queued.push(event);
+          if (queued.length > 1) return;
+          setTimeout(() => {
+            released = true;
+            const pending = queued;
+            queued = [];
+            for (const item of pending) handler.call(this, item);
+          }, 1200);
+        };
+      }
+      get onmessage() {
+        return this._asmOnMessage ?? null;
+      }
+    };
+  })()`);
   await evalJs("document.querySelector('.session-row').click()");
   check("terminal screen header shows", await waitFor("!!document.querySelector('.mobile-term-header')"));
   check("home no longer mounted (pushed screen)", await evalJs("!document.querySelector('.mobile-home-header')"));
   check("key bar rendered for live session", await waitFor("!!document.querySelector('.term-keybar')"));
+  check(
+    "terminal shows a loading placeholder while its first snapshot is pending",
+    await waitFor("!!document.querySelector('.terminal-loading')", 2000),
+  );
   const kbCount = await evalJs("document.querySelectorAll('.term-keybar .kb').length");
   // Esc Tab ⇧Tab Ctrl ^C ↑ ↓ ← → ⌨ Paste Copy
   check("key bar has all keys", kbCount === 12, `count=${kbCount}`);
@@ -72,7 +115,30 @@ async function main() {
   // 3. Terminal is live (shell prompt painted).
   check(
     "xterm painted output",
-    await waitFor("(document.querySelector('.terminal-host')?.innerText||'').trim().length > 0"),
+    await waitFor(
+      "!document.querySelector('.terminal-loading') && (document.querySelector('.terminal-mount .xterm-rows')?.innerText||'').trim().length > 0",
+    ),
+  );
+
+  // Once output exists, a stream loss must not replace it with the full blank
+  // loading cover. Keep the useful screen and show a compact reconnect badge.
+  const paintedBeforeReconnect = await evalJs(
+    "(document.querySelector('.terminal-mount .xterm-rows')?.innerText||'').trim()",
+  );
+  await evalJs("window.__asmTerminalSocket.close()");
+  check(
+    "a later stream loss shows the compact reconnecting state",
+    await waitFor("!!document.querySelector('.terminal-reconnecting')", 3000),
+  );
+  check(
+    "reconnecting keeps the previously painted terminal visible",
+    await evalJs(
+      `!document.querySelector('.terminal-loading') && (document.querySelector('.terminal-mount .xterm-rows')?.innerText||'').includes(${JSON.stringify(paintedBeforeReconnect)})`,
+    ),
+  );
+  check(
+    "terminal returns to ready after reconnecting",
+    await waitFor("!document.querySelector('.terminal-reconnecting')", 6000),
   );
 
   // 4. ⌨ focuses the xterm textarea (summons keyboard on a real device).

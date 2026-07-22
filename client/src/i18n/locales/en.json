@@ -424,6 +424,9 @@
   },
   "terminal": {
     "takenOver": "This session was taken over by another client.",
+    "loading": "Loading terminal…",
+    "loadingHint": "The daemon may still be restoring this session.",
+    "reconnecting": "Reconnecting…",
     "uploadingImage": "Uploading image…",
     "uploadingNamed": "Uploading {{name}}…",
     "pasteFailed": "Upload failed: {{message}}",
