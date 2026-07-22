@@ -11,6 +11,7 @@ import { TerminalView } from "./Terminal";
 import { RightPanel } from "./RightPanel";
 import { PanelResizer } from "./PanelResizer";
 import { UsageModal } from "./UsageModal";
+import { DeckModeLink } from "./DeckModeLink";
 
 /**
  * Desktop shell: the classic 3-pane workspace (session tree · terminal ·
@@ -54,6 +55,7 @@ export function DesktopShell() {
         <div className="health">
           <span className={"dot " + (reachable > 0 ? "ok" : "bad")} />
           {t("app.daemonSummary", { count: states.length, reachable, live: totalLive })}
+          <DeckModeLink />
           <button
             className="btn tiny conn-btn"
             onClick={() => setShowConnection(true)}

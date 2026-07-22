@@ -60,6 +60,19 @@ impl std::fmt::Display for NeedsForce {
 
 impl std::error::Error for NeedsForce {}
 
+/// A deck response named a prompt revision that is no longer on screen. Typed
+/// so the API can return 409 and make controllers refresh instead of guessing.
+#[derive(Debug)]
+pub struct StaleDeckPrompt;
+
+impl std::fmt::Display for StaleDeckPrompt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the approval prompt changed; refresh before responding")
+    }
+}
+
+impl std::error::Error for StaleDeckPrompt {}
+
 /// Request to start a new session.
 #[derive(Debug, Clone)]
 pub struct CreateSessionRequest {
@@ -616,6 +629,72 @@ impl SessionManager {
         } else {
             bail!("session is not live")
         }
+    }
+
+    /// Read the current approval as a provider-neutral button model. This is the
+    /// shared controller seam for the web deck and future physical hardware.
+    pub fn deck_prompt(&self, id: &str) -> Result<Option<crate::plugins::deck::DeckPrompt>> {
+        let session = self
+            .db
+            .get_session(id)?
+            .ok_or_else(|| anyhow!("no such session"))?;
+        if !session.attention_state.needs_user() {
+            return Ok(None);
+        }
+        let handle = self
+            .live_handle(id)
+            .ok_or_else(|| anyhow!("session is not live"))?;
+        Ok(crate::plugins::deck::parse_prompt(&handle.screen_text()))
+    }
+
+    /// Select one option on the live terminal menu without claiming its single
+    /// viewer attachment. The prompt is parsed again at tap time and revision-
+    /// checked so a delayed controller cannot answer the wrong question.
+    pub fn respond_to_deck_prompt(
+        &self,
+        id: &str,
+        revision: &str,
+        option_id: usize,
+    ) -> Result<Session> {
+        let session = self
+            .db
+            .get_session(id)?
+            .ok_or_else(|| anyhow!("no such session"))?;
+        if !session.attention_state.needs_user() {
+            bail!("session is not waiting for a response");
+        }
+        let handle = self
+            .live_handle(id)
+            .ok_or_else(|| anyhow!("session is not live"))?;
+        let prompt = crate::plugins::deck::parse_prompt(&handle.screen_text())
+            .ok_or_else(|| anyhow!("the current prompt has no button-addressable choices"))?;
+        if prompt.revision != revision {
+            return Err(StaleDeckPrompt.into());
+        }
+        let selected_at = prompt
+            .options
+            .iter()
+            .position(|o| o.id == prompt.selected)
+            .ok_or_else(|| anyhow!("selected option is no longer available"))?;
+        let target_at = prompt
+            .options
+            .iter()
+            .position(|o| o.id == option_id)
+            .ok_or_else(|| anyhow!("no such prompt option"))?;
+
+        let mut input = Vec::new();
+        let (sequence, steps) = if target_at >= selected_at {
+            (b"\x1b[B".as_slice(), target_at - selected_at)
+        } else {
+            (b"\x1b[A".as_slice(), selected_at - target_at)
+        };
+        for _ in 0..steps {
+            input.extend_from_slice(sequence);
+        }
+        input.push(b'\r');
+        handle.send_input(&input)?;
+        self.note_interaction(id, &input);
+        self.acknowledge_attention(id)
     }
 
     /// Clear the attention flag when the user views/acknowledges a session.

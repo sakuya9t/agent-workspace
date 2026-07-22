@@ -12,6 +12,7 @@ import { TerminalView } from "./Terminal";
 import { TermKeyBar } from "./TermKeyBar";
 import { RightPanel } from "./RightPanel";
 import { UsageModal } from "./UsageModal";
+import { DeckModeLink } from "./DeckModeLink";
 
 /**
  * Mirror the mobile UI layer stack (home → terminal → details sheet) onto the
@@ -113,6 +114,7 @@ export function MobileShell() {
       <div className="mobile-shell" style={shellStyle}>
         <header className="mobile-home-header">
           <span className="brand">{t("app.title")}</span>
+          <DeckModeLink />
           <span className="health">
             <span className={"dot " + (reachable > 0 ? "ok" : "bad")} />
             {t("app.daemonSummary", { count: states.length, reachable, live: totalLive })}

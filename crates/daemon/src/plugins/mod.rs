@@ -5,6 +5,7 @@ use anyhow::Result;
 use serde::Serialize;
 
 pub(crate) mod attention;
+pub(crate) mod deck;
 pub mod builtin;
 pub mod conversation;
 pub mod fork;

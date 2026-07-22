@@ -53,6 +53,21 @@ export interface Session {
   has_agent_conversation?: boolean;
 }
 
+/** One numbered choice exposed by a live agent approval menu. */
+export interface DeckOption {
+  id: number;
+  label: string;
+}
+
+/** Provider-neutral approval model consumed by web or hardware button decks. */
+export interface DeckPrompt {
+  revision: string;
+  question: string;
+  detail: string;
+  options: DeckOption[];
+  selected: number;
+}
+
 export interface AgentOption {
   key: string;
   label: string;
@@ -595,6 +610,20 @@ export const api = {
     req<{ session: Session }>(t, `/api/sessions/${id}/ack`, { method: "POST" }).then(
       (r) => r.session,
     ),
+  deckPrompt: (t: Target, id: string) =>
+    req<{ prompt: DeckPrompt | null }>(t, `/api/sessions/${id}/deck`).then(
+      (r) => r.prompt,
+    ),
+  respondToDeckPrompt: (
+    t: Target,
+    id: string,
+    revision: string,
+    optionId: number,
+  ) =>
+    req<{ session: Session }>(t, `/api/sessions/${id}/deck/respond`, {
+      method: "POST",
+      body: JSON.stringify({ revision, option_id: optionId }),
+    }).then((r) => r.session),
   resizeSession: (t: Target, id: string, rows: number, cols: number) =>
     req<{ ok: boolean }>(t, `/api/sessions/${id}/resize`, {
       method: "POST",

@@ -340,6 +340,8 @@ at registration; a mismatched client entry reads as unreachable.
 | POST | `/api/sessions/:id/cleanup?force=` | remove the session's worktree |
 | POST | `/api/sessions/:id/resize` | resize (`{rows, cols}`) |
 | POST | `/api/sessions/:id/ack` | acknowledge/clear attention |
+| GET | `/api/sessions/:id/deck` | structured, button-addressable approval prompt |
+| POST | `/api/sessions/:id/deck/respond` | revision-checked approval option response |
 | GET | `/api/sessions/:id/vscode-target` | path/user/host for the client's `vscode://` deep link |
 | GET (WS) | `/api/sessions/:id/stream` | terminal stream |
 | GET | `/api/sessions/:id/scm/status` | repo status, branch, changed files |

@@ -9,7 +9,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 use tower_http::cors::CorsLayer;
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::config::Config;
 use crate::plugins::{current_platform, PluginModels};
@@ -109,6 +109,11 @@ pub fn router(state: AppState) -> Router {
                 .layer(axum::extract::DefaultBodyLimit::max(paste::MAX_PASTE_BYTES + 512 * 1024)),
         )
         .route("/api/sessions/:id/ack", post(ack_attention))
+        .route("/api/sessions/:id/deck", get(get_deck_prompt))
+        .route(
+            "/api/sessions/:id/deck/respond",
+            post(respond_to_deck_prompt),
+        )
         .route("/api/sessions/:id/vscode-target", get(vscode_target))
         .route("/api/sessions/:id/stream", get(ws::stream))
         .route("/api/sessions/:id/scm/status", get(scm::status))
@@ -128,7 +133,14 @@ pub fn router(state: AppState) -> Router {
     // Optionally serve a packaged web client.
     if let Some(dir) = static_dir {
         if dir.is_dir() {
-            app = app.fallback_service(ServeDir::new(dir));
+            // `/deck` is a real, bookmarkable client-side route. Serve the SPA
+            // entry at that exact path while preserving honest 404s for unknown
+            // API paths (a catch-all SPA fallback would answer those with HTML).
+            let index = dir.join("index.html");
+            app = app
+                .route_service("/deck", ServeFile::new(index.clone()))
+                .route_service("/deck/", ServeFile::new(index))
+                .fallback_service(ServeDir::new(dir));
         }
     }
 
@@ -155,12 +167,16 @@ const READY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Session sub-resources that resolve a *live* backend handle, and so mean
 /// nothing until the startup reconcile pass has adopted the survivors.
-const LIVE_ROUTES: [&str; 4] = ["stream", "stop", "resize", "paste"];
+const LIVE_ROUTES: [&str; 5] = ["stream", "stop", "resize", "paste", "deck"];
 
 fn needs_live_session(path: &str) -> bool {
     path.strip_prefix("/api/sessions/")
         .and_then(|rest| rest.split_once('/'))
-        .is_some_and(|(_, sub)| LIVE_ROUTES.contains(&sub))
+        .is_some_and(|(_, sub)| {
+            sub.split('/')
+                .next()
+                .is_some_and(|resource| LIVE_ROUTES.contains(&resource))
+        })
 }
 
 /// Park requests that need a live session until adoption has run.
@@ -620,6 +636,42 @@ async fn get_summary(
     }
 }
 
+/// Structured approval data for button-based controllers. `prompt: null` means
+/// the session needs attention but its current screen cannot be answered safely
+/// as numbered buttons; controllers should offer the full terminal instead.
+async fn get_deck_prompt(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let prompt = state.manager.deck_prompt(&id)?;
+    Ok(Json(json!({ "prompt": prompt })))
+}
+
+#[derive(Debug, Deserialize)]
+struct DeckResponseBody {
+    revision: String,
+    option_id: usize,
+}
+
+/// Drive the same arrow+Enter input the terminal menu expects, without opening
+/// a WebSocket attachment (and therefore without taking over another viewer).
+async fn respond_to_deck_prompt(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<DeckResponseBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    match state
+        .manager
+        .respond_to_deck_prompt(&id, &body.revision, body.option_id)
+    {
+        Ok(session) => Ok(Json(json!({ "session": session }))),
+        Err(e) if e.downcast_ref::<crate::session_manager::StaleDeckPrompt>().is_some() => {
+            Err(AppError(StatusCode::CONFLICT, format!("{e:#}")))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// `?format=raw` opts out of the rendered conversation.
 #[derive(Debug, Default, Deserialize)]
 struct TranscriptQuery {
@@ -862,6 +914,8 @@ mod tests {
         assert!(needs_live_session("/api/sessions/abc/stop"));
         assert!(needs_live_session("/api/sessions/abc/resize"));
         assert!(needs_live_session("/api/sessions/abc/paste"));
+        assert!(needs_live_session("/api/sessions/abc/deck"));
+        assert!(needs_live_session("/api/sessions/abc/deck/respond"));
 
         // Pure DB/git reads, and session creation — none of them touch `live`,
         // so they must not wait on adoption.

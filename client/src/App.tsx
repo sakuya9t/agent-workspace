@@ -10,6 +10,7 @@ import { NewSessionDialog } from "./components/NewSessionDialog";
 import { NewWorkspaceDialog } from "./components/NewWorkspaceDialog";
 import { ConnectionDialog } from "./components/ConnectionDialog";
 import { BranchManagerDialog } from "./components/BranchManagerDialog";
+import { DeckShell } from "./components/DeckShell";
 
 /**
  * Root: pick the shell for the device class, then render the shared dialogs
@@ -20,6 +21,7 @@ import { BranchManagerDialog } from "./components/BranchManagerDialog";
 export function App() {
   const { t } = useTranslation();
   const isPhone = useIsPhone();
+  const deckMode = window.location.pathname.replace(/\/+$/, "").endsWith("/deck");
 
   // Blink the tab title while any session is blocked and waiting on the user, so
   // it's noticeable even when this tab is in the background. Driven from the root
@@ -34,6 +36,8 @@ export function App() {
     const m = /^#s=([^:]+):(.+)$/.exec(window.location.hash);
     if (m) useUiStore.getState().setActive({ daemonId: m[1], sessionId: m[2] });
   }, []);
+
+  if (deckMode) return <DeckShell />;
 
   return (
     <>
