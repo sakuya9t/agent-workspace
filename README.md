@@ -9,16 +9,22 @@ terminal output.
 start agent → disconnect → agent keeps running → reconnect → resume the same live session
 ```
 
-> **Status:** runnable MVP core (Alpha Gate). The daemon proves the central loop
-> end to end; the Electron shell and rich output rendering are next. See the
-> [MVP execution plan](docs/mvp-execution-plan.md) for what's landed and what's coming.
+> **Status (2026-07-24):** runnable **Unix/web alpha core**. The central
+> disconnect/reconnect loop, durable daemon restarts, mobile web UI, relay +
+> gateway connectivity, session fork/recovery, and Git workflows run end to end.
+> The formal Alpha/MVP gates are not yet met: Windows holder support, rich
+> rendering, workspace hooks/checkpoints, Electron packaging, and reliability /
+> security hardening remain. See the [cross-track backlog](docs/backlog.md) for
+> current priority and the [MVP execution plan](docs/mvp-execution-plan.md) for
+> the original release definition.
 
 ## Architecture
 
 The **client** is a thin view; the **daemon** owns everything. Sessions are durable
 server-side objects, terminal state lives in a server-side VT100 emulator (so a
-fresh client resumes the current screen without replaying history), and live PTYs
-are held by an out-of-process **asmux** holder that survives daemon restarts.
+fresh client resumes a coherent screen; normal-buffer agents also receive
+bounded raw-history replay for scrollback), and live PTYs are held by an
+out-of-process **asmux** holder that survives daemon restarts.
 
 ![Agent Session Manager architecture](docs/architecture.png)
 
@@ -40,8 +46,10 @@ Full design in [`docs/architecture.md`](docs/architecture.md); durability model 
 - **Isolate concurrent agents.** Each session gets its own Git worktree (auto-named
   branch, a new branch off a base, or an existing branch), so multiple agents on one
   repo never share a working tree.
-- **Track changes.** Per-session SCM panel: status, diffs, log, branches, and
-  fast-forward pull / rebase / merge of the session branch.
+- **Track and integrate changes.** Per-session SCM: status, diffs, log, remote
+  tips, fetch/pull/push, rebase/merge, branch attach/detach, and agent-driven
+  commit. Workspace branch management can inspect, delete, merge or rebase
+  branches, with agent-assisted conflict resolution where appropriate.
 - **Aggregate many hosts.** Connect to several daemons at once; one left-panel tree
   shows every host → workspace → agent. Attention signals flag sessions that are
   active, likely blocked, need approval, or failed.

@@ -1,5 +1,14 @@
 # MVP Execution Plan
 
+> **Status snapshot — 2026-07-24.** The central Unix/web product loop below is
+> implemented, including durable daemon restart, mobile web control, relay +
+> gateway routing, session fork/recovery, and Git write workflows that exceeded
+> the original MVP scope. The formal release gates in this document are **not**
+> complete: M5 Windows/ConPTY, rich rendering, workspace hooks/checkpoints,
+> Electron packaging/service install, and reliability/security hardening remain.
+> Current priority and cross-track dependencies live in [`backlog.md`](backlog.md);
+> this document remains the original MVP definition and acceptance baseline.
+
 ## Purpose
 
 This document turns the architecture and requirements into an execution plan for the first shippable MVP.
@@ -54,7 +63,9 @@ start agent -> disconnect -> agent keeps working -> reconnect -> resume terminal
 - Automatic personal pool placement.
 - Repository sync orchestration across machines.
 - Browser-based full editor replacement.
-- User-facing Git write workflows.
+- ~~User-facing Git write workflows.~~ Shipped beyond the original baseline:
+  fetch/pull/push/rebase/merge, agent-driven commit, branch management, and
+  agent-assisted conflict resolution.
 - Team/session sharing.
 - Advanced memory UI.
 - Production-grade secret redaction.
@@ -77,6 +88,12 @@ The MVP keeps these semantics under product control:
 Dependencies are wrapped behind internal interfaces.
 
 ## Baseline Technology Decisions
+
+The daemon choices below describe the implemented direction. The frontend table
+is partly historical: the shipped client uses React/Vite/xterm.js/Zustand/TanStack
+Query, but shadcn/Tailwind/Dockview/CodeMirror/Electron and the rich-rendering
+stack were never adopted. Backlog decision **DEC-1** must either adopt those
+pieces incrementally or amend this baseline before MVP-RICH/MVP-PKG.
 
 ### Daemon
 
@@ -971,5 +988,5 @@ Cut under schedule pressure:
 - production relay/gateway,
 - personal pool placement,
 - memory UI,
-- user-facing Git write workflows,
+- ~~user-facing Git write workflows~~ (already shipped beyond the original cut),
 - advanced markdown rendering features.

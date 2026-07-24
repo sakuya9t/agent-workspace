@@ -120,8 +120,11 @@ fix through the daemon's own listener again.
 
 ## 7. No auth rate-limiting / lifecycle audit log — LOW
 
-- **What:** enroll and token checks aren't rate-limited; lifecycle audit events
-  (create/attach/input/stop/delete) listed in the docs aren't emitted yet.
+- **What:** enroll and token checks aren't rate-limited; persisted lifecycle
+  audit events (create/attach/input/stop/delete) listed in the docs aren't
+  emitted yet. Partial progress on 2026-07-21: terminal attachment open/close
+  lifetimes are now logged at DEBUG for diagnosis, but they are not the durable,
+  queryable audit log this item requires.
 - **Guidance:** add rate-limiting on `/api/auth/*`; emit and persist the
   lifecycle audit events; surface them in diagnostics.
 

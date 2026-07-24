@@ -1,5 +1,8 @@
 # Agent Deck
 
+**Status:** implemented in `90735f6` (2026-07-22); controller API and web UI
+below are current as of 2026-07-24.
+
 `/deck` is a button-first control surface for phones and Stream Deck-shaped
 screens. It deliberately does not replace the terminal: it shows live sessions
 that are working or blocked, collapses idle sessions into one count, and opens

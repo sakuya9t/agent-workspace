@@ -1,7 +1,9 @@
 # Forking a session
 
-**Status:** implemented. Supersedes most of [`session-recovery.md`](session-recovery.md)
-(backlog row **REC**) — see [What this leaves of REC](#what-this-leaves-of-rec).
+**Status:** implemented 2026-07-14; model selection/worktree launch corrections
+current through 2026-07-23. Supersedes most of
+[`session-recovery.md`](session-recovery.md) (backlog row **REC**) — see
+[What this leaves of REC](#what-this-leaves-of-rec).
 
 A session in flight holds three things worth keeping: a branch, a working
 directory, and an agent that has learned the shape of the problem. **Forking**
@@ -163,7 +165,8 @@ summary of it.
 
 ## Surface
 
-* `POST /api/sessions/:id/fork` — `{ agent_plugin_id, same_branch?, options? }`.
+* `POST /api/sessions/:id/fork` —
+  `{ agent_plugin_id, same_branch?, options?, model?, rows?, cols? }`.
   Runs in `spawn_blocking`: it does `git worktree add` and may run an agent for
   tens of seconds, either of which would stall the whole daemon on the async
   runtime.
