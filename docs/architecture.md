@@ -22,6 +22,8 @@ Supported agent targets include Codex, Claude Code, opencode, myclaw, Hermes, an
 - Replaceable execution: agent runtimes, session backends, and source-control panels use plugin boundaries.
 - Native portability: the daemon runs natively on Linux, macOS, and Windows; Windows support does not depend on WSL.
 - Workspace isolation: independent agents never share one writable working tree by default.
+- Independent review: a copilot inspects an immutable snapshot in a disposable
+  worktree, never the main agent's live terminal or writable workspace.
 - Workspace setup: isolated instances receive explicit setup hooks for secrets, caches, dependencies, and repo-specific bootstrap.
 - Git-backed change tracking: MVP diff and checkpoint behavior is unified through Git.
 - Component leverage: mature dependencies are used behind product-owned interfaces.
@@ -32,6 +34,9 @@ Supported agent targets include Codex, Claude Code, opencode, myclaw, Hermes, an
 ### Personal Model
 
 A session belongs to one owner. The same owner can attach from multiple devices. The architecture does not support multi-person live terminal control, team roles, organization policy, or live session transfer.
+
+A session copilot is same-owner automation, not another collaborator or another
+terminal controller. Its findings and gate policy remain private to the owner.
 
 Repository collaboration remains outside the session layer:
 
@@ -48,6 +53,7 @@ Repository collaboration remains outside the session layer:
 | Terminal renderer | xterm.js | Addons and renderer tuning |
 | Session backend | Single out-of-process holder (`asmux`) owning all PTYs; VT emulator in the daemon | tmux backend, future platform backends |
 | Agent runtime | Built-in Codex, Claude Code, opencode, custom command | myclaw, Hermes, third-party plugins |
+| Independent review | Not in the core MVP | One-shot local plugin/model over an immutable Git snapshot; later multiple reviewers, remote runners, required-check adapters |
 | Source control | Git plugin | SVN, Mercurial, Perforce, custom panels |
 | Workspace isolation | Git worktrees | Clone, reflink, full-copy, provider-specific isolation |
 | Change tracking | Git checkpoints | Provider-specific checkpoint models |
@@ -231,6 +237,7 @@ Agent plugins define:
 - transcript location and parser behavior when the agent writes structured transcripts,
 - memory injection adapter,
 - readiness and health detection,
+- optional non-interactive, model-aware review job construction,
 - UI actions.
 
 Built-in agent plugins:
@@ -238,18 +245,41 @@ Built-in agent plugins:
 ```text
 codex
 claude
+opencode
 custom_command
 ```
 
 Planned built-ins:
 
 ```text
-opencode
 myclaw
 hermes
 ```
 
 Agent plugins do not own session lifetime. They provide launch and interpretation behavior to the daemon and selected session backend.
+
+### Copilot Review Jobs
+
+A copilot is a daemon-owned policy attached to a session. It selects an agent
+plugin and optional model, review trigger, rubric, deterministic checks, and
+advisory or gatekeeper role. A review run is not a session backend object: it is
+a bounded non-interactive child process with closed stdin, captured output, a
+deadline, and explicit cancellation.
+
+For every run the daemon captures the session's exact committed and dirty Git
+tree with a private temporary index, retains it under an ephemeral private ref,
+and checks it out into a detached disposable worktree. The reviewer receives
+that repository plus a deterministic session digest and must return a versioned
+structured verdict. It never attaches to the main PTY and never shares the
+main workspace. See [`copilot.md`](copilot.md) for the snapshot algorithm,
+result schema, stale-result rules, and enforcement limits.
+
+Gatekeeping is a source-control policy above the agent plugin. Before an
+ASM-owned promotion, the daemon recomputes the review fingerprint and promotes
+the exact reviewed object only when the configured verdict and deterministic
+checks pass. Direct Git commands in the terminal are outside this local policy;
+universal enforcement requires a remote protected-branch/required-check
+boundary.
 
 ### Session Backend Plugins
 
@@ -559,6 +589,8 @@ Git workspace behavior:
 - the explicit "New segment" UI action sends the agent command and advances the active checkpoint,
 - plugin input sniffing is an optional session-boundary capability,
 - dirty checkpoint capture uses temporary-index plumbing to write a tree and update an app-managed ref,
+- dirty copilot-review capture reuses the same tree-snapshot primitive but keeps
+  only an ephemeral `refs/asm/reviews/*` ref,
 - checkpoint policy defines whether untracked files are captured,
 - changed files are clickable and open a diff.
 
@@ -942,6 +974,18 @@ ChangeTrackingService
   CreateCheckpoint
   UpdateCheckpoint
 
+ReviewService
+  ListSessionCopilots
+  CreateSessionCopilot
+  UpdateSessionCopilot
+  DeleteSessionCopilot
+  StartReview
+  ListReviews
+  GetReview
+  CancelReview
+  DeliverReview
+  CheckPromotionGate
+
 MemoryService
   GetAgentProfile
   UpdateAgentMemory
@@ -1002,13 +1046,17 @@ placement_decisions
 repo_identities
 ```
 
+The post-MVP copilot extension adds `session_copilots`, `review_runs`,
+`review_findings`, `review_checks`, and `review_gate_events`.
+
 ## Security Model
 
 Baseline security:
 
 - device enrollment,
 - per-server identity,
-- encrypted transport,
+- authenticated transport; encryption through SSH tunneling or the production
+  relay (trusted-LAN direct mode remains plaintext by explicit decision),
 - scoped access tokens,
 - workspace allowlist,
 - explicit approval before arbitrary custom commands,
@@ -1037,6 +1085,8 @@ MVP storage disclosure:
 - API and protocol compatibility across client/daemon version skew.
 - Cross-machine repository identity and clone/sync metadata.
 - Git checkpoint and worktree naming, retention, and garbage collection.
+- Remote copilot runners, multi-reviewer quorum, and required-check attestation
+  format; local single-reviewer semantics are defined in `copilot.md`.
 - Binary, large-file, generated-file, and ignored-path diff behavior.
 - Placement policy defaults across locality, latency, load, cost, and power state.
 - Relay transport hardening beyond the shipped dial-out-per-stream design

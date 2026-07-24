@@ -30,6 +30,8 @@ custom terminal command
 - Windows server support does not require WSL.
 - Agent TUIs, session backends, and source-control panels use plugin boundaries.
 - Concurrent agents on the same repo use separate workspace instances by default.
+- A review agent inspects an immutable snapshot in its own disposable workspace;
+  it never shares the main agent's writable instance or terminal attachment.
 - Isolated workspace instances support setup hooks for secrets, caches, dependency installation, and generated files.
 - The first client is a real control center, not a thin terminal wrapper.
 - The control center highlights sessions with new activity or likely user-blocking prompts.
@@ -79,6 +81,23 @@ Runs agents behind NAT, bastion hosts, VPNs, or nested private networks such as 
 - As a user, I can pass launch arguments and environment variables safely.
 - As a user, I can add future agent-like TUIs through plugins.
 - As a user, I can configure agent plugins without changing the core app.
+
+### Session Copilots
+
+- As a user, I can attach an advisory reviewer to a session.
+- As a user, I can choose another model from the same provider or a model from a
+  different installed provider.
+- As a user, I can review committed and uncommitted work without pausing or
+  sharing a writable worktree with the main agent.
+- As a user, I can see evidence-backed findings and whether they still apply to
+  the current source revision.
+- As a user, I can send a review to the main agent for verification and fixes.
+- As a user, I can opt into automatic review after stable agent turns, with
+  explicit cost and loop limits.
+- As a user, I can require a current passing review and deterministic checks
+  before ASM promotes a reviewed revision.
+- As a user, I can see which actions ASM can gate and which direct terminal or
+  remote actions remain outside that boundary.
 
 ### Workspace And Source Control
 
@@ -370,6 +389,16 @@ Agent plugins must define:
 - memory injection behavior,
 - readiness and health detection.
 
+An agent plugin may additionally expose a non-interactive review capability
+that:
+
+- accepts an explicit model through the same model-selection contract as a
+  session launch,
+- runs in a daemon-provided disposable workspace with closed stdin,
+- preserves normal provider permission guardrails,
+- produces a versioned structured result, and
+- supports deadline, bounded-output, cancellation, and process-tree cleanup.
+
 MVP plugin implementation:
 
 - compiled-in Rust traits,
@@ -392,6 +421,39 @@ opencode
 myclaw
 hermes
 ```
+
+### Session Copilots And Review Gates
+
+The daemon must:
+
+- persist copilot policy separately from immutable review runs,
+- capture a coherent Git tree containing committed, staged, unstaged, and
+  non-ignored untracked work without modifying the user's index,
+- run each reviewer in a disposable worktree, never the main session worktree,
+- include bounded session-goal context and the exact review revision,
+- parse findings with severity, evidence, location, and recommendation,
+- treat invalid or missing structured output as review failure, never a pass,
+- retain deterministic-check results independently of model claims,
+- mark applicability stale whenever the review base, HEAD, captured tree,
+  reviewer, model, prompt schema, or gate policy changes,
+- debounce and deduplicate automatic reviews by exact fingerprint,
+- enforce per-session and global concurrency, deadline, output, and automatic
+  run/cost limits,
+- keep automatic feedback opt-in and bound review/fix rounds, and
+- record gate blocks and owner overrides.
+
+A gatekeeper must:
+
+- require a current passing review plus configured deterministic checks,
+- recompute applicability immediately before the protected operation,
+- promote the exact reviewed Git object rather than a moving branch name, and
+- return a typed, explainable precondition failure for missing, stale, failed,
+  or changes-requested review.
+
+The initial gate applies only to source-control actions invoked through ASM.
+The product must not represent this as universal repository protection: direct
+terminal Git remains bypassable unless an external protected-branch/required
+check enforces the policy. Full design: [`copilot.md`](copilot.md).
 
 ### Source Control And Change Tracking
 
@@ -694,6 +756,7 @@ The product does not support:
 - Browser-based full editor replacement.
 - User-facing Git write operations.
 - Advanced memory UI.
+- Session copilots and review gates.
 
 ## Milestones
 

@@ -1,8 +1,8 @@
 # Backlog
 
 Last reconciled: **2026-07-24**, row by row against the code and history through
-`02792b9` (not against this table's own claims). The table has 40 rows: two
-completed rows retained for context, one decision folded into R5, and 37 open or
+`99814d9` (not against this table's own claims). The table has 42 rows: two
+completed rows retained for context, one decision folded into R5, and 39 open or
 explicitly deferred rows.
 
 **What this reconcile changed:**
@@ -28,6 +28,11 @@ explicitly deferred rows.
 - **Growth triggers were updated:** `RightPanel.tsx` is now 1,209 lines,
   `Terminal.tsx` 1,087, and `api.ts` 837. The RF-REC/RF-HYG/RF-QUERY splits are
   no longer hypothetical preparation; they are active maintenance debt.
+- **Session copilots are now designed, not implemented:** **COPILOT-REVIEW**
+  adds isolated same- or cross-provider review of an exact dirty-tree snapshot;
+  **COPILOT-GATE** adds stale-proof policy over ASM-owned promotion actions.
+  The design and honest enforcement boundary are in
+  [`copilot.md`](copilot.md).
 
 **2026-07-12 addition (rows added, not a full reconcile):** a five-subsystem
 tech-debt review ([`refactoring-plan.md`](refactoring-plan.md) → §6; every
@@ -58,6 +63,7 @@ implemented**. The detailed designs stay in their own documents
 [`vscode-over-relay-plan.md`](vscode-over-relay-plan.md),
 [`mobile-ui.md`](mobile-ui.md),
 [`security-followups.md`](security-followups.md),
+[`copilot.md`](copilot.md),
 [`mvp-execution-plan.md`](mvp-execution-plan.md),
 [`refactoring-plan.md`](refactoring-plan.md),
 [`classifier-measurement.md`](classifier-measurement.md)); this file only records
@@ -378,6 +384,8 @@ pick it up**.
 | RF-ERR | Typed daemon error → HTTP status mapping (RelayError-style) | **P2** | — (pair with SEC-2 or RF-REC) | refactoring-plan.md → RF-ERR |
 | RF-GATE | Build gate & test safety net: react-hooks + recommended eslint, minimal CI, HTTP-router test harness, `MockHolder`, asmux e2e for readBuffer/detach/backpressure/takeover, `generated.rs` drift check, migration-ladder test + `user_version` guard | **P1/P2** | — (before M4-C wiring; minimal harness before RF-FLOW/RF-LIFE) | refactoring-plan.md → §6.4 |
 | RF-OPS | **Truthful health, deadlines and task supervision:** liveness/readiness probes for DB writer + holder; cancellation tree for background tasks; blocking-work boundary; child/client request deadlines; jittered reconnect; structured reliability metrics | **P2** | minimal RF-GATE; Git deadline implementation shares RF-REC | refactoring-plan.md → §7.3 |
+| COPILOT-REVIEW | **Session copilot, manual advisory MVP:** select any capable installed agent plugin + model; capture committed/staged/unstaged/untracked code into an immutable disposable Git worktree; run a bounded structured review; persist evidence/findings/checks; show current/stale history in a standalone panel; explicitly send a review file to the main agent | **P2** | FIX + minimal RF-GATE; shared `GitTreeSnapshot` slice of MVP-CKPT; RF-OPS child runner; pair UI/API work with RF-REC + RF-QUERY | copilot.md → Stages 0–1 |
+| COPILOT-GATE | **Automatic copilot + gatekeeper:** debounced idle review, fingerprint deduplication, budgets and bounded feedback; then require a current passing review + deterministic checks before ASM promotes the exact reviewed commit. Gate ASM actions only; direct terminal Git remains bypassable unless a remote required check enforces it. | **P2** after advisory proof | COPILOT-REVIEW; RF-ERR; relevant RF-LIFE SCM serialization; exact-commit promotion | copilot.md → Stages 2–4 |
 | SEC-2 | Constrain `/api/fs/list` + workspace roots | **P1** | RF-ERR recommended (403 mapping) | security-followups.md → 2 (HIGH) |
 | SEC-1 | Transport encryption off-loopback. **DECIDED 2026-07-12: the LAN direct path is plaintext by design.** TLS was built end to end (`1dcb15e`: agent `wss://`, relay rustls, daemon HTTPS) and **reverted** (`a36fdfa`): a self-signed daemon cert is refused by the browser on the client's cross-origin `fetch` (no interstitial, no API) — unreachable by construction — and both escapes (a public name + ACME; a private CA installed per device) violate the product constraints: no external dependencies, no per-device setup, journey immutable. Encryption returns at the **relay** when R5 gives it a real name + ACME cert (resurrect the relay half of `1dcb15e`); SSH port-forward is the encrypted path meanwhile | **folded into R5** (was P1/P2) | R5 | security-followups.md → 1 |
 | V0 | Web-editor de-risking spike (scratchpad only) | **P2** | R1–R3 (done) | vscode-over-relay-plan.md → V0 |
@@ -490,6 +498,33 @@ long-lived tasks; isolate synchronous DB/Git/filesystem work from async workers;
 apply deadlines/kill/output caps to children and requests; pass TanStack abort
 signals through the client; use capped jittered WS reconnect; expose reliability
 metrics. Detail and acceptance criteria: refactoring-plan.md → §7.3.
+
+### COPILOT-REVIEW / COPILOT-GATE — independent session review (P2)
+
+Full design: [`copilot.md`](copilot.md).
+
+A copilot is a policy attached to a session, not a second PTY or terminal
+attacher. Each run materializes the exact Git tree—including committed, staged,
+unstaged, and non-ignored untracked work—through a private temporary index, then
+gives a disposable detached worktree plus a deterministic session digest to a
+selected plugin/model. The reviewer cannot race or rewrite the main agent's
+worktree. Parsed findings carry severity, path/line evidence, recommendations,
+and daemon-recorded deterministic checks; a changed base/HEAD/tree or policy
+makes the prior verdict stale.
+
+Stage 1 is deliberately manual and advisory. Stage 2 adds debounced idle
+triggers and an opt-in, bounded feedback loop. Stage 3 gives a configured
+gatekeeper authority over ASM-owned promotion, beginning with pushing the exact
+reviewed clean commit. This is not universal repository protection: a user or
+agent can still run Git directly in the terminal. Protected remote branches and
+a required status adapter are the later enforcement boundary.
+
+The snapshot capture is the minimum shared Git plumbing slice of MVP-CKPT, not
+a reason to build all checkpoint UI first. The reviewer needs a dedicated
+model-aware `AgentPlugin` capability: the existing fork summarizer has an empty
+cwd/no model selection, while conflict resolution deliberately bypasses
+guardrails in the real worktree. Reuse RF-OPS process supervision and keep the
+new client surface out of `RightPanel.tsx` from its first commit.
 
 ### M4-C — Holder hardening Stage C (P2/P3)
 
@@ -827,19 +862,24 @@ via fork**~~ ✅ 2026-07-14.
 5. **RF-OPS** can run after the minimal gate or alongside feature work. Land
    truthful readiness before deployment/packaging and bounded child/client
    requests before adding more polling or agent-driven operations.
-6. **MEAS-1** after RF-HYG's `MonitorState` extraction. It is dev-only and can
+6. **COPILOT-REVIEW** after its `GitTreeSnapshot` + bounded child-runner slices.
+   Ship manual advisory review first. Add automatic idle review only after
+   fingerprint deduplication/budgets; add **COPILOT-GATE** only after RF-ERR and
+   the relevant RF-LIFE SCM unit-of-work, beginning with exact-commit push.
+7. **MEAS-1** after RF-HYG's `MonitorState` extraction. It is dev-only and can
    accrue classifier-disagreement data while later feature work proceeds;
    MEAS-2/3 remain opportunistic.
-7. **V0** spike → V1–V3 as a block when browser editing becomes a product goal.
-8. **MOB-PWA** (only the iOS metas remain), then **MOB-PUSH** after
+8. **V0** spike → V1–V3 as a block when browser editing becomes a product goal.
+9. **MOB-PWA** (only the iOS metas remain), then **MOB-PUSH** after
    RF-WSPROTO and a daemon push-transport design.
-9. Take **R5** by deployment need: TLS/443 + ops first, ACL/key rotation next,
+10. Take **R5** by deployment need: TLS/443 + ops first, ACL/key rotation next,
    pairing and the splice-point confidentiality decision with the V-track.
-10. **M4-C**, **MVP-HOOKS**, **MVP-CKPT**, **FORK-SHELL**, **FORK-OC**, and
+11. **M4-C**, **MVP-HOOKS**, the remaining **MVP-CKPT** product surface,
+    **FORK-SHELL**, **FORK-OC**, and
     smaller **RF-HYG** items opportunistically. The RF-HYG Terminal split trigger
     has already fired; do it before another substantial terminal feature or
     xterm upgrade.
-11. **M5** → **MVP-PKG** when formal cross-platform/packaging gates become the
+12. **M5** → **MVP-PKG** when formal cross-platform/packaging gates become the
     goal. Additional locales (**I18N-2**) stay explicitly deferred.
 
 Constraints to respect when reordering: nothing in R-track may assume M4
