@@ -139,7 +139,7 @@ pub trait AgentPlugin: Send + Sync {
     /// May be empty even when [`supports_models`](Self::supports_models) is true
     /// (an agent whose models can't be enumerated offers only its detected default
     /// plus a free-text "Custom…"). Called off the request path, so an agent that
-    /// has to shell out to list its models — opencode — may do so here.
+    /// has to shell out to list its models — Codex/opencode — may do so here.
     fn models(&self) -> Vec<AgentModel> {
         Vec::new()
     }
@@ -266,11 +266,16 @@ pub trait AgentPlugin: Send + Sync {
     /// `seed` is the opening prompt, and every agent that supports this also
     /// accepts one alongside the resume — so a native fork still boots saying
     /// what it understands rather than silently picking up mid-thought.
+    ///
+    /// `cwd` is the session manager's resolved destination. Native histories may
+    /// remember their source directory, so plugins must explicitly apply this
+    /// destination when their CLI would otherwise restore the old one.
     fn build_fork(
         &self,
         _ctx: &AgentContext,
         _native_id: &str,
         _seed: &str,
+        _cwd: &Path,
     ) -> Option<Result<LaunchSpec>> {
         None
     }

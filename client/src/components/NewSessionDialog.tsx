@@ -99,8 +99,9 @@ export function NewSessionDialog() {
   });
 
   // The selected agent's models, resolved per-host. Kept off the plugins list
-  // because it can be slow (opencode shells out to enumerate), so it is only
-  // fetched for the agent actually in front of the user, and cached per agent.
+  // because it can be slow (Codex queries app-server; opencode shells out), so
+  // it is only fetched for the agent actually in front of the user and cached
+  // per agent.
   const { data: modelInfo } = useQuery({
     queryKey: ["models", conn.baseUrl, pluginId],
     queryFn: () => api.listModels(conn, pluginId),

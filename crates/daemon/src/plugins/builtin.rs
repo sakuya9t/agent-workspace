@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -91,8 +91,12 @@ impl AgentPlugin for CodexPlugin {
     fn model_args(&self, model: &str) -> Vec<String> {
         vec!["-m".to_string(), model.to_string()]
     }
-    // Codex has no CLI to enumerate its models, so `models()` stays empty: the
-    // dropdown offers the configured default plus a free-text "Custom…".
+    fn models(&self) -> Vec<AgentModel> {
+        // This is the same catalog the TUI's `/model` picker reads. The app
+        // server accounts for the installed Codex version, auth and rollout
+        // state, so a curated list here would inevitably drift.
+        list_codex_models(self.detect_binary().as_deref())
+    }
     fn detect_default_model(&self) -> Option<String> {
         detect_codex_model()
     }
@@ -148,30 +152,22 @@ impl AgentPlugin for CodexPlugin {
     fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
         cli_launch(self, ctx, "bypass_approvals", "--dangerously-bypass-approvals-and-sandbox")
     }
-    /// `codex fork <id> <prompt>` — a subcommand, so unlike Claude's flags it has
-    /// to *lead* argv, ahead of the danger flag. This is the reason forking is a
-    /// whole plugin method rather than a few extra args contributed to
-    /// `build_launch`.
+    /// `codex -C <cwd> fork <id> <prompt>` — `fork` is a subcommand (after the
+    /// global cwd override), so unlike Claude's flags it has to precede the
+    /// danger/model flags and positionals. This is the reason forking is a whole
+    /// plugin method rather than a few extra args contributed to `build_launch`.
     fn build_fork(
         &self,
         ctx: &AgentContext,
         native_id: &str,
         seed: &str,
+        cwd: &Path,
     ) -> Option<Result<LaunchSpec>> {
         Some(self.detect_binary().ok_or_else(|| anyhow!("`codex` binary not found in PATH")).map(
             |command| {
-                let mut args = vec!["fork".to_string()];
-                if ctx.opt("bypass_approvals") {
-                    args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
-                }
-                if let Some(model) = ctx.model.as_deref() {
-                    args.extend(self.model_args(model));
-                }
-                args.push(native_id.to_string());
-                args.push(seed.to_string());
                 LaunchSpec {
                     command,
-                    args,
+                    args: codex_fork_args(ctx, native_id, seed, cwd),
                     env: ctx.extra_env.clone(),
                     requires_approval: false,
                 }
@@ -306,6 +302,7 @@ impl AgentPlugin for ClaudePlugin {
         ctx: &AgentContext,
         native_id: &str,
         seed: &str,
+        _cwd: &Path,
     ) -> Option<Result<LaunchSpec>> {
         Some(self.detect_binary().ok_or_else(|| anyhow!("`claude` binary not found in PATH")).map(
             |command| {
@@ -490,6 +487,28 @@ fn cli_launch(
     })
 }
 
+fn codex_fork_args(ctx: &AgentContext, native_id: &str, seed: &str, cwd: &Path) -> Vec<String> {
+    // A persisted Codex conversation includes its original cwd. Without an
+    // explicit override, `codex fork` restores that cwd even though the daemon
+    // spawned the process in a new worktree: the TUI displays the source
+    // directory and the agent edits and commits there. `-C` makes the session
+    // manager's resolved fork destination win.
+    let mut args = vec![
+        "-C".to_string(),
+        cwd.to_string_lossy().into_owned(),
+        "fork".to_string(),
+    ];
+    if ctx.opt("bypass_approvals") {
+        args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+    }
+    if let Some(model) = ctx.model.as_deref() {
+        args.extend(CodexPlugin.model_args(model));
+    }
+    args.push(native_id.to_string());
+    args.push(seed.to_string());
+    args
+}
+
 fn default_shell() -> String {
     if cfg!(target_os = "windows") {
         std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_string())
@@ -650,6 +669,164 @@ fn strip_jsonc_comments(text: &str) -> String {
     out
 }
 
+// ---- Codex model enumeration (`codex app-server`, `model/list`) ----
+
+/// Ask Codex's app server for the picker-visible catalog used by `/model`.
+///
+/// The server is a long-lived JSONL process, so this cannot use `run_capture`:
+/// initialize the connection, page through `model/list`, then terminate it once
+/// all pages arrive. Empty on an absent/older Codex, protocol error or timeout;
+/// the dialog still retains its detected default and "Custom…" escape hatch.
+fn list_codex_models(binary: Option<&str>) -> Vec<AgentModel> {
+    let Some(bin) = binary else {
+        return Vec::new();
+    };
+
+    let mut child = match Command::new(bin)
+        .arg("app-server")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return Vec::new(),
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Vec::new();
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Vec::new();
+    };
+
+    let (tx, rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) {
+                if tx.send(message).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let result = (|| {
+        write_json_line(
+            &mut stdin,
+            &serde_json::json!({
+                "method": "initialize",
+                "id": 0,
+                "params": {
+                    "clientInfo": {
+                        "name": "agent_session_manager",
+                        "title": "Agent Session Manager",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }
+            }),
+        )?;
+        write_json_line(
+            &mut stdin,
+            &serde_json::json!({ "method": "initialized", "params": {} }),
+        )?;
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut request_id = 1_i64;
+        let mut cursor: Option<String> = None;
+        let mut models = Vec::new();
+
+        loop {
+            let mut params = serde_json::json!({
+                "limit": 100,
+                "includeHidden": false
+            });
+            if let Some(cursor) = &cursor {
+                params["cursor"] = serde_json::Value::String(cursor.clone());
+            }
+            write_json_line(
+                &mut stdin,
+                &serde_json::json!({
+                    "method": "model/list",
+                    "id": request_id,
+                    "params": params
+                }),
+            )?;
+
+            let response = loop {
+                let remaining = deadline.checked_duration_since(Instant::now())?;
+                let message = rx.recv_timeout(remaining).ok()?;
+                if message.get("id").and_then(|id| id.as_i64()) == Some(request_id) {
+                    break message;
+                }
+            };
+            if response.get("error").is_some() {
+                return None;
+            }
+
+            let (page, next_cursor) = parse_codex_model_page(response.get("result")?)?;
+            for model in page {
+                if !models.iter().any(|existing: &AgentModel| existing.id == model.id) {
+                    models.push(model);
+                }
+            }
+            let Some(next_cursor) = next_cursor else {
+                return Some(models);
+            };
+            cursor = Some(next_cursor);
+            request_id += 1;
+        }
+    })();
+
+    // Closing stdin and killing the long-lived server both unblock its stdout
+    // reader. Always reap it so a model-dropdown request cannot leak a process.
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+    result.unwrap_or_default()
+}
+
+fn write_json_line(stdin: &mut impl Write, value: &serde_json::Value) -> Option<()> {
+    serde_json::to_writer(&mut *stdin, value).ok()?;
+    stdin.write_all(b"\n").ok()?;
+    stdin.flush().ok()
+}
+
+/// Parse one `model/list` result. Use `model` as the CLI flag value (falling
+/// back to `id` for older catalogs) and `displayName` as the friendly label.
+fn parse_codex_model_page(
+    result: &serde_json::Value,
+) -> Option<(Vec<AgentModel>, Option<String>)> {
+    let models = result
+        .get("data")?
+        .as_array()?
+        .iter()
+        .filter(|entry| entry.get("hidden").and_then(|v| v.as_bool()) != Some(true))
+        .filter_map(|entry| {
+            let id = entry
+                .get("model")
+                .and_then(|v| v.as_str())
+                .or_else(|| entry.get("id").and_then(|v| v.as_str()))
+                .and_then(non_empty)?;
+            let label = entry
+                .get("displayName")
+                .and_then(|v| v.as_str())
+                .and_then(non_empty)
+                .unwrap_or_else(|| id.clone());
+            Some(AgentModel { id, label })
+        })
+        .collect();
+    let cursor = result
+        .get("nextCursor")
+        .and_then(|v| v.as_str())
+        .and_then(non_empty);
+    Some((models, cursor))
+}
+
 // ---- opencode model enumeration (`opencode models`) ----
 
 /// List opencode's available models by running `opencode models`. Empty on any
@@ -793,7 +970,7 @@ mod tests {
             return;
         }
         let spec = ClaudePlugin
-            .build_fork(&ctx_with_model("opus"), "conv-1", "hi")
+            .build_fork(&ctx_with_model("opus"), "conv-1", "hi", Path::new("/workspace/fork"))
             .unwrap()
             .unwrap();
         let model_at = spec.args.iter().position(|a| a == "--model").unwrap();
@@ -803,21 +980,21 @@ mod tests {
     }
 
     #[test]
-    fn codex_fork_puts_model_before_positionals() {
-        if CodexPlugin.detect_binary().is_none() {
-            return;
-        }
-        let spec = CodexPlugin
-            .build_fork(&ctx_with_model("gpt-x"), "conv-1", "hi")
-            .unwrap()
-            .unwrap();
-        // `codex fork -m <model> <id> <seed>`: -m sits after the `fork` subcommand
-        // and before the id/seed positionals.
-        let m = spec.args.iter().position(|a| a == "-m").unwrap();
-        let id = spec.args.iter().position(|a| a == "conv-1").unwrap();
-        assert_eq!(spec.args[0], "fork");
+    fn codex_fork_forces_the_resolved_cwd_and_puts_model_before_positionals() {
+        let args = codex_fork_args(
+            &ctx_with_model("gpt-x"),
+            "conv-1",
+            "hi",
+            Path::new("/workspace/fork"),
+        );
+        // `codex -C <new-worktree> fork -m <model> <id> <seed>`: the explicit
+        // cwd overrides the source conversation's persisted cwd, and -m remains
+        // before the id/seed positionals.
+        let m = args.iter().position(|a| a == "-m").unwrap();
+        let id = args.iter().position(|a| a == "conv-1").unwrap();
+        assert_eq!(&args[..3], ["-C", "/workspace/fork", "fork"]);
         assert!(m < id);
-        assert_eq!(spec.args[m + 1], "gpt-x");
+        assert_eq!(args[m + 1], "gpt-x");
     }
 
     #[test]
@@ -875,5 +1052,88 @@ mod tests {
         let models = parse_opencode_models_output(out);
         let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["opencode/big-pickle", "ollama-cloud/glm-5"]);
+    }
+
+    #[test]
+    fn parse_codex_model_list_uses_cli_ids_and_display_names() {
+        let result = serde_json::json!({
+            "data": [
+                {
+                    "id": "catalog-entry-1",
+                    "model": "gpt-5.4",
+                    "displayName": "GPT-5.4",
+                    "hidden": false,
+                    "isDefault": true
+                },
+                {
+                    "id": "gpt-5.4-mini",
+                    "displayName": null,
+                    "hidden": false
+                },
+                {
+                    "id": "internal-model",
+                    "displayName": "Internal",
+                    "hidden": true
+                },
+                {
+                    "id": "",
+                    "displayName": "Invalid"
+                }
+            ],
+            "nextCursor": "page-2"
+        });
+        let (models, cursor) = parse_codex_model_page(&result).unwrap();
+        assert_eq!(cursor.as_deref(), Some("page-2"));
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "gpt-5.4");
+        assert_eq!(models[0].label, "GPT-5.4");
+        assert_eq!(models[1].id, "gpt-5.4-mini");
+        assert_eq!(models[1].label, "gpt-5.4-mini");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_models_uses_initialized_app_server_and_follows_pages() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("asm-codex-models-{}", uuid::Uuid::new_v4()));
+        let binary = dir.join("codex");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &binary,
+            r#"#!/bin/sh
+state=0
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) state=1 ;;
+    *'"method":"initialized"'*) [ "$state" = 1 ] || exit 2; state=2 ;;
+    *'"method":"model/list"'*)
+      [ "$state" = 2 ] || exit 3
+      case "$line" in
+        *'"cursor":"page-2"'*)
+          printf '%s\n' '{"id":2,"result":{"data":[{"id":"gpt-b","displayName":"GPT B"}],"nextCursor":null}}'
+          exit 0
+          ;;
+        *)
+          printf '%s\n' '{"id":1,"result":{"data":[{"id":"gpt-a","displayName":"GPT A"}],"nextCursor":"page-2"}}'
+          ;;
+      esac
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).unwrap();
+
+        let models = list_codex_models(binary.to_str());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["gpt-a", "gpt-b"]);
+        assert_eq!(models[0].label, "GPT A");
+        assert_eq!(models[1].label, "GPT B");
     }
 }

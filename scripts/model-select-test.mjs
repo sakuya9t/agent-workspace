@@ -46,10 +46,15 @@ async function main() {
 
   const codex = await models("codex");
   check("codex supports a model dropdown", codex.supported === true);
-  check(
-    "codex can't enumerate models, so its list is empty (Default + Custom only)",
-    Array.isArray(codex.models) && codex.models.length === 0,
-  );
+  check("codex returns a model list array", Array.isArray(codex.models));
+  if (avail("codex")) {
+    check(
+      "codex enumerates the same picker-visible catalog as /model",
+      codex.models.length > 0 &&
+        codex.models.every((m) => typeof m.id === "string" && m.id.length > 0),
+      JSON.stringify(codex.models.slice(0, 5)),
+    );
+  }
 
   const opencode = await models("opencode");
   check("opencode supports a model dropdown", opencode.supported === true);

@@ -245,9 +245,9 @@ async fn list_plugins(State(state): State<AppState>) -> Json<serde_json::Value> 
 }
 
 /// The models a client can pick for one agent, for the new-session / fork
-/// dropdown. Kept off `/api/plugins` because it can be slow — opencode shells out
-/// to `opencode models` — so it is only paid when the dialog needs it. Runs on a
-/// blocking thread for the same reason.
+/// dropdown. Kept off `/api/plugins` because it can be slow — Codex queries its
+/// app server and opencode shells out to `opencode models` — so it is only paid
+/// when the dialog needs it. Runs on a blocking thread for the same reason.
 async fn list_plugin_models(
     State(state): State<AppState>,
     Path(id): Path<String>,
