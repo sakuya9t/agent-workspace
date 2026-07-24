@@ -6,7 +6,7 @@ import { Target } from "../connectionStore";
 import { useUiStore } from "../store";
 import { copyText } from "../clipboard";
 import { glog } from "../gestureLog";
-import { CtrlLatch, TerminalHandle } from "../terminalTypes";
+import { CtrlLatch, SOFT_RETURN, TerminalHandle } from "../terminalTypes";
 import { useIsPhone } from "../useIsPhone";
 import { useIsTouch } from "../useIsTouch";
 import { useTerminalPaste } from "../useTerminalPaste";
@@ -473,7 +473,28 @@ export function TerminalView({
     // quoted-insert, vim's visual-block) on Windows/Linux, the same trade Windows
     // Terminal and VS Code's terminal make — vim's own Ctrl-Q is the way back.
     term.attachCustomKeyEventHandler((e) => {
-      if (e.type !== "keydown" || isMac || !e.ctrlKey || e.altKey || e.metaKey) return true;
+      if (e.type !== "keydown") return true;
+      // Soft return, every platform. xterm maps Shift+Enter to a bare CR —
+      // byte-identical to Enter — so the chord every agent's own footer
+      // advertises for "newline" was silently sending the message instead.
+      // Claim it and send ESC+CR (see SOFT_RETURN); plain Enter never reaches
+      // this branch and still submits. IME composition is left alone: there
+      // Enter belongs to the candidate list, not to us.
+      if (
+        e.key === "Enter" &&
+        e.shiftKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        !e.metaKey &&
+        !e.isComposing
+      ) {
+        // Raw, not typed: this is a hardware chord, so it must not consume the
+        // soft-keyboard Ctrl latch (which targets the NEXT single key).
+        sendRaw(SOFT_RETURN);
+        e.preventDefault();
+        return false; // swallow: don't let xterm forward it as a CR
+      }
+      if (isMac || !e.ctrlKey || e.altKey || e.metaKey) return true;
       if (e.shiftKey && (e.key === "c" || e.key === "C") && term.hasSelection()) {
         void copySelection();
         e.preventDefault();

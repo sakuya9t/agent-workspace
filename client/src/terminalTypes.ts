@@ -22,6 +22,25 @@ export interface TerminalHandle {
 export type CtrlLatch = "off" | "armed" | "locked";
 
 /**
+ * Soft return — a newline inside the agent's composer instead of a send.
+ *
+ * Plain Enter has to keep submitting, so the soft return must arrive as some
+ * OTHER byte sequence that every agent reads as "insert a newline". ESC+CR
+ * ("Meta+Enter") is that sequence, and it is Claude Code's own choice:
+ * `/terminal-setup` writes exactly `{"key": "shift+enter", "command":
+ * "workbench.action.terminal.sendSequence", "args": {"text": "\x1B\r"}}` into
+ * VS Code's keybindings. Verified by hand against every agent we drive — claude
+ * 2.1.219, codex 0.144.6, opencode 1.17.18 — all three insert a newline.
+ *
+ * A bare LF (`\n`, i.e. Ctrl+J) works in those three as well, and is the wrong
+ * choice anyway: a `shell` session is also a session here, and to readline LF
+ * *is* accept-line — Shift+Enter would silently RUN the half-typed command.
+ * ESC+CR is unbound there (readline just beeps), so on the one target that has
+ * no composer to insert into, the keystroke is inert rather than destructive.
+ */
+export const SOFT_RETURN = "\x1b\r";
+
+/**
  * How long to wait after the text before sending the Enter.
  *
  * This has to clear the *Enter-suppression window* of the slowest agent TUI we

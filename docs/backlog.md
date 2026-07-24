@@ -283,6 +283,20 @@ pick it up**.
   was handed are counted and handed back as wheel-DOWNs (it clamps at its own
   bottom, so overshoot is free — which is what makes an approximate counter
   safe). `scripts/term-jump-test.mjs` drives a real shell into each shape.
+- **Soft return** (2026-07-24, client-only): **Shift+Enter** puts a newline in
+  the agent's composer instead of sending the message; plain Enter still sends.
+  xterm maps the chord to a bare CR — byte-identical to Enter — so the key every
+  agent's own footer advertises for "newline" was silently submitting. The wire
+  form is `SOFT_RETURN` = **ESC+CR** (`terminalTypes.ts`), which is Claude Code's
+  own choice (`/terminal-setup` writes exactly that sequence into VS Code's
+  keybindings) and which codex + opencode also read as a newline. A bare LF works
+  in all three too and is still wrong: a `shell` session has no composer, and to
+  readline LF *is* accept-line — Shift+Enter would RUN the half-typed command,
+  where ESC+CR is merely unbound. Soft keyboards can't type the chord at all, so
+  the phone key bar and the iPad control panel grow a `⇧⏎` key.
+  `scripts/soft-return-test.mjs` proves both halves: the frame on the wire (and
+  that xterm's CR is swallowed, not sent alongside) and the ESC arriving at the
+  pty, via a `cat -v` session where control bytes are visible.
 - **Client polish, uncredited:** `97cfe0d`/`3dad62e` two-level connection dialog
   (Existing/Add × Daemon/Relay); `f7c7640` app icons + blocked-session favicon
   blink and `d291a4e` tab-title blink (`f7c7640` also shipped most of MOB-PWA —

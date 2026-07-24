@@ -116,6 +116,7 @@ Terminal screen.
   | `Esc` | `\x1b` | interrupt Claude Code / dismiss TUI prompts |
   | `Tab` | `\x09` | completion |
   | `⇧Tab` | `\x1b[Z` | Claude Code auto-accept toggle |
+  | `⇧⏎` | `\x1b\r` | soft return — a newline in the agent's composer instead of a send (`SOFT_RETURN`). A soft keyboard cannot type the Shift+Enter chord, so on a phone this button *is* the feature; a hardware keyboard gets the chord itself, claimed in `TerminalView` on every platform |
   | `Ctrl` | latch: next key → `\x01`–`\x1a` | any control chord; double-tap locks |
   | `^C` | `\x03` | dedicated because it's the most common chord |
   | `↑ ↓ ← →` | `\x1b[A/B/C/D` | history, TUI menus |

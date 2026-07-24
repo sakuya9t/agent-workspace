@@ -1,6 +1,6 @@
 import { MutableRefObject, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { CtrlLatch, TerminalHandle } from "../terminalTypes";
+import { CtrlLatch, SOFT_RETURN, TerminalHandle } from "../terminalTypes";
 
 interface Props {
   /** Live handle onto the mounted terminal (see TerminalView.onReady). */
@@ -50,6 +50,12 @@ export function TermControlPanel({ handleRef, ctrl, onCycleCtrl, onCopy, onPaste
       </button>
       <button className="kb" onClick={send("\x1b[Z")}>
         {t("keybar.shiftTab")}
+      </button>
+      {/* A tablet's on-screen keyboard has no Shift+Enter chord to press, so
+          this button is its soft return (a paired hardware keyboard still has
+          the chord itself — TerminalView claims it on every platform). */}
+      <button className="kb" onClick={send(SOFT_RETURN)}>
+        {t("keybar.softReturn")}
       </button>
       <button
         className={"kb" + (ctrl !== "off" ? " on" : "") + (ctrl === "locked" ? " locked" : "")}

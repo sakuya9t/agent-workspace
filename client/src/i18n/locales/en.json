@@ -449,6 +449,7 @@
     "esc": "Esc",
     "tab": "Tab",
     "shiftTab": "⇧Tab",
+    "softReturn": "⇧⏎",
     "ctrl": "Ctrl",
     "ctrlC": "^C",
     "up": "Arrow up",

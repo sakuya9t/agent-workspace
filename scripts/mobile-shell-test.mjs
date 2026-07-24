@@ -109,8 +109,8 @@ async function main() {
     await waitFor("!!document.querySelector('.terminal-loading')", 2000),
   );
   const kbCount = await evalJs("document.querySelectorAll('.term-keybar .kb').length");
-  // Esc Tab ⇧Tab Ctrl ^C ↑ ↓ ← → ⌨ Paste Copy
-  check("key bar has all keys", kbCount === 12, `count=${kbCount}`);
+  // Esc Tab ⇧Tab ⇧⏎ Ctrl ^C ↑ ↓ ← → ⌨ Paste Copy
+  check("key bar has all keys", kbCount === 13, `count=${kbCount}`);
 
   // 3. Terminal is live (shell prompt painted).
   check(

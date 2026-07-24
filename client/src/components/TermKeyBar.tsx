@@ -1,7 +1,7 @@
 import { Dispatch, MutableRefObject, SetStateAction } from "react";
 import { useTranslation } from "react-i18next";
 import { copyText } from "../clipboard";
-import { CtrlLatch, TerminalHandle } from "../terminalTypes";
+import { CtrlLatch, SOFT_RETURN, TerminalHandle } from "../terminalTypes";
 import { useTerminalPaste } from "../useTerminalPaste";
 import { PasteSheet } from "./PasteSheet";
 
@@ -44,6 +44,11 @@ export function TermKeyBar({ handleRef, ctrl, setCtrl }: Props) {
         </button>
         <button className="kb" onClick={send("\x1b[Z")}>
           {t("keybar.shiftTab")}
+        </button>
+        {/* A soft keyboard has no Shift+Enter chord to press, so on a phone this
+            button IS the soft return — the same reason ⇧Tab sits next to it. */}
+        <button className="kb" onClick={send(SOFT_RETURN)}>
+          {t("keybar.softReturn")}
         </button>
         <button
           className={"kb" + (ctrl !== "off" ? " on" : "") + (ctrl === "locked" ? " locked" : "")}
