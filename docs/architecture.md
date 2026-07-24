@@ -253,14 +253,13 @@ Agent plugins do not own session lifetime. They provide launch and interpretatio
 
 ### Session Backend Plugins
 
-> **Superseded in part by asmux** (see docs/durable-sessions.md and
-> docs/asmux-protocol.md): the native backend is a **single out-of-process holder
-> for all sessions** (`asmux`), not one sidecar per session; the **VT emulator
-> lives in the daemon**, not the holder; and attach is **single-client with
-> takeover**. The per-session-sidecar prose below predates that decision; where it
-> conflicts with the asmux docs, the asmux docs are authoritative.
-
-Session backend plugins own live terminal mechanics under daemon policy. The native backend uses one out-of-process sidecar per live session. Each sidecar holds that session's PTY master or ConPTY handle, child process handle, terminal emulator state, and backend-local output spool.
+Session backend plugins own live terminal mechanics under daemon policy. The
+native durable backend is one out-of-process holder, **asmux**, for all live
+sessions owned by that daemon user. asmux owns PTY masters/child handles and a
+bounded raw-byte ring per session; the daemon owns VT emulation, SQLite terminal
+events, attention classification and product lifecycle. The frozen contract is
+[`asmux-protocol.md`](asmux-protocol.md); durability and failure reasoning are in
+[`durable-sessions.md`](durable-sessions.md).
 
 Backend responsibilities:
 
@@ -269,70 +268,81 @@ Backend responsibilities:
 - stream terminal output,
 - accept terminal input,
 - resize terminals,
-- maintain a headless terminal emulator screen model,
-- export terminal screen snapshots,
 - report health and exit status,
 - preserve backend-local continuity while clients are disconnected,
-- provide durable event drain or a backend-local append-only output spool.
+- retain bounded hot output for reconnect/adoption,
+- leave live children running when the daemon disconnects or restarts.
+
+Daemon responsibilities above the backend:
+
+- maintain a headless terminal emulator screen model,
+- persist terminal events and exact backend cursors,
+- synthesize attach repaint/history streams,
+- cold-stitch SQLite history to the holder tail after daemon restart,
+- classify attention and commit lifecycle/summary state.
 
 Backend IPC operations:
 
 ```text
-RegisterBackend
-CreateBackendSession
-AttachBackendSession
-QueryBackendSession
-StreamBackendOutput
-DrainBackendEvents
-SendBackendInput
-ResizeBackendSession
-StopBackendSession
-ExportBackendSnapshot
-DetachDaemon
+Hello
+Create / List
+Attach / Detach
+SessionInput / SessionOutput
+Resize / Kill
+Purge / UpdateMetadata / ReadBuffer
+Heartbeat
+SessionExited / SessionDetached / Error
 ```
 
 No-gap rules:
 
 - client disconnect never stops a backend session,
-- daemon restart reattaches to live per-session sidecars,
-- daemon upgrade leaves existing sidecars and live PTYs running,
-- backend output generated during daemon reconnect is drained into the terminal event store,
+- daemon restart reconnects to the same holder and adopts live sessions,
+- output produced while the daemon is away remains in asmux's bounded ring,
+- adoption seeds the daemon from SQLite cold history, then attaches from the
+  exact persisted holder cursor,
+- a wrapped holder ring produces an explicit visible gap marker rather than
+  silently pretending continuity,
 - exited or failed processes are recorded as terminal states,
-- rerunning an agent creates an explicit follow-up session.
+- rerunning/continuing work creates an explicit forked session.
 
-Native sidecar lifetime:
+Native holder lifetime:
 
-- one sidecar per live session is the default MVP model,
-- daemon restart leaves per-session sidecars and live PTYs running,
-- daemon upgrade leaves existing sidecars running on their original binary until their sessions exit,
-- new sessions use the currently installed sidecar binary,
-- systemd user units keep sidecar processes outside daemon restart kill paths,
+- one asmux process owns every live native session for the user/daemon,
+- daemon restart leaves asmux and all live PTYs running,
+- a reconnect supervisor re-dials, reattaches each route from its last cursor,
+  and reconciles `list` after every connection recovery,
+- systemd deployments keep asmux outside the daemon restart kill path,
 - Windows user-scoped startup avoids placing live session processes in a daemon job object that is torn down on daemon restart,
-- sidecar crash marks its owned session failed,
-- sidecar maintenance that terminates a live session is explicit and session-scoped.
+- an asmux crash loses all live PTYs but preserves SQLite history and reconciles
+  affected sessions to `indeterminate`,
+- holder binary-drift soft reboot and orphan adoption UI remain M4 Stage C.
 
-Sidecar rendezvous:
+Holder rendezvous:
 
-- sidecar IPC sockets live in a well-known per-user runtime directory,
-- socket names are derived from session IDs,
-- session records persist the expected sidecar socket path and sidecar process metadata,
-- daemon startup scans the runtime directory before reconciling session records,
-- live sidecars without matching session records become orphaned sidecar records,
-- orphaned sidecars are surfaced in diagnostics and the session list,
-- the owner can adopt an orphan as a recovered session or terminate it.
+- one `0600` socket lives in a `0700` per-user runtime directory,
+- asmux refuses to displace a live holder unless explicitly overridden,
+- a watchdog rebinds if the live socket path is unlinked or replaced,
+- daemon startup listens first, then reconciles DB live rows against asmux
+  `list`, so ordinary API/history reads are available during adoption,
+- holder sessions missing DB ownership are the pending M4-C orphan-surfacing
+  case.
 
 Resume model:
 
-- the sidecar runs a headless VT emulator for every live session,
-- live attach requests fetch a fresh emulator snapshot from the session sidecar,
-- terminal snapshots are exported as a synthesized ANSI repaint stream with cursor and mode metadata,
+- the daemon runs a headless VT emulator for every live session,
+- alternate-screen/self-scrolling agents attach with a synthesized ANSI repaint,
+- normal-buffer agents attach with bounded raw-history replay so xterm.js
+  reconstructs scrollback as well as the current screen,
 - fresh clients resume by writing the repaint stream through the same xterm.js path as live output,
-- event replay fills only the tail after the snapshot,
-- persisted snapshots support exited-session history, inspection, search, diagnostics, and fallback recovery,
-- replay from an arbitrary raw byte offset is not a resume mechanism,
+- daemon restart uses exact SQLite cold-stitch plus the holder tail,
+- persisted terminal events support exited-session history, inspection,
+  transcript fallback, diagnostics and restart recovery,
 - resize repaint requests are available as a pragmatic TUI refresh trigger.
 
-The native PTY sidecar is the MVP backend. A tmux backend is a normal backend plugin that maps product sessions to tmux sessions, windows, or panes and uses tmux's server-side screen state. Windows-native operation does not depend on tmux or WSL.
+asmux is the native MVP backend. A future tmux backend remains a normal backend
+plugin mapping product sessions to tmux sessions/windows/panes. Windows-native
+operation will use ConPTY and does not depend on tmux or WSL (M5).
 
 ### Source-Control Plugins
 
@@ -1029,5 +1039,7 @@ MVP storage disclosure:
 - Git checkpoint and worktree naming, retention, and garbage collection.
 - Binary, large-file, generated-file, and ignored-path diff behavior.
 - Placement policy defaults across locality, latency, load, cost, and power state.
-- Relay stream-multiplexing framing: default is yamux over the registration WSS, with frp-style dial-out-per-stream as the documented fallback (see connectivity-execution-plan.md → Locked decisions).
+- Relay transport hardening beyond the shipped dial-out-per-stream design
+  (TLS/443 deployment, ACLs, key rotation, pairing, and splice-point
+  confidentiality); see `connectivity-execution-plan.md` → R5.
 - Pairing-code enrollment brokered through the relay to replace manual token paste.

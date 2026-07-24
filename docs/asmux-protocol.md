@@ -1,10 +1,10 @@
 # asmux Wire Protocol (Frozen Contract)
 
-Status: **draft, pre-freeze** — changeable until asmux ships. After that the
-contract is **append-only**: no ordinal is reused, no FlatBuffers field `id` is
-removed or renumbered, no enum value repurposed, no error code changed in
-meaning. New capability is added only as new ordinals, new trailing fields with
-new ids, or new enum/error values.
+Status: **shipped and frozen** (M1 landed; reconciled 2026-07-24). The contract
+is **append-only**: no ordinal is reused, no FlatBuffers field `id` is removed or
+renumbered, no enum value repurposed, and no error code changed in meaning. New
+capability is added only as new ordinals, new trailing fields with new ids, or
+new enum/error values.
 
 Companion: [`durable-sessions.md`](durable-sessions.md) (architecture & rationale).
 
@@ -487,9 +487,11 @@ an in-place mutation).
 
 ## Resolved protocol decisions
 
-1. **Toolchain: `planus`** (pure-Rust FlatBuffers), codegen from `schema/
-   asmux.fbs` via `build.rs`. Falls back to `flatc` + the `flatbuffers` crate if
-   needed; wire bytes are identical, so this is not part of the frozen contract.
+1. **Toolchain: `planus`** (pure-Rust FlatBuffers), manually generated from
+   `crates/asmux-wire/schema/asmux.fbs` with the command recorded in
+   `crates/asmux-wire/src/lib.rs`. There is no `build.rs`; RF-GATE tracks a CI
+   drift check. `flatc` + the `flatbuffers` crate remains a fallback if needed;
+   wire bytes are identical, so this is not part of the frozen contract.
 2. **Single holder for all sessions**, bounded by a total-memory cap and made
    recoverable by the two-tier model (see [Failure domain](#failure-domain-one-holder-bounded-recoverable)),
    in place of a per-session sidecar.

@@ -21,13 +21,11 @@
 >
 > Read [`fork-session.md`](fork-session.md) for what actually exists.
 
-A session that ended still holds most of its value: a branch with work on it, a
-worktree with that work checked out, and a conversation in which an agent
-learned the shape of the problem. Today all three are stranded — the only way
-forward from a dead session is a new session that knows nothing. This document
-specifies **recovery**: continuing a terminated session's work in a fresh
-session, on the same branch, in the same worktree, with the old conversation
-carried across.
+At the time this design was written, a session that ended still held most of its
+value—a branch, worktree and learned conversation—but all three were stranded.
+This document specified **recovery**: continuing that work in a fresh session,
+on the same branch and worktree, with the old conversation carried across. The
+shipping fork feature now provides that path.
 
 Recovery is explicitly **not** resurrection. The PTY is gone; the child process
 is gone. We never pretend otherwise. What we recover is the *place* (branch +
@@ -264,29 +262,22 @@ if a recovery is itself recovered) and costs one nullable column.
 | origin has no conversation (shell) | brief (its scrollback is genuinely useful here) |
 | brief empty (no `terminal_events`) | recover anyway — place without context beats nothing |
 
-## Staging
+## Historical staging and current status
 
-- **Stage A — native resume for Claude + Codex.** The trait seam, `SCHEMA_V7`,
-  id capture in the monitor, `POST /api/sessions/:id/recover`, and the client
-  affordance on a terminal session. Both providers' ids are already discoverable
-  by code that exists.
-- **Stage B — the brief.** vt100 → prose, the `.asm/recovered-*.txt` file, the
-  pointer prompt. Covers shell, `custom_command`, and any Stage-A miss.
-- **Stage C — opencode native resume.** Read the id out of `opencode.db`. Pure
-  plugin change; the recovery flow is untouched.
-
-Stage A is small: the worktree reuse and the argv passthrough both already work
-(`args` flows `CreateSessionBody` → `AgentContext.extra_args` → `cli_launch` →
-`BackendSpawnSpec` → argv, `builtin.rs:231`), so most of Stage A is capture,
-persistence, and UI rather than new machinery.
+- **Stage A — shipped as fork.** The trait seam, `SCHEMA_V7`, monitor-time id
+  capture, client affordance, and native Claude/Codex continuation landed behind
+  `POST /api/sessions/:id/fork`.
+- **Stage B — mostly shipped, one follow-up.** Transcript-bearing agents get a
+  bounded deterministic digest, optional prose summary, file and pointer prompt.
+  The PTY-scrollback source for `shell`/`custom_command` remains **FORK-SHELL**.
+- **Stage C — pending as FORK-OC.** Read the conversation id from `opencode.db`
+  and launch its native fork. The general fork flow does not move.
 
 ## Open questions
 
-- **Recover into a *new* branch?** Recovering onto the origin's branch means the
-  new session commits onto the same line of work — usually right. A variant that
-  branches off the origin's tip instead would suit "retry this differently".
-  Deferred; the branch triple on `CreateSessionRequest` already expresses it if
-  we want it.
+- ~~**Recover into a new branch?**~~ Resolved by fork: the default creates a new
+  `asm-session/<id>` branch from the origin's tip; an explicit same-branch option
+  shares the origin's worktree after the origin stops.
 - **Recovering an `indeterminate` session whose process is secretly still alive.**
   The advisory says it may still be running as an orphan. Recovery would put a
   second agent in the same worktree. M4 Stage C's orphan reconciliation is the
