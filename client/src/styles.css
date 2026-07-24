@@ -1399,24 +1399,47 @@ body.col-resizing iframe {
   margin: 4px 0 10px;
 }
 
-/* Upload into the session workspace. The panel body is the drop target, so the
-   affordance is an inset outline on the whole column rather than a box around
-   the button — a dragged file can be aimed anywhere in Details. */
+/* Upload into the session workspace. The panel body remains the generous drop
+   target, while the persistent dashed box makes the affordance visible before
+   a drag begins. */
 .details.dropping {
   outline: 2px dashed var(--accent);
   outline-offset: -6px;
+}
+.upload-box {
+  border: 1px dashed var(--dim);
+  border-radius: 8px;
+  padding: 9px 10px;
+  margin: 4px 0 10px;
+  background: color-mix(in srgb, var(--accent) 4%, transparent);
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.details.dropping .upload-box {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
 .upload-row {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin: 4px 0 10px;
   flex-wrap: wrap;
 }
-/* Match `.field`'s bottom gap so the upload result reads as its own row rather
-   than running into the field that follows it. */
+.upload-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.upload-icon {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
 .upload-result {
-  margin-bottom: 10px;
+  margin-top: 8px;
 }
 .drop-hint {
   color: var(--accent);

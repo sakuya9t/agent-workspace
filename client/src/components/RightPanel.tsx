@@ -443,39 +443,53 @@ export function RightPanel({ target, session, onCommitChanges }: Props) {
         <Field label={t("rightPanel.fieldDirectory")} value={session.working_directory} mono />
         {/* Sits directly under the path it writes into, so "where does this go?"
             is answered by the layout rather than by the help text. */}
-        <div className="upload-row">
-          <button
-            className="btn tiny"
-            disabled={upload.phase === "busy"}
-            onClick={() => fileInputRef.current?.click()}
-            title={t("rightPanel.upload.title")}
-          >
-            {t("rightPanel.upload.button")}
-          </button>
-          {/* There is no drag-and-drop on a phone, so don't offer it there. */}
-          {!isPhone && <span className="dim small">{t("rightPanel.upload.hint")}</span>}
-        </div>
-        {/* No `accept` — any file type is worth handing an agent, bounded by
-            size alone; `multiple` because collecting a few files at once is the
-            normal case for this action. */}
-        <input
-          ref={fileInputRef}
-          type="file"
-          multiple
-          hidden
-          onChange={(e) => {
-            void uploadFiles(Array.from(e.target.files ?? []));
-            e.target.value = ""; // let the same file be picked again next time
-          }}
-        />
-        {upload.phase === "busy" && <div className="dim small upload-result">{upload.message}</div>}
-        {upload.phase === "done" && (
-          <div className="dim small upload-result">
-            {t("rightPanel.upload.done", { count: upload.paths.length })}
-            <div className="mono">{upload.paths.join(", ")}</div>
+        <div className="upload-box">
+          <div className="upload-row">
+            <button
+              className="btn tiny upload-button"
+              disabled={upload.phase === "busy"}
+              onClick={() => fileInputRef.current?.click()}
+              title={t("rightPanel.upload.title")}
+            >
+              <svg
+                className="upload-icon"
+                viewBox="0 0 16 16"
+                fill="none"
+                aria-hidden="true"
+                focusable="false"
+              >
+                <path d="M8 10V2M8 2 4.75 5.25M8 2l3.25 3.25" />
+                <path d="M3 9.5V12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V9.5" />
+              </svg>
+              <span>{t("rightPanel.upload.button")}</span>
+            </button>
+            {/* There is no drag-and-drop on a phone, so don't offer it there. */}
+            {!isPhone && <span className="dim small">{t("rightPanel.upload.hint")}</span>}
           </div>
-        )}
-        {upload.phase === "error" && <div className="error upload-result">{upload.message}</div>}
+          {/* No `accept` — any file type is worth handing an agent, bounded by
+              size alone; `multiple` because collecting a few files at once is the
+              normal case for this action. */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            hidden
+            onChange={(e) => {
+              void uploadFiles(Array.from(e.target.files ?? []));
+              e.target.value = ""; // let the same file be picked again next time
+            }}
+          />
+          {upload.phase === "busy" && (
+            <div className="dim small upload-result">{upload.message}</div>
+          )}
+          {upload.phase === "done" && (
+            <div className="dim small upload-result">
+              {t("rightPanel.upload.done", { count: upload.paths.length })}
+              <div className="mono">{upload.paths.join(", ")}</div>
+            </div>
+          )}
+          {upload.phase === "error" && <div className="error upload-result">{upload.message}</div>}
+        </div>
         {instance && (
           <>
             <Field
@@ -505,7 +519,6 @@ export function RightPanel({ target, session, onCommitChanges }: Props) {
             {cleanup.error && <div className="error">{String(cleanup.error)}</div>}
           </>
         )}
-        <Field label={t("rightPanel.fieldSize")} value={`${session.cols}×${session.rows}`} />
         {session.exit_code !== null && (
           <Field label={t("rightPanel.fieldExitCode")} value={String(session.exit_code)} />
         )}

@@ -300,7 +300,6 @@
     "fieldCommand": "Command",
     "fieldDirectory": "Directory",
     "fieldWorkspaceInstance": "Workspace instance",
-    "fieldSize": "Size",
     "fieldExitCode": "Exit code",
     "fieldAttention": "Attention",
     "fieldExit": "Exit",
