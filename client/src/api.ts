@@ -596,10 +596,17 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }).then((r) => r.session),
-  stopSession: (t: Target, id: string) =>
-    req<{ session: Session }>(t, `/api/sessions/${id}/stop`, { method: "POST" }).then(
-      (r) => r.session,
-    ),
+  /**
+   * End a session. The daemon refuses with 409 while the agent is working or
+   * blocked on a prompt (a turn is in flight); `force` is the deliberate
+   * override the stop dialog's "force stop" checkbox sends.
+   */
+  stopSession: (t: Target, id: string, force = false) =>
+    req<{ session: Session }>(
+      t,
+      `/api/sessions/${id}/stop${force ? "?force=true" : ""}`,
+      { method: "POST" },
+    ).then((r) => r.session),
   archiveSession: (t: Target, id: string, force = false) =>
     req<{ session: Session }>(
       t,

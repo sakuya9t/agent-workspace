@@ -1266,6 +1266,16 @@ body.col-resizing iframe {
   padding: 2px 8px;
   font-size: 11px;
 }
+/* Destructive confirm (stop / force stop). Red enough to read as "this ends
+   something", but still a plain button so it sits level with Cancel rather than
+   inviting the click the way `.primary` does. */
+.btn.danger {
+  color: #f7768e;
+  border-color: #5a2b34;
+}
+.btn.danger:hover:not(:disabled) {
+  border-color: #f7768e;
+}
 .btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;

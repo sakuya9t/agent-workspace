@@ -373,7 +373,7 @@ at registration; a mismatched client entry reads as unreachable.
 | GET | `/api/sessions/:id` | session detail |
 | GET | `/api/sessions/:id/summary` | structural summary record |
 | GET | `/api/sessions/:id/workspace` | this session's isolated instance |
-| POST | `/api/sessions/:id/stop` | stop a live session |
+| POST | `/api/sessions/:id/stop?force=` | stop a live session — `409` while the agent is working or blocked (a turn is in flight) unless `force=true` |
 | POST | `/api/sessions/:id/archive` | archive a terminal session |
 | POST | `/api/sessions/:id/cleanup?force=` | remove the session's worktree |
 | POST | `/api/sessions/:id/resize` | resize (`{rows, cols}`) |
@@ -459,6 +459,7 @@ node scripts/mobile-shell-test.mjs         # mobile adaptive shell at a phone vi
 node scripts/copy-paste-test.mjs           # copy/paste personas (T1 + T2)
 node scripts/archive-kickout-test.mjs      # archiving kicks every client out of the session view
 node scripts/confirm-destructive-test.mjs  # stop / archive ask before they act
+node scripts/stop-protection-test.mjs      # working/blocked sessions refuse an unforced stop
 ```
 
 `copy-paste`'s **T3** needs a genuinely insecure origin (a LAN IP), which a

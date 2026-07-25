@@ -5,17 +5,24 @@
 //   cd client && npm run build              # once, to produce client/dist
 //   node scripts/confirm-destructive-test.mjs
 //
-// Both halves are tested the same way, and the *dismiss* half is the one that
-// matters: a confirm() nobody can say no to is just a slower button.
+// The *dismiss* half is the one that matters: a prompt nobody can say no to is
+// just a slower button.
 //
 //   1. stop, dismissed    -> session must STILL be running
 //   2. stop, accepted     -> session stops
 //   3. archive, dismissed -> session must STILL be in history, not archived
 //   4. archive, accepted  -> archived, and gone from history
 //
-// The dialog text is asserted too, not just its existence: rows carry no visible
-// session id, so the prompt has to echo back what the row showed ("shell · cwd")
-// or a mis-click gets confirmed as readily as the intended click.
+// The two halves prompt differently. Archive still uses a native confirm();
+// stop uses the in-app StopSessionDialog, because a session that is *mid-turn*
+// needs a force-stop checkbox the browser dialog cannot carry (that half —
+// working/blocked sessions refusing an unforced stop — is
+// `stop-protection-test.mjs`). Here the session is an idle shell, so the dialog
+// must show NO checkbox and stop in one click.
+//
+// The prompt text is asserted too, not just its existence: rows carry no visible
+// session id, so it has to echo back what the row showed ("shell · cwd") or a
+// mis-click gets confirmed as readily as the intended click.
 //
 // Layout note (same as archive-kickout-test): the workspace tree lists only LIVE
 // sessions, so once stopped, a session moves to the History section — collapsed
@@ -46,6 +53,19 @@ const OPEN_HISTORY = `(() => {
   return true;
 })()`;
 const HIST_ROW = ".history-list .session-row";
+
+const MODAL = ".modal-backdrop .modal";
+
+/** Click the stop dialog's action button whose label matches `re`. */
+const clickModalBtn = (re) => `(() => {
+  const m = document.querySelector('${MODAL}');
+  if (!m) return 'no modal';
+  const b = [...m.querySelectorAll('.modal-actions button')].find((b) => ${re}.test(b.textContent || ''));
+  if (!b) return 'no button';
+  if (b.disabled) return 'disabled';
+  b.click();
+  return 'clicked';
+})()`;
 
 /** Click the row's action button whose tooltip matches `re` (buttons are icon-only). */
 const clickAction = (rowSel, re) => `(() => {
@@ -98,18 +118,33 @@ async function main() {
   check("row rendered (live tree)", await page.waitFor("!!document.querySelector('.session-row')"));
 
   // ======================================================== 1. stop, dismissed
-  answer = false;
   const c1 = await page.evalJs(clickAction(".session-row", /stop/i));
   check("stop clicked", c1 === "clicked", c1);
+  check("stop opened the dialog", await page.waitFor(`!!document.querySelector('${MODAL}')`));
+  const stopText = await page.evalJs(`document.querySelector('${MODAL}').innerText`);
+  check(
+    "stop dialog names the session",
+    stopText.includes("shell") && stopText.includes("cwd"),
+    stopText.split("\n")[0],
+  );
+  // A shell carries no attention signal at all ("none" — silent), which counts
+  // as idle, not as work worth guarding: no checkbox, Stop live immediately.
+  check(
+    "no force checkbox for a silent session",
+    !(await page.evalJs(`!!document.querySelector('${MODAL} input[type=checkbox]')`)),
+  );
+  const cancel = await page.evalJs(clickModalBtn(/cancel/i));
+  check("cancel clicked", cancel === "clicked", cancel);
   await sleep(1500);
-  check("stop prompted a confirm()", dialogs.length === 1, firstLine());
-  check("stop prompt names the session", last().includes("shell") && last().includes("cwd"), firstLine());
   check("DISMISSED -> still running  <-- the point of the test", (await statusOf(a.id)) === "running");
+  check("DISMISSED -> dialog closed", !(await page.evalJs(`!!document.querySelector('${MODAL}')`)));
 
   // ======================================================== 2. stop, accepted
-  answer = true;
   const c2 = await page.evalJs(clickAction(".session-row", /stop/i));
   check("stop clicked again", c2 === "clicked", c2);
+  check("dialog reopened", await page.waitFor(`!!document.querySelector('${MODAL}')`));
+  const confirmStop = await page.evalJs(clickModalBtn(/^stop$/i));
+  check("stop confirmed", confirmStop === "clicked", confirmStop);
   check("ACCEPTED -> stopped", await reaches(a.id, "stopped"), await statusOf(a.id));
 
   // ==================================================== 3. archive, dismissed

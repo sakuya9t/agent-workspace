@@ -45,3 +45,25 @@ export function needsAttention(attention: AttentionState): boolean {
     attention === "error"
   );
 }
+
+/**
+ * The agent has a turn in flight: it is working ("activity"), or blocked on a
+ * prompt waiting for the user to let that turn proceed. Stopping here throws
+ * the work away, so the daemon refuses an unforced stop for these states and
+ * the stop dialog gates the button behind a "force stop" checkbox.
+ *
+ * Only working and blocked are protected. "idle", "none" (silent — no signal,
+ * e.g. a plain shell, which opts out of attention tracking entirely) and
+ * "error" all stop in one click. That makes this narrower than
+ * `needsAttention`, which counts "error": needing attention is not the same as
+ * being mid-turn — an errored turn has already aborted, so there is nothing
+ * left to lose. This is the client-side twin of `AttentionState::is_busy`
+ * (`crates/daemon/src/domain.rs`); the two definitions have to agree.
+ */
+export function isBusy(attention: AttentionState): boolean {
+  return (
+    attention === "activity" ||
+    attention === "likely_blocked" ||
+    attention === "approval_needed"
+  );
+}

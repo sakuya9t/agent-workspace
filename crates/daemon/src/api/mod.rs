@@ -800,12 +800,21 @@ async fn get_session_usage(
     Ok(Json(json!({ "usage": usage })))
 }
 
+/// Stop a session. Refused with `409` while the agent is working or blocked on
+/// a prompt — a turn is in flight and killing it loses that work. `?force=true`
+/// (the client's "force stop" checkbox) overrides.
 async fn stop_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<CleanupParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let s = state.manager.stop_session(&id)?;
-    Ok(Json(json!({ "session": s })))
+    match state.manager.stop_session(&id, params.force) {
+        Ok(s) => Ok(Json(json!({ "session": s }))),
+        Err(e) if e.downcast_ref::<crate::session_manager::SessionBusy>().is_some() => {
+            Err(AppError(StatusCode::CONFLICT, format!("{e:#}")))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 async fn archive_session(

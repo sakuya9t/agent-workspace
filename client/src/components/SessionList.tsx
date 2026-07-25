@@ -6,7 +6,8 @@ import { daemonLabel, Target, targetOf, useConnStore } from "../connectionStore"
 import { useUiStore } from "../store";
 import { DaemonState, useDaemonPlugins, useDaemonStates } from "../useDaemons";
 import { canForkInto } from "./NewSessionDialog";
-import { isLive } from "../status";
+import { StopSessionDialog } from "./StopSessionDialog";
+import { isBusy, isLive } from "../status";
 import { relTime } from "../i18n/time";
 import { attentionLabel, endedLabel, statusLabel } from "../i18n/labels";
 
@@ -33,6 +34,16 @@ const ATTENTION_COLOR: Partial<Record<AttentionState, string>> = {
 
 type MutArgs = { target: Target; id: string };
 
+/** The session the stop dialog is confirming, plus how it was reached. */
+type StopTarget = {
+  daemonId: string;
+  target: Target;
+  session: Session;
+  name: string;
+  /** Sticky once the daemon has answered 409, even if the row looks idle. */
+  forceRequired: boolean;
+};
+
 export function SessionList() {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -46,6 +57,7 @@ export function SessionList() {
   const updateDaemon = useConnStore((s) => s.updateDaemon);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [stopTarget, setStopTarget] = useState<StopTarget | null>(null);
 
   const states = useDaemonStates();
   const pluginsByDaemon = useDaemonPlugins();
@@ -59,9 +71,24 @@ export function SessionList() {
   const isOpen = (id: string) => !collapsed.has(id);
   const refresh = () => qc.invalidateQueries({ queryKey: ["daemon"] });
 
+  // Stopping is confirmed in a dialog rather than a native `confirm()` because
+  // a working/blocked session needs the force-stop checkbox (see
+  // StopSessionDialog). The daemon guards the same rule, so a 409 here means the
+  // row was stale — keep the dialog open and make it the force variant instead
+  // of failing the click.
   const stop = useMutation({
-    mutationFn: ({ target, id }: MutArgs) => api.stopSession(target, id),
-    onSuccess: refresh,
+    mutationFn: ({ target, id, force }: MutArgs & { force: boolean }) =>
+      api.stopSession(target, id, force),
+    onSuccess: () => {
+      setStopTarget(null);
+      refresh();
+    },
+    onError: (e) => {
+      if ((e as { status?: number }).status === 409) {
+        setStopTarget((prev) => (prev ? { ...prev, forceRequired: true } : prev));
+      }
+      refresh();
+    },
   });
   // Archiving removes the session from history and deletes its branch. The click
   // is already confirmed; this second prompt is the escalation — the daemon
@@ -147,6 +174,16 @@ export function SessionList() {
   }
   history.sort((a, b) => b.s.last_activity_at - a.s.last_activity_at);
 
+  // Re-read the session the stop dialog is open on from the latest poll: a
+  // session that starts working *while* the dialog sits open must grow the
+  // checkbox, not be stopped by the click the user already aimed at an idle row.
+  const stopCurrent = stopTarget
+    ? (states
+        .find((st) => st.daemon.id === stopTarget.daemonId)
+        ?.data?.sessions.find((x) => x.id === stopTarget.session.id) ??
+      stopTarget.session)
+    : null;
+
   const row = (
     daemonId: string,
     target: Target,
@@ -209,13 +246,22 @@ export function SessionList() {
           {isLive(s.status) ? (
             <button
               className="icon-btn"
-              title={t("sessionList.stopTitle")}
+              title={
+                isBusy(s.attention_state)
+                  ? t("sessionList.stopBusyTitle")
+                  : t("sessionList.stopTitle")
+              }
               aria-label={t("sessionList.stopTitle")}
               onClick={(e) => {
                 e.stopPropagation();
-                if (confirm(t("sessionList.confirmStop", { name }))) {
-                  stop.mutate({ target, id: s.id });
-                }
+                stop.reset();
+                setStopTarget({
+                  daemonId,
+                  target,
+                  session: s,
+                  name,
+                  forceRequired: isBusy(s.attention_state),
+                });
               }}
             >
               <span className="action-icon action-icon-stop" aria-hidden="true" />
@@ -537,6 +583,23 @@ export function SessionList() {
             </div>
           )}
         </div>
+      )}
+
+      {stopTarget && stopCurrent && (
+        <StopSessionDialog
+          name={stopTarget.name}
+          busy={stopTarget.forceRequired || isBusy(stopCurrent.attention_state)}
+          attention={stopCurrent.attention_state}
+          pending={stop.isPending}
+          error={stop.error ? String((stop.error as Error).message) : null}
+          onCancel={() => {
+            stop.reset();
+            setStopTarget(null);
+          }}
+          onConfirm={(force) =>
+            stop.mutate({ target: stopTarget.target, id: stopTarget.session.id, force })
+          }
+        />
       )}
     </div>
   );

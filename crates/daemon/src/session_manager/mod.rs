@@ -60,6 +60,23 @@ impl std::fmt::Display for NeedsForce {
 
 impl std::error::Error for NeedsForce {}
 
+/// A stop was refused because the agent has a turn in flight — it is working,
+/// or blocked on a prompt waiting for the user (see
+/// [`AttentionState::is_busy`]). Typed like [`NeedsForce`] so the API can answer
+/// `409 Conflict` and the client can offer the force-stop escape hatch, but kept
+/// distinct because the reason is different: nothing on disk is at risk here,
+/// the *running turn* is.
+#[derive(Debug)]
+pub struct SessionBusy(pub String);
+
+impl std::fmt::Display for SessionBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for SessionBusy {}
+
 /// A deck response named a prompt revision that is no longer on screen. Typed
 /// so the API can return 409 and make controllers refresh instead of guessing.
 #[derive(Debug)]
@@ -344,7 +361,37 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("session vanished after creation"))
     }
 
-    pub fn stop_session(&self, id: &str) -> Result<Session> {
+    /// End a session: kill the backend child and record `stopped`.
+    ///
+    /// Guarded. A session whose agent is *working* or *blocked on a prompt* has
+    /// a turn in flight, and stopping it there loses that work — one mis-clicked
+    /// row and a long-running agent is gone. Such a stop is refused with a typed
+    /// [`SessionBusy`] (the API turns it into `409`) unless the caller passes
+    /// `force`, which is what the client's "force stop" checkbox sends. Idle,
+    /// errored, and unattended sessions stop without ceremony.
+    ///
+    /// The guard reads the *stored* attention state, so it is the daemon — not
+    /// the client's possibly-stale row — that decides whether a session is busy.
+    /// Daemon shutdown does not come through here (see
+    /// [`shutdown_all_live`](Self::shutdown_all_live)): it tears live sessions
+    /// down unconditionally, which is correct — the process is going away either
+    /// way, and refusing would leak children.
+    pub fn stop_session(&self, id: &str, force: bool) -> Result<Session> {
+        if !force {
+            if let Some(s) = self.db.get_session(id)? {
+                if !s.status.is_terminal() && s.attention_state.is_busy() {
+                    return Err(SessionBusy(format!(
+                        "the agent is {} — stopping now would kill the turn in flight; \
+                         use force stop to end it anyway",
+                        match s.attention_state {
+                            AttentionState::Activity => "still working",
+                            _ => "blocked waiting for you",
+                        }
+                    ))
+                    .into());
+                }
+            }
+        }
         let handle = self.live_handle(id);
         match handle {
             Some(h) => {
@@ -1109,7 +1156,7 @@ mod tests {
         let s = manager.create_session(shell_req()).unwrap();
         assert_eq!(s.status, SessionStatus::Running);
 
-        let stopped = manager.stop_session(&s.id).unwrap();
+        let stopped = manager.stop_session(&s.id, false).unwrap();
         assert_eq!(stopped.status, SessionStatus::Stopped);
 
         // Let the monitor task observe the backend exit and finalize.
@@ -1122,6 +1169,70 @@ mod tests {
         assert!(summary.is_some(), "a structural summary must be written");
         assert_eq!(summary.unwrap().session_id, s.id);
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn busy_session_refuses_stop_without_force() {
+        let (manager, dir) = test_manager();
+        let s = manager.create_session(shell_req()).unwrap();
+        let set = |a| {
+            manager
+                .db
+                .set_attention(&s.id, a, None, now_millis())
+                .unwrap()
+        };
+
+        // Working, then blocked on a prompt: both have a turn in flight, so the
+        // stop is refused and the session is left running untouched.
+        for busy in [
+            AttentionState::Activity,
+            AttentionState::LikelyBlocked,
+            AttentionState::ApprovalNeeded,
+        ] {
+            set(busy);
+            let err = manager.stop_session(&s.id, false).unwrap_err();
+            assert!(
+                err.downcast_ref::<SessionBusy>().is_some(),
+                "{busy:?} must refuse an unforced stop, got: {err:#}"
+            );
+            assert_eq!(
+                manager.get_session(&s.id).unwrap().unwrap().status,
+                SessionStatus::Running
+            );
+        }
+
+        // Force is the escape hatch the client's checkbox sends.
+        assert_eq!(
+            manager.stop_session(&s.id, true).unwrap().status,
+            SessionStatus::Stopped
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn idle_silent_and_errored_sessions_stop_unforced() {
+        let (manager, dir) = test_manager();
+        // Only working and blocked are protected. An idle session never started
+        // a turn, a silent one (`none`) has no signal to go on, and an errored
+        // one already aborted — stopping is the ordinary way to end all three.
+        for a in [
+            AttentionState::Idle,
+            AttentionState::None,
+            AttentionState::Error,
+        ] {
+            let s = manager.create_session(shell_req()).unwrap();
+            manager
+                .db
+                .set_attention(&s.id, a, None, now_millis())
+                .unwrap();
+            assert_eq!(
+                manager.stop_session(&s.id, false).unwrap().status,
+                SessionStatus::Stopped,
+                "{a:?} must stop without force"
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1444,7 +1555,7 @@ mod tests {
         // Live session cannot be archived.
         assert!(manager.archive_session(&s.id, false).is_err());
         // After stop it can.
-        manager.stop_session(&s.id).unwrap();
+        manager.stop_session(&s.id, false).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         let archived = manager.archive_session(&s.id, false).unwrap();
         assert_eq!(archived.status, SessionStatus::Archived);
@@ -1501,7 +1612,7 @@ mod tests {
         assert!(Path::new(&inst.path).is_dir());
         assert!(workspace::branch_exists(&repo, &branch));
 
-        manager.stop_session(&s.id).unwrap();
+        manager.stop_session(&s.id, false).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         // Branch is merged (points at HEAD) and worktree is clean → archives
@@ -1532,7 +1643,7 @@ mod tests {
         // Add a commit on the session branch so it is no longer merged into HEAD.
         git_in(wt, &["commit", "-q", "--allow-empty", "-m", "work"]);
 
-        manager.stop_session(&s.id).unwrap();
+        manager.stop_session(&s.id, false).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         // Non-force archive refuses (unmerged) with a NeedsForce error, leaving
@@ -1585,7 +1696,7 @@ mod tests {
         assert!(inst.owns_worktree, "we created this worktree");
         assert!(!inst.owns_branch, "`main` was the user's, not ours");
 
-        manager.stop_session(&s.id).unwrap();
+        manager.stop_session(&s.id, false).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         // Archive succeeds and takes the worktree — but `main` survives.
@@ -1626,7 +1737,7 @@ mod tests {
         git_in(wt, &["commit", "-q", "--allow-empty", "-m", "shipped"]);
         std::fs::write(wt.join("dirty.txt"), "wip").unwrap();
 
-        manager.stop_session(&s.id).unwrap();
+        manager.stop_session(&s.id, false).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         let archived = manager.archive_session(&s.id, true).unwrap();
@@ -1672,7 +1783,7 @@ mod tests {
         assert_eq!(Path::new(&inst.path), theirs.as_path());
         assert!(!inst.owns_worktree && !inst.owns_branch);
 
-        manager.stop_session(&s.id).unwrap();
+        manager.stop_session(&s.id, false).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         manager.archive_session(&s.id, true).unwrap();
@@ -2116,7 +2227,7 @@ mod tests {
 
         // Archive the owner first while the sharer is still active: the shared
         // worktree and branch must survive — the sharer is still using them.
-        manager.stop_session(&a.id).unwrap();
+        manager.stop_session(&a.id, false).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         manager.archive_session(&a.id, false).unwrap();
         assert!(Path::new(&wt).is_dir(), "worktree kept while a sharer lives");
@@ -2126,7 +2237,7 @@ mod tests {
         );
 
         // The last session out reclaims both.
-        manager.stop_session(&b.id).unwrap();
+        manager.stop_session(&b.id, false).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         manager.archive_session(&b.id, false).unwrap();
         assert!(!Path::new(&wt).exists(), "last session removes the worktree");
