@@ -160,7 +160,9 @@ Environment overrides: `ASM_BIND`, `ASM_DATA_DIR`, `ASM_CONFIG_DIR`,
 `ASM_RUNTIME_DIR`, `ASM_STATIC_DIR`, `ASM_LOG`; managed Vite uses `ASM_RUN_UI`,
 `ASM_UI_HOST`, `ASM_UI_PORT`, `ASM_UI_ONLY`, `ASM_UI_DAEMON`, and
 `ASM_UI_DAEMON_TOKEN`; and for the holder:
-`ASM_BACKEND` (`native`|`sidecar`), `ASM_ASMUX_AUTOSPAWN` (`0` disables
+`ASM_BACKEND` (`native`|`sidecar`; unset means `native`, and any other value is
+rejected at startup rather than falling back to non-durable native),
+`ASM_ASMUX_AUTOSPAWN` (`0` disables
 auto-spawn), `ASM_ASMUX_BIN` (explicit holder binary path), `ASMUX_SOCK` (holder
 socket path), `ASMUX_MEMORY_LIMIT` (holder ring-memory cap, bytes).
 

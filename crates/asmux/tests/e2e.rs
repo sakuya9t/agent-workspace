@@ -266,6 +266,86 @@ async fn end_to_end_m1_lifecycle() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Dropped output must reach the attacher as `ALLOC_FAILED`.
+///
+/// The reader thread discards a chunk when the ring's fallible reserve fails —
+/// the never-crash rule — and a failed push does not advance `head`, so the loss
+/// leaves no cursor gap for anyone to notice. `ALLOC_FAILED` used to be a
+/// constant no code path emitted, meaning output vanished under exactly the
+/// memory pressure the design exists to survive, with no log and no signal.
+///
+/// A real allocation failure can't be provoked here, so the drop is recorded
+/// through the same call the reader thread makes; what is under test is the
+/// reporting path from that record to the attacher's socket.
+#[tokio::test]
+async fn dropped_output_is_reported_to_the_attacher() {
+    let dir = std::env::temp_dir().join(format!("asmux-e2e-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("asmux.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let registry = Arc::new(Registry::new(
+        "drop-instance".to_string(),
+        0,
+        MEMORY_LIMIT_DEFAULT_BYTES,
+    ));
+    let ctx = ServerCtx::new(registry.clone(), std::process::id() as i32, String::new());
+    tokio::spawn(serve(listener, ctx));
+
+    let stream = UnixStream::connect(&sock).await.unwrap();
+    let (mut rd, mut wr) = stream.into_split();
+
+    let hello = wire::HelloRequest {
+        rpc_id: 1,
+        client_pid: std::process::id() as i32,
+        client_name: Some("e2e".to_string()),
+        protocol_min: 1,
+        protocol_max: 1,
+    };
+    write_frame(&mut wr, frame::encode(ord::HELLO_REQUEST, &hello)).await;
+    let (o, _) = recv_resp(&mut rd).await;
+    assert_eq!(o, ord::HELLO_RESPONSE);
+
+    let create = wire::CreateRequest {
+        rpc_id: 2,
+        command: Some("cat".to_string()),
+        args: None,
+        cwd: None,
+        env: None,
+        cols: 80,
+        rows: 24,
+        metadata: None,
+        ring_capacity: 0,
+        session_id: Some("s-drop".to_string()),
+    };
+    write_frame(&mut wr, frame::encode(ord::CREATE_REQUEST, &create)).await;
+    let (o, _) = recv_resp(&mut rd).await;
+    assert_eq!(o, ord::CREATE_RESPONSE);
+
+    let attach = wire::AttachRequest {
+        rpc_id: 3,
+        session_id: Some("s-drop".to_string()),
+        mode: wire::AttachMode::FromEarliest,
+        from_cursor: 0,
+    };
+    write_frame(&mut wr, frame::encode(ord::ATTACH_REQUEST, &attach)).await;
+    let (o, _) = recv_resp(&mut rd).await;
+    assert_eq!(o, ord::ATTACH_RESPONSE);
+
+    // What the reader thread does when `Ring::push` returns AllocFailed.
+    let session = registry.get("s-drop").expect("session must exist");
+    session.note_output_dropped(4096);
+
+    let (o, b) = recv_resp(&mut rd).await;
+    assert_eq!(o, ord::ERROR, "the attacher must be told output was lost");
+    let er = wire::ErrorRef::read_as_root(&b).unwrap();
+    assert_eq!(er.code().unwrap(), frame::code::ALLOC_FAILED);
+    assert_eq!(er.session_id().unwrap(), Some("s-drop"));
+    assert_eq!(er.rpc_id().unwrap(), 0, "unsolicited, not an RPC reply");
+
+    session.kill(9);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn hello_required_first() {
     let dir = std::env::temp_dir().join(format!("asmux-e2e-{}", uuid::Uuid::new_v4()));

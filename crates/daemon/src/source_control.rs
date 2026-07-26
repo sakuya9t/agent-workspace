@@ -429,9 +429,7 @@ impl SourceControl for GitSourceControl {
             // path resolved relative to `cwd`, matching the working-tree branch
             // below rather than defaulting to the repo root.
             guard_ref(hash)?;
-            let output = Command::new("git")
-                .args(["show", &format!("{hash}:./{path}")])
-                .current_dir(cwd)
+            let output = git_command(cwd, &["show", &format!("{hash}:./{path}")])
                 .output()
                 .map_err(|e| anyhow!("failed to run git: {e}"))?;
             // git ran but the path isn't present at that commit (added later, or
@@ -472,16 +470,17 @@ impl SourceControl for GitSourceControl {
     fn resolve_commit(&self, cwd: &Path, rev: &str) -> Result<Option<String>> {
         // `--verify --quiet` exits non-zero with empty output when the rev does
         // not resolve. Peeling with `^{commit}` guarantees a commit hash out.
-        let output = Command::new("git")
-            .args([
+        let output = git_command(
+            cwd,
+            &[
                 "rev-parse",
                 "--verify",
                 "--quiet",
                 &format!("{rev}^{{commit}}"),
-            ])
-            .current_dir(cwd)
-            .output()
-            .map_err(|e| anyhow!("failed to run git: {e}"))?;
+            ],
+        )
+        .output()
+        .map_err(|e| anyhow!("failed to run git: {e}"))?;
         if !output.status.success() {
             return Ok(None);
         }
@@ -570,15 +569,8 @@ impl SourceControl for GitSourceControl {
         // `--prune` drops tracking refs whose branch is gone upstream, so a
         // branch deleted on the remote stops being reported as living there.
         // Only refs under refs/remotes/ are touched — no local branch, and no
-        // working tree. `GIT_TERMINAL_PROMPT=0` makes a missing or expired
-        // credential fail fast with git's own message rather than blocking the
-        // daemon on an interactive prompt that never gets answered.
-        let out = Command::new("git")
-            .args(["fetch", "--all", "--prune"])
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .current_dir(cwd)
-            .output()
-            .map_err(|e| anyhow!("failed to run git: {e}"))?;
+        // working tree. Credential prompts are disarmed by `git_command`.
+        let out = git_output(cwd, &["fetch", "--all", "--prune"])?;
         if out.status.success() {
             Ok(combined_output(&out))
         } else {
@@ -806,15 +798,8 @@ impl SourceControl for GitSourceControl {
         // and records origin/<branch> as the upstream, so a later Pull has
         // somewhere to pull from. An existing remote branch is fast-forwarded;
         // a diverged one is rejected (non-fast-forward) and surfaced rather
-        // than forced. `GIT_TERMINAL_PROMPT=0` makes a missing/expired
-        // credential fail fast with git's own message instead of blocking the
-        // daemon on an interactive username/password prompt that never comes.
-        let out = Command::new("git")
-            .args(["push", "--set-upstream", "origin", &branch])
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .current_dir(cwd)
-            .output()
-            .map_err(|e| anyhow!("failed to run git: {e}"))?;
+        // than forced. Credential prompts are disarmed by `git_command`.
+        let out = git_output(cwd, &["push", "--set-upstream", "origin", &branch])?;
         if out.status.success() {
             Ok(combined_output(&out))
         } else {
@@ -1390,10 +1375,28 @@ fn git_ok(cwd: &Path, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .args(args)
+/// Every git invocation in this module, built in one place.
+///
+/// The env is the point. `GIT_TERMINAL_PROMPT=0` makes a missing or expired
+/// credential fail fast with git's own message instead of blocking the child on
+/// an interactive prompt that nothing in a daemon will ever answer — a hang that
+/// wedges the `spawn_blocking` worker running it, not just the request. Setting
+/// it per-call was the bug: `fetch` and `push` remembered, `pull` (which reaches
+/// the network just as surely) did not. A helper nobody can forget is the fix.
+///
+/// It is set for local operations too. They never prompt, so it costs nothing
+/// there, and the guarantee is worth more than the exception: any git call added
+/// later inherits it, whether or not its author thought about credentials.
+fn git_command(cwd: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.args(args)
         .current_dir(cwd)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    cmd
+}
+
+pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String> {
+    let output = git_command(cwd, args)
         .output()
         .map_err(|e| anyhow!("failed to run git: {e}"))?;
     if !output.status.success() {
@@ -1410,9 +1413,7 @@ pub(crate) fn git(cwd: &Path, args: &[&str]) -> Result<String> {
 /// treating a non-zero exit as an error. Used by pull/rebase, which want git's
 /// message on both success and failure and decide how to react themselves.
 fn git_output(cwd: &Path, args: &[&str]) -> Result<std::process::Output> {
-    Command::new("git")
-        .args(args)
-        .current_dir(cwd)
+    git_command(cwd, args)
         .output()
         .map_err(|e| anyhow!("failed to run git: {e}"))
 }
@@ -1512,9 +1513,7 @@ fn combined_output(out: &std::process::Output) -> String {
 /// Like `git`, but tolerates exit code 1 (used by diff, which returns 1 when
 /// there are differences — notably `--no-index`).
 fn git_allow_diff(cwd: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
+    let output = git_command(cwd, args)
         .output()
         .map_err(|e| anyhow!("failed to run git: {e}"))?;
     match output.status.code() {
@@ -1601,9 +1600,7 @@ mod tests {
     }
 
     fn git_test(cwd: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(cwd)
+        let output = git_command(cwd, args)
             .output()
             .unwrap_or_else(|e| panic!("failed to run git {args:?}: {e}"));
         assert!(
@@ -1621,6 +1618,37 @@ mod tests {
     fn commit_all(cwd: &Path, message: &str) {
         git_test(cwd, &["add", "."]);
         git_test(cwd, &["commit", "-q", "-m", message]);
+    }
+
+    #[test]
+    fn git_commands_disable_credential_prompts() {
+        let cmd = git_command(Path::new("/"), &["status"]);
+        let prompt = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("GIT_TERMINAL_PROMPT"))
+            .map(|(_, v)| v);
+        assert_eq!(
+            prompt,
+            Some(Some(std::ffi::OsStr::new("0"))),
+            "a git child that can prompt for credentials can hang a daemon worker"
+        );
+    }
+
+    #[test]
+    fn no_git_call_bypasses_the_shared_builder() {
+        // The guarantee is only as good as its single entry point: a git child
+        // spawned directly opts out of `GIT_TERMINAL_PROMPT=0` without saying
+        // so, which is precisely how `pull` came to be able to hang on a
+        // credential prompt while `fetch` and `push` next to it could not.
+        let src = include_str!("source_control.rs");
+        // Split so the needle doesn't match itself in this very file.
+        let needle = concat!("Command::new(\"gi", "t\")");
+        let hand_rolled = src.matches(needle).count();
+        assert_eq!(
+            hand_rolled, 1,
+            "expected the only hand-rolled git Command to be the one inside \
+             `git_command`; route new git calls through it"
+        );
     }
 
     #[test]

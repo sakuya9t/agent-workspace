@@ -720,10 +720,28 @@ async fn stream_session(
     live_attach: bool,
 ) {
     let mut cursor = start;
+    // Output the holder had to discard before this stream existed is already
+    // missing from the replay it is about to send; what this stream owes the
+    // attacher is every drop that happens *while it is watching*, because those
+    // leave no cursor gap to notice (a failed push doesn't advance `head`).
+    let mut reported_drops = session.dropped_events();
     loop {
         // Created before the read so a wake that races it is not lost (`Notify`
         // stores a permit).
         let woken = session.notified();
+        let drops = session.dropped_events();
+        if drops != reported_drops {
+            reported_drops = drops;
+            send_error(
+                &conn.ctrl_tx,
+                0,
+                code::ALLOC_FAILED,
+                Some(&sid),
+                None,
+                "output was dropped: the holder could not allocate ring space",
+            )
+            .await;
+        }
         match session.read_at(cursor, 0) {
             ReadOutcome::Invalid => break,
             ReadOutcome::Gap { earliest: _ } => {

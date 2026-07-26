@@ -204,8 +204,24 @@ pub trait Holder: Send + Sync {
     fn resize(&self, session_id: &str, cols: u16, rows: u16);
     fn kill(&self, session_id: &str, signal: i32);
     /// Register a per-session output route and return its receiver.
-    fn route(&self, session_id: &str) -> mpsc::UnboundedReceiver<StreamEvent>;
+    ///
+    /// `from_cursor` is where the caller's *first* attach starts, and it is not
+    /// optional bookkeeping: it is what a reconnect resumes from. Seeded at 0
+    /// regardless of the attach, an adopted session that dropped its socket
+    /// before delivering a single chunk re-attached `FromCursor(0)` and replayed
+    /// the entire ring into the emulator, the broadcast and the history ring —
+    /// duplicated scrollback on exactly the path made exact by cold-stitch
+    /// adopt. Pass what you attach from.
+    fn route(&self, session_id: &str, from_cursor: u64) -> mpsc::UnboundedReceiver<StreamEvent>;
     fn unroute(&self, session_id: &str);
+    /// Move a route's resume point after a re-attach landed somewhere other than
+    /// where it asked (a ring gap resyncs to the tail, not to `from_cursor`).
+    fn set_stream_cursor(&self, session_id: &str, cursor: u64);
+    /// Where this route would resume from right now: the end of the last chunk
+    /// delivered, or its seed if none has arrived. The single owner of that
+    /// number — a drain loop resyncing after a backpressure eviction asks here
+    /// rather than keeping a second copy that can disagree.
+    fn stream_cursor(&self, session_id: &str) -> u64;
     /// Deliver a synthetic `Exited` into a session's route so its drain finalizes
     /// through the normal exit path. Used by reconnect reconciliation when a
     /// `list` reveals a session exited while the daemon was detached.
@@ -321,13 +337,13 @@ impl Holder for AsmuxClient {
             .send(ClientCmd::Fire(frame::encode(ord::KILL_REQUEST, &req)));
     }
 
-    fn route(&self, session_id: &str) -> mpsc::UnboundedReceiver<StreamEvent> {
+    fn route(&self, session_id: &str, from_cursor: u64) -> mpsc::UnboundedReceiver<StreamEvent> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.shared.routes.lock().insert(
             session_id.to_string(),
             Arc::new(Route {
                 tx,
-                last_cursor: AtomicU64::new(0),
+                last_cursor: AtomicU64::new(from_cursor),
             }),
         );
         rx
@@ -335,6 +351,21 @@ impl Holder for AsmuxClient {
 
     fn unroute(&self, session_id: &str) {
         self.shared.routes.lock().remove(session_id);
+    }
+
+    fn set_stream_cursor(&self, session_id: &str, cursor: u64) {
+        if let Some(route) = self.shared.routes.lock().get(session_id) {
+            route.last_cursor.store(cursor, Ordering::Relaxed);
+        }
+    }
+
+    fn stream_cursor(&self, session_id: &str) -> u64 {
+        self.shared
+            .routes
+            .lock()
+            .get(session_id)
+            .map(|r| r.last_cursor.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     fn inject_exit(&self, session_id: &str, code: i32, signal: i32) {
@@ -630,11 +661,20 @@ fn route_frame(ordinal: u16, body: &[u8], shared: &Arc<Shared>) {
                 } else if ordinal == ord::ERROR {
                     // Unsolicited data-plane error (rpc_id=0, e.g. INPUT_OVERFLOW).
                     if let Ok(r) = wire::ErrorRef::read_as_root(body) {
-                        tracing::debug!(
-                            code = r.code().unwrap_or(0),
-                            session = r.session_id().ok().flatten().unwrap_or(""),
-                            "asmux unsolicited error"
-                        );
+                        let c = r.code().unwrap_or(0);
+                        let session = r.session_id().ok().flatten().unwrap_or("");
+                        if c == code::ALLOC_FAILED {
+                            // Not debug noise: the holder could not store PTY
+                            // output, so the scrollback we persist and replay is
+                            // missing bytes that no cursor gap will reveal.
+                            tracing::error!(
+                                %session,
+                                "asmux dropped session output under memory pressure — \
+                                 recorded scrollback has a hole"
+                            );
+                        } else {
+                            tracing::debug!(code = c, %session, "asmux unsolicited error");
+                        }
                     }
                 }
             }
@@ -767,7 +807,7 @@ mod tests {
             cols: 80,
         };
         client.create(&spec).await.unwrap();
-        let mut rx = client.route("reconn");
+        let mut rx = client.route("reconn", 0);
         match client.attach("reconn", wire::AttachMode::FromEarliest, 0).await {
             Ok(_) => {}
             Err(_) => panic!("initial attach failed"),
@@ -794,6 +834,99 @@ mod tests {
         );
 
         client.kill("reconn", 9);
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    /// A drop in the window *before* a freshly-adopted route has delivered
+    /// anything must still resume from where the adopt attached — not from 0.
+    ///
+    /// This is the adopt→reconnect rewind: the route's cursor only ever advanced
+    /// on live output, so a socket drop before the first post-adopt chunk
+    /// re-attached `FromCursor(0)` and replayed the entire ring. The drain feeds
+    /// replay to the emulator, the broadcast and the history ring unconditionally
+    /// (only the SQLite persist is gated), so the session's scrollback doubled —
+    /// on exactly the path cold-stitch adopt exists to make exact.
+    ///
+    /// `cat` is the fixture because its output is entirely under the test's
+    /// control: whatever comes back after the drop is what the holder replayed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drop_before_first_output_resumes_from_the_adopt_cursor() {
+        let sock = std::env::temp_dir().join(format!("asmux-adopt-{}.sock", uuid::Uuid::new_v4()));
+        let listener = UnixListener::bind(&sock).unwrap();
+        let registry = Arc::new(Registry::new(
+            "test-instance".to_string(),
+            0,
+            MEMORY_LIMIT_DEFAULT_BYTES,
+        ));
+        let ctx = ServerCtx::new(registry, std::process::id() as i32, String::new());
+        tokio::spawn(serve(listener, ctx));
+
+        let client = AsmuxClient::connect(&sock).await.unwrap();
+        let spec = BackendSpawnSpec {
+            session_id: "adopted".to_string(),
+            command: "cat".to_string(),
+            args: vec![],
+            env: vec![],
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            rows: 24,
+            cols: 80,
+        };
+        client.create(&spec).await.unwrap();
+
+        // Phase 1: produce output the "previous daemon" already consumed.
+        let mut rx = client.route("adopted", 0);
+        client
+            .attach("adopted", wire::AttachMode::FromEarliest, 0)
+            .await
+            .unwrap_or_else(|_| panic!("initial attach failed"));
+        client.send_input("adopted", b"BEFORE\n");
+        let mut before = Vec::new();
+        while !String::from_utf8_lossy(&before).contains("BEFORE") {
+            let chunk = next_output(&mut rx, Duration::from_secs(3))
+                .await
+                .expect("echo before adopt");
+            before.extend_from_slice(&chunk);
+        }
+        // Drain to quiescence first: a PTY echoes the line and `cat` writes it
+        // back, so the cursor mid-echo is not the end of what has been produced —
+        // and a resume from there would legitimately replay the rest.
+        while next_output(&mut rx, Duration::from_millis(300)).await.is_some() {}
+        let consumed = client.stream_cursor("adopted");
+        assert!(consumed > 0, "cursor must have advanced");
+
+        // Phase 2: adopt — a new route seeded at `consumed`, attached there, and
+        // nothing delivered on it yet. This is the window.
+        client.unroute("adopted");
+        let mut rx = client.route("adopted", consumed);
+        client
+            .attach("adopted", wire::AttachMode::FromCursor, consumed)
+            .await
+            .unwrap_or_else(|_| panic!("adopt attach failed"));
+
+        let mut reconnects = client.reconnect_events();
+        client.force_drop();
+        tokio::time::timeout(Duration::from_secs(3), reconnects.recv())
+            .await
+            .expect("reconnect within 3s")
+            .expect("reconnect event");
+
+        // Phase 3: only post-adopt output may arrive. Anything from before the
+        // adopt cursor is a replay the emulator would render a second time.
+        client.send_input("adopted", b"AFTER\n");
+        let mut seen = Vec::new();
+        while !String::from_utf8_lossy(&seen).contains("AFTER") {
+            let chunk = next_output(&mut rx, Duration::from_secs(5))
+                .await
+                .expect("echo after reconnect");
+            seen.extend_from_slice(&chunk);
+        }
+        assert!(
+            !String::from_utf8_lossy(&seen).contains("BEFORE"),
+            "re-attach replayed already-consumed output: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+
+        client.kill("adopted", 9);
         let _ = std::fs::remove_file(&sock);
     }
 }

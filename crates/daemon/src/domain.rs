@@ -48,6 +48,10 @@ impl SessionStatus {
     /// A session that is no longer producing live output. `indeterminate` counts:
     /// there is no live backend to attach to, so it behaves terminally (history
     /// only) even though its true outcome is unknown.
+    ///
+    /// This answers "is there anything to attach to?" — **not** "is it safe to
+    /// throw away?". For that, see
+    /// [`is_definitively_ended`](Self::is_definitively_ended).
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -56,6 +60,32 @@ impl SessionStatus {
                 | SessionStatus::Stopped
                 | SessionStatus::Archived
                 | SessionStatus::Indeterminate
+        )
+    }
+
+    /// The session is **known** to be over: the process is gone and will not
+    /// resume, so the work it owned (worktree, branch, workspace registration)
+    /// is ours to discard.
+    ///
+    /// `indeterminate` is deliberately excluded, which is the whole reason this
+    /// exists apart from [`is_terminal`](Self::is_terminal). An indeterminate
+    /// session lost its completion record when the holder died — the process may
+    /// have finished, or may still be running as an orphan writing to that very
+    /// worktree. Authorizing destruction on "not attachable" would delete a live
+    /// agent's branch. The client already draws this line (`isTerminal` in
+    /// `client/src/status.ts` excludes `indeterminate`, so the UI offers neither
+    /// archive nor cleanup); before this predicate existed, a direct API call
+    /// could do exactly what the UI called unsafe.
+    ///
+    /// RF-LIFE replaces both booleans with named per-transition capabilities;
+    /// until then, use this one for anything destructive.
+    pub fn is_definitively_ended(&self) -> bool {
+        matches!(
+            self,
+            SessionStatus::Exited
+                | SessionStatus::Failed
+                | SessionStatus::Stopped
+                | SessionStatus::Archived
         )
     }
 }
@@ -313,6 +343,26 @@ mod tests {
         assert!(SessionStatus::Stopped.is_terminal());
         assert!(!SessionStatus::Running.is_terminal());
         assert!(!SessionStatus::Starting.is_terminal());
+    }
+
+    #[test]
+    fn indeterminate_is_terminal_but_never_definitively_ended() {
+        // The one status where the two predicates must disagree: nothing to
+        // attach to, but no proof the process is gone — so history, yes;
+        // deleting its worktree and branch, no.
+        assert!(SessionStatus::Indeterminate.is_terminal());
+        assert!(!SessionStatus::Indeterminate.is_definitively_ended());
+
+        for s in [
+            SessionStatus::Exited,
+            SessionStatus::Failed,
+            SessionStatus::Stopped,
+            SessionStatus::Archived,
+        ] {
+            assert!(s.is_definitively_ended(), "{s:?} is a known outcome");
+        }
+        assert!(!SessionStatus::Running.is_definitively_ended());
+        assert!(!SessionStatus::Starting.is_definitively_ended());
     }
 
     #[test]

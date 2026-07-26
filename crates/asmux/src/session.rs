@@ -12,7 +12,7 @@
 //! daemon's job (see `docs/asmux-protocol.md` → Never-crash invariants).
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -102,6 +102,15 @@ pub struct Session {
     metadata: Mutex<Vec<(String, String)>>,
     /// Woken on every ring append and on child exit, so a streamer can flush.
     data_signal: Arc<Notify>,
+    /// How many times the reader thread had to discard PTY output because the
+    /// ring could not allocate space for it, and how many bytes that cost.
+    ///
+    /// A failed push leaves `head` where it was, so the loss produces no cursor
+    /// gap and no reader can infer it — under exactly the memory pressure the
+    /// never-crash design exists to survive, output would vanish with no log and
+    /// no signal. Counting it is what makes `ALLOC_FAILED` reportable.
+    dropped_events: AtomicU64,
+    dropped_bytes: AtomicU64,
 
     // Live-child handles. All three are released (set to `None`) by the reader
     // thread once the child is reaped, so a *tombstone* no longer pins a PTY
@@ -204,6 +213,8 @@ impl Session {
             status: Mutex::new(Status::Running),
             metadata: Mutex::new(spec.metadata),
             data_signal: data_signal.clone(),
+            dropped_events: AtomicU64::new(0),
+            dropped_bytes: AtomicU64::new(0),
             master: Mutex::new(Some(pair.master)),
             killer: Mutex::new(Some(killer)),
             input_tx: Mutex::new(Some(input_tx)),
@@ -276,6 +287,39 @@ impl Session {
     /// (`Notify` stores a single permit).
     pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.data_signal.notified()
+    }
+
+    /// Record that `bytes` of PTY output could not be stored, and say so.
+    ///
+    /// Called by the reader thread when the ring's fallible reserve fails. The
+    /// never-crash rule says drop the chunk rather than abort the holder; the
+    /// invariants also promise the loss surfaces as `ALLOC_FAILED`, and until
+    /// this existed only the first half was true. The counter is what a streamer
+    /// polls to turn the drop into an unsolicited `Error` frame for the
+    /// attacher, so the wake matters as much as the log.
+    pub fn note_output_dropped(&self, bytes: usize) {
+        let events = self
+            .dropped_events
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let total = self
+            .dropped_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed)
+            .saturating_add(bytes as u64);
+        tracing::error!(
+            session = %self.id,
+            bytes,
+            dropped_events = events,
+            dropped_bytes = total,
+            "ring allocation failed: PTY output dropped (recorded stream now has a hole)"
+        );
+        self.data_signal.notify_one();
+    }
+
+    /// How many times output has been dropped for this session. Monotonic; a
+    /// streamer reports every increase it observes.
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped_events.load(Ordering::Relaxed)
     }
 
     /// Copy up to `max` bytes at cursor `from` (0 => a default chunk).
@@ -438,9 +482,15 @@ fn reader_loop(mut reader: Box<dyn Read + Send>, session: Arc<Session>, mut chil
             Ok(0) => break,
             Ok(n) => {
                 if let Some(chunk) = buf.get(..n) {
-                    // A failed ring alloc (ALLOC_FAILED territory) must not crash
-                    // the holder: drop the chunk, keep the session readable.
-                    let _ = session.ring.lock().push(chunk);
+                    // A failed ring alloc must not crash the holder: drop the
+                    // chunk, keep the session readable — but never silently.
+                    // `note_output_dropped` is what turns this into a logged,
+                    // reportable `ALLOC_FAILED` instead of output that simply
+                    // ceases to exist. (Logging happens outside the ring lock.)
+                    let dropped = session.ring.lock().push(chunk).is_err();
+                    if dropped {
+                        session.note_output_dropped(chunk.len());
+                    }
                     session.data_signal.notify_one();
                 }
             }
@@ -449,27 +499,7 @@ fn reader_loop(mut reader: Box<dyn Read + Send>, session: Arc<Session>, mut chil
         }
     }
 
-    let status = match child.wait() {
-        Ok(es) => {
-            if es.success() {
-                Status::Exited {
-                    code: 0,
-                    signal: 0,
-                }
-            } else {
-                // portable_pty does not surface the signal separately; record the
-                // raw code. Signal decomposition is a daemon-side refinement.
-                Status::Exited {
-                    code: es.exit_code() as i32,
-                    signal: 0,
-                }
-            }
-        }
-        Err(_) => Status::Exited {
-            code: -1,
-            signal: 0,
-        },
-    };
+    let status = reap(session.pid, &mut child);
     *session.status.lock() = status;
     // The child is gone. Release the live-only handles so this tombstone stops
     // pinning a PTY master fd and an idle writer thread; the ring (recorded
@@ -477,6 +507,53 @@ fn reader_loop(mut reader: Box<dyn Read + Send>, session: Arc<Session>, mut chil
     session.release_child_handles();
     // Wake the streamer so it can flush the tail and emit SessionExited.
     session.data_signal.notify_one();
+}
+
+/// Reap the exited child and record **how** it died.
+///
+/// Not `portable_pty::Child::wait`, which flattens the wait status: a signalled
+/// child comes back as `code = 1` (indistinguishable from `exit(1)`) plus a
+/// locale-dependent signal *name* the crate exposes through nothing but
+/// `Display`. The wire contract is the opposite — `exit_signal != 0` means the
+/// child was signalled, and `exit_code` is meaningful only when it is zero — and
+/// the daemon classifies the session's outcome from exactly that field. Reported
+/// as `signal: 0`, a `kill -9`'d agent read as a clean exit all the way up into
+/// the UI.
+///
+/// `waitpid` on the pid we already keep for `kill` gives the real thing. It
+/// reaps no earlier than `child.wait()` did, on the same pid the killer uses, so
+/// it opens no window that did not already exist; `child` stays owned here so
+/// nothing else can race us to the corpse.
+fn reap(pid: i32, child: &mut Box<dyn Child + Send + Sync>) -> Status {
+    #[cfg(unix)]
+    {
+        use nix::sys::wait::{waitpid, WaitStatus};
+        match waitpid(nix::unistd::Pid::from_raw(pid), None) {
+            Ok(WaitStatus::Exited(_, code)) => return Status::Exited { code, signal: 0 },
+            Ok(WaitStatus::Signaled(_, sig, _)) => {
+                return Status::Exited {
+                    code: -1,
+                    signal: sig as i32,
+                }
+            }
+            // Stopped/Continued need WUNTRACED/WCONTINUED, which we don't pass,
+            // so anything else here means the child was already reaped (ECHILD)
+            // or the call failed. Fall through and take what portable_pty has.
+            Ok(_) | Err(_) => {}
+        }
+    }
+    let _ = pid; // only the reaping path above uses it
+    match child.wait() {
+        Ok(es) if es.success() => Status::Exited { code: 0, signal: 0 },
+        Ok(es) => Status::Exited {
+            code: es.exit_code() as i32,
+            signal: 0,
+        },
+        Err(_) => Status::Exited {
+            code: -1,
+            signal: 0,
+        },
+    }
 }
 
 /// Writer thread: drain the input queue into the PTY with blocking writes.
@@ -567,6 +644,30 @@ mod tests {
         // The tombstone stays usable and correctly rejects further input.
         assert_eq!(session.send_input(b"x"), InputOutcome::NotAlive);
         assert!(!session.record().alive);
+    }
+
+    #[test]
+    fn a_normal_exit_records_its_code_and_no_signal() {
+        let session = Session::spawn(spec("/bin/sh", &["-c", "exit 7"])).unwrap();
+        assert!(wait_until(5, || !session.is_alive()));
+        assert_eq!(session.status(), Status::Exited { code: 7, signal: 0 });
+        let rec = session.record();
+        assert_eq!((rec.exit_code, rec.exit_signal), (7, 0));
+    }
+
+    #[test]
+    fn a_signalled_child_reports_the_signal_not_a_clean_exit() {
+        // The defect this guards: the holder recorded `signal: 0` for every
+        // outcome, so a killed agent arrived at the daemon — and the UI — as an
+        // ordinary exit. `cat` waits forever, so the only way out is the signal.
+        let session = Session::spawn(spec("/bin/cat", &[])).unwrap();
+        assert!(session.is_alive());
+        session.kill(9);
+        assert!(wait_until(5, || !session.is_alive()), "cat should be killed");
+        assert_eq!(session.status(), Status::Exited { code: -1, signal: 9 });
+        let rec = session.record();
+        assert!(!rec.alive);
+        assert_eq!(rec.exit_signal, 9, "SIGKILL must survive to the wire record");
     }
 
     #[test]

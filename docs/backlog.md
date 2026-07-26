@@ -1,5 +1,11 @@
 # Backlog
 
+**2026-07-25 update (not a reconcile):** the **FIX** row landed in full — all
+eight verified defects, each with a regression test that fails without its fix.
+Its row and sequencing entry below are struck through; the 2026-07-24 reconcile
+narrative that follows is left as written, so "all eight … remain open" there
+should be read as of that date.
+
 Last reconciled: **2026-07-24**, row by row against the code and history through
 `99814d9` (not against this table's own claims). The table has 42 rows: two
 completed rows retained for context, one decision folded into R5, and 39 open or
@@ -373,7 +379,7 @@ pick it up**.
 | ~~REC~~ | **Session recovery — landed, as the more general [fork](fork-session.md).** Forking a *stopped* session onto its *own* branch is exactly recovery, so one feature covers both, and it also does what REC could not: fork a **live** session, and fork onto a **different agent**. Shipped: the `AgentPlugin` fork seam, SCHEMA_V7 (`agent_session_id` + `forked_from`), native-id capture while live, `POST /api/sessions/:id/fork`, native fork for claude + codex, the digest/summary brief, and the UI. Two pieces of the old design remain, split out as **FORK-SHELL** and **FORK-OC** below. | ~~P1~~ **done** | — | fork-session.md |
 | FORK-SHELL | Fork a **shell / custom_command** origin usefully: it keeps no transcript, so it gets a brief with no digest today. Its real context is its scrollback (`terminal_events` → vt100 → ANSI-stripped prose) — the one source where a shell's brief is genuinely *good* (a shell has real scrollback; the TUI agents have none, which is why they use their own transcripts). This is REC Stage B. | **P3** | fork (done) | session-recovery.md → §3; fork-session.md |
 | FORK-OC | **opencode native fork**: read its conversation id out of `~/.local/share/opencode/opencode.db` and launch `opencode --session <id> --fork`. Pure plugin change — `native_session_id` + `build_fork`; the fork flow does not move. An opencode fork gets the brief meanwhile. This is REC Stage C. | **P3** | fork (done) | session-recovery.md → §2; fork-session.md |
-| FIX | **Verified latent defects** (2026-07-12 review, all hand-verified): `pull` credential-prompt hang; adopt→reconnect cursor-0 rewind; worktree created before create-validation, no rollback; asmux silent ring-alloc output drop; `exit_signal` never populated; fabricated adopt defaults; server/client disagreement over whether `indeterminate` is terminal; invalid `ASM_BACKEND` silently selects non-durable native mode | **P1** | — (~2–3 days incl. regression tests) | refactoring-plan.md → §6.1 |
+| ~~FIX~~ | **Verified latent defects — all eight landed 2026-07-25**, each with a regression test: `pull` credential-prompt hang (one `git_command` builder owns `GIT_TERMINAL_PROMPT=0`, guarded by a test that no git child bypasses it); adopt→reconnect cursor-0 rewind (routes are seeded with the cursor their attach uses, and the drain's duplicate tracker is gone); worktree created before create-validation (validate first, roll the instance back on any later failure incl. a failed spawn); asmux silent ring-alloc output drop (logged, counted, and reported to the attacher as `ALLOC_FAILED`); `exit_signal` never populated (`waitpid` decomposes the real wait status); fabricated adopt defaults (a vanished row is logged and skipped); `indeterminate` authorizing destruction (new `is_definitively_ended` gates archive / cleanup / workspace-unregister, matching the client); invalid `ASM_BACKEND` (rejected at startup instead of silently selecting non-durable native) | ~~P1~~ **done** | — | refactoring-plan.md → §6.1 |
 | RF-FLOW | **Bounded terminal flow + durable persistence:** byte-budget output/command queues with explicit overload semantics; writer health + retry/degraded state + shutdown flush; acknowledged input/kill semantics; streaming history/transcripts; retention/compaction; disk-full/slow-consumer fault tests | **P1** | FIX + minimal RF-GATE harness | refactoring-plan.md → §7.1 |
 | RF-LIFE | **Explicit lifecycle state machine + units of work:** named status capabilities, conditional transitions/per-session serialization, atomic metadata/migrations, create+teardown sagas, central `go_live`/`finish`, concurrency/failure-step tests | **P1** | FIX + minimal RF-GATE harness | refactoring-plan.md → §7.2 |
 | RF-REC | **Generic Git/API/UI consolidation (legacy id; no longer blocks recovery):** one deadline/output-bounded `GitRunner`; `require_session` + typed `run_blocking`; split `ScmPanel` / session metadata / VS Code blocks out of the now-1,209-line `RightPanel`. | **P2** | FIX #1 for the immediate pull guard; pairs with RF-ERR on API helpers | refactoring-plan.md → §6.2 |
@@ -839,8 +845,8 @@ Completed path, retained as sequencing context: ~~**MOB phases 1–3**~~ ✅
 A/B**~~ ✅ 2026-07-07 → 07-11; ~~**TERM-SCROLL**~~ ✅ 2026-07-08; ~~**REC
 via fork**~~ ✅ 2026-07-14.
 
-1. **FIX** → the minimal **RF-GATE** harness → **RF-FLOW** → **RF-LIFE**.
-   FIX repairs eight concrete defects still present on 2026-07-24. RF-GATE
+1. ~~**FIX**~~ (landed 2026-07-25) → the minimal **RF-GATE** harness →
+   **RF-FLOW** → **RF-LIFE**. RF-GATE
    should first land the router/AppState harness, `MockHolder`, relevant asmux
    e2e, and a minimal CI job. RF-FLOW then makes cold-history/input promises
    explicit under overload and disk failure; RF-LIFE owns transitions,

@@ -242,7 +242,9 @@ impl SessionManager {
     }
 
     /// Unregister a workspace (removes it from the allowlist). Refuses while it
-    /// still has live sessions. Does not stop sessions or delete worktrees on
+    /// still has sessions that are not *known* to be over — including
+    /// `indeterminate` ones, whose process may still be running as an orphan in
+    /// a worktree under this root. Does not stop sessions or delete worktrees on
     /// disk — it only drops the registration; existing session records keep
     /// their (now dangling) `workspace_id`.
     pub fn remove_workspace(&self, id: &str) -> Result<()> {
@@ -254,10 +256,12 @@ impl SessionManager {
             .db
             .list_sessions()?
             .iter()
-            .any(|s| s.workspace_id.as_deref() == Some(id) && !s.status.is_terminal());
+            .any(|s| s.workspace_id.as_deref() == Some(id) && !s.status.is_definitively_ended());
         if has_live {
             bail!(
-                "workspace `{}` still has live sessions; stop them first",
+                "workspace `{}` still has sessions that have not definitively \
+                 ended; stop them first (a session whose outcome is unknown may \
+                 still be running)",
                 ws.name
             );
         }
@@ -503,6 +507,21 @@ impl SessionManager {
             if self.live_handle(session_id).is_some() {
                 bail!("stop the session before cleaning up its worktree");
             }
+            // A live *handle* is not the whole question. An `indeterminate`
+            // session has no handle by definition — that is what indeterminate
+            // means — yet its process may still be alive as an orphan, writing
+            // into the worktree this is about to remove. The client already
+            // withholds this button for that status; the API has to agree, or
+            // "the UI says it's unsafe" is the only thing standing in the way.
+            if let Some(s) = self.db.get_session(session_id)? {
+                if !s.status.is_definitively_ended() {
+                    bail!(
+                        "cannot clean up the worktree of a session that has not \
+                         definitively ended (status `{}`)",
+                        s.status.as_str()
+                    );
+                }
+            }
             // Only reclaim the worktree once the last session sharing it leaves.
             if self.db.count_active_instances_at_path(&inst.path, &inst.id)? == 0 {
                 let ws = self
@@ -600,12 +619,23 @@ impl SessionManager {
     /// from the history view). A session that ran on a pre-existing branch keeps
     /// that branch. Refuses to discard uncommitted or unmerged work unless
     /// `force` — see `discard_instance`.
+    ///
+    /// Requires a session that is *definitively* ended, not merely unattachable:
+    /// an `indeterminate` session may still be running as an orphan in the very
+    /// worktree this would delete.
     pub fn archive_session(&self, id: &str, force: bool) -> Result<Session> {
         let s = self
             .db
             .get_session(id)?
             .ok_or_else(|| anyhow!("no such session"))?;
-        if !s.status.is_terminal() {
+        if !s.status.is_definitively_ended() {
+            if s.status == SessionStatus::Indeterminate {
+                bail!(
+                    "cannot archive a session whose outcome is unknown: its holder \
+                     exited without a completion record, so the process may still be \
+                     running in this worktree. Stop it first."
+                );
+            }
             bail!("cannot archive a live session; stop it first");
         }
         self.discard_instance(id, force)?;

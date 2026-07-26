@@ -69,7 +69,9 @@ impl SessionBackend for SidecarBackend {
 
         let session = block_on(async move {
             client.create(&spec).await?;
-            let rx = client.route(&session_id);
+            // Fresh session: the attach below starts at the very beginning, so
+            // that is also where a reconnect must resume from.
+            let rx = client.route(&session_id, 0);
             match client
                 .attach(&session_id, wire::AttachMode::FromEarliest, 0)
                 .await
@@ -126,7 +128,12 @@ impl SessionBackend for SidecarBackend {
             // Reconstruct both the screen (vt100) and the normal-buffer raw
             // scrollback (HistoryRing) from cold history.
             let (parser, history) = seed_from_cold(rows, cols, &cold);
-            let rx = client.route(&sid);
+            // Seeded with the same cursor the attach below uses. A socket drop
+            // in the window before the first post-adopt chunk arrives would
+            // otherwise re-attach from 0 and replay the whole ring — through the
+            // emulator and history ring, not just the (already gated) persist —
+            // duplicating the scrollback cold-stitch adopt just made exact.
+            let rx = client.route(&sid, consumed);
             let persist_from = match client
                 .attach(&sid, wire::AttachMode::FromCursor, consumed)
                 .await
@@ -147,6 +154,11 @@ impl SessionBackend for SidecarBackend {
                         Err(AttachError::Conn(e)) => return Err(e),
                         Err(_) => {}
                     }
+                    // We did not land where we asked: the stream now resumes at
+                    // the ring tail, so that — not `consumed` — is what a
+                    // reconnect must ask for. (`persist_from` stays `consumed`:
+                    // everything past it is genuinely new to cold history.)
+                    client.set_stream_cursor(&sid, earliest);
                     consumed
                 }
                 Err(AttachError::Code(c)) => {
@@ -335,12 +347,10 @@ async fn drain_loop(ctx: DrainCtx) {
         persist_from,
     } = ctx;
     let mut parser_ok = true;
-    let mut last_cursor = persist_from;
 
     while let Some(ev) = rx.recv().await {
         match ev {
             StreamEvent::Output { data, cursor } => {
-                last_cursor = cursor;
                 // Feed the emulator (isolate a parser panic to this session).
                 {
                     let mut p = parser.lock();
@@ -389,11 +399,14 @@ async fn drain_loop(ctx: DrainCtx) {
             StreamEvent::Detached { reason } => {
                 if reason == DETACH_BACKPRESSURE {
                     // This session's stream fell behind and was evicted. Resync
-                    // in place from the last cursor we saw; a socket drop during
-                    // this is fine — the supervisor re-attaches on reconnect.
-                    tracing::warn!(session = %session_id, "asmux backpressure eviction; resyncing");
+                    // in place from where the route says it stopped — the same
+                    // number a reconnect would resume from, asked of its one
+                    // owner rather than tracked again here. A socket drop during
+                    // this is fine: the supervisor re-attaches on reconnect.
+                    let from = client.stream_cursor(&session_id);
+                    tracing::warn!(session = %session_id, from, "asmux backpressure eviction; resyncing");
                     match client
-                        .attach(&session_id, wire::AttachMode::FromCursor, last_cursor)
+                        .attach(&session_id, wire::AttachMode::FromCursor, from)
                         .await
                     {
                         Ok(_) => {}
@@ -402,6 +415,7 @@ async fn drain_loop(ctx: DrainCtx) {
                             let _ = client
                                 .attach(&session_id, wire::AttachMode::FromEarliest, 0)
                                 .await;
+                            client.set_stream_cursor(&session_id, earliest);
                         }
                         // A connection error here is recovered by the supervisor's
                         // reconnect + reattach; keep draining the same route.
