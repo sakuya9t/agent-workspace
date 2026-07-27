@@ -329,3 +329,44 @@ async fn handle_history(socket: WebSocket, id: String, state: AppState) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Attachments;
+    use futures::FutureExt;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    #[test]
+    fn takeover_keeps_only_the_new_attachment() {
+        let attachments = Attachments::new();
+        let first = Arc::new(Notify::new());
+        let second = Arc::new(Notify::new());
+
+        assert!(attachments.attach("session", 1, first).is_none());
+        let superseded = attachments
+            .attach("session", 2, second)
+            .expect("the first connection is superseded");
+        assert!(attachments.is_attached("session"));
+
+        // A late close from the superseded connection must not erase the new
+        // owner. Only releasing the current connection clears the badge.
+        attachments.release("session", 1);
+        assert!(attachments.is_attached("session"));
+        attachments.release("session", 2);
+        assert!(!attachments.is_attached("session"));
+
+        // The takeover path returns the exact cancellation handle installed by
+        // the first connection.
+        superseded.notify_one();
+        assert!(superseded.notified().now_or_never().is_some());
+    }
+
+    #[test]
+    fn attachment_ids_are_monotonic() {
+        let attachments = Attachments::new();
+        assert_eq!(attachments.next_id(), 1);
+        assert_eq!(attachments.next_id(), 2);
+        assert_eq!(attachments.next_id(), 3);
+    }
+}

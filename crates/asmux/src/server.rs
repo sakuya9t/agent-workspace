@@ -345,10 +345,31 @@ async fn handle_hello(conn: &Arc<Conn>, body: &[u8]) -> bool {
     true
 }
 
+/// A valid frame envelope with a body that does not decode as the request named
+/// by its ordinal is still a protocol error. Every request path must answer it:
+/// silently returning leaves an RPC caller parked until its timeout and makes a
+/// corrupt fire-and-forget frame indistinguishable from a successfully accepted
+/// command.
+async fn reject_malformed_body(conn: &Arc<Conn>, request: &str) {
+    let message = format!("malformed {request} request body");
+    send_error(
+        &conn.ctrl_tx,
+        0,
+        code::INVALID_ARGUMENT,
+        None,
+        None,
+        &message,
+    )
+    .await;
+}
+
 async fn handle_create(conn: &Arc<Conn>, body: &[u8]) {
     let r = match wire::CreateRequestRef::read_as_root(body) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            reject_malformed_body(conn, "create").await;
+            return;
+        }
     };
     let rpc_id = r.rpc_id().unwrap_or(0);
 
@@ -442,7 +463,10 @@ async fn handle_create(conn: &Arc<Conn>, body: &[u8]) {
 async fn handle_kill(conn: &Arc<Conn>, body: &[u8]) {
     let r = match wire::KillRequestRef::read_as_root(body) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            reject_malformed_body(conn, "kill").await;
+            return;
+        }
     };
     let rpc_id = r.rpc_id().unwrap_or(0);
     let sid = r.session_id().ok().flatten().unwrap_or("");
@@ -462,7 +486,10 @@ async fn handle_kill(conn: &Arc<Conn>, body: &[u8]) {
 async fn handle_purge(conn: &Arc<Conn>, body: &[u8]) {
     let r = match wire::PurgeRequestRef::read_as_root(body) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            reject_malformed_body(conn, "purge").await;
+            return;
+        }
     };
     let rpc_id = r.rpc_id().unwrap_or(0);
     let sid = r.session_id().ok().flatten().unwrap_or("");
@@ -483,7 +510,10 @@ async fn handle_purge(conn: &Arc<Conn>, body: &[u8]) {
 async fn handle_list(conn: &Arc<Conn>, body: &[u8]) {
     let r = match wire::ListRequestRef::read_as_root(body) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            reject_malformed_body(conn, "list").await;
+            return;
+        }
     };
     let rpc_id = r.rpc_id().unwrap_or(0);
     let sessions: Vec<wire::SessionRecord> =
@@ -498,7 +528,10 @@ async fn handle_list(conn: &Arc<Conn>, body: &[u8]) {
 async fn handle_update_metadata(conn: &Arc<Conn>, body: &[u8]) {
     let r = match wire::UpdateMetadataRequestRef::read_as_root(body) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            reject_malformed_body(conn, "updateMetadata").await;
+            return;
+        }
     };
     let rpc_id = r.rpc_id().unwrap_or(0);
     let sid = r.session_id().ok().flatten().unwrap_or("");
@@ -521,7 +554,10 @@ async fn handle_update_metadata(conn: &Arc<Conn>, body: &[u8]) {
 async fn handle_resize(conn: &Arc<Conn>, body: &[u8]) {
     let r = match wire::ResizeRequestRef::read_as_root(body) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            reject_malformed_body(conn, "resize").await;
+            return;
+        }
     };
     let rpc_id = r.rpc_id().unwrap_or(0);
     let sid = r.session_id().ok().flatten().unwrap_or("");
@@ -546,7 +582,10 @@ async fn handle_resize(conn: &Arc<Conn>, body: &[u8]) {
 async fn handle_read_buffer(conn: &Arc<Conn>, body: &[u8]) {
     let r = match wire::ReadBufferRequestRef::read_as_root(body) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            reject_malformed_body(conn, "readBuffer").await;
+            return;
+        }
     };
     let rpc_id = r.rpc_id().unwrap_or(0);
     let sid = r.session_id().ok().flatten().unwrap_or("");
@@ -583,7 +622,10 @@ async fn handle_read_buffer(conn: &Arc<Conn>, body: &[u8]) {
 async fn handle_attach(conn: &Arc<Conn>, body: &[u8]) {
     let r = match wire::AttachRequestRef::read_as_root(body) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            reject_malformed_body(conn, "attach").await;
+            return;
+        }
     };
     let rpc_id = r.rpc_id().unwrap_or(0);
     let sid = r.session_id().ok().flatten().unwrap_or("").to_string();
@@ -659,7 +701,10 @@ async fn handle_attach(conn: &Arc<Conn>, body: &[u8]) {
 async fn handle_detach(conn: &Arc<Conn>, body: &[u8]) {
     let r = match wire::DetachRequestRef::read_as_root(body) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            reject_malformed_body(conn, "detach").await;
+            return;
+        }
     };
     let rpc_id = r.rpc_id().unwrap_or(0);
     let sid = r.session_id().ok().flatten().unwrap_or("");
@@ -682,7 +727,10 @@ async fn handle_detach(conn: &Arc<Conn>, body: &[u8]) {
 async fn handle_input(conn: &Arc<Conn>, body: &[u8]) {
     let r = match wire::SessionInputRef::read_as_root(body) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            reject_malformed_body(conn, "input").await;
+            return;
+        }
     };
     let sid = r.session_id().ok().flatten().unwrap_or("");
     let data = r.data().ok().flatten();

@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@v1
+
+      - name: Build Rust workspace
+        run: cargo build --workspace --locked
+
+      - name: Lint Rust workspace
+        run: cargo clippy --workspace --all-targets --locked
+
+      - name: Test Rust workspace
+        run: cargo test --workspace --locked
+
+      - name: Install client dependencies
+        working-directory: client
+        run: npm ci
+
+      - name: Build and lint client
+        working-directory: client
+        run: npm run build
+
+      - name: Test client
+        working-directory: client
+        run: npm test
+
+      - name: Test core session loop
+        run: node scripts/smoke.mjs
+
+      - name: Test mobile shell
+        env:
+          CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
+        run: node scripts/mobile-shell-test.mjs

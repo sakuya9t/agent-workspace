@@ -461,6 +461,14 @@ frame and will otherwise each invent one.
 
 The net every other item in this document relies on. ~2–3 days.
 
+**Status 2026-07-26:** the minimal P1 gate is implemented. CI runs workspace
+build/clippy/tests, the client build/lint/locale/test gates, and sandboxed smoke
++ mobile-shell e2e. Tests now construct the real router/AppState, pin attachment
+takeover, drive sidecar create/adopt/resync/end paths through a scripted
+`MockHolder`, and exercise asmux readBuffer, detach ownership, backpressure
+eviction, cross-connection takeover, and every malformed request-body dispatch.
+Items 1, 6, and 7 below remain as the P2 gate remainder.
+
 1. **Client lint is a single rule.** `eslint.config.js` enforces only
    `i18next/no-literal-string`; it imports `typescript-eslint` but never
    spreads a recommended config, and `eslint-plugin-react-hooks` is not
@@ -471,33 +479,22 @@ The net every other item in this document relies on. ~2–3 days.
    `tseslint.configs.recommended` + react-hooks (error); expect and burn
    down a findings backlog. Optionally `noUncheckedIndexedAccess` (the
    color-map/array indexing MVP-RICH will multiply).
-2. **There is no CI.** `.github/workflows` does not exist; `npm test` runs
-   only the proxy test; the 25 e2e scripts run when a human remembers. A
-   minimal job: cargo build + clippy + test → client tsc/eslint/
-   check-locales/vite build → 2–3 fast e2e scripts (smoke, mobile-shell).
-3. **No HTTP-router or WS attachment harness.** A 2026-07-22 pure unit test now
-   covers `needs_live_session` path classification, but no test constructs
-   `api::router` or an `AppState`; `ws.rs`'s `Attachments` single-attacher/takeover logic
-   (`:55-69`) is untested despite needing no I/O. Stand up a
-   `tower::ServiceExt::oneshot` harness against the router (the RF-M4 #4
-   `MockBackend` seams already exist); RF-ERR's status-mapping changes and
-   current handlers then get fast guards.
-4. **No `MockHolder`.** The `Holder` trait was added for testability but
-   only `AsmuxClient` implements it; `SidecarBackend::create`/`adopt`, the
-   whole `drain_loop` including the `DETACH_BACKPRESSURE` resync arm
-   (`sidecar.rs:389-411`), and `end_session_stream` have zero unit coverage
-   — the one integration test asserts "output resumes", not cursor
-   correctness, and would not catch FIX #2. Add a `MockHolder` (canned
-   attach results incl. `Gap`, scripted `StreamEvent`s) and drive the
-   branches.
-5. **asmux e2e for the dead/half-wired paths.** `handle_read_buffer`
-   (`asmux/src/server.rs:546`) and `handle_detach` (`:659`) have no test and
-   no caller; backpressure eviction (`:729-737`) and cross-connection
-   takeover are entirely unexercised; malformed RPC bodies are silently
-   dropped by 10 `Err(_) => return` arms (contract says answer with
-   `Error`). Add cases for readBuffer (partial / `BUFFER_GAP` / invalid),
-   detach ownership, eviction, takeover, and truncated-body dispatch —
-   cheap insurance **before** M4-C wires the daemon side.
+2. ✅ **Minimal CI.** `.github/workflows/ci.yml` runs cargo build + clippy +
+   test → client tsc/eslint/check-locales/vite build + proxy test → sandboxed
+   smoke + mobile-shell e2e.
+3. ✅ **HTTP-router and WS attachment harness.** `api::tests` constructs the
+   real router/AppState and checks health plus remote/local auth behavior through
+   `tower::ServiceExt::oneshot`; `ws::tests` pins monotonic attachment ids and
+   proves a superseded connection cannot release its replacement.
+4. ✅ **Scripted `MockHolder`.** Sidecar tests supply canned attach results
+   (including `Gap`) and scripted `StreamEvent`s to drive create, cold adopt,
+   output persistence, command forwarding, backpressure resync, synthetic exit,
+   vanished-route, and rejected-adopt branches.
+5. ✅ **asmux e2e for the dead/half-wired paths.** Real UDS cases cover
+   readBuffer partial / `BUFFER_GAP` / invalid cursors, detach ownership,
+   backpressure eviction, cross-connection takeover, and malformed bodies for
+   all ten request ordinals. Malformed requests now return `INVALID_ARGUMENT`
+   instead of silently parking RPC callers until timeout.
 6. **`generated.rs` has no drift check.** There is no `build.rs` in the
    workspace — `asmux-protocol.md` was corrected on 2026-07-24 to say so;
    regeneration is the manual command in

@@ -1,5 +1,13 @@
 # Backlog
 
+**2026-07-26 update (not a reconcile):** the minimal **RF-GATE** harness landed:
+a real router/AppState auth + health harness, attachment takeover units, a
+scripted `MockHolder` driving sidecar create/adopt/resync/end paths, asmux e2e
+coverage for readBuffer/detach/backpressure/takeover/malformed bodies, and CI
+running Rust + client gates with smoke/mobile-shell e2e. This clears the gate in
+front of **RF-FLOW** and **RF-LIFE**; RF-GATE remains open at P2 for the client
+lint expansion, generated-schema drift check, and migration/version-skew guard.
+
 **2026-07-25 update (not a reconcile):** the **FIX** row landed in full — all
 eight verified defects, each with a regression test that fails without its fix.
 Its row and sequencing entry below are struck through; the 2026-07-24 reconcile
@@ -388,7 +396,7 @@ pick it up**.
 | MOB-PUSH | Web Push for attention states | **P3** | MOB (done); RF-WSPROTO (server→client frame type); daemon push plumbing (relay as carrier) | mobile-ui.md → Follow-ups |
 | IMG-2 | Attachment follow-ups: `.asm/pastes/` cleanup policy (more pressing now that a 10 MiB zip can land there), multi-file select/drop **on the 📎/paste path** (the Details-panel workspace upload already takes several at once), per-agent capability hint | **P3** | attachments + 📎 button (done) | image-paste.md → Follow-ups |
 | RF-ERR | Typed daemon error → HTTP status mapping (RelayError-style) | **P2** | — (pair with SEC-2 or RF-REC) | refactoring-plan.md → RF-ERR |
-| RF-GATE | Build gate & test safety net: react-hooks + recommended eslint, minimal CI, HTTP-router test harness, `MockHolder`, asmux e2e for readBuffer/detach/backpressure/takeover, `generated.rs` drift check, migration-ladder test + `user_version` guard | **P1/P2** | — (before M4-C wiring; minimal harness before RF-FLOW/RF-LIFE) | refactoring-plan.md → §6.4 |
+| RF-GATE | **Minimal P1 harness landed 2026-07-26:** CI; real router/AppState + attachment tests; scripted `MockHolder`; asmux e2e for readBuffer/detach/backpressure/takeover/malformed bodies. Remaining: react-hooks + recommended eslint, `generated.rs` drift check, migration-ladder test + `user_version` guard. | **P2 remainder** | — (remaining guards before their affected work) | refactoring-plan.md → §6.4 |
 | RF-OPS | **Truthful health, deadlines and task supervision:** liveness/readiness probes for DB writer + holder; cancellation tree for background tasks; blocking-work boundary; child/client request deadlines; jittered reconnect; structured reliability metrics | **P2** | minimal RF-GATE; Git deadline implementation shares RF-REC | refactoring-plan.md → §7.3 |
 | COPILOT-REVIEW | **Session copilot, manual advisory MVP:** select any capable installed agent plugin + model; capture committed/staged/unstaged/untracked code into an immutable disposable Git worktree; run a bounded structured review; persist evidence/findings/checks; show current/stale history in a standalone panel; explicitly send a review file to the main agent | **P2** | FIX + minimal RF-GATE; shared `GitTreeSnapshot` slice of MVP-CKPT; RF-OPS child runner; pair UI/API work with RF-REC + RF-QUERY | copilot.md → Stages 0–1 |
 | COPILOT-GATE | **Automatic copilot + gatekeeper:** debounced idle review, fingerprint deduplication, budgets and bounded feedback; then require a current passing review + deterministic checks before ASM promotes the exact reviewed commit. Gate ASM actions only; direct terminal Git remains bypassable unless a remote required check enforces it. | **P2** after advisory proof | COPILOT-REVIEW; RF-ERR; relevant RF-LIFE SCM serialization; exact-commit promotion | copilot.md → Stages 2–4 |
@@ -845,13 +853,12 @@ Completed path, retained as sequencing context: ~~**MOB phases 1–3**~~ ✅
 A/B**~~ ✅ 2026-07-07 → 07-11; ~~**TERM-SCROLL**~~ ✅ 2026-07-08; ~~**REC
 via fork**~~ ✅ 2026-07-14.
 
-1. ~~**FIX**~~ (landed 2026-07-25) → the minimal **RF-GATE** harness →
-   **RF-FLOW** → **RF-LIFE**. RF-GATE
-   should first land the router/AppState harness, `MockHolder`, relevant asmux
-   e2e, and a minimal CI job. RF-FLOW then makes cold-history/input promises
-   explicit under overload and disk failure; RF-LIFE owns transitions,
-   atomicity, and compensation. Recovery is already shipped and is not the end
-   of this chain.
+1. ~~**FIX**~~ (landed 2026-07-25) → ~~the minimal **RF-GATE** harness~~
+   (landed 2026-07-26) → **RF-FLOW** → **RF-LIFE**. RF-FLOW now makes
+   cold-history/input promises explicit under overload and disk failure;
+   RF-LIFE owns transitions, atomicity, and compensation. Recovery is already
+   shipped and is not the end of this chain. The P2 RF-GATE remainder can land
+   alongside the work it guards.
 2. **SEC-2 + RF-ERR** together — before exposure beyond trusted networks.
    The daemon-managed UI and UI-only gateway make the allowed-roots gap more
    consequential. SEC-1(direct) is decided: LAN direct is plaintext by design;

@@ -905,7 +905,75 @@ impl From<anyhow::Error> for AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::{needs_live_session, normalize_model};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::body::{to_bytes, Body};
+    use axum::extract::ConnectInfo;
+    use axum::http::{Request, StatusCode};
+    use serde_json::Value;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    use super::{needs_live_session, normalize_model, router, AppState};
+    use crate::backend::native::NativePtyBackend;
+    use crate::config::{BackendKind, Config};
+    use crate::db::Db;
+    use crate::plugins::PluginRegistry;
+    use crate::session_manager::SessionManager;
+    use crate::source_control::GitSourceControl;
+    use crate::util::now_millis;
+
+    fn test_router() -> (axum::Router, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("asm-api-{}", Uuid::new_v4()));
+        let data_dir = dir.join("data");
+        let config_dir = dir.join("config");
+        let runtime_dir = dir.join("run");
+        for path in [&data_dir, &config_dir, &runtime_dir] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let config = Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            data_dir: data_dir.clone(),
+            config_dir,
+            runtime_dir: runtime_dir.clone(),
+            static_dir: None,
+            backend: BackendKind::Native,
+            asmux_socket: runtime_dir.join("asmux.sock"),
+            asmux_autospawn: false,
+            asmux_wait: Duration::from_millis(10),
+            asmux_bin: None,
+            relay_url: None,
+            relay_key: None,
+            node_label: "test-node".into(),
+            relay_downstreams: vec![],
+            relay_probe_interval: Duration::from_secs(5),
+        };
+        let db = Db::open(&config.db_path()).unwrap();
+        let backend = Arc::new(NativePtyBackend::new(db.events()));
+        let manager = Arc::new(SessionManager::new(
+            db,
+            Arc::new(PluginRegistry::with_builtins()),
+            backend,
+            data_dir.join("worktrees"),
+        ));
+        let app = router(AppState {
+            manager,
+            config: Arc::new(config),
+            scm: Arc::new(GitSourceControl),
+            started_at: now_millis(),
+            node_id: "test-node-id".into(),
+            node_label: "test-node".into(),
+            attachments: super::ws::Attachments::new(),
+        });
+        (app, dir)
+    }
+
+    async fn json(response: axum::response::Response) -> Value {
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
 
     #[test]
     fn normalize_model_treats_blank_as_no_override() {
@@ -936,5 +1004,56 @@ mod tests {
         assert!(!needs_live_session("/api/sessions/abc/upload"));
         assert!(!needs_live_session("/api/sessions/abc/scm/status"));
         assert!(!needs_live_session("/health"));
+    }
+
+    #[tokio::test]
+    async fn router_health_uses_real_app_state() {
+        let (app, dir) = test_router();
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json(response).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["node_id"], "test-node-id");
+        assert_eq!(body["backend"], "native-pty");
+        assert_eq!(body["active_sessions"], 0);
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn router_enforces_auth_and_serves_local_session_list() {
+        let (app, dir) = test_router();
+
+        let remote = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(remote.status(), StatusCode::UNAUTHORIZED);
+
+        let mut local_request = Request::builder()
+            .uri("/api/sessions")
+            .body(Body::empty())
+            .unwrap();
+        local_request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+        ));
+        let local = app.clone().oneshot(local_request).await.unwrap();
+        assert_eq!(local.status(), StatusCode::OK);
+        assert_eq!(json(local).await["sessions"], serde_json::json!([]));
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
