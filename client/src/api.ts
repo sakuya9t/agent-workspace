@@ -655,6 +655,11 @@ export const api = {
     }),
   scmStatus: (t: Target, id: string) =>
     req<{ status: ScmStatus }>(t, `/api/sessions/${id}/scm/status`).then((r) => r.status),
+  scmDiscard: (t: Target, id: string, path: string) =>
+    req<{ path: string }>(t, `/api/sessions/${id}/scm/discard`, {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    }).then((r) => r.path),
   scmDiff: (t: Target, id: string, path: string, untracked: boolean, commit?: string) =>
     req<{ path: string; diff: string }>(
       t,

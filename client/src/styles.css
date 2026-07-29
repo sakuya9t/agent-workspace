@@ -1536,6 +1536,14 @@ body.col-resizing iframe {
   mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.5 1.5h5.6l3.4 3.4v9.6h-9z'/%3E%3Cpath d='M9.1 1.7v3.4h3.2M5.7 8h4.6M5.7 10.5h4.6M5.7 13h2.7'/%3E%3C/svg%3E");
   -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.5 1.5h5.6l3.4 3.4v9.6h-9z'/%3E%3Cpath d='M9.1 1.7v3.4h3.2M5.7 8h4.6M5.7 10.5h4.6M5.7 13h2.7'/%3E%3C/svg%3E");
 }
+.action-icon-discard {
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 5h10M6 5V3h4v2M4.5 5l.6 9h5.8l.6-9M7 7.5v4M9 7.5v4'/%3E%3C/svg%3E");
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 5h10M6 5V3h4v2M4.5 5l.6 9h5.8l.6-9M7 7.5v4M9 7.5v4'/%3E%3C/svg%3E");
+}
+.discard-file-btn:hover:not(:disabled) {
+  border-color: #f7768e;
+  color: #f7768e;
+}
 .action-icon-git-merge {
   mask-image: url("/icons/actions/git-merge.png");
   -webkit-mask-image: url("/icons/actions/git-merge.png");
@@ -1836,9 +1844,9 @@ body.col-resizing iframe {
   flex: none;
 }
 
-/* The two ways into one file — diff, or the whole file. Present at rest rather
-   than hover-revealed, because a touch device never hovers; dimmed so a long
-   changeset doesn't read as two columns of buttons. */
+/* Per-file actions are present at rest rather than hover-revealed, because a
+   touch device never hovers; dimmed so a long changeset does not read as a
+   wall of buttons. */
 .file-actions {
   display: flex;
   flex: none;
@@ -3348,7 +3356,7 @@ body.col-resizing iframe {
     padding: 9px 4px;
   }
   /* `.file-actions .icon-btn` out-specifies the `.icon-btn` rule above, so the
-     row's two buttons need the touch size restated or they'd stay at 22px. */
+     row buttons need the touch size restated or they would stay at 22px. */
   .file-actions .icon-btn {
     width: 36px;
     height: 32px;
@@ -3357,7 +3365,7 @@ body.col-resizing iframe {
     width: 15px;
     height: 15px;
   }
-  /* Nothing hovers on a phone, so the pair can't be dimmed-until-hover there. */
+  /* Nothing hovers on a phone, so actions cannot be dimmed-until-hover there. */
   .file-actions {
     opacity: 1;
   }

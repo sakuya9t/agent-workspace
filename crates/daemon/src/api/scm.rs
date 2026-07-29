@@ -55,6 +55,27 @@ pub async fn status(
 }
 
 #[derive(Debug, Deserialize)]
+pub struct DiscardBody {
+    path: String,
+}
+
+/// Discard all staged and unstaged changes for one entry in the current change
+/// set. The provider re-resolves the entry before mutating so the client cannot
+/// use this as a general-purpose file deletion endpoint.
+pub async fn discard(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<DiscardBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let cwd = session_cwd(&state, &id).await?;
+    let scm = state.scm.clone();
+    let path = body.path;
+    let result_path = path.clone();
+    run_blocking(move || scm.discard(&cwd, &path)).await?;
+    Ok(Json(json!({ "path": result_path })))
+}
+
+#[derive(Debug, Deserialize)]
 pub struct DiffParams {
     path: String,
     #[serde(default)]

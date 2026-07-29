@@ -285,6 +285,14 @@ export function RightPanel({ target, session, onCommitChanges }: Props) {
     },
   });
 
+  const discardFile = useMutation({
+    mutationFn: (path: string) => api.scmDiscard(target!, session!.id, path),
+    onSuccess: (path) => {
+      if (diffTarget?.file.path === path) setDiffTarget(null);
+      qc.invalidateQueries({ queryKey: ["scm", base, session?.id] });
+    },
+  });
+
   // `attached` here means the managed worktree currently holds its recorded
   // branch. Detaching leaves the files and HEAD in place, but releases Git's
   // branch lock so the source checkout can temporarily deploy/verify it.
@@ -324,7 +332,7 @@ export function RightPanel({ target, session, onCommitChanges }: Props) {
     resetScmOps();
     branchAttachment.mutate(attached);
   };
-  const scmBusy = scmOps.some((op) => op.isPending);
+  const scmBusy = scmOps.some((op) => op.isPending) || discardFile.isPending;
 
   const recordedBranch = instance?.branch ?? null;
   const canToggleBranchAttachment =
@@ -341,6 +349,7 @@ export function RightPanel({ target, session, onCommitChanges }: Props) {
     setMergeOpen(false);
     setMergeTarget("");
     resetScmOps();
+    discardFile.reset();
   }, [session?.id, base]);
 
   if (!session || !target) {
@@ -702,10 +711,27 @@ export function RightPanel({ target, session, onCommitChanges }: Props) {
                 {f.staged && <span className="staged-dot" title={t("rightPanel.staged")} />}
                 <FileViewActions
                   onOpen={(mode) => setDiffTarget({ file: f, mode })}
+                  onDiscard={() => {
+                    discardFile.reset();
+                    if (confirm(t("rightPanel.confirmDiscard", { path: f.path }))) {
+                      discardFile.mutate(f.path);
+                    }
+                  }}
+                  discardDisabled={scmBusy}
                 />
               </div>
             ))}
           </div>
+        )}
+
+        {discardFile.error && (
+          <ScmOpNotice
+            status="error"
+            title={t("rightPanel.discardFailed")}
+            summary={scmErrorSummary(discardFile.error)}
+            details={scmErrorDetails(discardFile.error)}
+            onDismiss={discardFile.reset}
+          />
         )}
 
         {scm?.is_repo && (

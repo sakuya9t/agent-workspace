@@ -292,6 +292,10 @@ fn resolve_rebase(dir: &Path, resolver: &dyn ConflictResolver) -> Result<()> {
 pub trait SourceControl: Send + Sync {
     fn detect(&self, cwd: &Path) -> bool;
     fn status(&self, cwd: &Path) -> Result<ScmStatus>;
+    /// Discard every staged and unstaged change for one path. Tracked content
+    /// is restored from HEAD; a path that did not exist at HEAD is removed.
+    /// Implementations must reject paths outside the current change set.
+    fn discard(&self, cwd: &Path, path: &str) -> Result<()>;
     /// Unified diff for one path. When `commit` is set, show that path's diff
     /// as introduced by the commit; otherwise diff the working tree (with
     /// `untracked` files diffed against /dev/null).
@@ -396,6 +400,71 @@ impl SourceControl for GitSourceControl {
             remotes,
             base,
         })
+    }
+
+    fn discard(&self, cwd: &Path, path: &str) -> Result<()> {
+        guard_path(path)?;
+        if !self.detect(cwd) {
+            bail!("not a git repository");
+        }
+
+        // Resolve the entry again at mutation time rather than trusting the
+        // client to say whether it is tracked, untracked, or renamed. Besides
+        // keeping those choices server-owned, exact membership makes this
+        // endpoint incapable of deleting an arbitrary valid-looking path.
+        let changed = self
+            .status(cwd)?
+            .changed_files
+            .into_iter()
+            .find(|file| file.path == path)
+            .ok_or_else(|| anyhow!("path is not in the current change set: {path}"))?;
+
+        if changed.untracked {
+            remove_untracked_file(cwd, &changed.path)?;
+            return Ok(());
+        }
+
+        let head = self.resolve_commit(cwd, "HEAD")?;
+        let mut paths = vec![changed.path];
+        if let Some(orig_path) = changed.orig_path {
+            guard_path(&orig_path)?;
+            paths.push(orig_path);
+        }
+
+        for changed_path in paths {
+            let existed_at_head = head.as_deref().is_some_and(|hash| {
+                git_ok(
+                    cwd,
+                    &["cat-file", "-e", &format!("{hash}:./{changed_path}")],
+                )
+            });
+            if existed_at_head {
+                // Restore both index and working tree so a staged change is
+                // discarded just as completely as an unstaged one.
+                git(
+                    cwd,
+                    &[
+                        "restore",
+                        "--source",
+                        head.as_deref().expect("checked above"),
+                        "--staged",
+                        "--worktree",
+                        "--",
+                        &changed_path,
+                    ],
+                )?;
+            } else {
+                // A staged addition (including one in an unborn repository)
+                // has no HEAD version to restore. Remove it from the index and
+                // disk, matching the semantics used for an untracked file.
+                git(
+                    cwd,
+                    &["rm", "-f", "--ignore-unmatch", "--", &changed_path],
+                )?;
+                remove_untracked_file(cwd, &changed_path)?;
+            }
+        }
+        Ok(())
     }
 
     fn diff(
@@ -1540,6 +1609,23 @@ fn guard_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Delete exactly one untracked/new file through Git's own path handling. With
+/// no `-d`, clean is deliberately non-recursive: it removes a leaf file or
+/// symlink but refuses untracked directories and nested repositories.
+fn remove_untracked_file(cwd: &Path, path: &str) -> Result<()> {
+    guard_path(path)?;
+    git(cwd, &["clean", "-f", "--", path])?;
+    if GitSourceControl
+        .status(cwd)?
+        .changed_files
+        .iter()
+        .any(|file| file.path == path)
+    {
+        bail!("Git refused to remove file: {path}");
+    }
+    Ok(())
+}
+
 /// Reject anything that isn't a bare commit hash. The value reaches git as a
 /// positional argument, so restricting it to hex digits blocks both option
 /// injection (a leading `-`) and revision expressions.
@@ -1694,6 +1780,66 @@ mod tests {
         assert!(guard_path("../secret").is_err());
         assert!(guard_path("a/../../b").is_err());
         assert!(guard_path("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn discards_tracked_staged_new_untracked_deleted_and_renamed_files() {
+        let repo = test_repo("discard");
+        write_file(&repo, "tracked.txt", "original\n");
+        write_file(&repo, "deleted.txt", "keep me\n");
+        write_file(&repo, "old-name.txt", "renamed contents\n");
+        commit_all(&repo, "base");
+
+        // Both index and worktree differ from HEAD.
+        write_file(&repo, "tracked.txt", "staged\n");
+        git_test(&repo, &["add", "tracked.txt"]);
+        write_file(&repo, "tracked.txt", "unstaged too\n");
+        GitSourceControl.discard(&repo, "tracked.txt").unwrap();
+        assert_eq!(fs::read_to_string(repo.join("tracked.txt")).unwrap(), "original\n");
+        assert!(
+            !GitSourceControl
+                .status(&repo)
+                .unwrap()
+                .changed_files
+                .iter()
+                .any(|file| file.path == "tracked.txt")
+        );
+
+        write_file(&repo, "added.txt", "new\n");
+        git_test(&repo, &["add", "added.txt"]);
+        GitSourceControl.discard(&repo, "added.txt").unwrap();
+        assert!(!repo.join("added.txt").exists());
+
+        write_file(&repo, "untracked.txt", "new\n");
+        GitSourceControl.discard(&repo, "untracked.txt").unwrap();
+        assert!(!repo.join("untracked.txt").exists());
+
+        fs::remove_file(repo.join("deleted.txt")).unwrap();
+        GitSourceControl.discard(&repo, "deleted.txt").unwrap();
+        assert_eq!(
+            fs::read_to_string(repo.join("deleted.txt")).unwrap(),
+            "keep me\n"
+        );
+
+        git_test(&repo, &["mv", "old-name.txt", "new-name.txt"]);
+        GitSourceControl.discard(&repo, "new-name.txt").unwrap();
+        assert_eq!(
+            fs::read_to_string(repo.join("old-name.txt")).unwrap(),
+            "renamed contents\n"
+        );
+        assert!(!repo.join("new-name.txt").exists());
+        assert!(GitSourceControl.status(&repo).unwrap().changed_files.is_empty());
+    }
+
+    #[test]
+    fn discard_rejects_paths_outside_the_current_change_set() {
+        let repo = test_repo("discard-guard");
+        write_file(&repo, "tracked.txt", "original\n");
+        commit_all(&repo, "base");
+
+        assert!(GitSourceControl.discard(&repo, "tracked.txt").is_err());
+        assert!(GitSourceControl.discard(&repo, "../outside.txt").is_err());
+        assert_eq!(fs::read_to_string(repo.join("tracked.txt")).unwrap(), "original\n");
     }
 
     #[test]

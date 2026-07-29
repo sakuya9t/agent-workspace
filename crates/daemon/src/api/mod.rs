@@ -117,6 +117,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/:id/vscode-target", get(vscode_target))
         .route("/api/sessions/:id/stream", get(ws::stream))
         .route("/api/sessions/:id/scm/status", get(scm::status))
+        .route("/api/sessions/:id/scm/discard", post(scm::discard))
         .route("/api/sessions/:id/scm/diff", get(scm::diff))
         .route("/api/sessions/:id/scm/file", get(scm::file))
         .route("/api/sessions/:id/scm/content", get(scm::content))
