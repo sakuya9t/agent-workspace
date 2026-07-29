@@ -82,8 +82,10 @@ impl Db {
             "INSERT INTO sessions (
                 id, agent_plugin_id, command, args, env, working_directory, workspace_id,
                 status, rows, cols, last_event_seq, exit_code, attention_state, attention_reason,
-                created_at, updated_at, last_activity_at, risky, agent_session_id, forked_from
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                created_at, updated_at, last_activity_at, risky, agent_session_id, forked_from,
+                state_since, state_kind
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,
+                      ?21, ?8 || '/' || ?13)",
             rusqlite::params![
                 s.id,
                 s.agent_plugin_id,
@@ -105,6 +107,7 @@ impl Db {
                 s.risky as i64,
                 s.agent_session_id,
                 s.forked_from,
+                s.state_since,
             ],
         )?;
         Ok(())
@@ -130,7 +133,8 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT id, agent_plugin_id, command, args, env, working_directory, workspace_id,
                     status, rows, cols, last_event_seq, exit_code, attention_state, attention_reason,
-                    created_at, updated_at, last_activity_at, risky, agent_session_id, forked_from
+                    created_at, updated_at, last_activity_at, risky, agent_session_id, forked_from,
+                    state_since
              FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
@@ -142,7 +146,8 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT id, agent_plugin_id, command, args, env, working_directory, workspace_id,
                     status, rows, cols, last_event_seq, exit_code, attention_state, attention_reason,
-                    created_at, updated_at, last_activity_at, risky, agent_session_id, forked_from
+                    created_at, updated_at, last_activity_at, risky, agent_session_id, forked_from,
+                    state_since
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map([id], row_to_session)?;
@@ -158,7 +163,12 @@ impl Db {
     ) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
-            "UPDATE sessions SET status = ?2, exit_code = ?3, updated_at = ?4 WHERE id = ?1",
+            "UPDATE sessions
+             SET status = ?2, exit_code = ?3, updated_at = ?4,
+                 state_since = CASE WHEN state_kind = ?2 || '/' || attention_state
+                                    THEN state_since ELSE ?4 END,
+                 state_kind = ?2 || '/' || attention_state
+             WHERE id = ?1",
             rusqlite::params![id, status.as_str(), exit_code, updated_at],
         )?;
         Ok(())
@@ -176,7 +186,10 @@ impl Db {
         conn.execute(
             "UPDATE sessions
              SET last_event_seq = ?2, last_activity_at = ?3, updated_at = ?3,
-                 attention_state = ?4, attention_reason = ?5
+                 attention_state = ?4, attention_reason = ?5,
+                 state_since = CASE WHEN state_kind = status || '/' || ?4
+                                    THEN state_since ELSE ?3 END,
+                 state_kind = status || '/' || ?4
              WHERE id = ?1",
             rusqlite::params![
                 id,
@@ -198,8 +211,32 @@ impl Db {
     ) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
-            "UPDATE sessions SET attention_state = ?2, attention_reason = ?3, updated_at = ?4 WHERE id = ?1",
+            "UPDATE sessions
+             SET attention_state = ?2, attention_reason = ?3, updated_at = ?4,
+                 state_since = CASE WHEN state_kind = status || '/' || ?2
+                                    THEN state_since ELSE ?4 END,
+                 state_kind = status || '/' || ?2
+             WHERE id = ?1",
             rusqlite::params![id, attention.as_str(), reason, updated_at],
+        )?;
+        Ok(())
+    }
+
+    /// Clear the badge because the user *looked* at the session.
+    ///
+    /// Deliberately the one attention write that leaves `state_since`/`state_kind`
+    /// alone: viewing a session doesn't change what it is doing, and the clock the
+    /// list shows is meant to answer "how long has it been blocked" — an answer
+    /// that must survive being looked at. It also survives the *return* of the
+    /// badge a moment later: an agent that is still blocked re-classifies to the
+    /// state `state_kind` already records, so the CASE above finds no change and
+    /// the original timestamp stands.
+    pub fn clear_attention_for_view(&self, id: &str, updated_at: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE sessions SET attention_state = 'none', attention_reason = NULL, updated_at = ?2
+             WHERE id = ?1",
+            rusqlite::params![id, updated_at],
         )?;
         Ok(())
     }
@@ -589,6 +626,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         risky: row.get::<_, i64>(17)? != 0,
         agent_session_id: row.get(18)?,
         forked_from: row.get(19)?,
+        state_since: row.get(20)?,
     })
 }
 
@@ -672,6 +710,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA_V7)?;
         conn.pragma_update(None, "user_version", 7)?;
         tracing::info!("applied schema migration v7");
+    }
+    if version < 8 {
+        conn.execute_batch(SCHEMA_V8)?;
+        conn.pragma_update(None, "user_version", 8)?;
+        tracing::info!("applied schema migration v8");
     }
     Ok(())
 }
@@ -806,6 +849,24 @@ ALTER TABLE sessions ADD COLUMN agent_session_id TEXT;
 ALTER TABLE sessions ADD COLUMN forked_from TEXT;
 "#;
 
+/// When the session entered the state it is in now, and which state that is.
+///
+/// `last_activity_at` answers "when did this last print something", which is not
+/// what the list's clock is for: a blocked agent redraws its TUI forever, so that
+/// timestamp resets every few hundred milliseconds and reads "just now" no matter
+/// how long the session has been waiting on you. `state_since` is only moved when
+/// `state_kind` — the `status/attention` pair — actually changes.
+///
+/// Backfilled from `last_activity_at` rather than left at 0, so sessions that
+/// predate the column report something plausible instead of 1970.
+const SCHEMA_V8: &str = r#"
+ALTER TABLE sessions ADD COLUMN state_since INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN state_kind TEXT NOT NULL DEFAULT '';
+UPDATE sessions
+   SET state_since = last_activity_at,
+       state_kind = status || '/' || attention_state;
+"#;
+
 /// Batches terminal events into transactions to keep write amplification low.
 fn event_writer_loop(mut conn: Connection, mut rx: UnboundedReceiver<EventMsg>) {
     // Block for the first event, then drain whatever else is queued.
@@ -877,6 +938,43 @@ mod tests {
         (Db::open(&dir.join("t.sqlite3")).unwrap(), dir)
     }
 
+    /// Upgrading an existing install, not just creating a fresh one: a session
+    /// row written before the state clock existed must come back with a
+    /// plausible timestamp rather than the epoch.
+    #[test]
+    fn migration_backfills_the_state_clock_for_existing_sessions() {
+        let (db, dir) = temp_db();
+        let path = dir.join("t.sqlite3");
+        seed_session(&db, "old");
+        db.update_activity("old", 1, 5_000, AttentionState::Idle, None)
+            .unwrap();
+
+        // Rewind the file to exactly what a v7 daemon would have left behind.
+        db.conn
+            .lock()
+            .execute_batch(
+                "ALTER TABLE sessions DROP COLUMN state_since;
+                 ALTER TABLE sessions DROP COLUMN state_kind;
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
+        drop(db);
+
+        let db = Db::open(&path).unwrap();
+        let s = db.get_session("old").unwrap().unwrap();
+        assert_eq!(
+            s.state_since, 5_000,
+            "backfilled from last_activity_at, not left at 0",
+        );
+        // And the backfilled `state_kind` has to match the row, or the very next
+        // write would read as a change and restart a clock that didn't move.
+        db.update_activity("old", 2, 9_000, AttentionState::Idle, None)
+            .unwrap();
+        assert_eq!(db.get_session("old").unwrap().unwrap().state_since, 5_000);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn seed_session(db: &Db, id: &str) {
         db.insert_session(&Session {
             id: id.into(),
@@ -899,6 +997,7 @@ mod tests {
             risky: false,
             agent_session_id: None,
             forked_from: None,
+            state_since: 1,
         })
         .unwrap();
     }
@@ -940,6 +1039,48 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(250));
         assert_eq!(db.get_backend_cursor("s1").unwrap(), 550);
         assert_eq!(db.max_event_seq("s1").unwrap(), 4);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The clock the session list shows: how long the session has been in the
+    /// state it is in, not how long since it last printed something.
+    #[test]
+    fn state_since_holds_through_redraws_and_moves_on_a_real_change() {
+        let (db, dir) = temp_db();
+        seed_session(&db, "s1");
+        let since = || db.get_session("s1").unwrap().unwrap().state_since;
+
+        // Blocked at 1_000. Every redraw after that repeats the same verdict, and
+        // the whole point is that they don't restart the clock — otherwise a
+        // session that has waited fifteen minutes reads "just now".
+        db.update_activity("s1", 1, 1_000, AttentionState::ApprovalNeeded, None)
+            .unwrap();
+        assert_eq!(since(), 1_000);
+        db.update_activity("s1", 2, 5_000, AttentionState::ApprovalNeeded, None)
+            .unwrap();
+        assert_eq!(since(), 1_000, "a redraw is not a state change");
+        assert_eq!(
+            db.get_session("s1").unwrap().unwrap().last_activity_at,
+            5_000,
+            "activity still tracks the last output — only the state clock holds",
+        );
+
+        // Viewing clears the badge but must not restart the clock, and neither
+        // must the badge coming back when the agent is still blocked.
+        db.clear_attention_for_view("s1", 6_000).unwrap();
+        assert_eq!(since(), 1_000, "looking at a session is not a state change");
+        db.update_activity("s1", 3, 7_000, AttentionState::ApprovalNeeded, None)
+            .unwrap();
+        assert_eq!(since(), 1_000, "the same block, re-reported after a view");
+
+        // Answering it is a real change; so is exiting.
+        db.update_activity("s1", 4, 8_000, AttentionState::Activity, None)
+            .unwrap();
+        assert_eq!(since(), 8_000);
+        db.update_status("s1", SessionStatus::Exited, Some(0), 9_000)
+            .unwrap();
+        assert_eq!(since(), 9_000, "the lifecycle status counts as state too");
 
         let _ = std::fs::remove_dir_all(dir);
     }

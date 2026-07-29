@@ -621,6 +621,7 @@ mod tests {
             risky: false,
             agent_session_id: None,
             forked_from: None,
+            state_since: now,
         })
         .unwrap();
     }

@@ -10,6 +10,7 @@ import { StopSessionDialog } from "./StopSessionDialog";
 import { isBusy, isLive } from "../status";
 import { relTime } from "../i18n/time";
 import { attentionLabel, endedLabel, statusLabel } from "../i18n/labels";
+import i18n from "../i18n";
 
 const STATUS_COLOR: Record<SessionStatus, string> = {
   starting: "#e0af68",
@@ -240,7 +241,12 @@ export function SessionList() {
             {s.agent_plugin_id}
             {ctx?.workspaceName ? ` · ${ctx.workspaceName}` : ""}
           </span>
-          <span className="dim">{relTime(s.last_activity_at)}</span>
+          {/* How long it has been in this state — "blocked 8m", not "8m since
+              it last drew a frame". An old daemon sends no `state_since`, so
+              fall back to the activity stamp it does send. */}
+          <span className="dim" title={stateSinceTitle(s)}>
+            {relTime(s.state_since ?? s.last_activity_at)}
+          </span>
         </div>
         <div className="session-actions">
           {isLive(s.status) ? (
@@ -698,6 +704,29 @@ function sessionTitle(s: Session, workspaceName?: string): string {
  */
 function sessionLabel(s: Session, workspaceName?: string): string {
   return `${s.agent_plugin_id} · ${sessionTitle(s, workspaceName)}`;
+}
+
+/**
+ * Spells out what the row's relative time is counting, since "8m" alone can't
+ * say whether that is eight minutes of being blocked or eight minutes since the
+ * session was last touched. Names the state and gives the absolute moment.
+ */
+function stateSinceTitle(s: Session): string {
+  const at = s.state_since ?? s.last_activity_at;
+  const state = isLive(s.status)
+    ? s.attention_state !== "none"
+      ? attentionLabel(s.attention_state)
+      : statusLabel(s.status)
+    : endedLabel(s.status);
+  return i18n.t("sessionList.stateSinceTitle", { state, since: absTime(at) });
+}
+
+function absTime(ms: number): string {
+  try {
+    return new Date(ms).toLocaleString();
+  } catch {
+    return "";
+  }
 }
 
 /**

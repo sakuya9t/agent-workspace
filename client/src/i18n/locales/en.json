@@ -204,6 +204,7 @@
   },
   "sessionList": {
     "sessionsHeader": "Sessions",
+    "stateSinceTitle": "{{state}} since {{since}}",
     "historyHeader": "History",
     "daemonsBtn": "daemons",
     "newBtn": "+ New",

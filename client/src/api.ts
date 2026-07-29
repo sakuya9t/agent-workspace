@@ -36,6 +36,13 @@ export interface Session {
   created_at: number;
   updated_at: number;
   last_activity_at: number;
+  /**
+   * When the session entered the state it is in now — what the row's clock
+   * counts from, so "blocked 8m" means eight minutes of being blocked. Unlike
+   * `last_activity_at` it isn't moved by a redraw, nor by viewing the session.
+   * (Absent on old daemons; fall back to `last_activity_at`.)
+   */
+  state_since?: number;
   risky: boolean;
   /** Whether a live client is currently attached (for takeover prompts). */
   attached?: boolean;

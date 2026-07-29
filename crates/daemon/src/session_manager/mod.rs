@@ -376,6 +376,7 @@ impl SessionManager {
             // Captured later, by the monitor, while this session is alive.
             agent_session_id: None,
             forked_from: req.fork.as_ref().map(|f| f.origin_id.clone()),
+            state_since: now,
         };
         self.db.insert_session(&session)?;
         if let Some(inst) = instance {
@@ -896,8 +897,7 @@ impl SessionManager {
 
     /// Clear the attention flag when the user views/acknowledges a session.
     pub fn acknowledge_attention(&self, id: &str) -> Result<Session> {
-        self.db
-            .set_attention(id, AttentionState::None, None, now_millis())?;
+        self.db.clear_attention_for_view(id, now_millis())?;
         self.signal_attn_reset(id);
         self.db
             .get_session(id)?
@@ -1271,6 +1271,7 @@ mod tests {
             risky: false,
             agent_session_id: None,
             forked_from: None,
+            state_since: now,
         })
         .unwrap();
     }

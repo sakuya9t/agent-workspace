@@ -216,6 +216,14 @@ pub struct Session {
     /// session started from scratch. Gives the UI a lineage, including a chain
     /// when a fork is itself forked.
     pub forked_from: Option<String>,
+    /// When the session entered the state it is in now — the timestamp behind the
+    /// list's "blocked 8m" / "idle 3m". Distinct from `last_activity_at`, which
+    /// is the last time it *printed* anything: a blocked agent redraws its TUI
+    /// continuously, so activity says "just now" for a session that has been
+    /// waiting on the user for a quarter of an hour. Moved only when the
+    /// `status`/`attention_state` pair changes, and deliberately *not* when the
+    /// user views the session (see [`crate::db::Db::clear_attention_for_view`]).
+    pub state_since: i64,
 }
 
 /// An enrolled client device. The `token` is the bearer credential and is
