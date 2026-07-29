@@ -11,8 +11,9 @@ import { isTerminal } from "../status";
 import { useIsPhone } from "../useIsPhone";
 import { shortPath } from "../paths";
 import { copyText } from "../clipboard";
-import { DiffModal } from "./DiffModal";
+import { DiffModal, DiffMode } from "./DiffModal";
 import { CommitModal } from "./CommitModal";
+import { FileViewActions } from "./FileViewActions";
 
 interface Props {
   target: Target | undefined;
@@ -54,7 +55,8 @@ export function RightPanel({ target, session, onCommitChanges }: Props) {
   // the whole "Continue in VS Code" affordance is hidden (mobile shell only).
   const isPhone = useIsPhone();
   const qc = useQueryClient();
-  const [diffTarget, setDiffTarget] = useState<ChangedFile | null>(null);
+  // The file the viewer is open on, and which of its two views it opened in.
+  const [diffTarget, setDiffTarget] = useState<{ file: ChangedFile; mode: DiffMode } | null>(null);
   const [commitTarget, setCommitTarget] = useState<string | null>(null);
   const [rebaseOpen, setRebaseOpen] = useState(false);
   const [rebaseOnto, setRebaseOnto] = useState("");
@@ -687,7 +689,7 @@ export function RightPanel({ target, session, onCommitChanges }: Props) {
               <div
                 key={f.path}
                 className="changed-file"
-                onClick={() => setDiffTarget(f)}
+                onClick={() => setDiffTarget({ file: f, mode: "diff" })}
                 title={t("rightPanel.viewDiff")}
               >
                 <span
@@ -698,6 +700,9 @@ export function RightPanel({ target, session, onCommitChanges }: Props) {
                 </span>
                 <span className="mono change-path">{shortPath(f.path)}</span>
                 {f.staged && <span className="staged-dot" title={t("rightPanel.staged")} />}
+                <FileViewActions
+                  onOpen={(mode) => setDiffTarget({ file: f, mode })}
+                />
               </div>
             ))}
           </div>
@@ -1066,8 +1071,9 @@ export function RightPanel({ target, session, onCommitChanges }: Props) {
         <DiffModal
           target={target}
           sessionId={session.id}
-          path={diffTarget.path}
-          untracked={diffTarget.untracked}
+          path={diffTarget.file.path}
+          untracked={diffTarget.file.untracked}
+          mode={diffTarget.mode}
           onClose={() => setDiffTarget(null)}
         />
       )}

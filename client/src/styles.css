@@ -1524,6 +1524,18 @@ body.col-resizing iframe {
   mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='4' cy='3' r='1.7'/%3E%3Ccircle cx='4' cy='13' r='1.7'/%3E%3Ccircle cx='12' cy='3' r='1.7'/%3E%3Cpath d='M4 4.7v6.6'/%3E%3Cpath d='M12 4.7v1.6a3 3 0 0 1-3 3H4'/%3E%3C/svg%3E");
   -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='4' cy='3' r='1.7'/%3E%3Ccircle cx='4' cy='13' r='1.7'/%3E%3Ccircle cx='12' cy='3' r='1.7'/%3E%3Cpath d='M4 4.7v6.6'/%3E%3Cpath d='M12 4.7v1.6a3 3 0 0 1-3 3H4'/%3E%3C/svg%3E");
 }
+/* The pair on every changed-file row. Both are the same sheet-of-paper outline
+   so they read as two views of one file; what differs is what's written on it —
+   a +/- pair for the diff, body text for the file itself. Inline SVG for the
+   same reason as the fork above: the hand-drawn PNG set has no glyph for either. */
+.action-icon-diff {
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4.2 2.2h5.1l3.2 3.2v8.4a.9.9 0 0 1-.9.9H4.2a.9.9 0 0 1-.9-.9V3.1a.9.9 0 0 1 .9-.9z'/%3E%3Cpath d='M9.3 2.3v3.2h3.2'/%3E%3Cpath d='M5.6 9.1h2.6M6.9 7.8v2.6'/%3E%3Cpath d='M5.6 12.1h2.6'/%3E%3C/svg%3E");
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4.2 2.2h5.1l3.2 3.2v8.4a.9.9 0 0 1-.9.9H4.2a.9.9 0 0 1-.9-.9V3.1a.9.9 0 0 1 .9-.9z'/%3E%3Cpath d='M9.3 2.3v3.2h3.2'/%3E%3Cpath d='M5.6 9.1h2.6M6.9 7.8v2.6'/%3E%3Cpath d='M5.6 12.1h2.6'/%3E%3C/svg%3E");
+}
+.action-icon-file {
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4.2 2.2h5.1l3.2 3.2v8.4a.9.9 0 0 1-.9.9H4.2a.9.9 0 0 1-.9-.9V3.1a.9.9 0 0 1 .9-.9z'/%3E%3Cpath d='M9.3 2.3v3.2h3.2'/%3E%3Cpath d='M5.5 8.4h5M5.5 10.6h5M5.5 12.8h2.8'/%3E%3C/svg%3E");
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4.2 2.2h5.1l3.2 3.2v8.4a.9.9 0 0 1-.9.9H4.2a.9.9 0 0 1-.9-.9V3.1a.9.9 0 0 1 .9-.9z'/%3E%3Cpath d='M9.3 2.3v3.2h3.2'/%3E%3Cpath d='M5.5 8.4h5M5.5 10.6h5M5.5 12.8h2.8'/%3E%3C/svg%3E");
+}
 .action-icon-git-merge {
   mask-image: url("/icons/actions/git-merge.png");
   -webkit-mask-image: url("/icons/actions/git-merge.png");
@@ -1806,19 +1818,46 @@ body.col-resizing iframe {
   font-family: ui-monospace, monospace;
   flex: none;
 }
+/* Takes the row's free width so the trailing dot and actions sit hard right and
+   a long path ellipsizes rather than pushing them off the edge. */
 .change-path {
+  flex: 1;
+  min-width: 0;
   font-size: 12px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .staged-dot {
-  margin-left: auto;
   width: 7px;
   height: 7px;
   border-radius: 50%;
   background: var(--accent);
   flex: none;
+}
+
+/* The two ways into one file — diff, or the whole file. Present at rest rather
+   than hover-revealed, because a touch device never hovers; dimmed so a long
+   changeset doesn't read as two columns of buttons. */
+.file-actions {
+  display: flex;
+  flex: none;
+  gap: 3px;
+  opacity: 0.5;
+  transition: opacity 0.12s ease;
+}
+.changed-file:hover .file-actions,
+.commit-file:hover .file-actions,
+.file-actions:focus-within {
+  opacity: 1;
+}
+.file-actions .icon-btn {
+  width: 22px;
+  height: 20px;
+}
+.file-actions .action-icon {
+  width: 12px;
+  height: 12px;
 }
 
 /* commit graph (single-lane MVP history) */
@@ -1941,9 +1980,44 @@ body.col-resizing iframe {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 12px;
   flex: none;
   padding: 14px 16px;
   margin-bottom: 0;
+}
+/* The path can be long; the controls must never be pushed out of reach. */
+.diff-modal .modal-title > .mono {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.diff-modal-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+/* Diff / Whole file: one control, so the two halves join into a single pill. */
+.mode-toggle {
+  display: flex;
+}
+.mode-toggle .btn {
+  border-radius: 0;
+}
+.mode-toggle .btn:first-child {
+  border-radius: 6px 0 0 6px;
+}
+.mode-toggle .btn:last-child {
+  border-radius: 0 6px 6px 0;
+  margin-left: -1px;
+}
+.mode-toggle .btn.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  /* Lift the selected half so its shared edge isn't drawn over by its sibling. */
+  position: relative;
+  z-index: 1;
 }
 .diff-view {
   flex: 1;
@@ -1973,6 +2047,31 @@ body.col-resizing iframe {
 }
 .diff-line.meta {
   color: var(--dim);
+}
+
+/* Whole-file mode. Gutter numbers are unselectable so copying a range of lines
+   yields the code alone, the way it would out of an editor. */
+.file-line {
+  display: flex;
+  gap: 12px;
+  white-space: pre;
+}
+.file-lineno {
+  flex: none;
+  min-width: 3.5ch;
+  text-align: right;
+  color: var(--dim);
+  user-select: none;
+  -webkit-user-select: none;
+}
+.file-code {
+  /* The gutter must stay put when a long line scrolls the view sideways. */
+  flex: 1;
+  min-width: 0;
+}
+.file-note {
+  padding: 4px;
+  font-style: italic;
 }
 
 /* Image preview: center the picture(s) in the scroll area instead of the
@@ -2102,6 +2201,8 @@ body.col-resizing iframe {
   justify-content: flex-end;
 }
 .commit-file-path {
+  flex: 1;
+  min-width: 0;
   font-size: 12px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3090,6 +3191,20 @@ body.col-resizing iframe {
   }
   .changed-file {
     padding: 9px 4px;
+  }
+  /* `.file-actions .icon-btn` out-specifies the `.icon-btn` rule above, so the
+     row's two buttons need the touch size restated or they'd stay at 22px. */
+  .file-actions .icon-btn {
+    width: 36px;
+    height: 32px;
+  }
+  .file-actions .action-icon {
+    width: 15px;
+    height: 15px;
+  }
+  /* Nothing hovers on a phone, so the pair can't be dimmed-until-hover there. */
+  .file-actions {
+    opacity: 1;
   }
   .commit-row {
     min-height: 44px;

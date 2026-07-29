@@ -5,7 +5,8 @@ import { api, CommitFileStat } from "../api";
 import { Target } from "../connectionStore";
 import { relTime } from "../i18n/time";
 import { shortPath } from "../paths";
-import { DiffModal } from "./DiffModal";
+import { DiffModal, DiffMode } from "./DiffModal";
+import { FileViewActions } from "./FileViewActions";
 
 interface Props {
   target: Target;
@@ -17,12 +18,16 @@ interface Props {
 /**
  * Commit-detail popup mirroring the git-graph experience: subject, author,
  * absolute + relative time, message body, total churn, and the per-file
- * +/- list. Clicking a file opens that file's diff at this commit (a nested
- * DiffModal, rendered as a sibling so its backdrop click stays scoped to it).
+ * +/- list. Each file opens either its diff at this commit or the whole file as
+ * of it (a nested DiffModal, rendered as a sibling so its backdrop click stays
+ * scoped to it).
  */
 export function CommitModal({ target, sessionId, hash, onClose }: Props) {
   const { t } = useTranslation();
-  const [fileTarget, setFileTarget] = useState<CommitFileStat | null>(null);
+  const [fileTarget, setFileTarget] = useState<{
+    file: CommitFileStat;
+    mode: DiffMode;
+  } | null>(null);
   const { data, error, isLoading } = useQuery({
     queryKey: ["commit", target.baseUrl, sessionId, hash],
     queryFn: () => api.scmCommit(target, sessionId, hash),
@@ -90,7 +95,7 @@ export function CommitModal({ target, sessionId, hash, onClose }: Props) {
                   <div
                     key={f.path}
                     className="commit-file"
-                    onClick={() => setFileTarget(f)}
+                    onClick={() => setFileTarget({ file: f, mode: "diff" })}
                     title={
                       f.orig_path
                         ? t("commitModal.renamed", { from: f.orig_path, to: f.path })
@@ -115,6 +120,7 @@ export function CommitModal({ target, sessionId, hash, onClose }: Props) {
                           })
                         : shortPath(f.path)}
                     </span>
+                    <FileViewActions onOpen={(mode) => setFileTarget({ file: f, mode })} />
                   </div>
                 ))}
               </div>
@@ -127,9 +133,10 @@ export function CommitModal({ target, sessionId, hash, onClose }: Props) {
         <DiffModal
           target={target}
           sessionId={sessionId}
-          path={fileTarget.path}
+          path={fileTarget.file.path}
           untracked={false}
           commit={hash}
+          mode={fileTarget.mode}
           onClose={() => setFileTarget(null)}
         />
       )}

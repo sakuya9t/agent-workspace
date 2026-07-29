@@ -358,6 +358,7 @@
     "notRepo": "Not a Git repository. `{{cmd}}` support arrives with workspace isolation.",
     "treeClean": "Working tree clean.",
     "viewDiff": "View diff",
+    "viewWholeFile": "View whole file",
     "viewCommit": "View commit details",
     "staged": "staged",
     "historyHeader": "History",
@@ -420,9 +421,17 @@
   "diffModal": {
     "loading": "Loading diff…",
     "loadingImage": "Loading image…",
+    "loadingFile": "Loading file…",
     "before": "Before",
     "after": "After",
-    "noChanges": "No changes to display."
+    "noChanges": "No changes to display.",
+    "modeGroup": "What to show for this file",
+    "modeDiff": "Diff",
+    "modeFile": "Whole file",
+    "binaryFile": "Binary file — nothing to show as text.",
+    "emptyFile": "This file is empty.",
+    "truncated": "This file is too large to show in full — this is the beginning of it.",
+    "showingBeforeDeletion": "This file was deleted; showing the version before the deletion."
   },
   "commitModal": {
     "loading": "Loading commit…",

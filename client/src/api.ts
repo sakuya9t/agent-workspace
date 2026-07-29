@@ -189,6 +189,16 @@ export interface Commit {
   parents: string[];
 }
 
+/** Whole-file text for the diff viewer's file mode. */
+export interface FileContent {
+  path: string;
+  content: string;
+  /** The daemon refuses to render bytes it read as binary; `content` is empty. */
+  binary: boolean;
+  /** Cut at the daemon's size cap — what's shown is the head of the file. */
+  truncated: boolean;
+}
+
 export interface CommitFileStat {
   path: string;
   orig_path: string | null;
@@ -653,6 +663,16 @@ export const api = {
     getBlob(
       t,
       `/api/sessions/${id}/scm/file?path=${encodeURIComponent(path)}&side=${side}` +
+        (commit ? `&commit=${encodeURIComponent(commit)}` : ""),
+    ),
+  /**
+   * Whole-file text for the diff viewer's "view whole file" mode. `side` picks
+   * the same versions `scmFile` does; a side with no content rejects with 404.
+   */
+  scmContent: (t: Target, id: string, path: string, side: "before" | "after", commit?: string) =>
+    req<FileContent>(
+      t,
+      `/api/sessions/${id}/scm/content?path=${encodeURIComponent(path)}&side=${side}` +
         (commit ? `&commit=${encodeURIComponent(commit)}` : ""),
     ),
   scmLog: (t: Target, id: string, limit = 30) =>
