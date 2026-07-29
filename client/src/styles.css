@@ -1780,6 +1780,14 @@ body.col-resizing iframe {
 .ref-count.behind {
   color: #e0af68;
 }
+/* A session can touch hundreds of files. Cap the list and scroll it in place so
+   the panel's own height stays bounded and the history below stays reachable;
+   `contain` keeps a flick at the end of the list from scrolling the panel. */
+.changed-files {
+  max-height: 30vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
 .changed-file {
   display: flex;
   align-items: center;

@@ -679,24 +679,29 @@ export function RightPanel({ target, session, onCommitChanges }: Props) {
           <div className="dim small">{t("rightPanel.treeClean")}</div>
         )}
 
-        {scm?.is_repo &&
-          scm.changed_files.map((f) => (
-            <div
-              key={f.path}
-              className="changed-file"
-              onClick={() => setDiffTarget(f)}
-              title={t("rightPanel.viewDiff")}
-            >
-              <span
-                className="change-badge"
-                style={{ color: STATUS_COLOR[f.status] ?? "#c7d0e0" }}
+        {/* A big changeset would otherwise push the history and its actions far
+            below the fold, so the list scrolls within its own bounded box. */}
+        {scm?.is_repo && scm.changed_files.length > 0 && (
+          <div className="changed-files">
+            {scm.changed_files.map((f) => (
+              <div
+                key={f.path}
+                className="changed-file"
+                onClick={() => setDiffTarget(f)}
+                title={t("rightPanel.viewDiff")}
               >
-                {f.status}
-              </span>
-              <span className="mono change-path">{shortPath(f.path)}</span>
-              {f.staged && <span className="staged-dot" title={t("rightPanel.staged")} />}
-            </div>
-          ))}
+                <span
+                  className="change-badge"
+                  style={{ color: STATUS_COLOR[f.status] ?? "#c7d0e0" }}
+                >
+                  {f.status}
+                </span>
+                <span className="mono change-path">{shortPath(f.path)}</span>
+                {f.staged && <span className="staged-dot" title={t("rightPanel.staged")} />}
+              </div>
+            ))}
+          </div>
+        )}
 
         {scm?.is_repo && (
           <>
