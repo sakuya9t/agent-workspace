@@ -1524,17 +1524,17 @@ body.col-resizing iframe {
   mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='4' cy='3' r='1.7'/%3E%3Ccircle cx='4' cy='13' r='1.7'/%3E%3Ccircle cx='12' cy='3' r='1.7'/%3E%3Cpath d='M4 4.7v6.6'/%3E%3Cpath d='M12 4.7v1.6a3 3 0 0 1-3 3H4'/%3E%3C/svg%3E");
   -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='4' cy='3' r='1.7'/%3E%3Ccircle cx='4' cy='13' r='1.7'/%3E%3Ccircle cx='12' cy='3' r='1.7'/%3E%3Cpath d='M4 4.7v6.6'/%3E%3Cpath d='M12 4.7v1.6a3 3 0 0 1-3 3H4'/%3E%3C/svg%3E");
 }
-/* The pair on every changed-file row. Both are the same sheet-of-paper outline
-   so they read as two views of one file; what differs is what's written on it —
-   a +/- pair for the diff, body text for the file itself. Inline SVG for the
-   same reason as the fork above: the hand-drawn PNG set has no glyph for either. */
+/* The pair on every changed-file row needs different silhouettes at 12px:
+   changed lines (+/-) for the diff, and a sheet of text for the whole file.
+   Inline SVG for the same reason as the fork above: the hand-drawn PNG set has
+   no glyph for either. */
 .action-icon-diff {
-  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4.2 2.2h5.1l3.2 3.2v8.4a.9.9 0 0 1-.9.9H4.2a.9.9 0 0 1-.9-.9V3.1a.9.9 0 0 1 .9-.9z'/%3E%3Cpath d='M9.3 2.3v3.2h3.2'/%3E%3Cpath d='M5.6 9.1h2.6M6.9 7.8v2.6'/%3E%3Cpath d='M5.6 12.1h2.6'/%3E%3C/svg%3E");
-  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4.2 2.2h5.1l3.2 3.2v8.4a.9.9 0 0 1-.9.9H4.2a.9.9 0 0 1-.9-.9V3.1a.9.9 0 0 1 .9-.9z'/%3E%3Cpath d='M9.3 2.3v3.2h3.2'/%3E%3Cpath d='M5.6 9.1h2.6M6.9 7.8v2.6'/%3E%3Cpath d='M5.6 12.1h2.6'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.6' stroke-linecap='round'%3E%3Cpath d='M1.8 4.5h4M3.8 2.5v4M8 4.5h6.2M1.8 11.5h4M8 11.5h6.2'/%3E%3C/svg%3E");
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.6' stroke-linecap='round'%3E%3Cpath d='M1.8 4.5h4M3.8 2.5v4M8 4.5h6.2M1.8 11.5h4M8 11.5h6.2'/%3E%3C/svg%3E");
 }
 .action-icon-file {
-  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4.2 2.2h5.1l3.2 3.2v8.4a.9.9 0 0 1-.9.9H4.2a.9.9 0 0 1-.9-.9V3.1a.9.9 0 0 1 .9-.9z'/%3E%3Cpath d='M9.3 2.3v3.2h3.2'/%3E%3Cpath d='M5.5 8.4h5M5.5 10.6h5M5.5 12.8h2.8'/%3E%3C/svg%3E");
-  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.3' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4.2 2.2h5.1l3.2 3.2v8.4a.9.9 0 0 1-.9.9H4.2a.9.9 0 0 1-.9-.9V3.1a.9.9 0 0 1 .9-.9z'/%3E%3Cpath d='M9.3 2.3v3.2h3.2'/%3E%3Cpath d='M5.5 8.4h5M5.5 10.6h5M5.5 12.8h2.8'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.5 1.5h5.6l3.4 3.4v9.6h-9z'/%3E%3Cpath d='M9.1 1.7v3.4h3.2M5.7 8h4.6M5.7 10.5h4.6M5.7 13h2.7'/%3E%3C/svg%3E");
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.5 1.5h5.6l3.4 3.4v9.6h-9z'/%3E%3Cpath d='M9.1 1.7v3.4h3.2M5.7 8h4.6M5.7 10.5h4.6M5.7 13h2.7'/%3E%3C/svg%3E");
 }
 .action-icon-git-merge {
   mask-image: url("/icons/actions/git-merge.png");
@@ -1998,7 +1998,7 @@ body.col-resizing iframe {
   align-items: center;
   gap: 8px;
 }
-/* Diff / Whole file: one control, so the two halves join into a single pill. */
+/* Diff / Whole file / Markdown preview: one joined mode control. */
 .mode-toggle {
   display: flex;
 }
@@ -2072,6 +2072,161 @@ body.col-resizing iframe {
 .file-note {
   padding: 4px;
   font-style: italic;
+}
+
+/* Rendered Markdown stays within a readable measure while the surrounding diff
+   surface owns scrolling. Raw HTML is never injected by the renderer. */
+.diff-view.diff-markdown-view {
+  padding: 0;
+  font-size: 14px;
+  line-height: 1.65;
+}
+.markdown-preview {
+  max-width: 780px;
+  min-height: 100%;
+  margin: 0 auto;
+  padding: 28px 36px 48px;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+.markdown-preview > :first-child {
+  margin-top: 0;
+}
+.markdown-preview > :last-child {
+  margin-bottom: 0;
+}
+.markdown-preview h1,
+.markdown-preview h2,
+.markdown-preview h3,
+.markdown-preview h4,
+.markdown-preview h5,
+.markdown-preview h6 {
+  margin: 1.4em 0 0.55em;
+  line-height: 1.25;
+  color: #e4e9f2;
+}
+.markdown-preview h1 {
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--border);
+  font-size: 2em;
+}
+.markdown-preview h2 {
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--border);
+  font-size: 1.5em;
+}
+.markdown-preview h3 {
+  font-size: 1.25em;
+}
+.markdown-preview h4 {
+  font-size: 1.08em;
+}
+.markdown-preview h5,
+.markdown-preview h6 {
+  font-size: 1em;
+}
+.markdown-preview p {
+  margin: 0 0 1em;
+}
+.markdown-preview a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.markdown-preview a:hover {
+  text-decoration: underline;
+}
+.markdown-preview code {
+  padding: 0.15em 0.35em;
+  border: 1px solid #232c40;
+  border-radius: 4px;
+  background: var(--panel-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Cascadia Code", monospace;
+  font-size: 0.9em;
+}
+.markdown-preview pre {
+  margin: 0 0 1em;
+  padding: 14px 16px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #080b10;
+  line-height: 1.5;
+}
+.markdown-preview pre code {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-size: 12px;
+  white-space: pre;
+}
+.markdown-preview blockquote {
+  margin: 0 0 1em;
+  padding: 0.1em 1em;
+  border-left: 3px solid var(--accent-2);
+  color: var(--dim);
+}
+.markdown-preview blockquote > :last-child {
+  margin-bottom: 0;
+}
+.markdown-preview ul,
+.markdown-preview ol {
+  margin: 0 0 1em;
+  padding-left: 2em;
+}
+.markdown-preview li + li {
+  margin-top: 0.25em;
+}
+.markdown-preview .task-list {
+  padding-left: 0.25em;
+  list-style: none;
+}
+.markdown-preview .task-list-item {
+  display: flex;
+  align-items: baseline;
+  gap: 0.55em;
+}
+.markdown-preview .task-list > li:not(.task-list-item) {
+  margin-left: 1.75em;
+  list-style: disc;
+}
+.markdown-preview .task-list-item input {
+  accent-color: var(--accent);
+}
+.markdown-preview hr {
+  height: 1px;
+  margin: 1.75em 0;
+  border: 0;
+  background: var(--border);
+}
+.markdown-table-wrap {
+  max-width: 100%;
+  margin: 0 0 1em;
+  overflow-x: auto;
+}
+.markdown-preview table {
+  width: 100%;
+  border-spacing: 0;
+  border-collapse: collapse;
+}
+.markdown-preview th,
+.markdown-preview td {
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+}
+.markdown-preview th {
+  background: var(--panel-2);
+  color: #e4e9f2;
+}
+.markdown-preview tbody tr:nth-child(even) {
+  background: rgba(19, 24, 38, 0.55);
+}
+.markdown-preview img {
+  display: block;
+  max-width: 100%;
+  max-height: 65vh;
+  margin: 1em auto;
+  border-radius: 6px;
 }
 
 /* Image preview: center the picture(s) in the scroll area instead of the
@@ -3283,8 +3438,21 @@ body.col-resizing iframe {
     padding: 0;
     overflow: hidden;
   }
+  /* Three Markdown modes plus Close do not fit beside a useful filename on a
+     narrow phone, so the controls get their own row. */
+  .diff-modal .modal-title {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .diff-modal-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
   .diff-view {
     font-size: 11px;
+  }
+  .markdown-preview {
+    padding: 22px 18px 40px;
   }
   /* Commit sheet inherits the generic padded/scrolling .modal sheet; just tame
      its inner scroll regions to the sheet height. */

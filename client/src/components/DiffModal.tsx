@@ -3,11 +3,17 @@ import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { api } from "../api";
 import { Target } from "../connectionStore";
+import { MarkdownPreview } from "./MarkdownPreview";
 
 /** Extensions the daemon can serve as an inline image (magic-byte sniffed). */
 const IMAGE_EXT = /\.(png|jpe?g|gif|webp)$/i;
 function isImagePath(path: string): boolean {
   return IMAGE_EXT.test(path);
+}
+
+const MARKDOWN_EXT = /\.(?:md|markdown|mdown|mkd)$/i;
+function isMarkdownPath(path: string): boolean {
+  return MARKDOWN_EXT.test(path);
 }
 
 /** Turn a fetched Blob into an object URL, revoking it on change/unmount. */
@@ -25,8 +31,8 @@ function useObjectUrl(blob: Blob | undefined): string | null {
   return url;
 }
 
-/** What the viewer is showing: the change, or the file the change landed in. */
-export type DiffMode = "diff" | "file";
+/** What the viewer is showing: the change, its source text, or rendered Markdown. */
+export type DiffMode = "diff" | "file" | "preview";
 
 interface Props {
   target: Target;
@@ -41,9 +47,10 @@ interface Props {
 }
 
 /**
- * Read-only viewer for one file, in two modes: the unified diff (what changed)
- * and the whole file (what it now says). Line-colored for MVP; a CodeMirror-based
- * side-by-side viewer is the next iteration (Phase 4).
+ * Read-only viewer for one file: the unified diff (what changed), the whole
+ * file (what it now says), and — for Markdown only — a rendered preview.
+ * Line-colored for MVP; a CodeMirror-based side-by-side viewer is the next
+ * iteration (Phase 4).
  */
 export function DiffModal({
   target,
@@ -56,9 +63,12 @@ export function DiffModal({
 }: Props) {
   const { t } = useTranslation();
   const isImage = isImagePath(path);
+  const isMarkdown = isMarkdownPath(path);
   // An image *is* its own whole-file view — the before/after preview already
   // shows the file rather than a description of it — so images stay single-mode.
-  const [mode, setMode] = useState<DiffMode>(initialMode);
+  const [mode, setMode] = useState<DiffMode>(
+    initialMode === "preview" && !isMarkdown ? "file" : initialMode,
+  );
 
   // Text diff for everything else. Skipped for images: git only reports
   // "Binary files differ" (or dumps raw bytes), neither of which is useful.
@@ -75,14 +85,14 @@ export function DiffModal({
   const fileAfter = useQuery({
     queryKey: ["scmContent", target.baseUrl, sessionId, path, commit ?? null, "after"],
     queryFn: () => api.scmContent(target, sessionId, path, "after", commit),
-    enabled: !isImage && mode === "file",
+    enabled: !isImage && mode !== "diff",
     retry: false,
   });
   const deleted = (fileAfter.error as { status?: number } | null)?.status === 404;
   const fileBefore = useQuery({
     queryKey: ["scmContent", target.baseUrl, sessionId, path, commit ?? null, "before"],
     queryFn: () => api.scmContent(target, sessionId, path, "before", commit),
-    enabled: !isImage && mode === "file" && deleted && !untracked,
+    enabled: !isImage && mode !== "diff" && deleted && !untracked,
     retry: false,
   });
   const file = fileAfter.data ?? fileBefore.data;
@@ -145,6 +155,15 @@ export function DiffModal({
                 >
                   {t("diffModal.modeFile")}
                 </button>
+                {isMarkdown && (
+                  <button
+                    className={"btn tiny" + (mode === "preview" ? " active" : "")}
+                    aria-pressed={mode === "preview"}
+                    onClick={() => setMode("preview")}
+                  >
+                    {t("diffModal.modePreview")}
+                  </button>
+                )}
               </span>
             )}
             <button className="btn tiny" onClick={onClose}>
@@ -152,7 +171,13 @@ export function DiffModal({
             </button>
           </span>
         </div>
-        <div className={"diff-view mono" + (isImage ? " diff-image-view" : "")}>
+        <div
+          className={
+            "diff-view" +
+            (mode === "preview" ? " diff-markdown-view" : " mono") +
+            (isImage ? " diff-image-view" : "")
+          }
+        >
           {isImage ? (
             <>
               {imageLoading && <div className="dim">{t("diffModal.loadingImage")}</div>}
@@ -173,6 +198,22 @@ export function DiffModal({
                   )}
                 </div>
               )}
+            </>
+          ) : mode === "preview" ? (
+            <>
+              {fileLoading && <div className="dim">{t("diffModal.loadingFile")}</div>}
+              {fileError && <div className="error">{String(fileError)}</div>}
+              {fileBefore.data && (
+                <div className="dim file-note">{t("diffModal.showingBeforeDeletion")}</div>
+              )}
+              {file?.binary && <div className="dim">{t("diffModal.binaryFile")}</div>}
+              {file && !file.binary && file.content.length === 0 && (
+                <div className="dim">{t("diffModal.emptyFile")}</div>
+              )}
+              {file && !file.binary && file.content.length > 0 && (
+                <MarkdownPreview content={file.content} />
+              )}
+              {file?.truncated && <div className="dim file-note">{t("diffModal.truncated")}</div>}
             </>
           ) : mode === "file" ? (
             <>
