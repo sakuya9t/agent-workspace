@@ -113,13 +113,17 @@ All three providers can **fork** on resume. We always fork. This is an invariant
 | **claude** | `sessionId`, both the JSONL filename stem and a field on every line, in `~/.claude/projects/<encoded-cwd>/` — the exact file `claude_transcript_usage` already opens (`usage.rs:109`) | `claude --resume <id> --fork-session` | A |
 | **codex** | the UUID in the rollout filename `rollout-<ts>-<uuid>.jsonl`, under `~/.codex/sessions/**` — files `codex_usage` already collects (`usage.rs:403`) | `codex fork <id>` (subcommand leads argv) | A |
 | **opencode** | `~/.local/share/opencode/opencode.db` (SQLite) — no per-cwd file to discover | `opencode --session <id> --fork` | C |
+| **pi** | the `id` on the `session` header opening `~/.pi/agent/sessions/--<cwd>--/<ts>_<uuid>.jsonl` — the file `pi_usage` already opens | `pi --fork <id>` | A |
 | **shell** | no conversation | — | brief only |
 | **custom_command** | unknown by definition | — | brief only |
 
 Verified against the installed binaries: `codex fork` accepts
 `--dangerously-bypass-approvals-and-sandbox`, and `claude --fork-session` composes
 with `--resume`, so the existing danger-flag toggles survive a resume launch on
-both.
+both. `pi --fork` (0.84.2) resolves its argument as a path, then as an id in the
+current project, then as an id across every project — and forks a cross-project
+match straight into the current directory without asking, which `--session` does
+*not* do. That last step is what lets a pi fork land in a fresh worktree.
 
 Opencode is the reason this is a plugin capability and not two `if` branches: it
 has native resume, but its id is behind a SQLite read rather than a filesystem

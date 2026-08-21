@@ -41,8 +41,8 @@ Full design in [`docs/architecture.md`](docs/architecture.md); durability model 
   across a daemon restart; the daemon re-adopts them on start. No silent relaunch —
   a dead agent is recorded as `exited`/`failed`/`indeterminate`, never faked.
 - **Run any CLI agent.** Built-in plugins for `shell`, `codex`, `claude`,
-  `opencode`, and approved `custom` commands — the new-session dialog only offers
-  agents whose CLI is actually installed on that host.
+  `opencode`, `pi`, and approved `custom` commands — the new-session dialog only
+  offers agents whose CLI is actually installed on that host.
 - **Isolate concurrent agents.** Each session gets its own Git worktree (auto-named
   branch, a new branch off a base, or an existing branch), so multiple agents on one
   repo never share a working tree.

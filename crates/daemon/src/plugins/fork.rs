@@ -25,7 +25,9 @@ use serde_json::Value;
 
 use super::conversation::strip_reminders;
 use super::title::codex_session_id;
-use super::usage::{claude_transcript_path, codex_rollout_path, read_head, TranscriptContext};
+use super::usage::{
+    claude_transcript_path, codex_rollout_path, pi_session_path, read_head, TranscriptContext,
+};
 
 /// Longest single user prompt carried verbatim. Prompts are the highest-signal
 /// thing in the transcript, so the clip is generous — but a user who pastes a
@@ -40,6 +42,8 @@ const TAIL_CHARS: usize = 2000;
 
 /// Claude tools that mean "a file changed".
 const CLAUDE_EDIT_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
+/// The same, for pi's built-in tools.
+const PI_EDIT_TOOLS: &[&str] = &["edit", "write"];
 
 /// What a fork inherits, before rendering.
 #[derive(Debug, Default, PartialEq)]
@@ -152,6 +156,28 @@ pub fn claude_digest(cx: &TranscriptContext) -> Option<String> {
 pub fn codex_digest(cx: &TranscriptContext) -> Option<String> {
     let text = fs::read_to_string(codex_rollout_path(cx)?).ok()?;
     parse_codex(&text).render()
+}
+
+/// Digest of a pi session, from its own session file.
+pub fn pi_digest(cx: &TranscriptContext) -> Option<String> {
+    let text = fs::read_to_string(pi_session_path(cx)?).ok()?;
+    parse_pi(&text).render()
+}
+
+/// pi's own conversation id: the `id` on the `session` header that opens every
+/// session file. `pi --fork <id>` resolves it from any directory, so a fork does
+/// not have to run where the origin ran.
+pub fn pi_native_id(cx: &TranscriptContext) -> Option<String> {
+    let path = pi_session_path(cx)?;
+    for line in read_head(&path, 64 * 1024)?.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["type"] == "session" {
+            return v["id"].as_str().filter(|s| !s.is_empty()).map(String::from);
+        }
+    }
+    None
 }
 
 /// Claude's own conversation id: the `sessionId` carried on every record. We read
@@ -290,6 +316,75 @@ fn parse_codex(text: &str) -> Digest {
     d
 }
 
+fn parse_pi(text: &str) -> Digest {
+    let mut d = Digest::default();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["type"] != "message" {
+            continue;
+        }
+        let m = &v["message"];
+        let content = &m["content"];
+        match m["role"].as_str() {
+            Some("user") => match content {
+                Value::String(s) => d.prompt(s),
+                Value::Array(blocks) => {
+                    for b in blocks {
+                        if b["type"] == "text" {
+                            if let Some(t) = b["text"].as_str() {
+                                d.prompt(t);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Some("assistant") => {
+                if let Value::Array(blocks) = content {
+                    for b in blocks {
+                        match b["type"].as_str() {
+                            Some("text") => {
+                                if let Some(t) = b["text"].as_str() {
+                                    d.message(t);
+                                }
+                            }
+                            Some("toolCall") => {
+                                let args = &b["arguments"];
+                                match b["name"].as_str().unwrap_or_default() {
+                                    // pi's file tools both take `path`.
+                                    name if PI_EDIT_TOOLS.contains(&name) => {
+                                        if let Some(p) = args["path"].as_str() {
+                                            d.file(p);
+                                        }
+                                    }
+                                    "bash" => {
+                                        if let Some(c) = args["command"].as_str() {
+                                            d.command(c);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            // A `!command` the user ran in pi's own shell — their doing, not the
+            // agent's, but still part of what happened in this session.
+            Some("bashExecution") => {
+                if let Some(c) = m["command"].as_str() {
+                    d.command(c);
+                }
+            }
+            _ => {}
+        }
+    }
+    d
+}
+
 /// Clip to `max` **characters** (not bytes — this text is user prose and may be
 /// any script), marking the cut so nobody reads a truncated line as the whole
 /// thing.
@@ -406,6 +501,30 @@ mod tests {
         assert_eq!(d.prompts, vec!["Fix the matcher"], "tagged harness payloads are not user turns");
         assert_eq!(d.files, vec![("/r/matcher.py".to_string(), 1)]);
         assert_eq!(d.commands, vec!["pytest -q"]);
+        assert_eq!(d.last_message, "Done.");
+    }
+
+    #[test]
+    fn pi_digest_reads_prompts_edits_and_commands() {
+        let text = concat!(
+            r#"{"type":"session","version":3,"id":"7c9","cwd":"/r"}"#,
+            "\n",
+            r#"{"type":"message","id":"a1","parentId":null,"message":{"role":"user","content":"Fix the matcher"}}"#,
+            "\n",
+            r#"{"type":"message","id":"b2","parentId":"a1","message":{"role":"assistant","content":[{"type":"toolCall","id":"t1","name":"edit","arguments":{"path":"/r/matcher.py","edits":[{"oldText":"a","newText":"b"}]}},{"type":"toolCall","id":"t2","name":"bash","arguments":{"command":"pytest -q"}},{"type":"toolCall","id":"t3","name":"read","arguments":{"path":"/r/untouched.py"}}],"provider":"anthropic","model":"m","usage":{"input":1,"output":1},"stopReason":"toolUse"}}"#,
+            "\n",
+            r#"{"type":"message","id":"c3","parentId":"b2","message":{"role":"toolResult","toolCallId":"t2","toolName":"bash","content":[{"type":"text","text":"1 passed"}],"isError":false}}"#,
+            "\n",
+            r#"{"type":"message","id":"d4","parentId":"c3","message":{"role":"bashExecution","command":"git diff --stat","output":"1 file changed","exitCode":0}}"#,
+            "\n",
+            r#"{"type":"message","id":"e5","parentId":"d4","message":{"role":"assistant","content":[{"type":"text","text":"Done."}],"provider":"anthropic","model":"m","usage":{"input":1,"output":1},"stopReason":"stop"}}"#,
+        );
+        let d = parse_pi(text);
+        assert_eq!(d.prompts, vec!["Fix the matcher"]);
+        // Only the tools that write count as a change — `read` touched nothing.
+        assert_eq!(d.files, vec![("/r/matcher.py".to_string(), 1)]);
+        // The agent's `bash` call and the `!command` the user ran themselves.
+        assert_eq!(d.commands, vec!["pytest -q", "git diff --stat"]);
         assert_eq!(d.last_message, "Done.");
     }
 

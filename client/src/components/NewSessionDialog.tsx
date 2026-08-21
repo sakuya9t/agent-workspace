@@ -16,7 +16,7 @@ type SessionTarget = { kind: "workspace"; id: string } | { kind: "path" };
  * When none of these is installed on a host, its sessions cannot be forked and
  * the Fork action is disabled — see `canForkInto`.
  */
-export const FORKABLE_AGENTS = ["claude", "codex", "opencode"];
+export const FORKABLE_AGENTS = ["claude", "codex", "opencode", "pi"];
 
 /** Sentinel dropdown value that reveals the free-text model field. */
 const CUSTOM_MODEL = "__custom__";

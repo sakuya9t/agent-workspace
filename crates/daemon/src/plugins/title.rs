@@ -5,8 +5,9 @@
 //! this module only reads what it wrote. Claude Code appends `ai-title` records
 //! to its per-session JSONL (last one wins), Codex keeps an id → `thread_name`
 //! index at `~/.codex/session_index.jsonl`, and opencode stores a `title`
-//! column in its sqlite db. When the agent hasn't titled the session (yet), the
-//! fallback is its first user prompt. All of these are undocumented internals
+//! column in its sqlite db. pi is the exception: it never titles a session
+//! itself, and records only the name the *user* gave it (`/name`). When the
+//! agent hasn't titled the session (yet), the fallback is its first user prompt. All of these are undocumented internals
 //! of the CLIs and can shift between versions, so every reader is best-effort:
 //! `None` just means "the UI shows workspace/directory naming instead".
 //!
@@ -25,9 +26,10 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
-use super::conversation::{claude_title, strip_reminders};
+use super::conversation::{claude_title, pi_title, strip_reminders};
 use super::usage::{
-    claude_transcript_path, codex_rollout_path, home_dir, read_head, TranscriptContext, SLACK_MS,
+    claude_transcript_path, codex_rollout_path, home_dir, pi_session_path, read_head,
+    TranscriptContext, SLACK_MS,
 };
 
 const TITLE_TTL: Duration = Duration::from_secs(30);
@@ -79,6 +81,16 @@ pub fn opencode_session_title(cx: &TranscriptContext) -> Option<String> {
             &cx.cwd.to_string_lossy(),
             cx.started_at_ms - SLACK_MS,
         )
+    })
+}
+
+/// Title of a pi session: the name the user gave it (`/name`, `--name`), else
+/// its first prompt. pi never titles a session itself, so the fallback is the
+/// usual case here — unlike Claude and Codex, whose own LLMs name theirs.
+pub fn pi_session_title(cx: &TranscriptContext) -> Option<String> {
+    cached("pi", cx, || {
+        let text = fs::read_to_string(pi_session_path(cx)?).ok()?;
+        pi_title(&text).or_else(|| pi_first_prompt(&text))
     })
 }
 
@@ -147,6 +159,35 @@ fn claude_first_prompt(text: &str) -> Option<String> {
                 .find_map(|b| (b["type"] == "text").then(|| b["text"].as_str()).flatten())
             {
                 Some(t) => strip_reminders(t),
+                None => continue,
+            },
+            _ => continue,
+        };
+        if let Some(t) = clip_title(&prompt) {
+            return Some(t);
+        }
+    }
+    None
+}
+
+/// First user prompt in a pi session file. `bashExecution` entries (`!cmd`) and
+/// tool results are not the user talking, and neither is an extension's
+/// `custom` message.
+fn pi_first_prompt(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["type"] != "message" || v["message"]["role"] != "user" {
+            continue;
+        }
+        let prompt = match &v["message"]["content"] {
+            Value::String(s) => s.clone(),
+            Value::Array(blocks) => match blocks
+                .iter()
+                .find_map(|b| (b["type"] == "text").then(|| b["text"].as_str()).flatten())
+            {
+                Some(t) => t.to_string(),
                 None => continue,
             },
             _ => continue,

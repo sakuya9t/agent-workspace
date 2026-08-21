@@ -26,6 +26,7 @@ pub fn all() -> Vec<Arc<dyn AgentPlugin>> {
         Arc::new(CodexPlugin),
         Arc::new(ClaudePlugin),
         Arc::new(OpencodePlugin),
+        Arc::new(PiPlugin),
         Arc::new(CustomCommandPlugin),
     ]
 }
@@ -428,6 +429,184 @@ impl AgentPlugin for OpencodePlugin {
     }
 }
 
+/// pi CLI agent (the `pi` TUI in the session's cwd).
+///
+/// pi is the odd one out on guardrails: it has **no sandbox and no per-tool
+/// approval prompts** — its built-in `bash`, `edit` and `write` tools run with
+/// the user's own permissions the moment the model calls them (see pi's
+/// `docs/security.md`). There is therefore no danger flag to offer, because
+/// there is no guardrail to disable; the toggle below runs in the other
+/// direction, handing pi a read-only tool set.
+pub struct PiPlugin;
+
+impl AgentPlugin for PiPlugin {
+    fn id(&self) -> &'static str {
+        "pi"
+    }
+    fn display_name(&self) -> &'static str {
+        "pi"
+    }
+    fn supported_platforms(&self) -> &'static [&'static str] {
+        ALL_PLATFORMS
+    }
+    fn detect_binary(&self) -> Option<String> {
+        find_in_path("pi")
+    }
+    fn supports_models(&self) -> bool {
+        true
+    }
+    fn model_args(&self, model: &str) -> Vec<String> {
+        // `--model` also accepts a bare pattern and a `:<thinking>` suffix, so a
+        // free-text "Custom…" entry works as well as a listed `provider/id`.
+        vec!["--model".to_string(), model.to_string()]
+    }
+    // Like opencode, pi fronts many providers and can list what this host is
+    // actually logged into (`pi --list-models`), so the dropdown shows the real
+    // catalog rather than a curated guess.
+    fn models(&self) -> Vec<AgentModel> {
+        list_pi_models(self.detect_binary().as_deref())
+    }
+    fn detect_default_model(&self) -> Option<String> {
+        detect_pi_model()
+    }
+    // `bell_means_attention` stays off: every 0x07 pi emits terminates an OSC
+    // sequence (OSC 133 prompt marks, OSC 52 clipboard writes) — it never rings
+    // a real bell. See `attention::pi`.
+    fn attention_uses_screen(&self) -> bool {
+        true
+    }
+    fn attention(&self, screen: &str, bell: bool) -> (AttentionState, Option<String>) {
+        attention::pi_attention(screen, bell)
+    }
+    fn usage(&self, cx: &TranscriptContext) -> Option<AgentUsage> {
+        usage::pi_usage(cx)
+    }
+    fn conversation(&self, cx: &TranscriptContext) -> Option<String> {
+        conversation::pi_conversation(cx)
+    }
+    fn title(&self, cx: &TranscriptContext) -> Option<String> {
+        title::pi_session_title(cx)
+    }
+    fn native_session_id(&self, cx: &TranscriptContext) -> Option<String> {
+        fork::pi_native_id(cx)
+    }
+    fn digest(&self, cx: &TranscriptContext) -> Option<String> {
+        fork::pi_digest(cx)
+    }
+    fn seed_prompt_args(&self, prompt: &str) -> Option<Vec<String>> {
+        // `pi <prompt>` — trailing positionals are the opening message(s).
+        Some(vec![prompt.to_string()])
+    }
+    // `native_fork_requires_same_cwd` stays false: `pi --fork <id>` looks the id
+    // up in the current project first and then across every project, so a fork
+    // resolves from a brand-new worktree.
+    fn options(&self) -> Vec<AgentOption> {
+        vec![AgentOption {
+            key: "read_only".into(),
+            label: "Read-only tools".into(),
+            description: "Launch with --tools read,grep,find,ls: pi can inspect the repo but \
+                          cannot edit files or run commands. pi has no sandbox or approval \
+                          prompts, so without this its edits and shell commands run unattended."
+                .into(),
+            danger: false,
+            default: false,
+        }]
+    }
+    fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
+        let command = self
+            .detect_binary()
+            .ok_or_else(|| anyhow!("`{}` binary not found in PATH", self.id()))?;
+        Ok(LaunchSpec {
+            command,
+            args: pi_launch_args(ctx),
+            env: ctx.extra_env.clone(),
+            requires_approval: false,
+        })
+    }
+    /// `pi --fork <id> <prompt>`: `--fork` copies the origin's conversation into
+    /// a *new* session file rooted at this process's cwd, so the origin's own
+    /// file is never appended to and the fork records the worktree it now runs in.
+    fn build_fork(
+        &self,
+        ctx: &AgentContext,
+        native_id: &str,
+        seed: &str,
+        _cwd: &Path,
+    ) -> Option<Result<LaunchSpec>> {
+        Some(
+            self.detect_binary()
+                .ok_or_else(|| anyhow!("`pi` binary not found in PATH"))
+                .map(|command| LaunchSpec {
+                    command,
+                    args: pi_fork_args(ctx, native_id, seed),
+                    env: ctx.extra_env.clone(),
+                    requires_approval: false,
+                }),
+        )
+    }
+    fn headless(&self, prompt: &str, _out: &Path) -> Option<HeadlessSpec> {
+        // `-p` prints the final answer to stdout and exits. `--no-session` keeps
+        // the summarizer out of pi's session store: the caller runs this in a
+        // throwaway directory, so the file it would leave behind is a session
+        // directory named after a temp path that no longer exists.
+        Some(HeadlessSpec {
+            command: self.detect_binary()?,
+            args: pi_headless_args(prompt),
+            output_file: None,
+        })
+    }
+    fn conflict_resolver(&self, prompt: &str) -> Option<ConflictResolveSpec> {
+        // No bypass flag to pass — pi's edit/write/bash tools never stop to ask.
+        // The session is kept (unlike `headless`): this runs in the user's real
+        // worktree, so `pi -c` there replays what the auto-resolve did.
+        Some(ConflictResolveSpec {
+            command: self.detect_binary()?,
+            args: vec!["-p".into(), prompt.to_string()],
+        })
+    }
+}
+
+/// Flags every pi launch opens with: the tool allowlist when the user asked for
+/// a read-only session (pi's own default set otherwise), then the model override.
+fn pi_common_args(ctx: &AgentContext) -> Vec<String> {
+    let mut args = Vec::new();
+    if ctx.opt("read_only") {
+        args.push("--tools".to_string());
+        args.push(PI_READ_ONLY_TOOLS.to_string());
+    }
+    if let Some(model) = ctx.model.as_deref() {
+        args.extend(PiPlugin.model_args(model));
+    }
+    args
+}
+
+/// `pi [--tools …] [--model …] <extra args>`.
+fn pi_launch_args(ctx: &AgentContext) -> Vec<String> {
+    let mut args = pi_common_args(ctx);
+    args.extend(ctx.extra_args.clone());
+    args
+}
+
+/// `pi [--tools …] [--model …] --fork <id> <seed>`. The seed is a trailing
+/// positional, so every flag has to precede it.
+fn pi_fork_args(ctx: &AgentContext, native_id: &str, seed: &str) -> Vec<String> {
+    let mut args = pi_common_args(ctx);
+    args.push("--fork".to_string());
+    args.push(native_id.to_string());
+    args.push(seed.to_string());
+    args
+}
+
+/// `pi -p --no-session <prompt>`: print the answer and exit, saving nothing.
+fn pi_headless_args(prompt: &str) -> Vec<String> {
+    vec!["-p".into(), "--no-session".into(), prompt.to_string()]
+}
+
+/// pi's built-in tools that cannot change anything: no `edit`, `write` or `bash`.
+/// `grep`/`find`/`ls` are off in pi's own default set, so naming them here buys
+/// back the searching a read-only session still needs.
+const PI_READ_ONLY_TOOLS: &str = "read,grep,find,ls";
+
 /// Arbitrary user-provided command. Requires explicit approval to launch.
 pub struct CustomCommandPlugin;
 
@@ -566,6 +745,28 @@ fn detect_opencode_model() -> Option<String> {
         }
     }
     None
+}
+
+/// pi's default model: `defaultModel` from its global settings, qualified with
+/// `defaultProvider` when there is one (`--model` takes `provider/id`). pi also
+/// reads a project-local `.pi/settings.json`, but the daemon can't know the
+/// eventual cwd here, so the user default is the best "current model" to
+/// preselect.
+fn detect_pi_model() -> Option<String> {
+    let text = std::fs::read_to_string(usage::pi_agent_dir()?.join("settings.json")).ok()?;
+    parse_pi_settings_model(&text)
+}
+
+/// Pull `defaultModel` (and `defaultProvider`) out of pi's `settings.json`.
+fn parse_pi_settings_model(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let model = non_empty(v.get("defaultModel")?.as_str()?)?;
+    match v.get("defaultProvider").and_then(|p| p.as_str()).and_then(non_empty) {
+        // Already qualified (`anthropic/claude-sonnet-4-5`) — don't double it up.
+        Some(_) if model.contains('/') => Some(model),
+        Some(provider) => Some(format!("{provider}/{model}")),
+        None => Some(model),
+    }
 }
 
 /// Pull `"model"` out of Claude's `settings.json`.
@@ -854,6 +1055,47 @@ fn parse_opencode_models_output(stdout: &str) -> Vec<AgentModel> {
         .collect()
 }
 
+// ---- pi model enumeration (`pi --list-models`) ----
+
+/// List the models pi can reach on this host by running `pi --list-models`.
+/// Empty on any failure (missing binary, error exit, timeout) — the dropdown
+/// then falls back to the detected default plus a free-text "Custom…".
+fn list_pi_models(binary: Option<&str>) -> Vec<AgentModel> {
+    let Some(bin) = binary else {
+        return Vec::new();
+    };
+    let mut cmd = Command::new(bin);
+    cmd.arg("--list-models");
+    // pi refreshes provider catalogs over the network before listing, with its
+    // own 15s bound; allow for that plus startup.
+    match run_capture(cmd, Duration::from_secs(25)) {
+        Some(out) => parse_pi_models_output(&out),
+        None => Vec::new(),
+    }
+}
+
+/// Parse `pi --list-models` stdout: a padded table whose rows are
+/// `provider  model  context  max-out  thinking  images`. Only the provider and
+/// model matter — joined into the `provider/id` form `--model` takes.
+///
+/// The `thinking`/`images` columns are the anchor: they are always `yes`/`no`,
+/// which the header row and pi's "no models available" advice are not, so a
+/// column count alone can't mistake either for a model.
+fn parse_pi_models_output(stdout: &str) -> Vec<AgentModel> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            let [provider, model, _context, _max_out, thinking, images] = cols[..] else {
+                return None;
+            };
+            let flag = |c: &str| c == "yes" || c == "no";
+            (flag(thinking) && flag(images))
+                .then(|| AgentModel::plain(&format!("{provider}/{model}")))
+        })
+        .collect()
+}
+
 /// Run a command and capture its stdout as a UTF-8 string, killing it if it runs
 /// past `timeout`. `None` on spawn failure or timeout. Used off the async runtime.
 fn run_capture(mut cmd: Command, timeout: Duration) -> Option<String> {
@@ -922,6 +1164,7 @@ mod tests {
         assert_eq!(ClaudePlugin.model_args("opus"), vec!["--model", "opus"]);
         assert_eq!(OpencodePlugin.model_args("a/b"), vec!["--model", "a/b"]);
         assert_eq!(CodexPlugin.model_args("gpt-5"), vec!["-m", "gpt-5"]);
+        assert_eq!(PiPlugin.model_args("a/b"), vec!["--model", "a/b"]);
         // A plain shell has no model selector.
         assert!(ShellPlugin.model_args("x").is_empty());
         assert!(!ShellPlugin.supports_models());
@@ -939,6 +1182,8 @@ mod tests {
             OpencodePlugin.seed_prompt_args("read the brief"),
             Some(vec!["--prompt".into(), "read the brief".into()])
         );
+        // pi reads trailing positionals as the opening message, like Claude/Codex.
+        assert_eq!(PiPlugin.seed_prompt_args("read the brief"), Some(vec!["read the brief".into()]));
         // A shell must not be seeded at all — it would run the brief as a script.
         assert_eq!(ShellPlugin.seed_prompt_args("read the brief"), None);
     }
@@ -995,6 +1240,97 @@ mod tests {
         assert_eq!(&args[..3], ["-C", "/workspace/fork", "fork"]);
         assert!(m < id);
         assert_eq!(args[m + 1], "gpt-x");
+    }
+
+    #[test]
+    fn pi_read_only_option_swaps_the_tool_set() {
+        // Off (the default): pi launches with its own tool set, no allowlist.
+        assert!(pi_launch_args(&AgentContext::default()).is_empty());
+
+        let ctx = AgentContext {
+            options: vec![("read_only".into(), true)],
+            model: Some("anthropic/claude-sonnet-4-5".into()),
+            ..Default::default()
+        };
+        let args = pi_launch_args(&ctx);
+        let tools = args.iter().position(|a| a == "--tools").expect("has --tools");
+        // No edit/write/bash in the allowlist — that is the point of the toggle.
+        assert_eq!(args[tools + 1], "read,grep,find,ls");
+        let model = args.iter().position(|a| a == "--model").unwrap();
+        assert!(tools < model, "tool set precedes the model flag: {args:?}");
+    }
+
+    #[test]
+    fn pi_launch_never_requires_approval() {
+        if PiPlugin.detect_binary().is_none() {
+            return;
+        }
+        assert!(!PiPlugin.build_launch(&AgentContext::default()).unwrap().requires_approval);
+    }
+
+    #[test]
+    fn pi_fork_passes_the_origin_id_then_the_seed() {
+        let args = pi_fork_args(&ctx_with_model("openai/gpt-4o"), "conv-1", "hi");
+        let fork_at = args.iter().position(|a| a == "--fork").unwrap();
+        let model_at = args.iter().position(|a| a == "--model").unwrap();
+        assert!(model_at < fork_at, "model flag must precede --fork: {args:?}");
+        // `--fork <id>` then the opening message, which pi reads as a positional.
+        assert_eq!(args[fork_at + 1], "conv-1");
+        assert_eq!(args[fork_at + 2], "hi");
+        // No `-C`-style cwd override, unlike Codex: pi roots the forked session
+        // at this process's cwd, which is already the destination worktree.
+        assert!(!args.iter().any(|a| a.starts_with('/')), "{args:?}");
+    }
+
+    #[test]
+    fn pi_headless_keeps_the_summarizer_out_of_the_session_store() {
+        // The caller runs this in a throwaway directory, so a saved session would
+        // leave a session dir named after a temp path that no longer exists.
+        let args = pi_headless_args("summarize this");
+        assert_eq!(args, vec!["-p", "--no-session", "summarize this"]);
+    }
+
+    #[test]
+    fn parse_pi_settings_qualifies_the_model_with_its_provider() {
+        assert_eq!(
+            parse_pi_settings_model(r#"{"defaultProvider":"anthropic","defaultModel":"claude-sonnet-4-5"}"#)
+                .as_deref(),
+            Some("anthropic/claude-sonnet-4-5")
+        );
+        // Already qualified — not doubled up.
+        assert_eq!(
+            parse_pi_settings_model(r#"{"defaultProvider":"openai","defaultModel":"openai/gpt-4o"}"#)
+                .as_deref(),
+            Some("openai/gpt-4o")
+        );
+        // Model alone is still usable: `--model` takes a bare pattern too.
+        assert_eq!(
+            parse_pi_settings_model(r#"{"defaultModel":"sonnet"}"#).as_deref(),
+            Some("sonnet")
+        );
+        assert_eq!(parse_pi_settings_model(r#"{"theme":"dark"}"#), None);
+        assert_eq!(parse_pi_settings_model("not json"), None);
+    }
+
+    #[test]
+    fn parse_pi_models_reads_the_table_and_skips_its_header() {
+        let out = "\
+provider   model              context  max-out  thinking  images
+anthropic  claude-sonnet-4-5  200K     64K      yes       yes
+openai     gpt-4o             128K     16K      no        yes
+";
+        let ids: Vec<_> = parse_pi_models_output(out)
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
+        assert_eq!(ids, vec!["anthropic/claude-sonnet-4-5", "openai/gpt-4o"]);
+    }
+
+    #[test]
+    fn parse_pi_models_ignores_advice_when_nothing_is_logged_in() {
+        // What `pi --list-models` actually prints with no provider configured.
+        let out = "No models available. Use /login to log into a provider via OAuth or API key. See:\n  /x/docs/providers.md\n";
+        assert!(parse_pi_models_output(out).is_empty());
     }
 
     #[test]

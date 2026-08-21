@@ -540,6 +540,134 @@ fn window_label(minutes: u64) -> String {
     }
 }
 
+// ---------- pi ----------
+
+/// pi's config directory: `$PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
+pub(crate) fn pi_agent_dir() -> Option<PathBuf> {
+    match std::env::var("PI_CODING_AGENT_DIR") {
+        Ok(d) if !d.trim().is_empty() => Some(PathBuf::from(d)),
+        _ => Some(home_dir()?.join(".pi").join("agent")),
+    }
+}
+
+/// The pi session file this asm session most likely owns:
+/// `<agent dir>/sessions/--<encoded cwd>--/<timestamp>_<uuid>.jsonl`.
+///
+/// `$PI_CODING_AGENT_SESSION_DIR` (and `--session-dir`) can move this elsewhere;
+/// we don't chase either, so such a session simply reports no usage rather than
+/// picking up an unrelated file.
+pub fn pi_session_path(cx: &TranscriptContext) -> Option<PathBuf> {
+    let dir = pi_agent_dir()?.join("sessions").join(encode_pi_dir(&cx.cwd));
+    if !dir.is_dir() {
+        return None;
+    }
+    newest_jsonl_in(&dir, cx.started_at_ms - SLACK_MS)
+}
+
+/// pi keys its session directories by working directory: the leading separator
+/// is dropped, the remaining path separators (and a Windows drive colon) become
+/// `-`, and the result is wrapped in `--…--`. Unlike Claude's encoder, dots are
+/// left alone.
+fn encode_pi_dir(cwd: &Path) -> String {
+    let path = cwd.to_string_lossy();
+    let stripped = path.trim_start_matches(['/', '\\']);
+    let body: String = stripped
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' => '-',
+            other => other,
+        })
+        .collect();
+    format!("--{body}--")
+}
+
+/// Read per-session token usage from pi's own session JSONL.
+pub fn pi_usage(cx: &TranscriptContext) -> Option<AgentUsage> {
+    let file = pi_session_path(cx)?;
+    let text = fs::read_to_string(&file).ok()?;
+    let mut u = parse_pi_text(&text)?;
+    u.source = Some(format!("pi session {}", file.display()));
+    Some(u)
+}
+
+/// pi records one `usage` object per assistant message — `{input, output,
+/// cacheRead, cacheWrite, totalTokens}` — but never the model's context window,
+/// so unlike Codex (which reports one) and Claude (whose model id we can
+/// estimate from) that field stays empty rather than guessed: pi front-ends
+/// dozens of providers, so the model id alone doesn't imply a window.
+///
+/// The file is a *tree* (`/tree` branches in place), and this walks it linearly,
+/// so tokens spent on branches the user later abandoned are still counted. That
+/// matches what the session cost you; it is not what the live context holds.
+///
+/// Only the assistant turns are summed. pi also records usage for work it did
+/// *around* the conversation — a compaction or branch summary it generated, and
+/// LLM calls nested inside a tool — which its own `/session` total includes and
+/// this does not, so these numbers can read a little low on a long session.
+fn parse_pi_text(text: &str) -> Option<AgentUsage> {
+    let mut u = AgentUsage::default();
+    let (mut in_sum, mut out_sum, mut cr_sum, mut cw_sum) = (0u64, 0u64, 0u64, 0u64);
+    let (mut last_in, mut last_cr, mut last_cw) = (0u64, 0u64, 0u64);
+    let mut found = false;
+
+    for line in text.lines() {
+        if !line.contains("\"usage\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let msg = &v["message"];
+        if msg["role"] != "assistant" {
+            continue;
+        }
+        let usage = &msg["usage"];
+        if !usage.is_object() {
+            continue;
+        }
+        let ii = usage["input"].as_u64().unwrap_or(0);
+        let oo = usage["output"].as_u64().unwrap_or(0);
+        let cr = usage["cacheRead"].as_u64().unwrap_or(0);
+        let cw = usage["cacheWrite"].as_u64().unwrap_or(0);
+        in_sum += ii;
+        out_sum += oo;
+        cr_sum += cr;
+        cw_sum += cw;
+        last_in = ii;
+        last_cr = cr;
+        last_cw = cw;
+        // `provider/model` is how pi itself names a model (`--model openai/gpt-4o`).
+        if let Some(m) = msg["model"].as_str().filter(|m| !m.is_empty()) {
+            u.model = Some(match msg["provider"].as_str().filter(|p| !p.is_empty()) {
+                Some(p) => format!("{p}/{m}"),
+                None => m.to_string(),
+            });
+        }
+        if let Some(ts) = v["timestamp"].as_str() {
+            u.updated_at = Some(ts.to_string());
+        }
+        found = true;
+    }
+
+    if !found {
+        return None;
+    }
+    u.available = true;
+    u.context_tokens = Some(last_in + last_cr + last_cw);
+    u.input_tokens = Some(in_sum);
+    // Cache writes are fresh input billed at a premium; pi counts them apart from
+    // `input`, and the client has no separate row for them, so they ride along
+    // with the cached total they will be read from next turn.
+    u.cached_input_tokens = Some(cr_sum + cw_sum);
+    u.output_tokens = Some(out_sum);
+    u.note = Some(
+        "Cumulative tokens read from pi's own session file, summed over its assistant turns; pi \
+         records no context-window size, and branches abandoned via /tree are still counted."
+            .into(),
+    );
+    Some(u)
+}
+
 // ---------- shared fs helpers ----------
 
 pub(crate) fn home_dir() -> Option<PathBuf> {
@@ -758,6 +886,59 @@ mod tests {
         // Pre-epoch dates stay correct (div_euclid, not integer division).
         assert_eq!(iso8601_to_unix_secs("1969-12-31T23:59:59Z"), Some(-1));
         assert_eq!(iso8601_to_unix_secs("garbage"), None);
+    }
+
+    #[test]
+    fn parses_pi_session() {
+        let text = concat!(
+            r#"{"type":"session","version":3,"id":"11111111-2222-3333-4444-555555555555","timestamp":"2026-08-20T10:00:00.000Z","cwd":"/home/x/proj"}"#,
+            "\n",
+            r#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-08-20T10:00:01.000Z","message":{"role":"user","content":"hi"}}"#,
+            "\n",
+            r#"{"type":"message","id":"b2","parentId":"a1","timestamp":"2026-08-20T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"hello"}],"provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":10,"output":50,"cacheRead":1000,"cacheWrite":100,"totalTokens":1160},"stopReason":"stop"}}"#,
+            "\n",
+            r#"{"type":"message","id":"c3","parentId":"b2","timestamp":"2026-08-20T10:00:09.000Z","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":2,"output":80,"cacheRead":2000,"cacheWrite":0,"totalTokens":2082},"stopReason":"stop"}}"#,
+        );
+        let u = parse_pi_text(text).expect("usage");
+        assert!(u.available);
+        // pi names a model `provider/id`, the same form its `--model` flag takes.
+        assert_eq!(u.model.as_deref(), Some("anthropic/claude-sonnet-4-5"));
+        // Last turn context = 2 + 2000 + 0.
+        assert_eq!(u.context_tokens, Some(2002));
+        assert_eq!(u.input_tokens, Some(12));
+        assert_eq!(u.output_tokens, Some(130));
+        // Cache reads and writes share the client's one "cached" row.
+        assert_eq!(u.cached_input_tokens, Some(3100));
+        // pi records no window, so none is claimed.
+        assert_eq!(u.context_window, None);
+        assert_eq!(u.updated_at.as_deref(), Some("2026-08-20T10:00:09.000Z"));
+    }
+
+    #[test]
+    fn pi_session_without_assistant_turn_has_no_usage() {
+        // A session whose only entries are the header and the opening prompt has
+        // nothing to report — `None`, not a zeroed reading.
+        let text = concat!(
+            r#"{"type":"session","version":3,"id":"u","cwd":"/home/x/proj"}"#,
+            "\n",
+            r#"{"type":"message","id":"a1","parentId":null,"message":{"role":"user","content":"hi"}}"#,
+        );
+        assert!(parse_pi_text(text).is_none());
+    }
+
+    #[test]
+    fn pi_dir_encoding() {
+        // Leading slash dropped, separators to `-`, wrapped in `--…--`, dots kept.
+        assert_eq!(
+            encode_pi_dir(Path::new("/home/sakuya/dev/agent.workspace")),
+            "--home-sakuya-dev-agent.workspace--"
+        );
+        // Windows: the drive colon and each separator both become `-`, so the
+        // drive letter is followed by two of them.
+        assert_eq!(
+            encode_pi_dir(Path::new("C:\\Users\\x")),
+            "--C--Users-x--"
+        );
     }
 
     #[test]

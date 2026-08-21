@@ -10,7 +10,7 @@ The core promise:
 start agent -> disconnect -> agent keeps running -> reconnect -> resume the same live session -> inspect code changes
 ```
 
-Supported agent targets include Codex, Claude Code, opencode, myclaw, Hermes, and custom terminal commands.
+Supported agent targets include Codex, Claude Code, opencode, pi, myclaw, Hermes, and custom terminal commands.
 
 ## Design Principles
 
@@ -52,7 +52,7 @@ Repository collaboration remains outside the session layer:
 | Desktop client | Electron shared web UI | Native mobile, richer editor UI |
 | Terminal renderer | xterm.js | Addons and renderer tuning |
 | Session backend | Single out-of-process holder (`asmux`) owning all PTYs; VT emulator in the daemon | tmux backend, future platform backends |
-| Agent runtime | Built-in Codex, Claude Code, opencode, custom command | myclaw, Hermes, third-party plugins |
+| Agent runtime | Built-in Codex, Claude Code, opencode, pi, custom command | myclaw, Hermes, third-party plugins |
 | Independent review | Not in the core MVP | One-shot local plugin/model over an immutable Git snapshot; later multiple reviewers, remote runners, required-check adapters |
 | Source control | Git plugin | SVN, Mercurial, Perforce, custom panels |
 | Workspace isolation | Git worktrees | Clone, reflink, full-copy, provider-specific isolation |

@@ -5,7 +5,7 @@
 //! (`super`), so each agent can read its own approval UI. This module is the
 //! entry point: it holds the shared default heuristic ([`default_attention`],
 //! used by most agents) and re-exports each provider's bespoke matcher from its
-//! own submodule ([`claude`], [`codex`]). Add a provider by dropping in a
+//! own submodule ([`claude`], [`codex`], [`pi`]). Add a provider by dropping in a
 //! `<name>.rs` submodule and re-exporting its classifier here; the monitor loop
 //! (`session_manager`) owns the *byte-stream* mechanics (bell scanning, tail
 //! trimming, the idle timer, echo/sticky rules), and the functions here are pure
@@ -17,9 +17,11 @@ use crate::domain::AttentionState;
 
 mod claude;
 mod codex;
+mod pi;
 
 pub(crate) use claude::{claude_attention, claude_idle_error};
 pub(crate) use codex::{codex_attention, codex_still_working};
+pub(crate) use pi::pi_attention;
 
 /// The shared default classifier, over the raw decoded output **tail**.
 ///

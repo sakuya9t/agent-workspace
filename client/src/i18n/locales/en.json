@@ -218,7 +218,7 @@
     "stopBusyTitle": "Stop session — the agent is mid-turn, so this needs a force stop",
     "saveTitle": "Save conversation",
     "forkTitle": "Fork — continue this work in a new session, with its context",
-    "forkUnavailableTitle": "Forking needs a coding agent (Claude Code, Codex or opencode) installed on this host",
+    "forkUnavailableTitle": "Forking needs a coding agent (Claude Code, Codex, opencode or pi) installed on this host",
     "archiveTitle": "Archive — remove from history and delete branch",
     "saveError": "Couldn't save the conversation: {{message}}",
     "confirmArchive": "Archive \"{{name}}\"?\n\nThis removes the session from history and deletes the branch and worktree it created. It cannot be undone.",
