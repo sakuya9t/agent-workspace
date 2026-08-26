@@ -3541,6 +3541,7 @@ body.col-resizing iframe {
 /* Paste target for contexts with no clipboard read (see PasteSheet.tsx). */
 .paste-sheet {
   width: 420px;
+  max-width: 100%;
 }
 .paste-sheet-input {
   width: 100%;
@@ -3560,15 +3561,20 @@ body.col-resizing iframe {
 
 /* This has to follow `.paste-sheet { width: 420px }`: that desktop width is
    declared after the generic phone modal rule and would otherwise win the
-   cascade, pushing 30px past each side of a 390px phone viewport. */
+   cascade, pushing 30px past each side of a 390px phone viewport. Keep the
+   textarea at 16px too: iOS Safari zooms focused form controls below that size,
+   narrowing the visual viewport and making a correctly sized sheet look wider
+   than the screen. */
 @media (max-width: 599px), (max-height: 599px) and (pointer: coarse) {
   .paste-sheet {
-    width: 100vw;
+    width: 100%;
     max-width: 100%;
+    min-width: 0;
   }
   .paste-sheet-input {
     min-width: 0;
     max-width: 100%;
+    font-size: 16px;
   }
 }
 

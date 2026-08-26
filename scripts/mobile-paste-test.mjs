@@ -151,7 +151,13 @@ async function main() {
       const r = document.querySelector(selector)?.getBoundingClientRect();
       return r && { left: r.left, right: r.right, width: r.width };
     };
-    return { viewport: window.innerWidth, sheet: rect('.paste-sheet'), input: rect('.paste-sheet-input') };
+    const input = document.querySelector('.paste-sheet-input');
+    return {
+      viewport: window.visualViewport?.width ?? window.innerWidth,
+      sheet: rect('.paste-sheet'),
+      input: rect('.paste-sheet-input'),
+      inputFontSize: input ? parseFloat(getComputedStyle(input).fontSize) : null,
+    };
   })()`);
   check(
     "insecure: paste sheet and input stay inside the phone viewport",
@@ -159,6 +165,11 @@ async function main() {
       (r) => r && r.left >= -0.5 && r.right <= sheetBounds.viewport + 0.5,
     ),
     JSON.stringify(sheetBounds),
+  );
+  check(
+    "insecure: focused input does not trigger iOS Safari's viewport zoom",
+    sheetBounds.inputFontSize >= 16,
+    `${sheetBounds.inputFontSize}px`,
   );
   check(
     "insecure: the sheet's input is focused, so the keyboard rises with it",
