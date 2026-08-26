@@ -31,6 +31,8 @@ Usage: scripts/start.sh [options]
                        bearer token injected into that backend proxy
   --ui-host HOST       UI listen host (default 127.0.0.1; implies --ui)
   --ui-port PORT       UI listen port (default 5273; implies --ui)
+  --ui-allowed-host HOST
+                       exact reverse-proxy hostname Vite may serve (repeatable)
 
   A flagless run keeps the settings recorded from the previous launch (bind,
   label, relay registration, bundled relay, managed UI) instead of reverting to
@@ -51,6 +53,7 @@ Examples:
   scripts/start.sh --no-ui                               # daemon/holder only
   scripts/start.sh --ui-only                             # UI shell/gateway, no local daemon
   scripts/start.sh --ui-only --ui-daemon http://host:4600
+  scripts/start.sh --ui-allowed-host host.example.ts.net
   scripts/start.sh --ui-host 0.0.0.0                     # expose UI on a trusted LAN
   scripts/start.sh --bind 0.0.0.0:4600
   scripts/start.sh --relay --relay-key s3cret               # relay host + daemon

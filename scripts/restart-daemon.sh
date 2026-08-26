@@ -27,6 +27,8 @@
 #   --ui / --no-ui       enable (the default) or disable managed Vite
 #   --ui-host HOST       UI listen host (default 127.0.0.1; implies --ui)
 #   --ui-port PORT       UI listen port (default 5273; implies --ui)
+#   --ui-allowed-host HOST
+#                        exact reverse-proxy hostname Vite may serve (repeatable)
 #
 #   Register this (NAT'd) daemon OUTBOUND to a relay — no relay runs here:
 #   --register URL       relay to register to, e.g. ws://relay-host:4700
@@ -40,7 +42,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=_asm_common.sh
 source "$HERE/_asm_common.sh"
 
-usage() { err "usage: restart-daemon.sh [--bind ADDR] [--data-dir DIR] [--runtime-dir DIR] [--label NAME] [--release] [--ui|--no-ui] [--ui-host HOST] [--ui-port PORT] [--register URL --relay-key KEY]"; }
+usage() { err "usage: restart-daemon.sh [--bind ADDR] [--data-dir DIR] [--runtime-dir DIR] [--label NAME] [--release] [--ui|--no-ui] [--ui-host HOST] [--ui-port PORT] [--ui-allowed-host HOST] [--register URL --relay-key KEY]"; }
 
 asm_parse_args "$@" || { usage; exit 2; }
 [ "${ASM_SHOW_HELP:-0}" = 1 ] && { usage; exit 0; }

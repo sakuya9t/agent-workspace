@@ -40,13 +40,37 @@ _port() { # _port FLAG VALUE — validate a TCP port before doing an expensive b
   return 2
 }
 
+_ui_allowed_host() { # _ui_allowed_host FLAG VALUE — exact DNS hostname, no URL/port
+  if [[ "${2:-}" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+    return 0
+  fi
+  err "option $1 expects an exact hostname without a scheme, port, path, or wildcard"
+  return 2
+}
+
+# Add a comma-separated set of exact Vite hostnames without duplicating an
+# entry. Each item has already passed _ui_allowed_host.
+append_ui_allowed_hosts() {
+  local csv="${1:-}" item
+  local items=()
+  [ -n "$csv" ] || return 0
+  IFS=',' read -r -a items <<<"$csv"
+  for item in "${items[@]}"; do
+    _ui_allowed_host ASM_UI_ALLOWED_HOSTS "$item" || return 2
+    case ",${ASM_UI_ALLOWED_HOSTS:-}," in
+      *",$item,"*) : ;;
+      *) export ASM_UI_ALLOWED_HOSTS="${ASM_UI_ALLOWED_HOSTS:+$ASM_UI_ALLOWED_HOSTS,}$item" ;;
+    esac
+  done
+}
+
 # Translate flags into the ASM_* env vars the binaries read (env stays the
 # fallback: a flag only overrides when given). Collects any non-flag args into
 # ASM_POSITIONAL and sets ASM_SHOW_HELP. Returns non-zero on a bad flag.
 asm_parse_args() {
   ASM_POSITIONAL=()
   ASM_SHOW_HELP=0
-  local key="" want_relay=0 reconfig=0 ui_reconfig=0 ui_value
+  local key="" want_relay=0 reconfig=0 ui_reconfig=0 ui_value ui_allowed_hosts_add=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --bind)         _need "$1" "${2:-}" || return 2; export ASM_BIND="$2"; reconfig=1; shift 2 ;;
@@ -67,6 +91,15 @@ asm_parse_args() {
       --ui-daemon-token) _need "$1" "${2:-}" || return 2; export ASM_UI_DAEMON_TOKEN="$2" ASM_RUN_UI=1 ASM_UI_ONLY=1; ui_reconfig=1; shift 2 ;;
       --ui-host)      _need "$1" "${2:-}" || return 2; export ASM_UI_HOST="$2" ASM_RUN_UI=1; ui_reconfig=1; shift 2 ;;
       --ui-port)      _need "$1" "${2:-}" || return 2; _port "$1" "$2" || return 2; export ASM_UI_PORT="$2" ASM_RUN_UI=1; ui_reconfig=1; shift 2 ;;
+      --ui-allowed-host)
+        _need "$1" "${2:-}" || return 2
+        _ui_allowed_host "$1" "$2" || return 2
+        case ",$ui_allowed_hosts_add," in
+          *",$2,"*) : ;;
+          *) ui_allowed_hosts_add="${ui_allowed_hosts_add:+$ui_allowed_hosts_add,}$2" ;;
+        esac
+        shift 2
+        ;;
       -h|--help)      ASM_SHOW_HELP=1; shift ;;
       --)             shift; while [ $# -gt 0 ]; do ASM_POSITIONAL+=("$1"); shift; done ;;
       --*)            err "unknown option: $1"; return 2 ;;
@@ -92,6 +125,10 @@ asm_parse_args() {
   export ASM_DAEMON_RECONFIG="$reconfig"
   export ASM_RELAY_RECONFIG="$want_relay"
   export ASM_UI_RECONFIG="$ui_reconfig"
+  # Unlike the other UI flags, --ui-allowed-host is an additive patch: it can
+  # extend a recorded UI-only gateway without making the operator re-enter its
+  # off-host daemon URL and bearer token.
+  export ASM_UI_ALLOWED_HOSTS_ADD="$ui_allowed_hosts_add"
   return 0
 }
 
@@ -123,6 +160,13 @@ asm_configure() {
   export ASM_UI_PORT="${ASM_UI_PORT:-5273}"
   export ASM_UI_DAEMON="${ASM_UI_DAEMON:-}"
   export ASM_UI_DAEMON_TOKEN="${ASM_UI_DAEMON_TOKEN:-}"
+  export ASM_UI_ALLOWED_HOSTS="${ASM_UI_ALLOWED_HOSTS:-}"
+  # Validate both the environment fallback and any CLI additions before either
+  # can reach Vite or the pipe-delimited persisted record.
+  local configured_ui_allowed_hosts="$ASM_UI_ALLOWED_HOSTS"
+  export ASM_UI_ALLOWED_HOSTS=""
+  append_ui_allowed_hosts "$configured_ui_allowed_hosts" || return 2
+  append_ui_allowed_hosts "${ASM_UI_ALLOWED_HOSTS_ADD:-}" || return 2
 
   # Packaged web client: if a build exists (client/dist), serve it straight from
   # the daemon so a box without npm/vite still gets a browser UI at ASM_BIND —
@@ -146,8 +190,8 @@ asm_configure() {
   # Same for the bundled relay: bind|keys|relay-only, recorded by start_relay.
   RELAY_STATE_FILE="$ASM_RUNTIME_DIR/asm-relay.reg"
   UI_PIDFILE="$ASM_RUNTIME_DIR/asm-ui.pid"
-  # enabled|host|port|daemon-bind|ui-only|proxy-url|proxy-token. Recorded
-  # independently because Vite can stay up while the daemon is rebuilt.
+  # enabled|host|port|daemon-bind|ui-only|proxy-url|proxy-token|allowed-hosts.
+  # Recorded independently because Vite can stay up while the daemon is rebuilt.
   UI_STATE_FILE="$ASM_RUNTIME_DIR/asm-ui.reg"
   UI_BIN="$ROOT/client/node_modules/.bin/vite"
 
@@ -255,16 +299,19 @@ relay_load_recorded_config() {
   if [ "${ASM_DAEMON_RECONFIG:-0}" = 0 ]; then export ASM_RELAY_ONLY="${only:-0}"; fi
 }
 
-# UI side (enabled|host|port|daemon-bind|ui-only|proxy-url|proxy-token). As with
-# daemon config, explicit UI flags win; otherwise a flagless start restores the
-# last selection and revives Vite if it died. The first four fields preserve
-# compatibility with UI records created before UI-only gateway mode existed.
+# UI side
+# (enabled|host|port|daemon-bind|ui-only|proxy-url|proxy-token|allowed-hosts).
+# As with daemon config, explicit UI flags win; otherwise a flagless start
+# restores the last selection and revives Vite if it died. The first four
+# fields preserve compatibility with UI records created before UI-only gateway
+# mode existed. --ui-allowed-host is deliberately additive, so it extends this
+# restored record without discarding the proxy URL/token.
 ui_load_recorded_config() {
   if [ "${ASM_UI_RECONFIG:-0}" = 1 ]; then return 0; fi
-  local rec enabled host port daemon_bind only daemon token
+  local rec enabled host port daemon_bind only daemon token allowed_hosts
   rec="$(cat "$UI_STATE_FILE" 2>/dev/null || true)"
   if [ -z "$rec" ]; then return 0; fi
-  IFS='|' read -r enabled host port daemon_bind only daemon token <<<"$rec" || true
+  IFS='|' read -r enabled host port daemon_bind only daemon token allowed_hosts <<<"$rec" || true
   export ASM_RUN_UI="${enabled:-0}"
   if [ -n "$host" ]; then export ASM_UI_HOST="$host"; fi
   if [ -n "$port" ]; then export ASM_UI_PORT="$port"; fi
@@ -272,15 +319,18 @@ ui_load_recorded_config() {
   export ASM_UI_ONLY="${only:-0}"
   export ASM_UI_DAEMON="${daemon:-}"
   export ASM_UI_DAEMON_TOKEN="${token:-}"
+  export ASM_UI_ALLOWED_HOSTS="${allowed_hosts:-}"
+  append_ui_allowed_hosts "${ASM_UI_ALLOWED_HOSTS_ADD:-}" || return 2
 }
 
 ui_enabled() { [ "${ASM_RUN_UI:-0}" = 1 ]; }
 ui_only() { [ "${ASM_UI_ONLY:-0}" = 1 ]; }
 
 ui_reg_signature() {
-  printf '%s|%s|%s|%s|%s|%s|%s' \
+  printf '%s|%s|%s|%s|%s|%s|%s|%s' \
     "${ASM_RUN_UI:-0}" "${ASM_UI_HOST:-}" "${ASM_UI_PORT:-}" "${ASM_BIND:-}" \
-    "${ASM_UI_ONLY:-0}" "${ASM_UI_DAEMON:-}" "${ASM_UI_DAEMON_TOKEN:-}"
+    "${ASM_UI_ONLY:-0}" "${ASM_UI_DAEMON:-}" "${ASM_UI_DAEMON_TOKEN:-}" \
+    "${ASM_UI_ALLOWED_HOSTS:-}"
 }
 
 record_ui_state() {
@@ -370,7 +420,7 @@ start_ui() {
   (
     cd "$ROOT/client"
     ASM_DAEMON="$(ui_daemon_url)" ASM_DAEMON_TOKEN="$ASM_UI_DAEMON_TOKEN" \
-      ASM_CLIENT_HOST="$ASM_UI_HOST" \
+      ASM_CLIENT_HOST="$ASM_UI_HOST" ASM_CLIENT_ALLOWED_HOSTS="$ASM_UI_ALLOWED_HOSTS" \
       nohup "$UI_BIN" --host "$ASM_UI_HOST" --port "$ASM_UI_PORT" --strictPort \
       >>"$LOG_DIR/asm-ui.log" 2>&1 </dev/null &
     echo $! > "$UI_PIDFILE"

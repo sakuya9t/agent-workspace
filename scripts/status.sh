@@ -52,6 +52,9 @@ if pid_alive "$UI_PIDFILE"; then
   else
     log "web UI  RUNNING  pid=$(cat "$UI_PIDFILE")  $(ui_url) → $(ui_daemon_url) (Vite)"
   fi
+  if [ -n "${ASM_UI_ALLOWED_HOSTS:-}" ]; then
+    log "        allowed reverse-proxy host(s): $ASM_UI_ALLOWED_HOSTS"
+  fi
 elif ui_enabled; then
   log "web UI  stopped  (enabled; proxy target $(ui_daemon_url); scripts/start.sh will revive it)"
 elif [ -f "$UI_STATE_FILE" ]; then

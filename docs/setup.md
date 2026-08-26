@@ -158,8 +158,9 @@ pkill -TERM asmux                 # then stop the holder
 
 Environment overrides: `ASM_BIND`, `ASM_DATA_DIR`, `ASM_CONFIG_DIR`,
 `ASM_RUNTIME_DIR`, `ASM_STATIC_DIR`, `ASM_LOG`; managed Vite uses `ASM_RUN_UI`,
-`ASM_UI_HOST`, `ASM_UI_PORT`, `ASM_UI_ONLY`, `ASM_UI_DAEMON`, and
-`ASM_UI_DAEMON_TOKEN`; and for the holder:
+`ASM_UI_HOST`, `ASM_UI_PORT`, `ASM_UI_ONLY`, `ASM_UI_DAEMON`,
+`ASM_UI_DAEMON_TOKEN`, and `ASM_UI_ALLOWED_HOSTS` (comma-separated exact
+reverse-proxy hostnames); and for the holder:
 `ASM_BACKEND` (`native`|`sidecar`; unset means `native`, and any other value is
 rejected at startup rather than falling back to non-durable native),
 `ASM_ASMUX_AUTOSPAWN` (`0` disables
@@ -218,6 +219,10 @@ scripts/start.sh --ui-only
 scripts/start.sh --ui-only --ui-daemon http://machine:4600
 scripts/start.sh --ui-only --ui-daemon http://machine:4600 \
   --ui-daemon-token DEVICE_BEARER_TOKEN --ui-host 0.0.0.0
+
+# Permit an HTTPS reverse proxy such as Tailscale Serve to retain its public
+# Host header. The option is repeatable and is persisted with the UI config.
+scripts/start.sh --ui-allowed-host raspberrypi.example-tailnet.ts.net
 ```
 
 Without `--ui-daemon`, the client shell still starts and users can add daemons
@@ -226,6 +231,13 @@ is proxied to that daemon. Off-host daemons normally require an enrolled device
 bearer token; it is stored in the runtime UI state file and injected by Vite,
 never sent to browser storage or placed in the WebSocket URL. The state file is
 written with owner-only (`0600`) permissions.
+
+Vite rejects unfamiliar `Host` headers to prevent DNS-rebinding attacks. When
+the gateway sits behind an HTTPS reverse proxy, add each exact public hostname
+with `--ui-allowed-host`. This option is additive: it preserves an already
+recorded UI-only daemon URL and bearer token, restarts the UI if needed, and is
+retained by later flagless `start.sh` runs. Do not use a broad wildcard or
+disable Vite's host check.
 
 You can still run Vite manually in the foreground on a development workstation:
 

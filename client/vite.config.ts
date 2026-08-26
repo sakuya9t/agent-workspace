@@ -23,6 +23,16 @@ const daemonAuth = daemonToken
 const host =
   process.env.ASM_CLIENT_HOST === undefined ? true : process.env.ASM_CLIENT_HOST;
 
+// Reverse proxies preserve their public Host header when dialing this local
+// HTTP server. Keep Vite's DNS-rebinding protection enabled and admit only the
+// exact hostnames the operator configured (for example a Tailscale Serve
+// `*.ts.net` name). The launcher validates and persists this comma-separated
+// list; an empty list retains Vite's localhost/IP defaults.
+const allowedHosts = (process.env.ASM_CLIENT_ALLOWED_HOSTS ?? "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
+
 // When the daemon isn't up, node-http-proxy raises a connection error on every
 // request (and /health is polled), which Vite would log as a full stack trace
 // on each one — flooding the console. Collapse that specific noise into one
@@ -35,6 +45,7 @@ export default defineConfig({
   customLogger,
   server: {
     host,
+    allowedHosts,
     port: 5273,
     proxy: {
       "/api": {
