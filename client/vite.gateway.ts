@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Socket } from "node:net";
-import { createProxyServer } from "http-proxy-3";
+import { createProxyServer, type ServerOptions } from "http-proxy-3";
 import type { Plugin } from "vite";
 
 export const UI_GATEWAY_PREFIX = "/__asm/gateway/";
@@ -79,6 +79,23 @@ export function parseGatewayRequest(rawUrl: string | undefined): GatewayRequest 
   };
 }
 
+/**
+ * Proxy options that carry one gateway request upstream.
+ *
+ * The upstream path rides in `target` (with `ignorePath`) instead of being
+ * written back onto `req.url`. Vite's own `/api` proxy keeps an `upgrade`
+ * listener on this same HTTP server and every listener is handed the same
+ * request object, so rewriting `req.url` to `/api/...` here made that listener
+ * match as well and proxy one browser WebSocket to the daemon a second time.
+ * The duplicate connection's `101` handshake then lands mid-stream on the
+ * browser's socket, which drops it as a protocol error before the attach
+ * snapshot arrives — leaving the terminal reconnecting forever behind
+ * "Loading terminal...".
+ */
+function upstreamOptions(route: GatewayRequest): ServerOptions {
+  return { target: `${route.target}${route.path}`, ignorePath: true, changeOrigin: true };
+}
+
 function writeGatewayError(res: ServerResponse | Socket, message: string) {
   if ("writeHead" in res) {
     if (res.headersSent || res.writableEnded) return;
@@ -118,8 +135,7 @@ export function uiGatewayPlugin(): Plugin {
           next();
           return;
         }
-        req.url = route.path;
-        proxy.web(req, res, { target: route.target, changeOrigin: true });
+        proxy.web(req, res, upstreamOptions(route));
       });
 
       const onUpgrade = (req: IncomingMessage, socket: Socket, head: Buffer) => {
@@ -131,8 +147,7 @@ export function uiGatewayPlugin(): Plugin {
           return;
         }
         if (!route) return;
-        req.url = route.path;
-        proxy.ws(req, socket, head, { target: route.target, changeOrigin: true });
+        proxy.ws(req, socket, head, upstreamOptions(route));
       };
       server.httpServer?.prependListener("upgrade", onUpgrade);
       server.httpServer?.once("close", () => {
