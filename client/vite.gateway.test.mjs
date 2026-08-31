@@ -70,8 +70,16 @@ check("is limited to ASM daemon and relay routes", () => {
 async function integration() {
   let seenHttp;
   let seenWs;
+  // One browser request must reach the daemon exactly once. Vite's own `/api`
+  // proxy (configured below, as in vite.config.ts) also listens for upgrades on
+  // this server, so a gateway that rewrites `req.url` into `/api/...` gets its
+  // WebSocket proxied a second time — which corrupts the browser's stream and
+  // leaves the terminal stuck loading.
+  let httpUpstreams = 0;
+  let wsUpstreams = 0;
   const upstreamSockets = new Set();
   const upstream = createHttpServer((req, res) => {
+    httpUpstreams++;
     const chunks = [];
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", () => {
@@ -86,6 +94,7 @@ async function integration() {
     });
   });
   upstream.on("upgrade", (req, socket) => {
+    wsUpstreams++;
     upstreamSockets.add(socket);
     socket.on("close", () => upstreamSockets.delete(socket));
     seenWs = req.url;
@@ -104,15 +113,22 @@ async function integration() {
   await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
   const upstreamPort = upstream.address().port;
 
+  const daemon = `http://127.0.0.1:${upstreamPort}/n/lan-node`;
+
   const vite = await createViteServer({
     configFile: false,
     logLevel: "silent",
     plugins: [uiGatewayPlugin()],
-    server: { host: "127.0.0.1", port: 0 },
+    server: {
+      host: "127.0.0.1",
+      port: 0,
+      // Mirrors vite.config.ts: the dev server proxies its own `/api` to the
+      // local daemon, WebSocket upgrades included.
+      proxy: { "/api": { target: `http://127.0.0.1:${upstreamPort}`, changeOrigin: true, ws: true } },
+    },
   });
   await vite.listen();
   const vitePort = vite.httpServer.address().port;
-  const daemon = `http://127.0.0.1:${upstreamPort}/n/lan-node`;
 
   try {
     const response = await fetch(
@@ -149,6 +165,36 @@ async function integration() {
     });
     assert.equal(wsMessage, "gateway-ws-ok");
     assert.equal(seenWs, "/n/lan-node/api/sessions/s1/stream?access_token=tok");
+    assert.equal(httpUpstreams, 1, "gateway HTTP request proxied more than once");
+
+    // A direct LAN daemon carries no relay base path, so the upstream path is
+    // `/api/...` — exactly the context Vite's own daemon proxy claims on this
+    // server's `upgrade` event. One browser socket must still reach the daemon
+    // once; two attaches corrupt the stream and hang the terminal on "Loading".
+    const before = wsUpstreams;
+    const directMessage = await new Promise((resolve, reject) => {
+      const ws = new WebSocket(
+        `ws://127.0.0.1:${vitePort}${route(`http://127.0.0.1:${upstreamPort}`, "/api/sessions/s2/stream")}`,
+      );
+      const timer = setTimeout(() => reject(new Error("gateway WebSocket timed out")), 3000);
+      ws.onmessage = (event) => {
+        clearTimeout(timer);
+        resolve(event.data);
+        ws.close();
+      };
+      ws.onerror = () => {
+        clearTimeout(timer);
+        reject(new Error("gateway WebSocket failed"));
+      };
+    });
+    assert.equal(directMessage, "gateway-ws-ok");
+    assert.equal(seenWs, "/api/sessions/s2/stream");
+    // A duplicate proxy dials upstream in the same tick as the first, but give
+    // it a window to land rather than racing the assertion against it.
+    for (let i = 0; i < 20 && wsUpstreams === before + 1; i++) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.equal(wsUpstreams - before, 1, "gateway WebSocket proxied more than once");
   } finally {
     for (const socket of upstreamSockets) socket.destroy();
     await vite.close();
