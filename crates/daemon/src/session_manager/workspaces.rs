@@ -728,7 +728,12 @@ impl SessionManager {
         }
         if let Some(branch) = branch {
             if workspace::branch_exists(root, branch) {
-                workspace::delete_branch(root, branch, force)?;
+                // The dirty/unmerged checks above are the archive policy. Use
+                // `-D` after they pass: `git branch -d` applies a second,
+                // different policy when the branch has an upstream, and can
+                // reject a branch that is fully merged into this worktree's
+                // HEAD merely because its stale upstream does not contain it.
+                workspace::delete_branch(root, branch, true)?;
             }
         }
         Ok(())

@@ -952,7 +952,9 @@ fn delete_orphan_branch(
     report: &mut WorktreeCleanupReport,
 ) {
     if force || workspace::branch_is_merged(root, branch) {
-        if workspace::delete_branch(root, branch, force).is_ok() {
+        // The condition above is our safety gate. Avoid letting `git branch
+        // -d` substitute its upstream-based merge policy for that decision.
+        if workspace::delete_branch(root, branch, true).is_ok() {
             report.deleted_branches.push(branch.to_string());
         }
     } else if !report.skipped_unmerged.iter().any(|b| b == branch) {
@@ -1939,6 +1941,59 @@ mod tests {
         assert_eq!(archived.status, SessionStatus::Archived);
         assert!(!wt.exists());
         assert!(!workspace::branch_exists(&repo, &branch));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// ASM decides whether archive is safe relative to the source checkout's
+    /// HEAD. `git branch -d` instead prefers a configured upstream and rejects
+    /// deletion when that upstream is stale, even after the session branch has
+    /// been merged locally. Archive must honor the safety decision it already
+    /// made rather than failing after it has removed the worktree.
+    #[tokio::test]
+    async fn archive_merged_branch_even_when_its_upstream_is_stale() {
+        let (manager, dir) = test_manager();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+        let base = git_in(&repo, &["rev-parse", "HEAD"]);
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+
+        let s = manager.create_session(ws_req(&ws.id)).unwrap();
+        let inst = manager.get_instance_for_session(&s.id).unwrap().unwrap();
+        let branch = inst.branch.clone().unwrap();
+        let wt = Path::new(&inst.path);
+        git_in(wt, &["commit", "-q", "--allow-empty", "-m", "work"]);
+
+        manager.stop_session(&s.id, false).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        git_in(&repo, &["merge", "-q", "--ff-only", &branch]);
+
+        // Simulate a published session branch whose remote-tracking ref has not
+        // caught up. In this state `git branch -d` refuses the local branch even
+        // though it is fully contained in the source checkout's HEAD.
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        git_in(&repo, &["update-ref", &remote_ref, base.trim()]);
+        git_in(
+            &repo,
+            &["config", &format!("branch.{branch}.remote"), "origin"],
+        );
+        git_in(
+            &repo,
+            &[
+                "config",
+                &format!("branch.{branch}.merge"),
+                &format!("refs/heads/{branch}"),
+            ],
+        );
+        assert!(workspace::branch_is_merged(&repo, &branch));
+
+        let archived = manager.archive_session(&s.id, false).unwrap();
+        assert_eq!(archived.status, SessionStatus::Archived);
+        assert!(!wt.exists(), "worktree reclaimed");
+        assert!(!workspace::branch_exists(&repo, &branch), "branch reclaimed");
 
         let _ = std::fs::remove_dir_all(dir);
     }
