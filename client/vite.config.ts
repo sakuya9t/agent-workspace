@@ -1,6 +1,7 @@
 import { defineConfig, createLogger } from "vite";
 import react from "@vitejs/plugin-react";
 import { createDaemonAwareLogger, respondDaemonDown } from "./vite.proxy-log";
+import { uiGatewayPlugin } from "./vite.gateway";
 
 // Proxy API + WebSocket traffic to the local daemon during development.
 const daemon = process.env.ASM_DAEMON ?? "http://127.0.0.1:4600";
@@ -41,7 +42,7 @@ const allowedHosts = (process.env.ASM_CLIENT_ALLOWED_HOSTS ?? "")
 const customLogger = createDaemonAwareLogger(createLogger(), daemon);
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), uiGatewayPlugin()],
   customLogger,
   server: {
     host,

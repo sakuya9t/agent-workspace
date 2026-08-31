@@ -8,7 +8,7 @@
     "build": "tsc --noEmit && eslint src && node check-locales.mjs && vite build",
     "lint": "eslint src && node check-locales.mjs",
     "preview": "vite preview",
-    "test": "node vite.proxy-log.test.mjs"
+    "test": "node vite.proxy-log.test.mjs && node vite.gateway.test.mjs"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.62.0",
@@ -27,6 +27,7 @@
     "@vitejs/plugin-react": "^4.3.4",
     "eslint": "^10.6.0",
     "eslint-plugin-i18next": "^6.1.5",
+    "http-proxy-3": "^1.23.3",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.62.1",
     "vite": "^6.0.5"

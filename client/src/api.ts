@@ -369,9 +369,25 @@ export interface VscodeTarget {
 import { Target } from "./connectionStore";
 import i18n from "./i18n";
 
+/** One reverse-proxy-safe path segment for a managed UI's upstream URL. */
+function gatewayTarget(baseUrl: string): string {
+  const bytes = new TextEncoder().encode(baseUrl);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
 /** Base URL with any trailing slash stripped ("" targets the local origin). */
 function baseOf(baseUrl: string): string {
-  return baseUrl.replace(/\/$/, "");
+  const base = baseUrl.replace(/\/$/, "");
+  // The managed UI is a Vite server running on the connected node. Route
+  // remote daemons through it so a phone entering over Tailscale does not try
+  // (and fail) to dial the node's private LAN from the phone's own network.
+  // Production bundles are served by a daemon and keep their existing direct
+  // connections; import.meta.env.DEV distinguishes the managed Vite runtime.
+  return base && import.meta.env.DEV
+    ? `/__asm/gateway/${gatewayTarget(base)}`
+    : base;
 }
 
 // fetch rejects with an opaque TypeError when the host is unreachable
@@ -575,7 +591,7 @@ export async function probeHealth(
   } catch {
     throw unreachableError(baseUrl);
   }
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) throw new Error((await errorMessage(res)).msg);
   return res.json();
 }
 
@@ -829,13 +845,21 @@ export const api = {
 export function streamUrl(t: Target, id: string): string {
   let base: string;
   if (t.baseUrl) {
-    const u = new URL(t.baseUrl);
-    const proto = u.protocol === "https:" ? "wss" : "ws";
-    // Preserve any path prefix (e.g. `/n/<node_id>` for a relayed daemon) —
-    // dropping it would bypass the relay route. Strip a trailing slash so we
-    // don't double it before `/api`.
-    const prefix = u.pathname.replace(/\/$/, "");
-    base = `${proto}://${u.host}${prefix}`;
+    const routed = baseOf(t.baseUrl);
+    if (routed.startsWith("/")) {
+      // Managed UI gateway: keep the browser on its Tailscale/same-origin WSS;
+      // Vite makes the private-network WS connection from the connected node.
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      base = `${proto}://${location.host}${routed}`;
+    } else {
+      const u = new URL(routed);
+      const proto = u.protocol === "https:" ? "wss" : "ws";
+      // Preserve any path prefix (e.g. `/n/<node_id>` for a relayed daemon) —
+      // dropping it would bypass the relay route. Strip a trailing slash so we
+      // don't double it before `/api`.
+      const prefix = u.pathname.replace(/\/$/, "");
+      base = `${proto}://${u.host}${prefix}`;
+    }
   } else {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     base = `${proto}://${location.host}`;

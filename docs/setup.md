@@ -239,6 +239,17 @@ recorded UI-only daemon URL and bearer token, restarts the UI if needed, and is
 retained by later flagless `start.sh` runs. Do not use a broad wildcard or
 disable Vite's host check.
 
+Remote daemon and relay URLs added through **manage** are also carried through
+the managed UI host. This matters when opening the UI through Tailscale: a URL
+such as `http://192.168.1.25:4600` names an address on the UI node's LAN, not on
+the phone's current LAN, and an HTTPS Tailscale page cannot fetch that HTTP URL
+directly anyway. The browser therefore keeps HTTP and terminal WebSocket
+traffic on the UI origin, while Vite dials the private address from the
+connected node. The gateway accepts only ASM's `/health`, `/api`, relay
+`/nodes`, and `/n/<node_id>` routes; it is not a general-purpose HTTP proxy.
+As with `--ui-host 0.0.0.0`, expose the managed UI only on a trusted LAN or
+through an access-controlled reverse proxy.
+
 You can still run Vite manually in the foreground on a development workstation:
 
 ```bash
