@@ -128,6 +128,29 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// Persist the user-requested session-list title generated from this
+    /// session's conversation. It intentionally lives apart from the agent's
+    /// own automatic title so regenerating can replace it without modifying the
+    /// agent CLI's private session store.
+    pub fn set_session_title(&self, id: &str, title: &str, updated_at: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO session_titles (session_id, title, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id) DO UPDATE
+             SET title = excluded.title, updated_at = excluded.updated_at",
+            rusqlite::params![id, title, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_session_title(&self, id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT title FROM session_titles WHERE session_id = ?1")?;
+        let mut rows = stmt.query_map([id], |row| row.get(0))?;
+        rows.next().transpose().map_err(Into::into)
+    }
+
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
@@ -716,6 +739,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.pragma_update(None, "user_version", 8)?;
         tracing::info!("applied schema migration v8");
     }
+    if version < 9 {
+        conn.execute_batch(SCHEMA_V9)?;
+        conn.pragma_update(None, "user_version", 9)?;
+        tracing::info!("applied schema migration v9");
+    }
     Ok(())
 }
 
@@ -867,6 +895,17 @@ UPDATE sessions
        state_kind = status || '/' || attention_state;
 "#;
 
+/// User-requested session-list titles. A separate table keeps this optional
+/// presentation metadata out of the lifecycle row and lets old sessions gain a
+/// generated title without rewriting them.
+const SCHEMA_V9: &str = r#"
+CREATE TABLE session_titles (
+    session_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+"#;
+
 /// Batches terminal events into transactions to keep write amplification low.
 fn event_writer_loop(mut conn: Connection, mut rx: UnboundedReceiver<EventMsg>) {
     // Block for the first event, then drain whatever else is queued.
@@ -955,6 +994,7 @@ mod tests {
             .execute_batch(
                 "ALTER TABLE sessions DROP COLUMN state_since;
                  ALTER TABLE sessions DROP COLUMN state_kind;
+                 DROP TABLE session_titles;
                  PRAGMA user_version = 7;",
             )
             .unwrap();
@@ -1000,6 +1040,21 @@ mod tests {
             state_since: 1,
         })
         .unwrap();
+    }
+
+    #[test]
+    fn regenerated_session_title_is_persisted_and_replaced() {
+        let (db, dir) = temp_db();
+        seed_session(&db, "s1");
+        assert_eq!(db.get_session_title("s1").unwrap(), None);
+
+        db.set_session_title("s1", "First title", 10).unwrap();
+        assert_eq!(db.get_session_title("s1").unwrap().as_deref(), Some("First title"));
+
+        db.set_session_title("s1", "Better title", 20).unwrap();
+        assert_eq!(db.get_session_title("s1").unwrap().as_deref(), Some("Better title"));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The exact cold-stitch anchor: after a batch flush, `backend_cursor` equals

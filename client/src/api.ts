@@ -590,6 +590,11 @@ export const api = {
     req<{ sessions: Session[] }>(t, "/api/sessions").then((r) => r.sessions),
   getSummary: (t: Target, id: string) =>
     req<{ summary: SessionSummary }>(t, `/api/sessions/${id}/summary`).then((r) => r.summary),
+  /** Generate and persist a new compact session-list title from the conversation. */
+  regenerateSessionTitle: (t: Target, id: string) =>
+    req<{ title: string }>(t, `/api/sessions/${id}/title/regenerate`, {
+      method: "POST",
+    }).then((r) => r.title),
   /**
    * Full conversation as a raw terminal transcript (ANSI included), as a Blob so
    * the browser can save it. No delta — always the complete recorded stream.

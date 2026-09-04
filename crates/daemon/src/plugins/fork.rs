@@ -292,6 +292,26 @@ fn parse_codex(text: &str) -> Digest {
                     }
                 }
             }
+            (Some("response_item"), Some("message")) => {
+                let Some(blocks) = p["content"].as_array() else {
+                    continue;
+                };
+                for block in blocks {
+                    match (p["role"].as_str(), block["type"].as_str()) {
+                        (Some("user"), Some("input_text")) => {
+                            if let Some(text) = block["text"].as_str() {
+                                d.prompt(text);
+                            }
+                        }
+                        (Some("assistant"), Some("output_text")) => {
+                            if let Some(text) = block["text"].as_str() {
+                                d.message(text);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
             (Some("response_item"), Some("function_call")) => {
                 // `arguments` is a JSON *string*, not an object.
                 let Some(args) = p["arguments"].as_str() else {
@@ -502,6 +522,21 @@ mod tests {
         assert_eq!(d.files, vec![("/r/matcher.py".to_string(), 1)]);
         assert_eq!(d.commands, vec!["pytest -q"]);
         assert_eq!(d.last_message, "Done.");
+    }
+
+    #[test]
+    fn codex_digest_reads_current_response_item_messages() {
+        let text = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>noise</environment_context>"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Regenerate the session summary"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Implemented it."}]}}"#,
+        );
+        let rendered = parse_codex(text).render().unwrap();
+        assert!(rendered.contains("- Regenerate the session summary"));
+        assert!(rendered.contains("Implemented it."));
+        assert!(!rendered.contains("environment_context"));
     }
 
     #[test]

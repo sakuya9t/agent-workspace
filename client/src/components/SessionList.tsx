@@ -125,6 +125,16 @@ export function SessionList() {
     onError: (e) =>
       alert(t("sessionList.saveError", { message: e instanceof Error ? e.message : String(e) })),
   });
+  const regenerateTitle = useMutation({
+    mutationFn: ({ target, id }: MutArgs) => api.regenerateSessionTitle(target, id),
+    onSuccess: refresh,
+    onError: (e) =>
+      alert(
+        t("sessionList.regenerateError", {
+          message: e instanceof Error ? e.message : String(e),
+        }),
+      ),
+  });
   const ack = useMutation({
     mutationFn: ({ target, id }: MutArgs) => api.ackAttention(target, id),
     onSuccess: refresh,
@@ -307,6 +317,33 @@ export function SessionList() {
               }}
             >
               <span className="action-icon action-icon-fork" aria-hidden="true" />
+            </button>
+          )}
+          {/* Re-run the compact title generator against this exact session's
+              conversation. It can take several seconds because a real installed
+              coding agent writes the title headlessly. */}
+          {s.status !== "archived" && (
+            <button
+              className="icon-btn"
+              title={t("sessionList.regenerateTitle")}
+              aria-label={t("sessionList.regenerateTitle")}
+              disabled={
+                regenerateTitle.isPending && regenerateTitle.variables?.id === s.id
+              }
+              onClick={(e) => {
+                e.stopPropagation();
+                regenerateTitle.mutate({ target, id: s.id });
+              }}
+            >
+              <span
+                className={
+                  "action-icon action-icon-regenerate-title" +
+                  (regenerateTitle.isPending && regenerateTitle.variables?.id === s.id
+                    ? " is-pending"
+                    : "")
+                }
+                aria-hidden="true"
+              />
             </button>
           )}
           {/* Save works for any non-archived session (live or ended); archived
