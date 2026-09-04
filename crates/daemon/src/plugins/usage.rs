@@ -29,6 +29,11 @@ pub struct TranscriptContext {
     pub cwd: PathBuf,
     /// Session `created_at` in unix milliseconds.
     pub started_at_ms: i64,
+    /// The agent's own persisted conversation id, once the session monitor has
+    /// captured it. This is the authoritative transcript binding: cwd/time are
+    /// only a launch-time heuristic and stop being unique when several sessions
+    /// use the same workspace.
+    pub native_session_id: Option<String>,
 }
 
 /// Normalized usage snapshot for one session, shaped for the client.
@@ -418,6 +423,35 @@ pub fn codex_rollout_path(cx: &TranscriptContext) -> Option<PathBuf> {
     }
     let mut files = Vec::new();
     collect_jsonl(&root, &mut files, 0);
+    choose_codex_rollout(cx, files)
+}
+
+fn choose_codex_rollout(
+    cx: &TranscriptContext,
+    mut files: Vec<(i64, PathBuf)>,
+) -> Option<PathBuf> {
+    // Once the monitor has captured Codex's id, never re-guess by cwd. A later
+    // session in the same worktree otherwise steals this session's title,
+    // transcript and usage merely by being written more recently. Codex embeds
+    // the id in both the rollout filename and its session_meta header; use the
+    // filename to narrow cheaply and the header to verify it. If the bound
+    // rollout disappeared, returning no data is safer than serving another
+    // conversation as this one.
+    if let Some(id) = cx.native_session_id.as_deref() {
+        return files
+            .iter()
+            .find(|(_, path)| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(id))
+                    && read_head(path, 64 * 1024)
+                        .and_then(|head| codex_file_id(&head))
+                        .as_deref()
+                        == Some(id)
+            })
+            .map(|(_, path)| path.clone());
+    }
+
     let min = cx.started_at_ms - SLACK_MS;
     files.retain(|(m, _)| *m >= min);
     files.sort_by_key(|(m, _)| std::cmp::Reverse(*m)); // newest first
@@ -431,6 +465,26 @@ pub fn codex_rollout_path(cx: &TranscriptContext) -> Option<PathBuf> {
         .find(|(_, p)| read_head(p, 64 * 1024).and_then(|h| codex_file_cwd(&h)).as_deref() == Some(want.as_str()))
         .or_else(|| files.first())
         .map(|(_, p)| p.clone())
+}
+
+/// Extract Codex's conversation id from the session_meta record that opens a
+/// rollout. Reading the record keeps callers independent of filename details.
+pub(crate) fn codex_file_id(head: &str) -> Option<String> {
+    for line in head.lines() {
+        if !line.contains("session_meta") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["type"] == "session_meta" {
+            return v["payload"]["id"]
+                .as_str()
+                .or_else(|| v["payload"]["session_id"].as_str())
+                .map(str::to_string);
+        }
+    }
+    None
 }
 
 /// Read usage for a Codex session from its rollout file.
@@ -812,6 +866,50 @@ mod tests {
         assert_eq!(u.rate_limits.len(), 2);
         assert_eq!(u.rate_limits[0].label, "5-hour");
         assert_eq!(u.rate_limits[1].label, "weekly");
+    }
+
+    #[test]
+    fn codex_rollout_uses_the_persisted_id_in_a_shared_worktree() {
+        let dir = std::env::temp_dir().join(format!(
+            "asm-codex-rollout-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let original_id = "11111111-1111-1111-1111-111111111111";
+        let later_id = "22222222-2222-2222-2222-222222222222";
+        let original = dir.join(format!("rollout-old-{original_id}.jsonl"));
+        let later = dir.join(format!("rollout-new-{later_id}.jsonl"));
+        fs::write(
+            &original,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{original_id}","cwd":"/repo"}}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &later,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{later_id}","cwd":"/repo"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let files = vec![(100, original.clone()), (200, later.clone())];
+        let bound = TranscriptContext {
+            cwd: PathBuf::from("/repo"),
+            started_at_ms: 0,
+            native_session_id: Some(original_id.into()),
+        };
+        assert_eq!(choose_codex_rollout(&bound, files.clone()), Some(original));
+
+        let unbound = TranscriptContext {
+            cwd: PathBuf::from("/repo"),
+            started_at_ms: 0,
+            native_session_id: None,
+        };
+        assert_eq!(choose_codex_rollout(&unbound, files), Some(later));
+
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

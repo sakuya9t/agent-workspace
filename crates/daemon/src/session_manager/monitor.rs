@@ -132,6 +132,7 @@ impl SessionManager {
             let cx = TranscriptContext {
                 cwd: PathBuf::from(&session.working_directory),
                 started_at_ms: started_at,
+                native_session_id: None,
             };
             let Some(native_id) = plugin.native_session_id(&cx) else {
                 return false;

@@ -476,6 +476,7 @@ fn session_json(s: &crate::domain::Session, state: &AppState) -> serde_json::Val
             p.title(&crate::plugins::usage::TranscriptContext {
                 cwd: std::path::PathBuf::from(&s.working_directory),
                 started_at_ms: s.created_at,
+                native_session_id: s.agent_session_id.clone(),
             })
         });
         obj.insert("title".into(), json!(title));
@@ -720,6 +721,7 @@ async fn get_transcript(
                 p.conversation(&crate::plugins::usage::TranscriptContext {
                     cwd: std::path::PathBuf::from(&sess.working_directory),
                     started_at_ms: sess.created_at,
+                    native_session_id: sess.agent_session_id.clone(),
                 })
             })
         })
@@ -790,6 +792,7 @@ async fn get_session_usage(
             p.usage(&crate::plugins::usage::TranscriptContext {
                 cwd: std::path::PathBuf::from(&s.working_directory),
                 started_at_ms: s.created_at,
+                native_session_id: s.agent_session_id.clone(),
             })
         })
     })

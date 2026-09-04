@@ -225,6 +225,7 @@ impl SessionManager {
         let cx = TranscriptContext {
             cwd: PathBuf::from(&origin.working_directory),
             started_at_ms: origin.created_at,
+            native_session_id: origin.agent_session_id.clone(),
         };
 
         let digest = origin_plugin.as_ref().and_then(|p| p.digest(&cx));

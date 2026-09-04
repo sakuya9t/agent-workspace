@@ -24,9 +24,9 @@ use std::fs;
 use serde_json::Value;
 
 use super::conversation::strip_reminders;
-use super::title::codex_session_id;
 use super::usage::{
-    claude_transcript_path, codex_rollout_path, pi_session_path, read_head, TranscriptContext,
+    claude_transcript_path, codex_file_id, codex_rollout_path, pi_session_path, read_head,
+    TranscriptContext,
 };
 
 /// Longest single user prompt carried verbatim. Prompts are the highest-signal
@@ -202,7 +202,7 @@ pub fn claude_native_id(cx: &TranscriptContext) -> Option<String> {
 /// rollout.
 pub fn codex_native_id(cx: &TranscriptContext) -> Option<String> {
     let path = codex_rollout_path(cx)?;
-    codex_session_id(&read_head(&path, 64 * 1024)?)
+    codex_file_id(&read_head(&path, 64 * 1024)?)
 }
 
 fn parse_claude(text: &str) -> Digest {

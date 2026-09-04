@@ -28,8 +28,8 @@ use serde_json::Value;
 
 use super::conversation::{claude_title, pi_title, strip_reminders};
 use super::usage::{
-    claude_transcript_path, codex_rollout_path, home_dir, pi_session_path, read_head,
-    TranscriptContext, SLACK_MS,
+    claude_transcript_path, codex_file_id, codex_rollout_path, home_dir, pi_session_path,
+    read_head, TranscriptContext, SLACK_MS,
 };
 
 const TITLE_TTL: Duration = Duration::from_secs(30);
@@ -37,11 +37,13 @@ const TITLE_TTL: Duration = Duration::from_secs(30);
 /// Longest title we synthesize from a first user prompt.
 pub(crate) const TITLE_CHARS: usize = 72;
 
-/// (agent id, cwd, started_at) → when computed + what. Both hits and misses are
-/// cached: a session with no transcript would otherwise be re-scanned for on
-/// every poll tick.
-static CACHE: Mutex<Option<HashMap<(String, String, i64), (Instant, Option<String>)>>> =
-    Mutex::new(None);
+/// (agent id, cwd, started_at, native conversation id) → when computed + what.
+/// Both hits and misses are cached: a session with no transcript would otherwise
+/// be re-scanned for on every poll tick. Including the native id makes a newly
+/// captured authoritative binding supersede an earlier heuristic cache entry.
+type TitleCacheKey = (String, String, i64, Option<String>);
+type CachedTitle = (Instant, Option<String>);
+static CACHE: Mutex<Option<HashMap<TitleCacheKey, CachedTitle>>> = Mutex::new(None);
 
 /// Title of a Claude Code session: the last `ai-title` record in its own
 /// transcript, else its first user prompt.
@@ -58,7 +60,7 @@ pub fn claude_session_title(cx: &TranscriptContext) -> Option<String> {
 pub fn codex_session_title(cx: &TranscriptContext) -> Option<String> {
     cached("codex", cx, || {
         let path = codex_rollout_path(cx)?;
-        let named = codex_session_id(&read_head(&path, 64 * 1024)?).and_then(|id| {
+        let named = codex_file_id(&read_head(&path, 64 * 1024)?).and_then(|id| {
             let index = home_dir()?.join(".codex").join("session_index.jsonl");
             codex_index_title(&fs::read_to_string(index).ok()?, &id)
         });
@@ -105,6 +107,7 @@ fn cached(
         agent.to_string(),
         cx.cwd.to_string_lossy().into_owned(),
         cx.started_at_ms,
+        cx.native_session_id.clone(),
     );
     if let Ok(mut guard) = CACHE.lock() {
         if let Some((at, title)) = guard.get_or_insert_with(HashMap::new).get(&key) {
@@ -199,25 +202,6 @@ fn pi_first_prompt(text: &str) -> Option<String> {
     None
 }
 
-/// The session uuid from a rollout head (`session_meta` is the first record).
-pub(crate) fn codex_session_id(head: &str) -> Option<String> {
-    for line in head.lines() {
-        if !line.contains("session_meta") {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if v["type"] == "session_meta" {
-            return v["payload"]["id"]
-                .as_str()
-                .or_else(|| v["payload"]["session_id"].as_str())
-                .map(|s| s.to_string());
-        }
-    }
-    None
-}
-
 /// Codex appends an `{id, thread_name}` record to its index whenever it
 /// (re)names a thread, so the last entry for the id wins.
 fn codex_index_title(index: &str, id: &str) -> Option<String> {
@@ -243,20 +227,34 @@ fn codex_index_title(index: &str, id: &str) -> Option<String> {
 /// `<environment_context>`); those aren't something the user typed.
 fn codex_first_prompt(text: &str) -> Option<String> {
     for line in text.lines() {
-        if !line.contains("user_message") {
+        if !line.contains("user_message") && !line.contains("\"role\":\"user\"") {
             continue;
         }
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if v["type"] != "event_msg" || v["payload"]["type"] != "user_message" {
-            continue;
-        }
-        if let Some(m) = v["payload"]["message"].as_str() {
-            if m.trim_start().starts_with('<') {
+        let prompt = if v["type"] == "event_msg" && v["payload"]["type"] == "user_message" {
+            v["payload"]["message"].as_str()
+        } else if v["type"] == "response_item"
+            && v["payload"]["type"] == "message"
+            && v["payload"]["role"] == "user"
+        {
+            v["payload"]["content"]
+                .as_array()
+                .and_then(|blocks| {
+                    blocks
+                        .iter()
+                        .find(|block| block["type"] == "input_text")
+                })
+                .and_then(|block| block["text"].as_str())
+        } else {
+            None
+        };
+        if let Some(prompt) = prompt {
+            if prompt.trim_start().starts_with('<') {
                 continue;
             }
-            if let Some(t) = clip_title(m) {
+            if let Some(t) = clip_title(prompt) {
                 return Some(t);
             }
         }
@@ -327,8 +325,8 @@ mod tests {
             "\n",
             r#"{"type":"turn_context","payload":{"cwd":"/repo"}}"#,
         );
-        assert_eq!(codex_session_id(head).as_deref(), Some("abc-123"));
-        assert_eq!(codex_session_id("not json"), None);
+        assert_eq!(codex_file_id(head).as_deref(), Some("abc-123"));
+        assert_eq!(codex_file_id("not json"), None);
     }
 
     #[test]
@@ -352,6 +350,19 @@ mod tests {
             r#"{"type":"event_msg","payload":{"type":"user_message","message":"Design a button icon."}}"#,
         );
         assert_eq!(codex_first_prompt(text).as_deref(), Some("Design a button icon."));
+    }
+
+    #[test]
+    fn codex_first_prompt_reads_current_response_items() {
+        let text = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>noise</environment_context>"}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Fix the session title."}]}}"#,
+        );
+        assert_eq!(
+            codex_first_prompt(text).as_deref(),
+            Some("Fix the session title.")
+        );
     }
 
     #[test]
