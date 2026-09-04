@@ -84,6 +84,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:id", get(get_session))
         .route("/api/sessions/:id/summary", get(get_summary))
+        .route(
+            "/api/sessions/:id/title/regenerate",
+            post(regenerate_session_title),
+        )
         .route("/api/sessions/:id/transcript", get(get_transcript))
         .route("/api/sessions/:id/usage", get(get_session_usage))
         .route("/api/sessions/:id/workspace", get(get_session_workspace))
@@ -465,20 +469,28 @@ async fn list_sessions(State(state): State<AppState>) -> Result<Json<serde_json:
 
 /// Serialize a session plus what the list view derives at read time: `attached`
 /// (is a live client currently on it? — so the UI can prompt for takeover
-/// instead of silently stealing it), the agent's own `title` for the session,
-/// and the `branch` its workspace instance holds. Blocking: a title-cache miss
-/// reads the agent's transcript.
+/// instead of silently stealing it), the persisted regenerated title or the
+/// agent's own `title` for the session, and the `branch` its workspace instance
+/// holds. Blocking: a title-cache miss reads the agent's transcript.
 fn session_json(s: &crate::domain::Session, state: &AppState) -> serde_json::Value {
     let mut v = serde_json::to_value(s).unwrap_or_else(|_| json!({}));
     if let Some(obj) = v.as_object_mut() {
         obj.insert("attached".into(), json!(state.attachments.is_attached(&s.id)));
-        let title = state.manager.registry().get(&s.agent_plugin_id).and_then(|p| {
-            p.title(&crate::plugins::usage::TranscriptContext {
-                cwd: std::path::PathBuf::from(&s.working_directory),
-                started_at_ms: s.created_at,
-                native_session_id: s.agent_session_id.clone(),
-            })
-        });
+        let title = state
+            .manager
+            .db()
+            .get_session_title(&s.id)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                state.manager.registry().get(&s.agent_plugin_id).and_then(|p| {
+                    p.title(&crate::plugins::usage::TranscriptContext {
+                        cwd: std::path::PathBuf::from(&s.working_directory),
+                        started_at_ms: s.created_at,
+                        native_session_id: s.agent_session_id.clone(),
+                    })
+                })
+            });
         obj.insert("title".into(), json!(title));
         let branch = state
             .manager
@@ -637,6 +649,53 @@ async fn get_summary(
         Some(s) => Ok(Json(json!({ "summary": s }))),
         None => Err(AppError(StatusCode::NOT_FOUND, "no summary yet".into())),
     }
+}
+
+/// Re-name a session from its bound conversation. This deliberately uses the
+/// compact deterministic digest rather than feeding a potentially enormous raw
+/// transcript to the model. The generated title is persisted by ASM and takes
+/// precedence over the agent CLI's own automatic title on future list polls.
+async fn regenerate_session_title(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = state
+        .manager
+        .get_session(&id)?
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "no such session".into()))?;
+    let manager = state.manager.clone();
+    let title = tokio::task::spawn_blocking(move || {
+        let plugin = manager
+            .registry()
+            .get(&session.agent_plugin_id)
+            .ok_or_else(|| anyhow::anyhow!("session agent is unavailable"))?;
+        let cx = crate::plugins::usage::TranscriptContext {
+            cwd: std::path::PathBuf::from(&session.working_directory),
+            started_at_ms: session.created_at,
+            native_session_id: session.agent_session_id.clone(),
+        };
+        let digest = plugin
+            .digest(&cx)
+            .ok_or_else(|| anyhow::anyhow!("this session has no readable conversation digest"))?;
+        let title = crate::summarize::session_title(
+            manager.registry(),
+            &session.agent_plugin_id,
+            &digest,
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no installed coding agent could generate a session title"
+            )
+        })?;
+        manager
+            .db()
+            .set_session_title(&session.id, &title, now_millis())?;
+        Ok::<_, anyhow::Error>(title)
+    })
+    .await
+    .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("title task: {e}")))??;
+
+    Ok(Json(json!({ "title": title })))
 }
 
 /// Structured approval data for button-based controllers. `prompt: null` means

@@ -1515,6 +1515,23 @@ body.col-resizing iframe {
   mask-image: url("/icons/actions/save-transcript.png");
   -webkit-mask-image: url("/icons/actions/save-transcript.png");
 }
+.action-icon-regenerate-title {
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M13.2 5.2A5.8 5.8 0 0 0 3.1 3.7L1.8 5.2'/%3E%3Cpath d='M1.8 2.3v2.9h2.9M2.8 10.8a5.8 5.8 0 0 0 10.1 1.5l1.3-1.5'/%3E%3Cpath d='M14.2 13.7v-2.9h-2.9'/%3E%3C/svg%3E");
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M13.2 5.2A5.8 5.8 0 0 0 3.1 3.7L1.8 5.2'/%3E%3Cpath d='M1.8 2.3v2.9h2.9M2.8 10.8a5.8 5.8 0 0 0 10.1 1.5l1.3-1.5'/%3E%3Cpath d='M14.2 13.7v-2.9h-2.9'/%3E%3C/svg%3E");
+}
+.action-icon-regenerate-title.is-pending {
+  animation: regenerate-title-spin 0.9s linear infinite;
+}
+@keyframes regenerate-title-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .action-icon-regenerate-title.is-pending {
+    animation: none;
+  }
+}
 /* Fork: a branch splitting off a line of work. Inline SVG rather than a PNG like
    its neighbours only because the hand-drawn set has no fork glyph yet — it masks
    to currentColor identically, and a matching PNG can drop in here later.

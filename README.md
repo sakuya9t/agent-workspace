@@ -46,6 +46,12 @@ Full design in [`docs/architecture.md`](docs/architecture.md); durability model 
 - **Isolate concurrent agents.** Each session gets its own Git worktree (auto-named
   branch, a new branch off a base, or an existing branch), so multiple agents on one
   repo never share a working tree.
+- **Keep agents on the tracked branch.** Git sessions receive workspace and
+  branch instructions covering planning and implementation: keep edits and
+  commits on the assigned branch unless the user explicitly requests a move.
+  Applied to fresh and forked Codex, Claude Code, Pi, and OpenCode launches;
+  this is agent guidance, not a Git lock. Already-running agents need a new
+  launch to receive it.
 - **Track and integrate changes.** Per-session SCM: status, diffs, log, remote
   tips, fetch/pull/push, rebase/merge, branch attach/detach, and agent-driven
   commit. Workspace branch management can inspect, delete, merge or rebase
