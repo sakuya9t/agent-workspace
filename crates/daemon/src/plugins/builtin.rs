@@ -178,10 +178,13 @@ impl AgentPlugin for CodexPlugin {
     fn headless(&self, prompt: &str, out: &Path) -> Option<HeadlessSpec> {
         // `-o` writes just the final message. Without it the answer arrives on
         // stdout wrapped in progress output and a token-usage footer.
+        // Summaries run in an empty temporary directory, deliberately outside
+        // any repository. Codex otherwise refuses before generating an answer.
         Some(HeadlessSpec {
             command: self.detect_binary()?,
             args: vec![
                 "exec".into(),
+                "--skip-git-repo-check".into(),
                 "--color".into(),
                 "never".into(),
                 "-o".into(),
