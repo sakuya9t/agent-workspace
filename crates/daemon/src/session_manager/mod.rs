@@ -42,6 +42,7 @@ use crate::workspace;
 
 mod fork;
 mod monitor;
+mod workspace_instructions;
 mod workspaces;
 
 pub use fork::ForkRequest;
@@ -331,7 +332,7 @@ impl SessionManager {
         // the origin's conversation natively, or it opens pointed at a brief we
         // write into the working directory we just resolved. Both need the cwd,
         // which is why this happens here and not in `fork_session`.
-        let launch = match (prechecked, &req.fork) {
+        let mut launch = match (prechecked, &req.fork) {
             (Some(launch), _) => launch,
             (None, Some(plan)) => self.fork_launch(plugin, ctx, plan, resolved_cwd)?,
             // Unreachable: a non-fork request is always prechecked above.
@@ -352,6 +353,20 @@ impl SessionManager {
         if !Path::new(resolved_cwd).is_dir() {
             bail!("working directory does not exist: {resolved_cwd}");
         }
+
+        // Apply after both fresh and fork launches have been assembled, and
+        // before persisting argv / spawning. A fork must use its destination's
+        // branch, not instructions remembered from the origin conversation.
+        workspace_instructions::apply(
+            plugin.id(),
+            &mut launch,
+            Path::new(resolved_cwd),
+            instance.and_then(|inst| inst.branch.as_deref()),
+            &self
+                .worktree_root
+                .join(".instructions")
+                .join(format!("{id}.md")),
+        )?;
 
         let now = now_millis();
         let session = Session {
@@ -1784,6 +1799,63 @@ mod tests {
         let mut r = shell_req();
         r.workspace_id = Some(workspace_id.to_string());
         r
+    }
+
+    #[tokio::test]
+    async fn workspace_instructions_are_persisted_for_the_resolved_destination() {
+        let (manager, dir) = test_manager_with(Arc::new(MockBackend::default()));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+        for plugin_id in ["codex", "claude", "pi", "opencode"] {
+            for direct in [false, true] {
+                let mut req = ws_req(&ws.id);
+                req.agent_plugin_id = plugin_id.into();
+                req.direct_checkout = direct;
+                let id = Uuid::new_v4().to_string();
+                let (cwd, instance) = manager.resolve_workspace(&id, &req).unwrap();
+                let branch = crate::source_control::current_branch(Path::new(&cwd)).unwrap();
+                let plugin = manager.registry.get(plugin_id).unwrap();
+                // Bypass only binary detection; the real create path still
+                // resolves, decorates, persists and spawns through the backend.
+                let launch = crate::plugins::LaunchSpec {
+                    command: "test-agent".into(),
+                    args: vec![],
+                    env: vec![],
+                    requires_approval: false,
+                };
+                let session = manager
+                    .create_in_instance(
+                        &id,
+                        &req,
+                        &plugin,
+                        &mut AgentContext::default(),
+                        Some(launch),
+                        &cwd,
+                        instance.as_ref(),
+                    )
+                    .unwrap();
+                let stored = manager.get_session(&session.id).unwrap().unwrap();
+                let text = if plugin_id == "opencode" {
+                    let config: serde_json::Value = serde_json::from_str(&stored.env[0].1).unwrap();
+                    std::fs::read_to_string(config["instructions"][0].as_str().unwrap()).unwrap()
+                } else {
+                    stored.args.join(" ")
+                };
+                assert!(
+                    text.contains(&branch),
+                    "{plugin_id}: destination branch missing"
+                );
+                assert!(text.contains(&cwd), "{plugin_id}: destination cwd missing");
+                assert_eq!(git_in(Path::new(&cwd), &["status", "--porcelain"]), "");
+                manager.stop_session(&id, false).unwrap();
+            }
+        }
+        manager.shutdown_all_live();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Nothing is built until the request is known to be launchable. The bail on
