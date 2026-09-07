@@ -11,6 +11,7 @@ import { isTerminal } from "../status";
 import { useIsPhone } from "../useIsPhone";
 import { shortPath } from "../paths";
 import { copyText } from "../clipboard";
+import { PromptSubmitter } from "../terminalTypes";
 import { DiffModal, DiffMode } from "./DiffModal";
 import { CommitModal } from "./CommitModal";
 import { FileViewActions } from "./FileViewActions";
@@ -18,8 +19,43 @@ import { FileViewActions } from "./FileViewActions";
 interface Props {
   target: Target | undefined;
   session: Session | undefined;
-  /** Submit the same prompt a user would type into the live session TUI. */
-  onCommitChanges?: () => void;
+  /** Capture the initiating session's terminal before starting an async operation. */
+  preparePrompt?: () => PromptSubmitter;
+}
+
+type ConflictOperation = "merge" | "rebase";
+
+type ConflictError = Error & { status?: number; promptSubmitted?: boolean };
+
+async function handoffConflict(
+  error: ConflictError,
+  operation: ConflictOperation,
+  target: string,
+  submit?: PromptSubmitter,
+) {
+  if (error.status !== 409) return;
+  // Store the result on this mutation's error, never on a different session's
+  // panel state if the user switches while Git or the delayed Enter is pending.
+  error.promptSubmitted = false;
+  try {
+    error.promptSubmitted = (await submit?.(conflictResolutionPrompt(operation, target))) ?? false;
+  } catch {
+    // A lost terminal connection leaves the Git conflict available for manual retry.
+  }
+}
+
+/**
+ * Ask the session that owns this worktree to retry a conflicted operation.
+ * Keep the operation as the first sentence so it is immediately actionable,
+ * while explicitly leaving ambiguous decisions to the user instead of inviting
+ * the agent to guess merely to make Git clean.
+ */
+export function conflictResolutionPrompt(operation: ConflictOperation, target: string): string {
+  const action =
+    operation === "merge"
+      ? `merge current branch to target branch ${target}, resolving conflicts`
+      : `rebase current branch onto target branch ${target}, resolving conflicts`;
+  return `${action}. Be careful: preserve the intent of both sides, and if any conflict is difficult or ambiguous, stop and leave it for a human rather than guessing.`;
 }
 
 type VscodeState =
@@ -49,7 +85,7 @@ const STATUS_COLOR: Record<string, string> = {
  * Right control-center panel: session metadata, the structural summary once a
  * session ends, and the Git changed-files list with click-to-diff.
  */
-export function RightPanel({ target, session, onCommitChanges }: Props) {
+export function RightPanel({ target, session, preparePrompt }: Props) {
   const { t } = useTranslation();
   // On a phone there's no local VS Code for the vscode:// deep link to reach, so
   // the whole "Continue in VS Code" affordance is hidden (mobile shell only).
@@ -269,20 +305,25 @@ export function RightPanel({ target, session, onCommitChanges }: Props) {
 
   const rebase = useMutation({
     mutationFn: (onto: string) => api.scmRebase(target!, session!.id, onto),
+    onMutate: () => ({ submit: preparePrompt?.() }),
     onSuccess: () => {
       setRebaseOpen(false);
       setRebaseOnto("");
       refreshScm();
     },
+    onError: (error, onto, context) => handoffConflict(error, "rebase", onto, context?.submit),
   });
 
   const merge = useMutation({
     mutationFn: (targetBranch: string) => api.scmMerge(target!, session!.id, targetBranch),
+    onMutate: () => ({ submit: preparePrompt?.() }),
     onSuccess: () => {
       setMergeOpen(false);
       setMergeTarget("");
       refreshScm();
     },
+    onError: (error, targetBranch, context) =>
+      handoffConflict(error, "merge", targetBranch, context?.submit),
   });
 
   const discardFile = useMutation({
@@ -743,9 +784,9 @@ export function RightPanel({ target, session, onCommitChanges }: Props) {
                   <button
                     className="icon-btn"
                     disabled={
-                      !onCommitChanges || scmBusy || scm.changed_files.length === 0
+                      !preparePrompt || scmBusy || scm.changed_files.length === 0
                     }
-                    onClick={onCommitChanges}
+                    onClick={() => preparePrompt?.()("commit the changes")}
                     title={t("rightPanel.commitTitle")}
                     aria-label={t("rightPanel.commitTitle")}
                   >
@@ -946,7 +987,15 @@ export function RightPanel({ target, session, onCommitChanges }: Props) {
               <ScmOpNotice
                 status="error"
                 title={t("rightPanel.rebaseFailed")}
-                summary={scmErrorSummary(rebase.error)}
+                summary={
+                  (rebase.error as { status?: number }).status === 409
+                    ? t(
+                        (rebase.error as ConflictError).promptSubmitted
+                          ? "rightPanel.rebaseConflictSummary"
+                          : "rightPanel.conflictManualSummary",
+                      )
+                    : scmErrorSummary(rebase.error)
+                }
                 details={scmErrorDetails(rebase.error)}
                 onDismiss={rebase.reset}
               />
@@ -957,7 +1006,11 @@ export function RightPanel({ target, session, onCommitChanges }: Props) {
                 title={t("rightPanel.mergeFailed")}
                 summary={
                   (merge.error as { status?: number }).status === 409
-                    ? t("rightPanel.mergeConflictSummary")
+                    ? t(
+                        (merge.error as ConflictError).promptSubmitted
+                          ? "rightPanel.mergeConflictSummary"
+                          : "rightPanel.conflictManualSummary",
+                      )
                     : scmErrorSummary(merge.error)
                 }
                 details={scmErrorDetails(merge.error)}

@@ -4,8 +4,8 @@
 
 /** Imperative handle a shell can grab off a mounted TerminalView. */
 export interface TerminalHandle {
-  /** Send raw bytes over the same WS input path as typed keys. */
-  write: (data: string) => void;
+  /** Send raw bytes over the typed-key WS path; false if input is unavailable. */
+  write: (data: string) => boolean;
   /** Focus xterm — summons the soft keyboard on iOS (call from a gesture). */
   focus: () => void;
   /** Current selection text (for the key bar's Copy). */
@@ -14,6 +14,8 @@ export interface TerminalHandle {
    *  scroll the running app is holding (see TerminalView's scroll-state block). */
   scrollToEnd: () => void;
 }
+
+export type PromptSubmitter = (text: string) => Promise<boolean>;
 
 /**
  * Mobile Ctrl key latch: `armed` transforms the next typed key into its control
@@ -66,12 +68,16 @@ const ENTER_GAP_MS = 250;
  * own ~8ms flush happened to retire the window first — a race a busy TUI loses.
  * That's why the button worked against Claude Code but left Codex holding an
  * unsent prompt.
+ * Returns true only when both the prompt and Enter were written to this terminal.
  */
-export function submitPrompt(handle: TerminalHandle | null | undefined, text: string) {
-  if (!handle) return;
-  handle.write(text);
+export async function submitPrompt(
+  handle: TerminalHandle | null | undefined,
+  text: string,
+): Promise<boolean> {
+  if (!handle || !handle.write(text)) return false;
   // Reuse `handle` (not a fresh ref read) so the Enter targets the same terminal
   // the text went to; if that terminal is gone, its write is a safe no-op (the
   // WS is closed).
-  setTimeout(() => handle.write("\r"), ENTER_GAP_MS);
+  await new Promise<void>((resolve) => setTimeout(resolve, ENTER_GAP_MS));
+  return handle.write("\r");
 }

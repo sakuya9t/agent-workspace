@@ -4,7 +4,7 @@ import { useUiStore } from "../store";
 import { daemonLabel } from "../connectionStore";
 import { useActiveSession } from "../useActiveSession";
 import { useVisualViewportHeight } from "../useVisualViewportHeight";
-import { USAGE_AGENTS } from "../agents";
+import { PROMPT_AGENTS, USAGE_AGENTS } from "../agents";
 import { CtrlLatch, TerminalHandle, submitPrompt } from "../terminalTypes";
 import { statusLabel } from "../i18n/labels";
 import { SessionList } from "./SessionList";
@@ -96,8 +96,9 @@ export function MobileShell() {
     handleRef.current = h;
     if (!h) setScrolledAway(false); // terminal went away; so did its scroll
   }, []);
-  const commitChanges = useCallback(() => {
-    submitPrompt(handleRef.current, "commit the changes");
+  const prepareAgentPrompt = useCallback(() => {
+    const handle = handleRef.current;
+    return (prompt: string) => submitPrompt(handle, prompt);
   }, []);
 
   // Track the visual viewport so the key bar stays above the soft keyboard.
@@ -200,7 +201,11 @@ export function MobileShell() {
             <RightPanel
               target={target}
               session={activeSession}
-              onCommitChanges={live ? commitChanges : undefined}
+              preparePrompt={
+                live && activeSession && PROMPT_AGENTS.has(activeSession.agent_plugin_id)
+                  ? prepareAgentPrompt
+                  : undefined
+              }
             />
           </div>
         </div>

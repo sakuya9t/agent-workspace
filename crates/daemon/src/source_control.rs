@@ -131,6 +131,14 @@ pub struct MergeConflict {
     pub output: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("rebase of `{source_branch}` onto `{target}` had conflicts and was aborted: {output}")]
+pub struct RebaseConflict {
+    pub source_branch: String,
+    pub target: String,
+    pub output: String,
+}
+
 /// Which git operation left the conflicts a [`ConflictResolver`] is asked to fix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictOp {
@@ -710,10 +718,12 @@ impl SourceControl for GitSourceControl {
         if head.as_deref() == Some(onto) {
             bail!("cannot rebase a branch onto itself");
         }
+        let source = head.unwrap_or_else(|| "HEAD".to_string());
         let out = git_output(cwd, &["rebase", onto])?;
         if out.status.success() {
             return Ok(combined_output(&out));
         }
+        let had_conflicts = has_unmerged_paths(cwd);
         // Conflicts leave a rebase in progress. Given a resolver, drive it to a
         // finish; a dirty-tree refusal (no rebase in progress) skips straight to
         // the abort below.
@@ -722,6 +732,14 @@ impl SourceControl for GitSourceControl {
                 Ok(()) => return Ok(format!("Rebased onto {onto} (conflicts auto-resolved).")),
                 Err(e) => {
                     let _ = git_output(cwd, &["rebase", "--abort"]);
+                    if had_conflicts {
+                        return Err(RebaseConflict {
+                            source_branch: source,
+                            target: onto.to_string(),
+                            output: format!("could not auto-resolve: {e:#}"),
+                        }
+                        .into());
+                    }
                     bail!("git rebase onto {onto} failed; could not auto-resolve (rebase aborted): {e:#}");
                 }
             }
@@ -729,6 +747,14 @@ impl SourceControl for GitSourceControl {
         // No resolver, or nothing to resolve: abort so the worktree returns to a
         // clean state instead of a confusing half-rebased one.
         let _ = git_output(cwd, &["rebase", "--abort"]);
+        if had_conflicts {
+            return Err(RebaseConflict {
+                source_branch: source,
+                target: onto.to_string(),
+                output: combined_output(&out),
+            }
+            .into());
+        }
         bail!(
             "git rebase onto {onto} failed (rebase aborted): {}",
             combined_output(&out).trim()
@@ -2039,6 +2065,24 @@ mod tests {
         commit_all(&repo, "main edit");
         git_test(&repo, &["checkout", "feature"]);
         repo
+    }
+
+    #[test]
+    fn rebase_conflict_is_typed_and_aborts_without_changing_branch() {
+        let repo = setup_merge_conflict("rebase-conflict");
+        let before = git_test(&repo, &["rev-parse", "HEAD"]);
+
+        let err = GitSourceControl.rebase(&repo, "main", None).unwrap_err();
+
+        let conflict = err
+            .downcast_ref::<RebaseConflict>()
+            .expect("a real rebase conflict must be distinguishable from other failures");
+        assert_eq!(conflict.source_branch, "feature");
+        assert_eq!(conflict.target, "main");
+        assert!(!rebase_in_progress(&repo));
+        assert_eq!(git_test(&repo, &["rev-parse", "HEAD"]), before);
+        assert_eq!(git_test(&repo, &["status", "--porcelain"]), "");
+        let _ = fs::remove_dir_all(repo);
     }
 
     #[test]

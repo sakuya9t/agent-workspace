@@ -125,24 +125,26 @@ pick it up**.
   restore has an explicit loading state; stale terminal attachments are released
   and every attachment lifetime is logged. These are shipped refinements, not
   pending roadmap work.
-- **Agent-driven conflict auto-resolution (2026-07-17).** A rebase/merge that hits
-  conflicts no longer aborts on the spot: the daemon points an agent at the
-  conflicted worktree (permission prompts bypassed) to resolve in place, then
-  stages exactly the conflicted files, rejects any leftover conflict markers via
-  `git diff --check`, and continues (`rebase --continue`/`--skip` in a bounded
-  loop, or the merge commit). Only an unresolvable conflict — or no capable agent —
-  aborts and fails as before (`MergeConflict` → 409). Covers all four paths:
-  session `scm/{rebase,merge}` and workspace `branches/{merge,rebase}`. Gated on
-  the session being an **agent** session: a session op is bound to exactly its own
-  agent with no fallback, so a **shell** (or `custom_command`) session gets no
-  auto-resolve and its conflicts stay manual; only the workspace ops, which belong
-  to no session, use any installed claude/codex/opencode. New
+- **Agent-driven conflict resolution (2026-07-17, refined 2026-09-07).** A
+  session rebase/merge first runs normally. A clean operation finishes without
+  interrupting the agent; an actual conflict is aborted and returned as 409, and
+  the client submits a retry-and-resolve prompt to that same live agent session
+  through the terminal path used by the commit action. The prompt tells the agent
+  to preserve both sides and leave difficult or ambiguous decisions to a human.
+  Only live coding agents receive prompts; shell, custom-command, and stopped
+  sessions keep manual resolution. Handoffs capture the initiating terminal,
+  so changing sessions cannot redirect input. The notice reports a handoff only
+  after both the prompt and Enter were written successfully.
+  Workspace-level branch operations, which have no owning session, retain the
+  headless resolver: it stages exactly the conflicted files, rejects leftover
+  conflict markers via `git diff --check`, and continues the operation. The
+  supporting machinery remains
   `plugins::AgentPlugin::conflict_resolver` (+ `ConflictResolveSpec`),
   `source_control::{ConflictResolver, ConflictContext, resolve_merge,
   resolve_rebase}`, and `conflict_resolve::AgentConflictResolver`. Proof: Rust
-  units (a `FakeResolver` drives both loops; a marker-leaving resolver aborts) +
-  sandbox E2E (claude resolved a real merge, codex a real rebase — both preserved
-  each side, no markers, clean worktree).
+  units cover typed conflicts and both resolver loops; the sandbox browser E2E
+  verifies silent clean operations, merge/rebase handoffs, session-switch races,
+  disconnected input, and manual resolution for non-agent or stopped sessions.
 - **Workspace branch management (2026-07-15).** A workspace-level git branch view,
   opened from an **(i)** icon next to each Git workspace in the tree
   (`SessionList.tsx` `.tree-actions`, gated on `is_git`), rendered by a new global

@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { fitPanels, RESIZER_W, useUiStore } from "../store";
 import { daemonLabel } from "../connectionStore";
 import { useActiveSession } from "../useActiveSession";
-import { USAGE_AGENTS } from "../agents";
+import { PROMPT_AGENTS, USAGE_AGENTS } from "../agents";
 import { statusLabel } from "../i18n/labels";
 import { TerminalHandle, submitPrompt } from "../terminalTypes";
 import { SessionList } from "./SessionList";
@@ -33,8 +33,9 @@ export function DesktopShell() {
   const onTerminalReady = useCallback((handle: TerminalHandle | null) => {
     terminalHandleRef.current = handle;
   }, []);
-  const commitChanges = useCallback(() => {
-    submitPrompt(terminalHandleRef.current, "commit the changes");
+  const prepareAgentPrompt = useCallback(() => {
+    const handle = terminalHandleRef.current;
+    return (prompt: string) => submitPrompt(handle, prompt);
   }, []);
 
   // Fit the stored side-panel widths to the live viewport so the terminal keeps
@@ -129,7 +130,11 @@ export function DesktopShell() {
         <RightPanel
           target={target}
           session={activeSession}
-          onCommitChanges={live ? commitChanges : undefined}
+          preparePrompt={
+            live && activeSession && PROMPT_AGENTS.has(activeSession.agent_plugin_id)
+              ? prepareAgentPrompt
+              : undefined
+          }
         />
       </div>
 

@@ -7,7 +7,7 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::source_control::MergeConflict;
+use crate::source_control::{MergeConflict, RebaseConflict};
 
 use super::paste::sniff_image_mime;
 use super::{AppError, AppState};
@@ -18,19 +18,6 @@ async fn session_cwd(state: &AppState, id: &str) -> Result<PathBuf, AppError> {
         .get_session(id)?
         .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "no such session".into()))?;
     Ok(PathBuf::from(session.working_directory))
-}
-
-/// The session's working directory *and* its agent id — the latter so a conflict
-/// resolver can prefer the session's own agent to resolve its rebase/merge.
-async fn session_cwd_and_agent(state: &AppState, id: &str) -> Result<(PathBuf, String), AppError> {
-    let session = state
-        .manager
-        .get_session(id)?
-        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "no such session".into()))?;
-    Ok((
-        PathBuf::from(session.working_directory),
-        session.agent_plugin_id,
-    ))
 }
 
 async fn run_blocking<T, F>(f: F) -> Result<T, AppError>
@@ -388,23 +375,27 @@ pub struct RebaseBody {
     onto: String,
 }
 
-/// Rebase the session's current branch onto another local branch. Conflicts are
-/// handed to the session's agent to auto-resolve before any abort.
+/// Rebase the session's current branch onto another local branch. A conflict is
+/// aborted and returned as 409 so the client can ask the live session itself to
+/// retry and resolve it, through the same terminal-input path as the commit action.
 pub async fn rebase(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<RebaseBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let (cwd, agent) = session_cwd_and_agent(&state, &id).await?;
+    let cwd = session_cwd(&state, &id).await?;
     let scm = state.scm.clone();
-    let registry = state.manager.registry_arc();
     let onto = body.onto;
-    let output = run_blocking(move || {
-        let resolver = crate::conflict_resolve::AgentConflictResolver::new(registry, Some(agent));
-        scm.rebase(&cwd, &onto, Some(&resolver))
-    })
-    .await?;
-    Ok(Json(json!({ "output": output })))
+    let result = tokio::task::spawn_blocking(move || scm.rebase(&cwd, &onto, None))
+        .await
+        .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("task join: {e}")))?;
+    match result {
+        Ok(output) => Ok(Json(json!({ "output": output }))),
+        Err(e) if e.downcast_ref::<RebaseConflict>().is_some() => {
+            Err(AppError(StatusCode::CONFLICT, format!("{e:#}")))
+        }
+        Err(e) => Err(AppError::from(e)),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -412,24 +403,20 @@ pub struct MergeBody {
     target: String,
 }
 
-/// Merge the session's current branch into another local branch. Conflicts are
-/// handed to the session's agent to auto-resolve; a `MergeConflict` now means the
-/// agent could not finish, not that no attempt was made.
+/// Merge the session's current branch into another local branch. A conflict is
+/// aborted and returned as 409 so the client can hand the operation to the live
+/// session itself. Clean merges complete here without sending the agent anything.
 pub async fn merge(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<MergeBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let (cwd, agent) = session_cwd_and_agent(&state, &id).await?;
+    let cwd = session_cwd(&state, &id).await?;
     let scm = state.scm.clone();
-    let registry = state.manager.registry_arc();
     let target = body.target;
-    let result = tokio::task::spawn_blocking(move || {
-        let resolver = crate::conflict_resolve::AgentConflictResolver::new(registry, Some(agent));
-        scm.merge_to_branch(&cwd, &target, Some(&resolver))
-    })
-    .await
-    .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("task join: {e}")))?;
+    let result = tokio::task::spawn_blocking(move || scm.merge_to_branch(&cwd, &target, None))
+        .await
+        .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("task join: {e}")))?;
     match result {
         Ok(output) => Ok(Json(json!({ "output": output }))),
         Err(e) if e.downcast_ref::<MergeConflict>().is_some() => {

@@ -397,11 +397,13 @@ export function TerminalView({
     const sendRaw = (d: string) => {
       if (batch) {
         batch.push(d);
-        return;
+        return true;
       }
-      if (live && ws && ws.readyState === WebSocket.OPEN) {
+      if (mounted && live && ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ t: "i", d }));
+        return true;
       }
+      return false;
     };
     // Soft-keyboard input honors a Ctrl latch; an "armed" one-shot is consumed
     // after a single key (bar/panel buttons send raw and bypass this). The phone
