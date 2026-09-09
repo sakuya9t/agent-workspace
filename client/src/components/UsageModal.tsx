@@ -43,14 +43,14 @@ export function UsageModal({ target, sessionId, agent, onClose }: Props) {
           {data && !data.available && (
             <div className="dim">{data.note ?? t("usage.noData")}</div>
           )}
-          {data && data.available && <UsageBody u={data} />}
+          {data && data.available && <UsageBody u={data} agent={agent} />}
         </div>
       </div>
     </div>
   );
 }
 
-function UsageBody({ u }: { u: SessionUsage }) {
+function UsageBody({ u, agent }: { u: SessionUsage; agent: string }) {
   const { t } = useTranslation();
   const ctxPct =
     u.context_tokens != null && u.context_window
@@ -66,7 +66,7 @@ function UsageBody({ u }: { u: SessionUsage }) {
       {u.context_tokens != null && (
         <div className="usage-block">
           <div className="usage-block-head">
-            <span>{t("usage.contextWindow")}</span>
+            <span>{t(agent === "codex" ? "usage.sessionContextBudget" : "usage.contextWindow")}</span>
             <span className="mono">
               {fmt(u.context_tokens)}
               {u.context_window ? ` / ${fmt(u.context_window)}` : ""}
@@ -79,6 +79,10 @@ function UsageBody({ u }: { u: SessionUsage }) {
             </div>
           )}
         </div>
+      )}
+
+      {u.model_max_context_window != null && (
+        <Stat label={t("usage.modelMaxContext")} value={u.model_max_context_window} />
       )}
 
       <div className="usage-grid">

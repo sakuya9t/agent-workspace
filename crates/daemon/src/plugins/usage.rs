@@ -47,8 +47,10 @@ pub struct AgentUsage {
     pub model: Option<String>,
     /// Context-window occupancy for the most recent turn (tokens).
     pub context_tokens: Option<u64>,
-    /// Model context-window size (real for Codex, estimated for Claude).
+    /// Session context budget (reported by Codex, estimated for Claude).
     pub context_window: Option<u64>,
+    /// Model maximum from local metadata, distinct from the session budget.
+    pub model_max_context_window: Option<u64>,
     /// Cumulative fresh (non-cached) input tokens for the session.
     pub input_tokens: Option<u64>,
     /// Cumulative cached / cache-read input tokens for the session.
@@ -492,13 +494,34 @@ pub fn codex_usage(cx: &TranscriptContext) -> Option<AgentUsage> {
     let chosen = codex_rollout_path(cx)?;
     let text = fs::read_to_string(&chosen).ok()?;
     let mut u = parse_codex_text(&text)?;
+    if let Some(model) = u.model.as_deref() {
+        let root = std::env::var_os("CODEX_HOME")
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home_dir().map(|p| p.join(".codex")));
+        u.model_max_context_window = root
+            .and_then(|root| fs::read_to_string(root.join("models_cache.json")).ok())
+            .and_then(|text| codex_model_max_context(&text, model));
+    }
     u.source = Some(format!("Codex rollout {}", chosen.display()));
     Some(u)
+}
+
+fn codex_model_max_context(text: &str, model: &str) -> Option<u64> {
+    let cache: Value = serde_json::from_str(text).ok()?;
+    cache["models"]
+        .as_array()?
+        .iter()
+        .find(|entry| entry["slug"].as_str() == Some(model))?
+        .get("max_context_window")?
+        .as_u64()
+        .filter(|n| *n > 0)
 }
 
 fn parse_codex_text(text: &str) -> Option<AgentUsage> {
     let mut last: Option<Value> = None;
     let mut model: Option<String> = None;
+    let mut rate_limits = std::collections::BTreeMap::new();
 
     for line in text.lines() {
         let has_model = line.contains("\"model\"");
@@ -518,11 +541,23 @@ fn parse_codex_text(text: &str) -> Option<AgentUsage> {
             }
         }
         if has_tc && v["payload"]["type"] == "token_count" {
-            last = Some(v);
+            // Rate-limit pools arrive independently, sometimes without token
+            // info. Keep the latest snapshot of each pool and token usage.
+            let limits = &v["payload"]["rate_limits"];
+            if limits.is_object() {
+                let id = limits["limit_id"].as_str().unwrap_or("codex").to_string();
+                rate_limits.insert(id, limits.clone());
+            }
+            if v["payload"]["info"].is_object() {
+                last = Some(v);
+            }
         }
     }
 
-    let v = last?;
+    if last.is_none() && rate_limits.is_empty() {
+        return None;
+    }
+    let v = last.unwrap_or(Value::Null);
     let info = &v["payload"]["info"];
     let total = &info["total_token_usage"];
     let last_turn = &info["last_token_usage"];
@@ -543,17 +578,27 @@ fn parse_codex_text(text: &str) -> Option<AgentUsage> {
         ..Default::default()
     };
 
-    let limits = &v["payload"]["rate_limits"];
-    for key in ["primary", "secondary"] {
-        let w = &limits[key];
-        if let Some(pct) = w["used_percent"].as_f64() {
-            let window_minutes = w["window_minutes"].as_u64();
-            u.rate_limits.push(RateLimitWindow {
-                label: window_minutes.map(window_label).unwrap_or_else(|| key.to_string()),
-                used_percent: pct,
-                window_minutes,
-                resets_at: w["resets_at"].as_i64(),
-            });
+    for (id, limits) in rate_limits {
+        for key in ["primary", "secondary"] {
+            let w = &limits[key];
+            if let Some(pct) = w["used_percent"].as_f64() {
+                let window_minutes = w["window_minutes"].as_u64();
+                u.rate_limits.push(RateLimitWindow {
+                    label: {
+                        let window = window_minutes
+                            .map(window_label)
+                            .unwrap_or_else(|| key.to_string());
+                        let pool = limits["limit_name"].as_str().filter(|name| !name.is_empty());
+                        match pool.or_else(|| (id != "codex").then_some(id.as_str())) {
+                            Some(pool) => format!("{pool} · {window}"),
+                            None => window,
+                        }
+                    },
+                    used_percent: pct,
+                    window_minutes,
+                    resets_at: w["resets_at"].as_i64(),
+                });
+            }
         }
     }
     u.note = Some("Read from the on-disk Codex session rollout.".into());
@@ -866,6 +911,41 @@ mod tests {
         assert_eq!(u.rate_limits.len(), 2);
         assert_eq!(u.rate_limits[0].label, "5-hour");
         assert_eq!(u.rate_limits[1].label, "weekly");
+    }
+
+    #[test]
+    fn codex_model_maximum_is_separate_from_default_budget() {
+        let cache = r#"{"models":[{"slug":"gpt-6-astra","context_window":272000,"max_context_window":872000,"effective_context_window_percent":95},{"slug":"unknown-max","context_window":272000}]}"#;
+        assert_eq!(codex_model_max_context(cache, "gpt-6-astra"), Some(872000));
+        assert_eq!(codex_model_max_context(cache, "unknown-max"), None);
+        assert_eq!(codex_model_max_context(cache, "missing"), None);
+        assert_eq!(codex_model_max_context("broken", "gpt-6-astra"), None);
+    }
+
+    #[test]
+    fn codex_preserves_tokens_and_independent_rate_limit_pools() {
+        let text = [
+            serde_json::json!({"payload": {"type": "token_count", "info": {
+                "total_token_usage": {"total_tokens": 12345},
+                "last_token_usage": {"input_tokens": 9000},
+                "model_context_window": 258400
+            }, "rate_limits": {"limit_id": "codex", "primary": {"used_percent": 10.0, "window_minutes": 10080}}}}),
+            serde_json::json!({"payload": {"type": "token_count", "info": null,
+                "rate_limits": {"limit_id": "codex", "primary": {"used_percent": 16.0, "window_minutes": 10080}}}}),
+            serde_json::json!({"payload": {"type": "token_count", "info": null,
+                "rate_limits": {"limit_id": "codex_bengalfox", "limit_name": "GPT-5.3-Codex-Spark",
+                    "primary": {"used_percent": 0.0, "window_minutes": 300}}}}),
+            serde_json::json!({"payload": {"type": "token_count", "info": null, "rate_limits": null}}),
+        ].iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        let u = parse_codex_text(&text).expect("usage");
+        assert_eq!(u.total_tokens, Some(12345));
+        assert_eq!(u.context_tokens, Some(9000));
+        assert_eq!(u.context_window, Some(258400));
+        assert_eq!(u.rate_limits.len(), 2);
+        assert_eq!(u.rate_limits[0].label, "weekly");
+        assert_eq!(u.rate_limits[0].used_percent, 16.0);
+        assert_eq!(u.rate_limits[1].label, "GPT-5.3-Codex-Spark · 5-hour");
+        assert_eq!(u.rate_limits[1].used_percent, 0.0);
     }
 
     #[test]

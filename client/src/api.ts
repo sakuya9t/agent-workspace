@@ -138,6 +138,7 @@ export interface SessionUsage {
   model: string | null;
   context_tokens: number | null;
   context_window: number | null;
+  model_max_context_window?: number | null;
   input_tokens: number | null;
   cached_input_tokens: number | null;
   output_tokens: number | null;
