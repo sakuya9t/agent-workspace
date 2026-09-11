@@ -10,7 +10,7 @@
 //! the session started), so callers should treat the result as best-effort.
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -416,6 +416,17 @@ fn iso8601_to_unix_secs(s: &str) -> Option<i64> {
 
 // ---------- Codex ----------
 
+/// Codex quota snapshots are account-wide, but a session routed to a
+/// model-specific pool can stop receiving updates for the general pool. Merge
+/// recent rollout tails so every session sees the freshest snapshot per pool.
+const CODEX_RL_CACHE_TTL: Duration = Duration::from_secs(4);
+const CODEX_RL_LOOKBACK_MS: i64 = 8 * 24 * 60 * 60 * 1000;
+const CODEX_RL_TAIL_BYTES: usize = 256 * 1024;
+
+type CodexRateLimitSnapshots = std::collections::BTreeMap<String, (String, Value)>;
+
+static CODEX_RL_CACHE: Mutex<Option<(Instant, CodexRateLimitSnapshots)>> = Mutex::new(None);
+
 /// The Codex rollout file this asm session most likely owns, from
 /// `~/.codex/sessions/**/rollout-*.jsonl`.
 pub fn codex_rollout_path(cx: &TranscriptContext) -> Option<PathBuf> {
@@ -545,6 +556,9 @@ pub fn codex_usage(cx: &TranscriptContext) -> Option<AgentUsage> {
     let chosen = codex_rollout_path(cx)?;
     let text = fs::read_to_string(&chosen).ok()?;
     let mut u = parse_codex_text(&text)?;
+    let mut limits = codex_rate_limit_snapshots_from_text(&text);
+    merge_codex_rate_limit_snapshots(&mut limits, codex_account_rate_limit_snapshots());
+    u.rate_limits = codex_rate_limit_rows(limits);
     if let Some(model) = u.model.as_deref() {
         let root = std::env::var_os("CODEX_HOME")
             .filter(|p| !p.is_empty())
@@ -572,7 +586,7 @@ fn codex_model_max_context(text: &str, model: &str) -> Option<u64> {
 fn parse_codex_text(text: &str) -> Option<AgentUsage> {
     let mut last: Option<Value> = None;
     let mut model: Option<String> = None;
-    let mut rate_limits = std::collections::BTreeMap::new();
+    let mut rate_limits = CodexRateLimitSnapshots::new();
 
     for line in text.lines() {
         let has_model = line.contains("\"model\"");
@@ -594,11 +608,7 @@ fn parse_codex_text(text: &str) -> Option<AgentUsage> {
         if has_tc && v["payload"]["type"] == "token_count" {
             // Rate-limit pools arrive independently, sometimes without token
             // info. Keep the latest snapshot of each pool and token usage.
-            let limits = &v["payload"]["rate_limits"];
-            if limits.is_object() {
-                let id = limits["limit_id"].as_str().unwrap_or("codex").to_string();
-                rate_limits.insert(id, limits.clone());
-            }
+            record_codex_rate_limit_snapshot(&mut rate_limits, &v);
             if v["payload"]["info"].is_object() {
                 last = Some(v);
             }
@@ -629,12 +639,61 @@ fn parse_codex_text(text: &str) -> Option<AgentUsage> {
         ..Default::default()
     };
 
-    for (id, limits) in rate_limits {
+    u.rate_limits = codex_rate_limit_rows(rate_limits);
+    u.note = Some("Read from the on-disk Codex session rollout.".into());
+    Some(u)
+}
+
+fn record_codex_rate_limit_snapshot(snapshots: &mut CodexRateLimitSnapshots, event: &Value) {
+    let limits = &event["payload"]["rate_limits"];
+    if !limits.is_object() {
+        return;
+    }
+    let id = limits["limit_id"].as_str().unwrap_or("codex").to_string();
+    let timestamp = event["timestamp"].as_str().unwrap_or("").to_string();
+    if snapshots
+        .get(&id)
+        .is_none_or(|(current, _)| timestamp >= *current)
+    {
+        snapshots.insert(id, (timestamp, limits.clone()));
+    }
+}
+
+fn codex_rate_limit_snapshots_from_text(text: &str) -> CodexRateLimitSnapshots {
+    let mut snapshots = CodexRateLimitSnapshots::new();
+    for line in text.lines().filter(|line| line.contains("token_count")) {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if event["payload"]["type"] == "token_count" {
+            record_codex_rate_limit_snapshot(&mut snapshots, &event);
+        }
+    }
+    snapshots
+}
+
+fn merge_codex_rate_limit_snapshots(
+    target: &mut CodexRateLimitSnapshots,
+    incoming: CodexRateLimitSnapshots,
+) {
+    for (id, (timestamp, limits)) in incoming {
+        if target
+            .get(&id)
+            .is_none_or(|(current, _)| timestamp >= *current)
+        {
+            target.insert(id, (timestamp, limits));
+        }
+    }
+}
+
+fn codex_rate_limit_rows(rate_limits: CodexRateLimitSnapshots) -> Vec<RateLimitWindow> {
+    let mut rows = Vec::new();
+    for (id, (_, limits)) in rate_limits {
         for key in ["primary", "secondary"] {
             let w = &limits[key];
             if let Some(pct) = w["used_percent"].as_f64() {
                 let window_minutes = w["window_minutes"].as_u64();
-                u.rate_limits.push(RateLimitWindow {
+                rows.push(RateLimitWindow {
                     label: {
                         let window = window_minutes
                             .map(window_label)
@@ -652,8 +711,40 @@ fn parse_codex_text(text: &str) -> Option<AgentUsage> {
             }
         }
     }
-    u.note = Some("Read from the on-disk Codex session rollout.".into());
-    Some(u)
+    rows
+}
+
+fn codex_account_rate_limit_snapshots() -> CodexRateLimitSnapshots {
+    if let Ok(guard) = CODEX_RL_CACHE.lock() {
+        if let Some((at, cached)) = guard.as_ref() {
+            if at.elapsed() < CODEX_RL_CACHE_TTL {
+                return cached.clone();
+            }
+        }
+    }
+
+    let mut snapshots = CodexRateLimitSnapshots::new();
+    if let Some(root) = home_dir().map(|h| h.join(".codex").join("sessions")) {
+        let mut files = Vec::new();
+        collect_jsonl(&root, &mut files, 0);
+        files.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+        if let Some((newest_mtime, _)) = files.first() {
+            let cutoff = newest_mtime.saturating_sub(CODEX_RL_LOOKBACK_MS);
+            for (_, path) in files.iter().take_while(|(mtime, _)| *mtime >= cutoff) {
+                if let Some(tail) = read_tail(path, CODEX_RL_TAIL_BYTES) {
+                    merge_codex_rate_limit_snapshots(
+                        &mut snapshots,
+                        codex_rate_limit_snapshots_from_text(&tail),
+                    );
+                }
+            }
+        }
+    }
+
+    if let Ok(mut guard) = CODEX_RL_CACHE.lock() {
+        *guard = Some((Instant::now(), snapshots.clone()));
+    }
+    snapshots
 }
 
 /// Extract the recorded cwd from the head of a Codex rollout (session_meta /
@@ -887,6 +978,22 @@ pub(crate) fn read_head(path: &Path, max: usize) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
+/// Read up to `max` bytes from the end of a file. When seeking into the file,
+/// discard the first partial JSONL record before parsing the remainder.
+fn read_tail(path: &Path, max: usize) -> Option<String> {
+    let mut f = fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(max as u64);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    f.read_to_end(&mut buf).ok()?;
+    if start > 0 {
+        let newline = buf.iter().position(|b| *b == b'\n')?;
+        buf.drain(..=newline);
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,6 +1104,45 @@ mod tests {
         assert_eq!(u.rate_limits[0].used_percent, 16.0);
         assert_eq!(u.rate_limits[1].label, "GPT-5.3-Codex-Spark · 5-hour");
         assert_eq!(u.rate_limits[1].used_percent, 0.0);
+    }
+
+    #[test]
+    fn codex_uses_freshest_account_limit_across_session_rollouts() {
+        let routed_session = [
+            serde_json::json!({"timestamp": "2026-09-08T14:29:37Z", "payload": {
+                "type": "token_count", "rate_limits": {"limit_id": "codex",
+                    "primary": {"used_percent": 16.0, "window_minutes": 10080}}
+            }}),
+            serde_json::json!({"timestamp": "2026-09-11T05:40:46Z", "payload": {
+                "type": "token_count", "rate_limits": {"limit_id": "codex_bengalfox",
+                    "limit_name": "GPT-5.3-Codex-Spark",
+                    "primary": {"used_percent": 0.0, "window_minutes": 300}}
+            }}),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        let general_session = serde_json::json!({
+            "timestamp": "2026-09-11T05:40:45Z", "payload": {
+                "type": "token_count", "rate_limits": {"limit_id": "codex",
+                    "primary": {"used_percent": 90.0, "window_minutes": 10080}}
+            }
+        })
+        .to_string();
+
+        let mut limits = codex_rate_limit_snapshots_from_text(&routed_session);
+        merge_codex_rate_limit_snapshots(
+            &mut limits,
+            codex_rate_limit_snapshots_from_text(&general_session),
+        );
+        let rows = codex_rate_limit_rows(limits);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "weekly");
+        assert_eq!(rows[0].used_percent, 90.0);
+        assert_eq!(rows[1].label, "GPT-5.3-Codex-Spark · 5-hour");
+        assert_eq!(rows[1].used_percent, 0.0);
     }
 
     #[test]
