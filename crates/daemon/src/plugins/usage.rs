@@ -419,26 +419,73 @@ fn iso8601_to_unix_secs(s: &str) -> Option<i64> {
 /// The Codex rollout file this asm session most likely owns, from
 /// `~/.codex/sessions/**/rollout-*.jsonl`.
 pub fn codex_rollout_path(cx: &TranscriptContext) -> Option<PathBuf> {
+    let files = codex_rollout_files()?;
+    choose_codex_rollout(cx, files)
+}
+
+fn codex_rollout_files() -> Option<Vec<(i64, PathBuf)>> {
     let root = home_dir()?.join(".codex").join("sessions");
     if !root.is_dir() {
         return None;
     }
     let mut files = Vec::new();
     collect_jsonl(&root, &mut files, 0);
-    choose_codex_rollout(cx, files)
+    Some(files)
+}
+
+/// Recover from the old global-newest fallback, which could persist another
+/// Codex session's id before this session had created its own rollout. A
+/// replacement is returned only when the bound rollout exists and records a
+/// different cwd, and an exact-cwd candidate exists for this session.
+pub fn codex_replacement_native_id(cx: &TranscriptContext) -> Option<String> {
+    codex_replacement_native_id_from(cx, codex_rollout_files()?)
+}
+
+fn codex_replacement_native_id_from(
+    cx: &TranscriptContext,
+    files: Vec<(i64, PathBuf)>,
+) -> Option<String> {
+    let existing = cx.native_session_id.as_deref()?;
+    let want = cx.cwd.to_string_lossy().to_string();
+    let belongs_elsewhere = files.iter().any(|(_, path)| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(existing))
+            && read_head(path, 64 * 1024).is_some_and(|head| {
+                codex_file_id(&head).as_deref() == Some(existing)
+                    && codex_file_cwd(&head)
+                        .as_deref()
+                        .is_some_and(|cwd| cwd != want.as_str())
+            })
+    });
+    if !belongs_elsewhere {
+        return None;
+    }
+
+    let unbound = TranscriptContext {
+        cwd: cx.cwd.clone(),
+        started_at_ms: cx.started_at_ms,
+        native_session_id: None,
+    };
+    let replacement = choose_codex_rollout(&unbound, files)
+        .and_then(|path| read_head(&path, 64 * 1024))
+        .and_then(|head| codex_file_id(&head))?;
+    (replacement != existing).then_some(replacement)
 }
 
 fn choose_codex_rollout(
     cx: &TranscriptContext,
     mut files: Vec<(i64, PathBuf)>,
 ) -> Option<PathBuf> {
+    let want = cx.cwd.to_string_lossy().to_string();
+
     // Once the monitor has captured Codex's id, never re-guess by cwd. A later
     // session in the same worktree otherwise steals this session's title,
     // transcript and usage merely by being written more recently. Codex embeds
     // the id in both the rollout filename and its session_meta header; use the
-    // filename to narrow cheaply and the header to verify it. If the bound
-    // rollout disappeared, returning no data is safer than serving another
-    // conversation as this one.
+    // filename to narrow cheaply and the header to verify both the id and cwd.
+    // Checking cwd also contains a stale or corrupt binding instead of serving
+    // another session's conversation through it.
     if let Some(id) = cx.native_session_id.as_deref() {
         return files
             .iter()
@@ -446,10 +493,10 @@ fn choose_codex_rollout(
                 path.file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| name.contains(id))
-                    && read_head(path, 64 * 1024)
-                        .and_then(|head| codex_file_id(&head))
-                        .as_deref()
-                        == Some(id)
+                    && read_head(path, 64 * 1024).is_some_and(|head| {
+                        codex_file_id(&head).as_deref() == Some(id)
+                            && codex_file_cwd(&head).as_deref() == Some(want.as_str())
+                    })
             })
             .map(|(_, path)| path.clone());
     }
@@ -458,14 +505,18 @@ fn choose_codex_rollout(
     files.retain(|(m, _)| *m >= min);
     files.sort_by_key(|(m, _)| std::cmp::Reverse(*m)); // newest first
 
-    // Prefer the rollout whose recorded cwd matches this session; otherwise take
-    // the most recently written candidate.
-    let want = cx.cwd.to_string_lossy().to_string();
+    // A rollout from another cwd can be very recent when another Codex session
+    // is active. It is never a safe fallback: Codex can create this session's
+    // own rollout lazily, so wait for an exact cwd match and let the monitor poll
+    // again instead of permanently capturing the unrelated conversation id.
     files
         .iter()
-        .take(20)
-        .find(|(_, p)| read_head(p, 64 * 1024).and_then(|h| codex_file_cwd(&h)).as_deref() == Some(want.as_str()))
-        .or_else(|| files.first())
+        .find(|(_, path)| {
+            read_head(path, 64 * 1024)
+                .and_then(|head| codex_file_cwd(&head))
+                .as_deref()
+                == Some(want.as_str())
+        })
         .map(|(_, p)| p.clone())
 }
 
@@ -988,6 +1039,99 @@ mod tests {
             native_session_id: None,
         };
         assert_eq!(choose_codex_rollout(&unbound, files), Some(later));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn codex_rollout_waits_for_its_own_cwd_instead_of_stealing_a_recent_session() {
+        let dir = std::env::temp_dir().join(format!(
+            "asm-codex-rollout-cwd-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let other_id = "33333333-3333-3333-3333-333333333333";
+        let other = dir.join(format!("rollout-new-{other_id}.jsonl"));
+        fs::write(
+            &other,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{other_id}","cwd":"/other-repo"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let cx = TranscriptContext {
+            cwd: PathBuf::from("/our-repo"),
+            started_at_ms: 100,
+            native_session_id: None,
+        };
+        assert_eq!(choose_codex_rollout(&cx, vec![(200, other)]), None);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn codex_rollout_rejects_a_persisted_id_from_another_cwd() {
+        let dir = std::env::temp_dir().join(format!(
+            "asm-codex-rollout-binding-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let other_id = "44444444-4444-4444-4444-444444444444";
+        let other = dir.join(format!("rollout-old-{other_id}.jsonl"));
+        fs::write(
+            &other,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{other_id}","cwd":"/other-repo"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let cx = TranscriptContext {
+            cwd: PathBuf::from("/our-repo"),
+            started_at_ms: 100,
+            native_session_id: Some(other_id.into()),
+        };
+        assert_eq!(choose_codex_rollout(&cx, vec![(200, other)]), None);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn codex_replaces_a_cross_cwd_duplicate_with_the_exact_cwd_rollout() {
+        let dir = std::env::temp_dir().join(format!(
+            "asm-codex-rollout-repair-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let wrong_id = "55555555-5555-5555-5555-555555555555";
+        let right_id = "66666666-6666-6666-6666-666666666666";
+        let wrong = dir.join(format!("rollout-old-{wrong_id}.jsonl"));
+        let right = dir.join(format!("rollout-new-{right_id}.jsonl"));
+        fs::write(
+            &wrong,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{wrong_id}","cwd":"/other-repo"}}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &right,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{right_id}","cwd":"/our-repo"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let cx = TranscriptContext {
+            cwd: PathBuf::from("/our-repo"),
+            started_at_ms: 100,
+            native_session_id: Some(wrong_id.into()),
+        };
+        assert_eq!(
+            codex_replacement_native_id_from(&cx, vec![(300, wrong), (200, right)]),
+            Some(right_id.into())
+        );
 
         fs::remove_dir_all(dir).unwrap();
     }

@@ -252,9 +252,18 @@ pub trait AgentPlugin: Send + Sync {
     /// read from the same on-disk transcript [`usage`] reads. `None` = the agent
     /// keeps no resumable conversation (a plain shell), or none can be matched.
     ///
-    /// Called repeatedly while the session is alive; the **first** `Some` is
-    /// persisted and never re-derived (see [`crate::domain::Session::agent_session_id`]).
+    /// Called repeatedly while the session is alive; the first unique `Some` is
+    /// persisted (see [`crate::domain::Session::agent_session_id`]).
     fn native_session_id(&self, _cx: &TranscriptContext) -> Option<String> {
+        None
+    }
+
+    /// Correct a persisted native id only when the plugin can prove that it
+    /// belongs to another session and can identify this session's replacement.
+    /// The daemon calls this only for duplicate bindings left by an older
+    /// matcher. `None` preserves the existing id: absence of a transcript is not
+    /// evidence that a binding is wrong.
+    fn replacement_native_session_id(&self, _cx: &TranscriptContext) -> Option<String> {
         None
     }
 

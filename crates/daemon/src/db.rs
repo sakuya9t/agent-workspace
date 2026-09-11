@@ -114,17 +114,54 @@ impl Db {
     }
 
     /// Record the agent's own conversation id for a live session. Written once —
-    /// the first successful capture wins, and later ticks must not overwrite it
-    /// with a re-derived guess (see [`Session::agent_session_id`]). The
-    /// `IS NULL` guard makes that a property of the statement rather than of
-    /// every caller.
+    /// the first successful unique capture wins, and later ticks must not
+    /// overwrite it with a re-derived guess (see [`Session::agent_session_id`]).
+    /// The guards make both properties atomic: another ASM session using the
+    /// same agent cannot claim an id that is already on record.
     pub fn set_agent_session_id(&self, id: &str, native_id: &str) -> Result<bool> {
         let conn = self.conn.lock();
         let n = conn.execute(
             "UPDATE sessions SET agent_session_id = ?2
-             WHERE id = ?1 AND agent_session_id IS NULL",
+             WHERE id = ?1 AND agent_session_id IS NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM sessions AS other
+                 WHERE other.id != ?1
+                   AND other.agent_plugin_id = sessions.agent_plugin_id
+                   AND other.agent_session_id = ?2
+               )",
             rusqlite::params![id, native_id],
         )?;
+        Ok(n > 0)
+    }
+
+    /// Replace a binding that the owning plugin proved belongs to another
+    /// session. The compare-and-swap guard prevents a stale repair from
+    /// overwriting a newer capture, while the uniqueness guard preserves the
+    /// same invariant as [`Self::set_agent_session_id`]. Any generated title was
+    /// based on the old conversation and must be discarded with it.
+    pub fn replace_agent_session_id(
+        &self,
+        id: &str,
+        previous: &str,
+        replacement: &str,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let n = tx.execute(
+            "UPDATE sessions SET agent_session_id = ?3
+             WHERE id = ?1 AND agent_session_id = ?2
+               AND NOT EXISTS (
+                 SELECT 1 FROM sessions AS other
+                 WHERE other.id != ?1
+                   AND other.agent_plugin_id = sessions.agent_plugin_id
+                   AND other.agent_session_id = ?3
+               )",
+            rusqlite::params![id, previous, replacement],
+        )?;
+        if n > 0 {
+            tx.execute("DELETE FROM session_titles WHERE session_id = ?1", [id])?;
+        }
+        tx.commit()?;
         Ok(n > 0)
     }
 
@@ -1053,6 +1090,44 @@ mod tests {
 
         db.set_session_title("s1", "Better title", 20).unwrap();
         assert_eq!(db.get_session_title("s1").unwrap().as_deref(), Some("Better title"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn native_id_capture_is_unique_and_repair_discards_the_stale_title() {
+        let (db, dir) = temp_db();
+        seed_session(&db, "s1");
+        seed_session(&db, "s2");
+
+        assert!(db.set_agent_session_id("s1", "native-old").unwrap());
+        assert!(!db.set_agent_session_id("s2", "native-old").unwrap());
+        assert_eq!(db.get_session("s2").unwrap().unwrap().agent_session_id, None);
+
+        // Simulate a duplicate written by an older daemon, before the unique
+        // capture guard existed.
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE sessions SET agent_session_id = 'native-old' WHERE id = 's2'",
+                [],
+            )
+            .unwrap();
+        db.set_session_title("s2", "Title from the wrong conversation", 10)
+            .unwrap();
+
+        assert!(db
+            .replace_agent_session_id("s2", "native-old", "native-correct")
+            .unwrap());
+        assert_eq!(
+            db.get_session("s2")
+                .unwrap()
+                .unwrap()
+                .agent_session_id
+                .as_deref(),
+            Some("native-correct")
+        );
+        assert_eq!(db.get_session_title("s2").unwrap(), None);
 
         let _ = std::fs::remove_dir_all(dir);
     }

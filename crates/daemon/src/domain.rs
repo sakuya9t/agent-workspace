@@ -197,8 +197,9 @@ pub struct Session {
     /// bypass-sandbox). Surfaced as a risk badge in the UI.
     pub risky: bool,
     /// The agent's *own* conversation id (Claude's `sessionId`, Codex's rollout
-    /// uuid), captured while the session is alive and never re-derived. A fork
-    /// that keeps the same agent resumes this conversation natively.
+    /// uuid), captured while the session is alive. It changes only when a plugin
+    /// proves an older duplicate binding belongs to another session. A fork that
+    /// keeps the same agent resumes this conversation natively.
     ///
     /// Captured live rather than at fork time on purpose: the transcript-matching
     /// heuristics in [`crate::plugins::usage`] are "newest file in the directory"

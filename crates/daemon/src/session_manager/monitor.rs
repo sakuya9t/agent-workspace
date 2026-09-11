@@ -104,8 +104,9 @@ impl SessionManager {
     /// off, and *guaranteed* for a same-branch fork) can collapse onto whichever
     /// transcript was written last. Reporting the wrong token count is survivable;
     /// resuming the wrong conversation is not. Capturing early, while this session
-    /// is the only recent writer, is when that heuristic is at its most reliable —
-    /// and once captured the id is never re-derived.
+    /// is the only recent writer, is when that heuristic is at its most reliable.
+    /// Once captured the id is stable, except for a plugin-proven repair of a
+    /// duplicate binding left by an older matcher.
     ///
     /// Returns whether the id is now on record (including when a previous tick
     /// wrote it), so the caller can stop polling.
@@ -138,10 +139,11 @@ impl SessionManager {
                 return false;
             };
             match this.db.set_agent_session_id(&id, &native_id) {
-                Ok(_) => {
+                Ok(true) => {
                     tracing::debug!(session = %id, native_id = %native_id, "captured the agent's conversation id");
                     true
                 }
+                Ok(false) => false,
                 Err(e) => {
                     tracing::warn!(session = %id, "could not record the agent's conversation id: {e:#}");
                     false

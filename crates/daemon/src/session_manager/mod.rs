@@ -24,8 +24,9 @@ const ECHO_WINDOW: Duration = Duration::from_millis(1000);
 
 /// How often a live session is checked for the agent's own conversation id, until
 /// one is found. An agent writes its transcript shortly *after* it starts, so this
-/// cannot be a single attempt at spawn — but once captured it is never re-derived,
-/// and the polling stops. See [`SessionManager::capture_native_id`].
+/// cannot be a single attempt at spawn. Once captured, polling stops; the only
+/// later change is a plugin-proven repair of duplicate bindings left by an older
+/// matcher. See [`SessionManager::capture_native_id`].
 const CAPTURE_EVERY: Duration = Duration::from_secs(5);
 
 use crate::backend::{
@@ -637,6 +638,10 @@ impl SessionManager {
     /// daemon runs it.
     pub fn startup_reconcile(self: &Arc<Self>) -> Result<()> {
         let _pass = self.reconcile_pass.lock();
+        let repaired = self.repair_duplicate_native_ids()?;
+        if repaired > 0 {
+            tracing::warn!("repaired {repaired} duplicate agent conversation binding(s)");
+        }
         if !self.backend.keep_sessions_on_shutdown() {
             let n = self.db.reconcile_orphans_on_startup(now_millis())?;
             if n > 0 {
@@ -658,6 +663,62 @@ impl SessionManager {
             }
         };
         self.reconcile_from_holder(holder)
+    }
+
+    /// Repair duplicates produced by the old Codex matcher, which fell back to
+    /// the newest rollout anywhere on the host before a new session had written
+    /// its own. Plugins opt in only when they can prove the stored id belongs to
+    /// another cwd and can resolve an exact replacement. A changed binding also
+    /// invalidates its persisted generated title in the database.
+    fn repair_duplicate_native_ids(&self) -> Result<usize> {
+        let sessions = self.db.list_sessions()?;
+        let mut counts = HashMap::<(String, String), usize>::new();
+        for session in &sessions {
+            if let Some(native_id) = &session.agent_session_id {
+                *counts
+                    .entry((session.agent_plugin_id.clone(), native_id.clone()))
+                    .or_default() += 1;
+            }
+        }
+
+        let mut repaired = 0;
+        for session in sessions {
+            let Some(previous) = session.agent_session_id.as_deref() else {
+                continue;
+            };
+            if counts
+                .get(&(session.agent_plugin_id.clone(), previous.to_string()))
+                .copied()
+                .unwrap_or_default()
+                < 2
+            {
+                continue;
+            }
+            let Some(plugin) = self.registry.get(&session.agent_plugin_id) else {
+                continue;
+            };
+            let cx = TranscriptContext {
+                cwd: PathBuf::from(&session.working_directory),
+                started_at_ms: session.created_at,
+                native_session_id: Some(previous.to_string()),
+            };
+            let Some(replacement) = plugin.replacement_native_session_id(&cx) else {
+                continue;
+            };
+            if self
+                .db
+                .replace_agent_session_id(&session.id, previous, &replacement)?
+            {
+                tracing::warn!(
+                    session = %session.id,
+                    old_native_id = %previous,
+                    new_native_id = %replacement,
+                    "repaired mismatched agent conversation binding"
+                );
+                repaired += 1;
+            }
+        }
+        Ok(repaired)
     }
 
     /// Re-run reconciliation after the daemon↔asmux connection dropped and came

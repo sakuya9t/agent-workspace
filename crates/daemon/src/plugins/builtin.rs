@@ -129,6 +129,9 @@ impl AgentPlugin for CodexPlugin {
     fn native_session_id(&self, cx: &TranscriptContext) -> Option<String> {
         fork::codex_native_id(cx)
     }
+    fn replacement_native_session_id(&self, cx: &TranscriptContext) -> Option<String> {
+        usage::codex_replacement_native_id(cx)
+    }
     fn digest(&self, cx: &TranscriptContext) -> Option<String> {
         fork::codex_digest(cx)
     }

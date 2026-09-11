@@ -150,7 +150,9 @@ trailing argument as a script rather than read it.
 ## Capturing the conversation id — while the session is alive
 
 `sessions.agent_session_id` (SCHEMA_V7) is written by the monitor, polling every
-5 s until it lands, and **never re-derived**.
+5 s until the first unique match lands. It stays fixed unless a plugin can prove
+that an older duplicate binding belongs to another session and find an exact
+replacement.
 
 This is deliberate. The transcript-matching in `plugins/usage.rs` is a heuristic —
 Claude's is literally *"the newest `*.jsonl` in this cwd's directory"* — and two
@@ -159,6 +161,8 @@ sessions sharing a working directory (normal with worktree isolation off, and
 written last. Reporting the wrong token count is survivable. *Resuming the wrong
 conversation* is not. So we capture early, when this session is the only recent
 writer, and read Claude's `sessionId` **field** rather than trusting the filename.
+Codex additionally requires an exact recorded-cwd match; if its rollout has not
+appeared yet, the monitor waits rather than using another session on the host.
 
 The id stays on the host: the API exposes only `has_agent_conversation`, which is
 all a client needs to say whether a fork carries the whole conversation or a

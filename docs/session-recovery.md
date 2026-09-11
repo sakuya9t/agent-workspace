@@ -175,15 +175,17 @@ not tolerable for choosing which conversation to resume:
   the directory", and the `sessionId` in the file is never read;
 - two agent sessions in one cwd (normal when worktree isolation is off) collapse
   onto whichever transcript was written last;
-- Codex falls back to `files.first()` — *any* newest rollout on the box — when the
-  cwd probe misses.
+- Codex must wait for an exact recorded-cwd match. Older releases fell back to
+  `files.first()` — any newest rollout on the box — when the cwd probe missed;
+  startup reconciliation repairs duplicate cross-cwd bindings from that bug.
 
 Resuming the wrong conversation is a much worse failure than reporting the wrong
 token count. So: **capture the native id once, while the session is alive and the
 heuristic is at its most reliable, and persist it.** The monitor already has the
-hooks; the first successful `native_session_id` for a session writes
-`sessions.agent_session_id` and never re-derives. Recovery then reads a column,
-not a filesystem race.
+hooks; the first unique `native_session_id` for a session writes
+`sessions.agent_session_id`. Recovery then reads a column, not a filesystem race.
+The only rewrite is a startup repair when the plugin proves a duplicate binding
+belongs to another cwd and resolves that session's exact replacement.
 
 (Persisting it also lets us *verify* rather than guess: for Claude we read the
 `sessionId` field out of the JSONL rather than trusting "newest file wins".)
