@@ -42,6 +42,10 @@ export type CtrlLatch = "off" | "armed" | "locked";
  */
 export const SOFT_RETURN = "\x1b\r";
 
+/** Preserve Alt for queued-input navigation; xterm remaps these to Ctrl on Linux/Windows. */
+export const ALT_UP = "\x1b[1;3A";
+export const ALT_DOWN = "\x1b[1;3B";
+
 /**
  * How long to wait after the text before sending the Enter.
  *

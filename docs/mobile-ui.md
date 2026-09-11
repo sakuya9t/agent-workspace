@@ -77,7 +77,7 @@ terminal — and its WebSocket — stays mounted underneath).
 ┌─ Sessions (home) ─┐  tap session   ┌─ Terminal ────────┐  ⓘ   ┌─ Details sheet ─┐
 │ health · Daemons  │ ─────────────▶ │ ‹ agent·status ⓘ  │ ───▶ │ fields, cleanup │
 │ host ▸ ws ▸ rows  │ ◀───────────── │  xterm (fills)    │ ◀─── │ SCM, diffs,     │
-│ history (bottom)  │  ‹ back /      │ [Esc Tab ^ ⇧⇥ ↑↓] │ swipe│ pull/rebase,    │
+│ history (bottom)  │  ‹ back /      │ [Esc Tab Alt↑ ↑↓] │ swipe│ pull/rebase,    │
 └───────────────────┘  system back   └───────────────────┘ down └─ commit graph ──┘
 ```
 
@@ -122,6 +122,8 @@ Terminal screen.
   | `⇧⏎` | `\x1b\r` | soft return — a newline in the agent's composer instead of a send (`SOFT_RETURN`). A soft keyboard cannot type the Shift+Enter chord, so on a phone this button *is* the feature; a hardware keyboard gets the chord itself, claimed in `TerminalView` on every platform |
   | `Ctrl` | latch: next key → `\x01`–`\x1a` | any control chord; double-tap locks |
   | `^C` | `\x03` | dedicated because it's the most common chord |
+  | `Alt+↑` | `\x1b[1;3A` | open and move forward through Codex's queued follow-up questions |
+  | `Alt+↓` | `\x1b[1;3B` | move backward through queued questions and close the question panel |
   | `↑ ↓ ← →` | `\x1b[A/B/C/D` | history, TUI menus |
   | `⌨` | focus xterm textarea | summon/dismiss keyboard (iOS needs a gesture) |
   | `Paste` | `clipboard.readText()` → input, else the paste sheet | long-press paste is flaky in xterm; the read needs a secure context, which a phone does **not** have (below) |

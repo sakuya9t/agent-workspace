@@ -1,7 +1,13 @@
 import { Dispatch, MutableRefObject, SetStateAction } from "react";
 import { useTranslation } from "react-i18next";
 import { copyText } from "../clipboard";
-import { CtrlLatch, SOFT_RETURN, TerminalHandle } from "../terminalTypes";
+import {
+  ALT_DOWN,
+  ALT_UP,
+  CtrlLatch,
+  SOFT_RETURN,
+  TerminalHandle,
+} from "../terminalTypes";
 import { useTerminalPaste } from "../useTerminalPaste";
 import { PasteSheet } from "./PasteSheet";
 
@@ -59,6 +65,22 @@ export function TermKeyBar({ handleRef, ctrl, setCtrl }: Props) {
         </button>
         <button className="kb" onClick={send("\x03")}>
           {t("keybar.ctrlC")}
+        </button>
+        <button
+          className="kb"
+          onClick={send(ALT_UP)}
+          aria-label={t("keybar.altUpLabel")}
+          title={t("keybar.altUpLabel")}
+        >
+          {t("keybar.altUp")}
+        </button>
+        <button
+          className="kb"
+          onClick={send(ALT_DOWN)}
+          aria-label={t("keybar.altDownLabel")}
+          title={t("keybar.altDownLabel")}
+        >
+          {t("keybar.altDown")}
         </button>
         <button className="kb up" onClick={send("\x1b[A")} aria-label={t("keybar.up")} />
         <button className="kb down" onClick={send("\x1b[B")} aria-label={t("keybar.down")} />

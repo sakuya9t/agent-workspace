@@ -6,7 +6,7 @@ import { Target } from "../connectionStore";
 import { useUiStore } from "../store";
 import { copyText } from "../clipboard";
 import { glog } from "../gestureLog";
-import { CtrlLatch, SOFT_RETURN, TerminalHandle } from "../terminalTypes";
+import { ALT_DOWN, ALT_UP, CtrlLatch, SOFT_RETURN, TerminalHandle } from "../terminalTypes";
 import { useIsPhone } from "../useIsPhone";
 import { useIsTouch } from "../useIsTouch";
 import { useTerminalPaste } from "../useTerminalPaste";
@@ -476,6 +476,20 @@ export function TerminalView({
     // Terminal and VS Code's terminal make — vim's own Ctrl-Q is the way back.
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== "keydown") return true;
+      // xterm 5 maps Alt+Up/Down to Ctrl+Up/Down on non-Mac platforms.
+      // Agent TUIs use the actual Alt chords to open queued follow-up inputs.
+      if (
+        (e.key === "ArrowUp" || e.key === "ArrowDown") &&
+        e.altKey &&
+        !e.ctrlKey &&
+        !e.shiftKey &&
+        !e.metaKey &&
+        !e.isComposing
+      ) {
+        sendRaw(e.key === "ArrowUp" ? ALT_UP : ALT_DOWN);
+        e.preventDefault();
+        return false;
+      }
       // Soft return, every platform. xterm maps Shift+Enter to a bare CR —
       // byte-identical to Enter — so the chord every agent's own footer
       // advertises for "newline" was silently sending the message instead.
