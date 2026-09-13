@@ -7,14 +7,14 @@
 
 use crate::domain::AttentionState;
 
-/// Codex's screen-based approval matcher, over the rendered visible **screen**.
+/// Codex's screen-based input matcher, over the rendered visible **screen**.
 ///
 /// Codex rings the terminal bell on **turn completion** — not only on approval
 /// prompts — so the default bell heuristic mis-reads a finished turn as
 /// "blocked" and, because that state is sticky, it stays there until the user
 /// clicks in. The bell alone therefore can't tell "your turn now" from "I need
 /// approval"; only the screen can. So — unlike [`super::default_attention`] — the
-/// bell is deliberately ignored here: with no approval menu on screen the turn is
+/// bell is deliberately ignored here: with no input prompt on screen the turn is
 /// simply done, so we report activity and let the idle timer settle it to a calm
 /// idle (matching Claude Code, whose finished turns also read as idle).
 ///
@@ -26,6 +26,8 @@ use crate::domain::AttentionState;
 /// numbered option, so it isn't mistaken for one. We require *both* the pointer
 /// and an approval phrase so an ordinary numbered list Codex printed — or prose
 /// that merely quotes such a phrase — isn't read as a prompt.
+/// Queued follow-up questions instead show a notice, a nonzero question count,
+/// and an answer shortcut. That widget also means the session needs user input.
 pub(crate) fn codex_attention(screen: &str, _bell: bool) -> (AttentionState, Option<String>) {
     const APPROVAL_PHRASES: &[&str] = &[
         // The question stem for command / patch approvals.
@@ -44,7 +46,50 @@ pub(crate) fn codex_attention(screen: &str, _bell: bool) -> (AttentionState, Opt
             );
         }
     }
+    if has_queued_questions(screen) {
+        return (
+            AttentionState::ApprovalNeeded,
+            Some("prompt detected: queued follow-up questions".to_string()),
+        );
+    }
     (AttentionState::Activity, None)
+}
+
+/// Require the complete queued-question widget on consecutive nonblank lines,
+/// so a queue of ordinary inputs or prose mentioning questions isn't blocked.
+fn has_queued_questions(screen: &str) -> bool {
+    let lower = screen.to_lowercase();
+    let mut lines = lower.lines().map(str::trim).filter(|line| !line.is_empty());
+    while let Some(line) = lines.next() {
+        if line.trim_start_matches('•').trim_start() != "queued follow-up inputs" {
+            continue;
+        }
+        let mut following = lines.clone();
+        let Some(count_line) = following.next() else {
+            continue;
+        };
+        let mut words = count_line.split_whitespace();
+        if words.next() != Some("?") {
+            continue;
+        }
+        let Some(count) = words.next() else {
+            continue;
+        };
+        if !count.bytes().all(|c| c.is_ascii_digit())
+            || count.bytes().all(|c| c == b'0')
+            || !matches!(words.next(), Some("question" | "questions"))
+            || words.next().is_some()
+        {
+            continue;
+        }
+        if following.next().is_some_and(|hint| {
+            hint.split_whitespace()
+                .eq(["alt", "+", "↑", "to", "answer"])
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Codex's still-working matcher, over the rendered visible **screen**.
@@ -174,6 +219,56 @@ mod tests {
         // Even with the turn-completion bell set, this is a finished turn.
         let (a, _) = codex_attention(screen, true);
         assert_eq!(a, AttentionState::Activity);
+    }
+
+    #[test]
+    fn codex_queued_follow_up_question_is_blocked() {
+        let screen = "─ Worked for 10m 45s ─────────────────────\n\n\
+                      • Queued follow-up inputs\n\
+                        ? 1 question\n\
+                          alt + ↑ to answer\n\n\
+                      › Ask Codex to do anything";
+        for bell in [false, true] {
+            let (state, reason) = codex_attention(screen, bell);
+            assert_eq!(state, AttentionState::ApprovalNeeded);
+            assert_eq!(
+                reason.as_deref(),
+                Some("prompt detected: queued follow-up questions")
+            );
+        }
+    }
+
+    #[test]
+    fn codex_multiple_queued_questions_are_blocked_while_working() {
+        let screen = "◦ Working (49s • esc to interrupt)\n\
+                      • Queued follow-up inputs\n\n\
+                        ? 12 questions\n\
+                          alt  +  ↑  to answer\n\
+                      › Ask Codex to do anything";
+        assert_eq!(
+            codex_attention(screen, false).0,
+            AttentionState::ApprovalNeeded
+        );
+    }
+
+    #[test]
+    fn codex_incomplete_or_non_question_queue_is_activity() {
+        for screen in [
+            "• Queued follow-up inputs\n? 0 questions\nalt + ↑ to answer",
+            "• Queued follow-up inputs\n? 00 questions\nalt + ↑ to answer",
+            "• Queued follow-up inputs\n? one question\nalt + ↑ to answer",
+            "• Queued follow-up inputs\n? 1 input\nalt + ↑ to answer",
+            "• Queued follow-up inputs\n? 1 question",
+            "? 1 question\nalt + ↑ to answer",
+            "• Queued follow-up inputs\n? 1 question\nAnswered.\nalt + ↑ to answer",
+            "The Queued follow-up inputs notice shows ? 1 question and alt + ↑ to answer.",
+        ] {
+            assert_eq!(
+                codex_attention(screen, false).0,
+                AttentionState::Activity,
+                "{screen}"
+            );
+        }
     }
 
     #[test]
