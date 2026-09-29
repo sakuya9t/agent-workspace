@@ -21,6 +21,7 @@ mod auth;
 mod fs;
 mod paste;
 mod scm;
+mod startup_config;
 pub mod ws;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -51,6 +52,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/enrollment-token", get(auth::enrollment_token))
         .route("/api/auth/devices", get(auth::list_devices))
         .route("/api/auth/devices/:id/revoke", post(auth::revoke_device))
+        .route(
+            "/api/config",
+            get(startup_config::get).put(startup_config::put),
+        )
         .route("/api/fs/list", get(fs::list))
         .route("/api/fs/mkdir", post(fs::mkdir))
         .route("/api/plugins", get(list_plugins))
@@ -1011,6 +1016,7 @@ mod tests {
             relay_url: None,
             relay_key: None,
             node_label: "test-node".into(),
+            enrollment_token: None,
             relay_downstreams: vec![],
             relay_probe_interval: Duration::from_secs(5),
         };
@@ -1116,6 +1122,97 @@ mod tests {
         let local = app.clone().oneshot(local_request).await.unwrap();
         assert_eq!(local.status(), StatusCode::OK);
         assert_eq!(json(local).await["sessions"], serde_json::json!([]));
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn local(method: &str, uri: &str, body: Option<Value>) -> Request<Body> {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+        ));
+        req
+    }
+
+    #[tokio::test]
+    async fn startup_config_round_trips_with_write_only_secrets() {
+        use crate::startup_config as sc;
+        let (app, dir) = test_router();
+        let path = dir.join("data").join(sc::FILE_NAME);
+
+        // Remote callers without a device token are refused like any /api call.
+        let remote = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(remote.status(), StatusCode::UNAUTHORIZED);
+
+        // Start from a complete (all-default) file so the ambient ASM_* env of
+        // whoever runs the tests cannot leak into the expected values.
+        let initial = sc::render(&sc::Values::new());
+        std::fs::write(&path, &initial).unwrap();
+        let got = json(app.clone().oneshot(local("GET", "/api/config", None)).await.unwrap()).await;
+        assert_eq!(got["source"], "daemon");
+        assert_eq!(got["exists"], true);
+        assert_eq!(got["path"], path.display().to_string());
+        assert_eq!(got["revision"], sc::revision(&initial));
+        assert_eq!(got["pending"], Value::Null);
+
+        let put = app
+            .clone()
+            .oneshot(local(
+                "PUT",
+                "/api/config",
+                Some(serde_json::json!({
+                    "revision": got["revision"],
+                    "values": {
+                        "ASM_NODE_LABEL": "box",
+                        "ASM_RELAY_URL": "ws://relay:4700",
+                        "ASM_RELAY_KEY": "s3cret",
+                    },
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK);
+        let saved = json(put).await;
+        assert_eq!(saved["values"]["ASM_NODE_LABEL"], "box");
+        assert!(saved["values"].get("ASM_RELAY_KEY").is_none(), "secret must not be echoed");
+        assert_eq!(saved["secrets"]["ASM_RELAY_KEY"], true);
+        assert_eq!(saved["secrets"]["ASM_UI_DAEMON_TOKEN"], false);
+        let on_disk = sc::parse(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(on_disk.get("ASM_RELAY_KEY").unwrap(), "s3cret");
+
+        // A stale revision is a conflict; an invalid value is a 400. Neither writes.
+        let stale = app
+            .clone()
+            .oneshot(local(
+                "PUT",
+                "/api/config",
+                Some(serde_json::json!({ "revision": got["revision"], "values": { "ASM_UI_PORT": "8080" } })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let invalid = app
+            .clone()
+            .oneshot(local(
+                "PUT",
+                "/api/config",
+                Some(serde_json::json!({ "revision": saved["revision"], "values": { "ASM_BIND": "nowhere" } })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert!(json(invalid).await["error"].as_str().unwrap().contains("ASM_BIND"));
+        assert_eq!(sc::parse(&std::fs::read_to_string(&path).unwrap()), on_disk);
 
         drop(app);
         let _ = std::fs::remove_dir_all(dir);

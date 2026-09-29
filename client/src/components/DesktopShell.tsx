@@ -21,6 +21,7 @@ import { DeckModeLink } from "./DeckModeLink";
 export function DesktopShell() {
   const { t } = useTranslation();
   const setShowConnection = useUiStore((s) => s.setShowConnection);
+  const setShowConfig = useUiStore((s) => s.setShowConfig);
   const leftWidth = useUiStore((s) => s.leftWidth);
   const rightWidth = useUiStore((s) => s.rightWidth);
   const setLeftWidth = useUiStore((s) => s.setLeftWidth);
@@ -63,6 +64,13 @@ export function DesktopShell() {
             title={t("app.manageTitle")}
           >
             {t("app.manage")}
+          </button>
+          <button
+            className="btn tiny conn-btn config-btn"
+            onClick={() => setShowConfig(true)}
+            title={t("app.configTitle")}
+          >
+            {t("app.config")}
           </button>
         </div>
       </header>

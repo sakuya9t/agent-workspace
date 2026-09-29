@@ -118,6 +118,9 @@ interface UiState {
   openNewWorkspace: (daemonId: string) => void;
   showConnection: boolean;
   setShowConnection: (v: boolean) => void;
+  /** Startup-settings dialog (the UI host + every connected daemon). */
+  showConfig: boolean;
+  setShowConfig: (v: boolean) => void;
   /**
    * Workspace-level git branch-management dialog. `branchManagerCtx` pins which
    * daemon + workspace it opened for (the (i) icon on a workspace row).
@@ -175,6 +178,8 @@ export const useUiStore = create<UiState>((set, get) => ({
     set({ showNewWorkspace: true, newWorkspaceDaemonId: daemonId }),
   showConnection: false,
   setShowConnection: (v) => set({ showConnection: v }),
+  showConfig: false,
+  setShowConfig: (v) => set({ showConfig: v }),
   showBranchManager: false,
   branchManagerCtx: null,
   openBranchManager: (daemonId, workspaceId) =>

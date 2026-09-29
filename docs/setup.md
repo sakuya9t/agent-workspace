@@ -12,6 +12,7 @@ the design rationale start with [`architecture.md`](architecture.md) and
   - [Native (quick start)](#native-quick-start)
   - [Durable sessions (daemon + asmux)](#durable-sessions-daemon--asmux)
 - [Running the client](#running-the-client)
+- [Saved startup config](#saved-startup-config)
 - [Connectivity & auth](#connectivity--auth)
 - [HTTP API](#http-api)
 - [Tests](#tests)
@@ -73,17 +74,19 @@ scripts/stop.sh             # stop all (stop.sh daemon|asmux|ui|relay for one)
 scripts/token.sh            # print this host's device-enrollment token
 ```
 
-Override with env, e.g. `ASM_BIND=0.0.0.0:4600 RELEASE=1 scripts/start.sh`. Once
-a component has launched, its settings are recorded (`asm-daemon.reg` /
-`asm-relay.reg` in the runtime dir): a **flagless** `start.sh` /
-`restart-daemon.sh` keeps those recorded settings — including a `0.0.0.0` bind, a
-`--register`, and relay-only-ness — rather than reverting to defaults, and the
-recording beats inherited `ASM_*` env (shells inside an asm session inherit the
-daemon's own exports). The managed UI has its own `asm-ui.reg` state, so a
-flagless start/restart revives it too. Pass flags to actually change settings;
-an explicit `stop.sh` clears the component's recording. The rest of this section
-is the manual equivalent, for when you want the processes in the foreground or
-wired into your own supervisor.
+Every run starts from the install's **saved startup config**
+(`~/.local/share/asm/startup.conf`; see [Saved startup config](#saved-startup-config)):
+flags change just the settings they name and are saved back, so a **flagless**
+`start.sh` / `restart-daemon.sh` reproduces the last setup — a `0.0.0.0` bind, a
+`--register`, a bundled relay, relay-/UI-only-ness, the managed UI, the build
+profile — across `stop.sh`, reboots, and SSH sessions, and applies anything
+changed since (for example in the web UI's **Config** dialog). The saved file
+beats inherited `ASM_*` env (shells inside an asm session inherit the daemon's
+own exports); env is only a fallback before the first save, e.g.
+`ASM_BIND=0.0.0.0:4600 RELEASE=1 scripts/start.sh` (`RELEASE=1` always selects
+the release profile, like `--release`). The rest of this section is the manual
+equivalent, for when you want the processes in the foreground or wired into
+your own supervisor.
 
 Build both binaries first — `cargo run -p asm-daemon` only builds the asmux
 *library*, not the `asmux` holder binary:
@@ -157,10 +160,12 @@ pkill -TERM asmux                 # then stop the holder
 ```
 
 Environment overrides: `ASM_BIND`, `ASM_DATA_DIR`, `ASM_CONFIG_DIR`,
-`ASM_RUNTIME_DIR`, `ASM_STATIC_DIR`, `ASM_LOG`; managed Vite uses `ASM_RUN_UI`,
-`ASM_UI_HOST`, `ASM_UI_PORT`, `ASM_UI_ONLY`, `ASM_UI_DAEMON`,
+`ASM_RUNTIME_DIR`, `ASM_STATIC_DIR`, `ASM_LOG`, `ASM_ENROLLMENT_TOKEN`; the
+component switches `ASM_RUN_DAEMON` / `ASM_RUN_RELAY` / `ASM_RUN_UI`; managed
+Vite uses `ASM_UI_HOST`, `ASM_UI_PORT`, `ASM_UI_DAEMON`,
 `ASM_UI_DAEMON_TOKEN`, and `ASM_UI_ALLOWED_HOSTS` (comma-separated exact
-reverse-proxy hostnames); and for the holder:
+reverse-proxy hostnames) — for the scripts, all of these are fallbacks behind
+the saved startup config; and for the holder:
 `ASM_BACKEND` (`native`|`sidecar`; unset means `native`, and any other value is
 rejected at startup rather than falling back to non-durable native),
 `ASM_ASMUX_AUTOSPAWN` (`0` disables
@@ -207,7 +212,7 @@ scripts/status.sh                            # reports daemon, holder, UI, relay
 ```
 
 `--run-ui=true` and `--run-ui=false` are accepted as explicit boolean aliases.
-The selection is recorded, so later flagless `start.sh` and
+The selection is saved, so later flagless `start.sh` and
 `restart-daemon.sh` runs preserve it. UI output goes to
 `$ASM_DATA_DIR/logs/asm-ui.log`; `scripts/stop.sh ui` stops only Vite.
 
@@ -225,17 +230,19 @@ scripts/start.sh --ui-only --ui-daemon http://machine:4600 \
 scripts/start.sh --ui-allowed-host raspberrypi.example-tailnet.ts.net
 ```
 
-Without `--ui-daemon`, the client shell still starts and users can add daemons
-or relays from **manage**. With a target, same-origin HTTP and WebSocket traffic
-is proxied to that daemon. Off-host daemons normally require an enrolled device
-bearer token; it is stored in the runtime UI state file and injected by Vite,
-never sent to browser storage or placed in the WebSocket URL. The state file is
-written with owner-only (`0600`) permissions.
+`--ui-only` turns the daemon and relay off (any other combination works too —
+see [Saved startup config](#saved-startup-config)). Without `--ui-daemon` (or
+after `--no-ui-daemon`), the client shell still starts and users can add
+daemons or relays from **manage**. With a target,
+same-origin HTTP and WebSocket traffic is proxied to that daemon. Off-host
+daemons normally require an enrolled device bearer token; it is saved in
+`startup.conf` (owner-only, `0600`) and injected by Vite, never sent to browser
+storage, placed in the WebSocket URL, or read back by the Config dialog.
 
 Vite rejects unfamiliar `Host` headers to prevent DNS-rebinding attacks. When
 the gateway sits behind an HTTPS reverse proxy, add each exact public hostname
-with `--ui-allowed-host`. This option is additive: it preserves an already
-recorded UI-only daemon URL and bearer token, restarts the UI if needed, and is
+with `--ui-allowed-host`. This option is additive: it keeps the saved list
+(and the UI-only daemon URL and bearer token), restarts the UI if needed, and is
 retained by later flagless `start.sh` runs. Do not use a broad wildcard or
 disable Vite's host check.
 
@@ -246,6 +253,102 @@ cd client
 npm install
 npm run dev   # Vite dev server, proxies /api and /health to the daemon
 ```
+
+## Saved startup config
+
+Every setting `scripts/start.sh` takes is kept in **one persistent file per
+install**, `$ASM_DATA_DIR/startup.conf` (default
+`~/.local/share/asm/startup.conf`). It lives in the data dir — not the
+tmpfs runtime dir — so it survives reboots, and a second install
+(`--data-dir`, a test sandbox) never shares it. It is outside the checkout by
+default, and `.gitignore` excludes `startup.conf` / `startup.applied` anywhere
+in the tree in case a data dir points into one.
+
+A host runs any non-empty combination of three **components**, each switched
+independently (`--daemon`/`--no-daemon`, `--relay`/`--no-relay`,
+`--ui`/`--no-ui`, or the Config dialog):
+
+| Component | Default | What it is |
+| --- | --- | --- |
+| daemon | on | sessions and agents, with the asmux holder that keeps them alive across daemon restarts |
+| relay | off | a rendezvous NAT'd nodes and clients dial out to |
+| web UI | on | the managed Vite client |
+
+There is no dependency between them — only between settings: relay
+registration, gateway downstreams, and the enrollment token belong to the
+daemon; a relay needs an access key; the UI proxies to this host's daemon when
+it runs, else to the optional `ASM_UI_DAEMON` (or is a bare client shell). So
+"UI + relay, no daemon" is as valid as the old UI-only and relay-only setups
+(`--ui-only` / `--relay-only` remain as shortcuts). Turning the daemon off
+stops it on the next `start.sh` but leaves the holder — and its live sessions —
+running; turn the daemon back on and it re-adopts them.
+
+- **Flagless runs use it.** `start.sh` and `restart-daemon.sh` start from the
+  file; a flagless run reproduces the last setup and applies anything changed
+  since, restarting only what changed (the holder never restarts, so live
+  sessions survive). `restart-daemon.sh` applies daemon and UI changes but
+  leaves a running relay alone; `start.sh` converges everything, including
+  starting, restarting, or stopping the bundled relay.
+- **Flags patch it.** A flag changes only the setting it names and is saved
+  back: `start.sh --label box` keeps the saved bind, registration, relay, and
+  UI. Switches that turn something off: `--no-daemon`, `--no-relay`,
+  `--no-ui`, `--no-register`, `--no-ui-daemon`, `--debug`. A daemon setting
+  (`--bind`, `--label`, `--register`, `--enrollment-token`) turns the daemon on;
+  `--ui-daemon` turns it off (the proxy target is only used without one). A
+  command line that both needs and disables a component is refused.
+- **Stopping keeps it.** `stop.sh` never touches the file: the next `start.sh`
+  brings the configured stack back. `stop.sh ui|relay` also clears that
+  component's runtime record, so `restart-daemon.sh` will not revive it — only
+  `start.sh` does. To stop running a relay or UI for good, turn it off in the
+  Config dialog or pass `--no-relay` / `--no-ui`.
+- **Edit it from the browser.** The web client's **config** button (top bar;
+  next to **daemons** on phones) opens a dialog listing the UI host (the server
+  that served the page) and every connected daemon, including ones reached
+  through a relay. Pick a host, edit, save: the file on *that* host changes and
+  applies the next time the scripts run there. The keys — the daemon's
+  enrollment token, its relay-registration key, the relay's accepted keys, and
+  the UI proxy token — can be set, replaced, or cleared there but are
+  write-only: the dialog shows whether each is set, never its value
+  (`scripts/token.sh` prints the enrollment token on the host). A host that both
+  serves the page and runs the daemon it proxies to shares one file and is
+  listed once.
+- **"Not applied yet."** Each run records what it applied in
+  `$ASM_RUNTIME_DIR/startup.applied`; the dialog and `status.sh` list the saved
+  settings that differ ("run scripts/start.sh on this host to apply them").
+- **Precedence:** flags > saved file > inherited `ASM_*` env > defaults. An
+  install started by an older version of the scripts is migrated on its first
+  run from the per-boot `.reg` records it left in the runtime dir. (The legacy
+  env switches `ASM_UI_ONLY=1` / `ASM_RELAY_ONLY=1` still work before the first
+  save.)
+- **Secrets stay out of sessions.** The scripts export these settings to what
+  they launch; the holder strips the keys and tokens from every agent's
+  environment.
+
+The format is the lowest common denominator of its three readers (bash, Rust,
+Node): one `KEY=value` per line, `#` comments, no quoting, never `source`d. The
+keys are the scripts' environment variables:
+
+| Key | Flag | Meaning (empty = default) |
+| --- | --- | --- |
+| `ASM_PROFILE` | `--release` / `--debug` | build profile, `debug` (default) or `release` |
+| `ASM_RUN_DAEMON` | `--daemon` / `--no-daemon` | run the daemon + holder (`1`) |
+| `ASM_BIND` | `--bind` | daemon listen address (`127.0.0.1:4600`) |
+| `ASM_NODE_LABEL` | `--label` | node label (hostname) |
+| `ASM_ENROLLMENT_TOKEN` | `--enrollment-token` | what new devices enter to enroll, ≥16 chars (the daemon's current, generated one); applied to its database at startup |
+| `ASM_RELAY_URL` / `ASM_RELAY_KEY` | `--register` / `--relay-key` | relay this daemon registers to, and its key |
+| `ASM_RELAY_DOWNSTREAMS` | — | gateway-mode downstreams, `host:port,…` |
+| `ASM_RUN_RELAY` | `--relay` / `--no-relay` | run a bundled relay (`0`) |
+| `ASM_RELAY_BIND` / `ASM_RELAY_KEYS` | `--relay-bind` / `--relay-key` | bundled relay address (`0.0.0.0:4700`) and accepted keys |
+| `ASM_RUN_UI` | `--ui` / `--no-ui` | run the managed Vite UI (`1`) |
+| `ASM_UI_HOST` / `ASM_UI_PORT` | `--ui-host` / `--ui-port` | Vite listen host (`127.0.0.1`) and port (`5273`) |
+| `ASM_UI_ALLOWED_HOSTS` | `--ui-allowed-host` | exact reverse-proxy hostnames, comma-separated |
+| `ASM_UI_DAEMON` / `ASM_UI_DAEMON_TOKEN` | `--ui-daemon` / `--ui-daemon-token` | the UI's proxy target and bearer token when this host runs no daemon |
+
+The file is written owner-only (`0600`). A hand edit is validated on the next
+run: an invalid value stops `start.sh` with the key named (while `stop.sh` and
+`status.sh` keep working); unknown keys are warned about and dropped on the next
+save. The same rules are implemented in `scripts/_asm_common.sh`,
+`crates/daemon/src/startup_config.rs`, and `client/src/startupConfig.ts`.
 
 ## Connectivity & auth
 
@@ -376,6 +479,8 @@ at registration; a mismatched client entry reads as unreachable.
 | GET | `/api/auth/enrollment-token` | reveal enrollment token (loopback only) |
 | GET | `/api/auth/devices` | list enrolled devices |
 | POST | `/api/auth/devices/:id/revoke` | revoke a device |
+| GET | `/api/config` | this host's saved startup config (`startup.conf`); secrets reported only as set/unset, plus keys saved but not yet applied |
+| PUT | `/api/config` | change it (`{revision, values}`; a secret key left out keeps its value, `""` clears) — `409` if the file changed since `revision`, `400` on an invalid setting |
 | GET | `/api/fs/list?path=&show_hidden=` | browse host directories (for the picker) |
 | GET | `/api/plugins` | list agent plugins + binary detection |
 | GET | `/api/workspaces` | list registered workspaces |
@@ -461,6 +566,7 @@ node scripts/paste-test.mjs             # image paste into the session cwd
 node scripts/relay-test.mjs             # a NAT'd daemon driven through the relay
 node scripts/gateway-test.mjs           # an egress-less downstream through a gateway
 node scripts/termscroll-test.mjs        # attach scrollback / alt-screen
+node scripts/startup-config-test.mjs    # saved startup config through the real start/restart/stop scripts
 ```
 
 The headless-Chrome tests drive the real client bundle, so build it once
@@ -474,6 +580,7 @@ node scripts/copy-paste-test.mjs           # copy/paste personas (T1 + T2)
 node scripts/archive-kickout-test.mjs      # archiving kicks every client out of the session view
 node scripts/confirm-destructive-test.mjs  # stop / archive ask before they act
 node scripts/stop-protection-test.mjs      # working/blocked sessions refuse an unforced stop
+node scripts/config-ui-test.mjs            # Config dialog over a real Vite + 2 daemons (needs client/node_modules, not dist)
 ```
 
 `copy-paste`'s **T3** needs a genuinely insecure origin (a LAN IP), which a

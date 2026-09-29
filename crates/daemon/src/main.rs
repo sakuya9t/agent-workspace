@@ -8,6 +8,7 @@ mod domain;
 mod plugins;
 mod session_manager;
 mod source_control;
+mod startup_config;
 mod summarize;
 mod util;
 mod workspace;
@@ -59,12 +60,17 @@ async fn main() -> Result<()> {
 
     let db = Db::open(&config.db_path()).context("opening database")?;
 
-    // Server identity + enrollment token (created once, persisted).
-    let (server_id, enrollment_token) = db.get_or_create_identity(
+    // Server identity + enrollment token (created once, persisted). A token
+    // from the startup config replaces the generated one.
+    let (server_id, generated) = db.get_or_create_identity(
         &auth::gen_server_id(),
         &auth::gen_enrollment_token(),
         now_millis(),
     )?;
+    let enrollment_token = db.apply_enrollment_token(config.enrollment_token.as_deref())?;
+    if enrollment_token != generated {
+        tracing::info!("enrollment token set from the startup config (ASM_ENROLLMENT_TOKEN)");
+    }
     let loopback_only = config.bind.ip().is_loopback();
     tracing::info!(server_id = %server_id, "server identity ready");
     tracing::info!("enrollment token for new devices: {enrollment_token}");

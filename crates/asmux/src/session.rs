@@ -134,10 +134,22 @@ pub struct Session {
 /// Claude Code launched with them treats itself as a nested *child* session of
 /// the outer one and stops writing its own per-project transcript, which
 /// breaks per-session usage reporting (and any other transcript consumer).
+///
+/// The service scripts also export the install's startup secrets (relay keys,
+/// the UI proxy token, the enrollment token) to the processes they launch; an
+/// agent's shell has no business seeing them, so they are removed too.
 /// Explicit `SpawnSpec.env` entries are applied after this, so a caller can
 /// still set these deliberately.
 pub fn scrub_inherited_agent_env(cmd: &mut CommandBuilder) {
-    const EXACT: &[&str] = &["CLAUDECODE", "CLAUDE_EFFORT", "AI_AGENT"];
+    const EXACT: &[&str] = &[
+        "CLAUDECODE",
+        "CLAUDE_EFFORT",
+        "AI_AGENT",
+        "ASM_ENROLLMENT_TOKEN",
+        "ASM_RELAY_KEY",
+        "ASM_RELAY_KEYS",
+        "ASM_UI_DAEMON_TOKEN",
+    ];
     const PREFIXES: &[&str] = &["CLAUDE_CODE_", "CODEX_SANDBOX"];
     for (key, _) in std::env::vars_os() {
         let Some(k) = key.to_str() else { continue };
@@ -618,10 +630,15 @@ mod tests {
         std::env::set_var("CLAUDE_CODE_SESSION_ID", "outer-session");
         std::env::set_var("CLAUDECODE", "1");
         std::env::set_var("CLAUDE_CONFIG_DIR", "/keep/me");
+        std::env::set_var("ASM_RELAY_KEYS", "relay-secret");
+        std::env::set_var("ASM_ENROLLMENT_TOKEN", "enroll-secret");
         let mut cmd = CommandBuilder::new("true");
         scrub_inherited_agent_env(&mut cmd);
         assert_eq!(cmd.get_env("CLAUDE_CODE_SESSION_ID"), None);
         assert_eq!(cmd.get_env("CLAUDECODE"), None);
+        // Startup secrets exported by the service scripts never reach a session.
+        assert_eq!(cmd.get_env("ASM_RELAY_KEYS"), None);
+        assert_eq!(cmd.get_env("ASM_ENROLLMENT_TOKEN"), None);
         // User-level config vars survive the scrub…
         assert!(cmd.get_env("CLAUDE_CONFIG_DIR").is_some());
         // …and an explicit spec env applied afterwards still wins.

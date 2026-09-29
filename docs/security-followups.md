@@ -89,7 +89,10 @@ fix through the daemon's own listener again.
 ## 3. Enrollment token is a static, non-expiring shared secret — MEDIUM
 
 - **What:** one long-lived enrollment token mints device tokens for anyone who
-  can reach `POST /api/auth/enroll` with it. No expiry, rotation, or use limit.
+  can reach `POST /api/auth/enroll` with it. No expiry or use limit.
+- **Partial mitigation (2026-09-28):** it can now be *rotated by hand* — set
+  `ASM_ENROLLMENT_TOKEN` (Config dialog, `--enrollment-token`, or
+  `startup.conf`, ≥16 chars) and restart; already-enrolled devices keep working.
 - **Guidance:** one-time / short-TTL enrollment codes, an owner-approval step
   for new devices, token rotation, and rate-limiting on the enroll endpoint.
 
@@ -188,3 +191,29 @@ fix through the daemon's own listener again.
 - **Guidance:** ship the item-6 "always require a token" mode and recommend it on
   any downstream that shares a host (or loopback range) with its gateway; fold
   into item 1's off-loopback story.
+
+## 12. Startup config is editable over the API — LOW (no new reach)
+
+- **What:** `PUT /api/config` (daemon) and `PUT /__asm/config` (the Vite UI
+  server) rewrite the host's saved startup config (`<data_dir>/startup.conf`):
+  which components run, bind address, enrollment token, relay registration,
+  bundled relay, managed UI, build profile. The next `scripts/start.sh` on that
+  host applies it — e.g. rebinding to `0.0.0.0`, setting a known enrollment
+  token, or registering to an attacker-chosen relay.
+- **Current mitigation:** no reach beyond what the caller already has. The
+  daemon endpoint sits behind the normal `/api` auth (loopback trust or an
+  enrolled device token) — a caller that passes it can already spawn a shell on
+  the host. The Vite endpoint is reachable by whoever can load that UI, who can
+  already drive the daemon it proxies to (loopback-trusted or token-injected);
+  it refuses cross-origin and non-JSON writes (`Origin` must match `Host`,
+  `Sec-Fetch-Site` must not be cross-site) so a foreign page in the user's
+  browser cannot post to it. Nothing restarts from the API — changes wait for
+  the owner's next script run, and the dialog/`status.sh` list them as "not
+  applied yet". Secrets (the enrollment token, relay keys, the UI proxy token)
+  are write-only over both endpoints; the file is `0600` and git-ignored; a
+  configured enrollment token must be ≥16 characters (the daemon refuses to
+  start with a weaker one); and asmux strips all of them from agent session
+  environments (they used to leak there via the scripts' exports).
+- **Guidance:** when item 6 ("always require a token") lands, gate these
+  endpoints like the rest of `/api`; consider logging config writes in the item-7
+  audit log.

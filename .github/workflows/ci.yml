@@ -64,3 +64,11 @@ jobs:
         env:
           CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
         run: node scripts/mobile-shell-test.mjs
+
+      - name: Test saved startup config through the service scripts
+        run: node scripts/startup-config-test.mjs
+
+      - name: Test Config dialog
+        env:
+          CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
+        run: node scripts/config-ui-test.mjs

@@ -541,6 +541,22 @@ impl Db {
         read_identity(&self.conn.lock())
     }
 
+    /// Make `configured` the enrollment token, if it is not already. The
+    /// startup config (`ASM_ENROLLMENT_TOKEN`) sets it; without one, the
+    /// generated token stands. Enrolled devices keep their own device tokens,
+    /// so this only changes what a NEW device must enter. Returns the token now
+    /// in effect.
+    pub fn apply_enrollment_token(&self, configured: Option<&str>) -> Result<String> {
+        let conn = self.conn.lock();
+        if let Some(token) = configured {
+            conn.execute(
+                "UPDATE server_identity SET enrollment_token = ?1 WHERE id = 1",
+                rusqlite::params![token],
+            )?;
+        }
+        Ok(read_identity(&conn)?.1)
+    }
+
     pub fn insert_device(&self, d: &Device) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
@@ -1007,6 +1023,24 @@ fn write_batch(conn: &mut Connection, batch: &[EventMsg]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::domain::{AttentionState, Session, SessionStatus};
+
+    #[test]
+    fn a_configured_enrollment_token_replaces_the_generated_one() {
+        let (db, dir) = temp_db();
+        let (_, generated) = db.get_or_create_identity("sid", "generated-token", 1).unwrap();
+        assert_eq!(generated, "generated-token");
+        assert_eq!(db.apply_enrollment_token(None).unwrap(), "generated-token");
+        assert_eq!(
+            db.apply_enrollment_token(Some("configured-token-123")).unwrap(),
+            "configured-token-123"
+        );
+        // It sticks: a later start with no configured token keeps it, and a
+        // re-run of identity creation never regenerates it.
+        let (sid, token) = db.get_or_create_identity("other", "other-token", 2).unwrap();
+        assert_eq!((sid.as_str(), token.as_str()), ("sid", "configured-token-123"));
+        assert_eq!(db.apply_enrollment_token(None).unwrap(), "configured-token-123");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn temp_db() -> (Db, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("asm-db-{}", uuid::Uuid::new_v4()));

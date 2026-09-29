@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { api, Session, SessionStatus, AttentionState, Workspace } from "../api";
 import { daemonLabel, Target, targetOf, useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
+import { useIsPhone } from "../useIsPhone";
 import { DaemonState, useDaemonPlugins, useDaemonStates } from "../useDaemons";
 import { canForkInto } from "./NewSessionDialog";
 import { StopSessionDialog } from "./StopSessionDialog";
@@ -55,6 +56,9 @@ export function SessionList() {
   const openBranchManager = useUiStore((s) => s.openBranchManager);
   const openFork = useUiStore((s) => s.openFork);
   const setShowConnection = useUiStore((s) => s.setShowConnection);
+  const setShowConfig = useUiStore((s) => s.setShowConfig);
+  // The desktop top bar carries its own config button; the phone header has no room.
+  const isPhone = useIsPhone();
   const updateDaemon = useConnStore((s) => s.updateDaemon);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
@@ -601,6 +605,15 @@ export function SessionList() {
           >
             {t("sessionList.daemonsBtn")}
           </button>
+          {isPhone && (
+            <button
+              className="btn tiny config-btn"
+              onClick={() => setShowConfig(true)}
+              title={t("app.configTitle")}
+            >
+              {t("app.config")}
+            </button>
+          )}
           <button className="btn primary" onClick={() => openNewSession(null, null)}>
             {t("sessionList.newBtn")}
           </button>

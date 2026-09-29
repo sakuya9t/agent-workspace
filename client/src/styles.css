@@ -930,6 +930,184 @@ body.col-resizing iframe {
 .conn-node-error {
   padding: 8px 0 0;
 }
+
+/* ---- startup settings (Config dialog) ---- */
+.config-modal {
+  width: 680px;
+  color-scheme: dark;
+}
+.config-hosts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 7px 0 12px;
+}
+.config-host {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.config-host:hover {
+  border-color: var(--accent);
+}
+.config-host:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.config-host.on {
+  border-color: var(--accent);
+  background: var(--accent-2);
+}
+.config-host-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.config-host-sub {
+  color: var(--dim);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.config-host.on .config-host-sub {
+  color: var(--text);
+}
+.config-tag {
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--dim);
+  font-size: 10px;
+  font-weight: 500;
+}
+.config-tag.warn-tag {
+  border-color: #ff9e64;
+  color: #ff9e64;
+}
+.config-body {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.config-meta {
+  overflow-wrap: anywhere;
+}
+.config-form .conn-callout {
+  margin-top: 8px;
+}
+.config-pending {
+  border-left-color: #ff9e64;
+  color: var(--text);
+}
+.config-step {
+  margin-top: 12px;
+}
+.config-components {
+  grid-template-columns: repeat(3, 1fr);
+  background: var(--bg);
+}
+.config-component .conn-type-tab-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  width: 100%;
+}
+.config-component .config-key {
+  margin-top: 4px;
+}
+.config-state {
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--dim);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+.config-state.on {
+  border-color: #9ece6a;
+  color: #9ece6a;
+}
+.config-subhint {
+  margin: 4px 0 2px;
+  line-height: 1.4;
+}
+.config-section {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.config-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 12px;
+}
+.config-field {
+  min-width: 0;
+}
+.config-field .input {
+  margin-bottom: 3px;
+}
+.config-field.invalid .input {
+  border-color: #f7768e;
+}
+.config-hint,
+.config-field-error {
+  margin-bottom: 6px;
+  font-size: 11px;
+  line-height: 1.35;
+}
+.config-field-error {
+  color: #f7768e;
+}
+.config-key {
+  color: var(--dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  letter-spacing: 0;
+  text-transform: none;
+  opacity: 0.75;
+}
+.config-toggle {
+  margin: 8px 0 4px;
+}
+.config-secret {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+.config-secret .input {
+  flex: 1;
+  min-width: 0;
+}
+.config-secret .btn {
+  margin-top: 5px;
+}
+.config-notice {
+  margin-top: 10px;
+  color: #9ece6a;
+  font-size: 12px;
+}
+@media (max-width: 560px) {
+  .config-grid,
+  .config-components {
+    grid-template-columns: 1fr;
+  }
+}
 .selectable {
   user-select: all;
   color: var(--accent);

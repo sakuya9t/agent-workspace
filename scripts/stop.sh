@@ -7,6 +7,11 @@
 #   scripts/stop.sh ui                 # only the managed Vite UI
 #   scripts/stop.sh relay              # only the relay (nodes/clients disconnect)
 #   scripts/stop.sh --data-dir DIR ... # target a non-default install
+#
+# Stopping never touches the saved startup config (startup.conf): the next
+# scripts/start.sh brings the configured stack back. To stop running a relay or
+# UI for good, turn it off in the web UI's Config dialog or pass
+# `start.sh --no-relay` / `--no-ui`.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=_asm_common.sh
@@ -19,8 +24,8 @@ asm_parse_args "$@" || { usage; exit 2; }
 asm_configure
 
 what="${ASM_POSITIONAL[0]:-all}"
-# An explicit stop also clears the component's recorded launch config (.reg) —
-# a later flagless start.sh/restart-daemon.sh must not resurrect it.
+# An explicit stop also clears the component's runtime record (.reg), which is
+# what tells restart-daemon.sh not to revive a relay/UI you stopped on purpose.
 case "$what" in
   daemon) stop_one asm-daemon "$DAEMON_PIDFILE"; rm -f "$DAEMON_STATE_FILE" ;;
   asmux)  stop_one asmux "$ASMUX_PIDFILE" ;;
@@ -32,6 +37,8 @@ case "$what" in
     stop_one asm-daemon "$DAEMON_PIDFILE"; rm -f "$DAEMON_STATE_FILE"
     stop_one asmux "$ASMUX_PIDFILE"
     stop_one asm-relay "$RELAY_PIDFILE"; rm -f "$RELAY_STATE_FILE"
+    # Nothing runs any more, so nothing is "applied" either.
+    rm -f "$ASM_APPLIED_FILE"
     ;;
   *) usage; exit 2 ;;
 esac

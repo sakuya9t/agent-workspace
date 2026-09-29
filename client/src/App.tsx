@@ -9,6 +9,7 @@ import { MobileShell } from "./components/MobileShell";
 import { NewSessionDialog } from "./components/NewSessionDialog";
 import { NewWorkspaceDialog } from "./components/NewWorkspaceDialog";
 import { ConnectionDialog } from "./components/ConnectionDialog";
+import { ConfigDialog } from "./components/ConfigDialog";
 import { BranchManagerDialog } from "./components/BranchManagerDialog";
 import { DeckShell } from "./components/DeckShell";
 
@@ -45,6 +46,7 @@ export function App() {
       <NewSessionDialog />
       <NewWorkspaceDialog />
       <ConnectionDialog />
+      <ConfigDialog />
       <BranchManagerDialog />
     </>
   );

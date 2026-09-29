@@ -369,6 +369,7 @@ export interface VscodeTarget {
 
 import { Target } from "./connectionStore";
 import i18n from "./i18n";
+import type { ConfigKey } from "./startupConfig";
 
 /** Base URL with any trailing slash stripped ("" targets the local origin). */
 function baseOf(baseUrl: string): string {
@@ -795,6 +796,9 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ parent, name }),
     }).then((r) => r.path),
+  getConfig: (t: Target) => req<ConfigView>(t, "/api/config"),
+  putConfig: (t: Target, body: ConfigUpdate) =>
+    req<ConfigView>(t, "/api/config", { method: "PUT", body: JSON.stringify(body) }),
   enrollmentToken: (t: Target) =>
     req<{ enrollment_token: string }>(t, "/api/auth/enrollment-token").then(
       (r) => r.enrollment_token,
@@ -831,6 +835,73 @@ export const api = {
       blob,
     ),
 };
+
+/**
+ * A host's saved startup configuration (`<data_dir>/startup.conf`), as the
+ * daemon's `GET /api/config` or the UI server's `GET /__asm/config` returns it.
+ * Secret keys are never sent back: `secrets` only says whether each is set.
+ */
+export interface ConfigView {
+  /** Who served it: a daemon, or the Vite server this page came from. */
+  source: "daemon" | "ui";
+  hostname: string;
+  /** The file on that host. */
+  path: string;
+  /** False until something saved it; `values` then reflect the process env. */
+  exists: boolean;
+  /** Change token to send back with an edit; null when there is no file. */
+  revision: string | null;
+  values: Partial<Record<ConfigKey, string>>;
+  secrets: Partial<Record<ConfigKey, boolean>>;
+  /** Saved but not yet applied by the scripts; null when unknown. */
+  pending: ConfigKey[] | null;
+  /** UI server only: whether scripts/start.sh launched it. */
+  managed?: boolean;
+}
+
+export interface ConfigUpdate {
+  revision: string | null;
+  /** Settings to change; a secret key that is absent keeps its value. */
+  values: Partial<Record<ConfigKey, string>>;
+}
+
+/** The UI server's endpoint (see client/vite.config-api.ts). */
+const UI_CONFIG_PATH = "/__asm/config";
+
+/**
+ * This page's own server's config, or null when that server has none — the
+ * daemon serving a packaged build, or a Vite from before the endpoint (whose
+ * SPA fallback answers with index.html, hence the content check).
+ */
+export async function getUiServerConfig(): Promise<ConfigView | null> {
+  let res: Response;
+  try {
+    res = await fetch(UI_CONFIG_PATH, { headers: { accept: "application/json" } });
+  } catch {
+    return null;
+  }
+  if (!res.ok || !(res.headers.get("content-type") ?? "").includes("application/json")) return null;
+  const body = (await res.json().catch(() => null)) as ConfigView | null;
+  return body?.source === "ui" ? body : null;
+}
+
+export async function putUiServerConfig(body: ConfigUpdate): Promise<ConfigView> {
+  let res: Response;
+  try {
+    res = await fetch(UI_CONFIG_PATH, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    throw unreachableError("");
+  }
+  if (!res.ok) {
+    const { msg } = await errorMessage(res);
+    throw Object.assign(new Error(msg), { status: res.status });
+  }
+  return res.json() as Promise<ConfigView>;
+}
 
 export function streamUrl(t: Target, id: string): string {
   let base: string;

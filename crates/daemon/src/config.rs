@@ -57,6 +57,10 @@ pub struct Config {
     /// Human label advertised to the relay and shown in clients
     /// (`ASM_NODE_LABEL`, default: hostname).
     pub node_label: String,
+    /// Enrollment token to use instead of the generated one
+    /// (`ASM_ENROLLMENT_TOKEN`, from the saved startup config). Applied to the
+    /// database at startup; unset keeps whatever token the database holds.
+    pub enrollment_token: Option<String>,
     /// Egress-less downstreams this daemon bridges as a gateway
     /// (`ASM_RELAY_DOWNSTREAMS`, comma-separated `host:port`). Each is probed on
     /// `/health` for its `node_id`/`label`, then advertised to the relay so a
@@ -121,6 +125,13 @@ impl Config {
         let relay_url = env_nonempty("ASM_RELAY_URL");
         let relay_key = env_nonempty("ASM_RELAY_KEY");
         let node_label = env_nonempty("ASM_NODE_LABEL").unwrap_or_else(hostname_label);
+        let enrollment_token = env_nonempty("ASM_ENROLLMENT_TOKEN");
+        if let Some(token) = &enrollment_token {
+            // The LAN's only gate to enrolling: refuse a weak one outright
+            // rather than quietly running with it (or with the old one).
+            crate::startup_config::validate_value("ASM_ENROLLMENT_TOKEN", token)
+                .map_err(|e| anyhow::anyhow!("invalid {e}"))?;
+        }
         let relay_downstreams = env_nonempty("ASM_RELAY_DOWNSTREAMS")
             .map(|s| {
                 s.split(',')
@@ -151,6 +162,7 @@ impl Config {
             relay_url,
             relay_key,
             node_label,
+            enrollment_token,
             relay_downstreams,
             relay_probe_interval,
         })

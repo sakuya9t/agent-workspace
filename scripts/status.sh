@@ -12,11 +12,12 @@ asm_parse_args "$@" || { err "usage: status.sh [--data-dir DIR] [--runtime-dir D
 [ "${ASM_SHOW_HELP:-0}" = 1 ] && { err "usage: status.sh [--data-dir DIR] [--runtime-dir DIR]"; exit 0; }
 asm_configure
 
-# Report against the RECORDED launch config, not bare defaults — otherwise a
-# 0.0.0.0-bound daemon shows a loopback URL and a stopped relay isn't mentioned.
-daemon_load_recorded_config
-relay_load_recorded_config
-ui_load_recorded_config
+# Report RUNNING components against the settings they were launched with (their
+# runtime records), not the saved config — that may hold edits not applied yet,
+# e.g. a new bind the daemon is not listening on. Components with no record fall
+# back to the saved settings (so a configured-but-stopped relay is mentioned).
+pending="$(config_pending)"
+legacy_load || true
 
 if pid_alive "$RELAY_PIDFILE"; then
   log "relay   RUNNING  pid=$(cat "$RELAY_PIDFILE")  http://$ASM_RELAY_BIND"
@@ -42,13 +43,15 @@ if pid_alive "$DAEMON_PIDFILE"; then
     curl -s "http://$ASM_BIND/health" 2>/dev/null | sed 's/^/        /' || true
     echo
   fi
-else
+elif daemon_enabled; then
   log "daemon  stopped"
+else
+  log "daemon  off (not run on this host)"
 fi
 
 if pid_alive "$UI_PIDFILE"; then
-  if ui_only; then
-    log "web UI  RUNNING  pid=$(cat "$UI_PIDFILE")  $(ui_url) → $(ui_daemon_url) (UI-only gateway)"
+  if ! daemon_enabled; then
+    log "web UI  RUNNING  pid=$(cat "$UI_PIDFILE")  $(ui_url) → $(ui_daemon_url) (no local daemon)"
   else
     log "web UI  RUNNING  pid=$(cat "$UI_PIDFILE")  $(ui_url) → $(ui_daemon_url) (Vite)"
   fi
@@ -59,4 +62,12 @@ elif ui_enabled; then
   log "web UI  stopped  (enabled; proxy target $(ui_daemon_url); scripts/start.sh will revive it)"
 elif [ -f "$UI_STATE_FILE" ]; then
   log "web UI  disabled"
+fi
+
+if [ -f "$ASM_CONFIG_FILE" ]; then
+  log "config  $ASM_CONFIG_FILE"
+  if [ -n "$pending" ]; then
+    log "        saved changes not applied yet: $pending"
+    log "        run scripts/start.sh to apply them"
+  fi
 fi

@@ -23,7 +23,8 @@ if [ ! -t 0 ] || [ ! -t 1 ]; then
   exit 1
 fi
 
-# Resolve default paths (pidfiles etc.) without parsing any flags.
+# Resolve default paths (pidfiles etc.) and the saved settings, without parsing
+# any flags.
 asm_configure
 
 # ── small prompt helpers ──────────────────────────────────────────────────
@@ -101,14 +102,10 @@ FLAGS=(); ROLE=""; RELAY_KEY=""; RELAY_URL=""; DAEMON_PORT="4600"; RELAY_PORT="4
 UI_WANTED=0; UI_HOST="127.0.0.1"; UI_PORT="5273"
 UI_DAEMON=""; UI_DAEMON_TOKEN=""
 
-# Defaults for a restart should reflect the last wizard/script selection.
-RECORDED_UI_ENABLED=1; RECORDED_UI_HOST="127.0.0.1"; RECORDED_UI_PORT="5273"
-if [ -f "$UI_STATE_FILE" ]; then
-  IFS='|' read -r RECORDED_UI_ENABLED RECORDED_UI_HOST RECORDED_UI_PORT _ < "$UI_STATE_FILE" || true
-  RECORDED_UI_ENABLED="${RECORDED_UI_ENABLED:-0}"
-  RECORDED_UI_HOST="${RECORDED_UI_HOST:-127.0.0.1}"
-  RECORDED_UI_PORT="${RECORDED_UI_PORT:-5273}"
-fi
+# Defaults for a restart reflect the saved settings (startup.conf), which the
+# last wizard/script run — or the web UI's Config dialog — left behind.
+RECORDED_UI_ENABLED="$ASM_RUN_UI"; RECORDED_UI_HOST="$ASM_UI_HOST"; RECORDED_UI_PORT="$ASM_UI_PORT"
+SAVED_PROFILE="$ASM_PROFILE"
 
 this_ip() { local ip; ip="$(hostname -I 2>/dev/null | awk '{print $1}')"; printf '%s' "${ip:-<this-host-ip>}"; }
 client_relay_url() { case "$1" in ws://*) printf 'http://%s' "${1#ws://}" ;; wss://*) printf 'https://%s' "${1#wss://}" ;; *) printf '%s' "$1" ;; esac; }
@@ -133,9 +130,14 @@ choose_connectivity() {
     case "$c" in 1) ROLE=local ;; 2) ROLE=uionly ;; 3) ROLE=lan ;; 4) ROLE=relayhost ;; 5) ROLE=relayonly ;; 6) ROLE=nat ;; esac
   fi
 
+  # Flags patch the saved settings key by key, so each role names everything it
+  # means — including what it switches OFF (--no-register / --no-relay).
   FLAGS=()
   case "$ROLE" in
-    reload | local) : ;;  # defaults — no connectivity flags
+    reload) : ;;  # the saved settings as they are
+    local)
+      FLAGS=(--daemon --bind "127.0.0.1:$DAEMON_PORT" --no-register --no-relay)
+      ;;
     uionly)
       FLAGS=(--ui-only)
       prompt UI_DAEMON "Daemon URL to proxy as the same-origin target (blank for client shell only)"
@@ -143,34 +145,42 @@ choose_connectivity() {
         FLAGS+=(--ui-daemon "$UI_DAEMON")
         prompt UI_DAEMON_TOKEN "Enrolled device bearer token (blank if target trusts this gateway)"
         [ -n "$UI_DAEMON_TOKEN" ] && FLAGS+=(--ui-daemon-token "$UI_DAEMON_TOKEN")
+      else
+        FLAGS+=(--no-ui-daemon)
       fi
       ;;
     lan)
       prompt_port DAEMON_PORT "Port for network clients to connect to" "4600"
-      FLAGS=(--bind "0.0.0.0:$DAEMON_PORT")
+      FLAGS=(--bind "0.0.0.0:$DAEMON_PORT" --no-register)
       ;;
     relayhost)
       prompt_port DAEMON_PORT "Daemon port (for direct LAN clients too)" "4600"
       prompt_required RELAY_KEY "Relay access key (shared secret nodes & clients present)"
       prompt_port RELAY_PORT "Relay port (private nodes register here)" "4700"
-      FLAGS=(--bind "0.0.0.0:$DAEMON_PORT" --relay --relay-key "$RELAY_KEY")
-      [ "$RELAY_PORT" != "4700" ] && FLAGS+=(--relay-bind "0.0.0.0:$RELAY_PORT")
+      FLAGS=(--bind "0.0.0.0:$DAEMON_PORT" --no-register --relay --relay-key "$RELAY_KEY" --relay-bind "0.0.0.0:$RELAY_PORT")
       ;;
     relayonly)
       prompt_required RELAY_KEY "Relay access key (shared secret nodes & clients present)"
       prompt_port RELAY_PORT "Relay port (private nodes register here)" "4700"
-      FLAGS=(--relay-only --relay-key "$RELAY_KEY")
-      [ "$RELAY_PORT" != "4700" ] && FLAGS+=(--relay-bind "0.0.0.0:$RELAY_PORT")
+      FLAGS=(--relay-only --relay-key "$RELAY_KEY" --relay-bind "0.0.0.0:$RELAY_PORT")
       ;;
     nat)
       prompt_required RELAY_URL "Relay URL to register to (e.g. ws://relay-host:4700)"
       prompt_required RELAY_KEY "Relay access key (must match the relay host's)"
-      FLAGS=(--register "$RELAY_URL" --relay-key "$RELAY_KEY")
+      FLAGS=(--bind "127.0.0.1:$DAEMON_PORT" --no-relay --register "$RELAY_URL" --relay-key "$RELAY_KEY")
       ;;
   esac
 
   choose_ui "$mode"
-  if [ "$ROLE" != uionly ] && yesno "Build/run the release profile (faster; for real use)?" n; then FLAGS+=(--release); fi
+  if [ "$ROLE" != uionly ]; then
+    local release_default=n
+    [ "$SAVED_PROFILE" = release ] && release_default=y
+    if yesno "Build/run the release profile (faster; for real use)?" "$release_default"; then
+      FLAGS+=(--release)
+    else
+      FLAGS+=(--debug)
+    fi
+  fi
 }
 
 # UI is independent of relay topology: any host that runs a daemon can also run

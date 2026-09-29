@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Start the durable stack: the asmux holder + the daemon in sidecar mode, plus
-# a default detached Vite UI and optional rendezvous relay. --relay-only starts
-# JUST the relay (a pure rendezvous box; no sessions run here). Sessions survive
-# a daemon restart (see scripts/restart-daemon.sh), and every managed process
-# survives the SSH session that launched it.
+# Start this host's components — any of: the daemon (with its asmux session
+# holder, so sessions survive a daemon restart), a bundled rendezvous relay, and
+# a detached Vite web UI. By default the daemon and the UI run and the relay does
+# not; each is switched on or off independently. Every managed process survives
+# the SSH session that launched it.
 #
-# Options are flags (the ASM_* env vars still work as fallbacks). See --help.
+# Settings come from the install's saved startup config ($ASM_DATA_DIR/
+# startup.conf — also editable from the web UI's Config dialog); flags patch it
+# and are saved back, so plain `scripts/start.sh` reproduces the last setup and
+# applies anything changed since. The ASM_* env vars are fallbacks. See --help.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=_asm_common.sh
@@ -15,41 +18,54 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/start.sh [options]
 
-  --bind ADDR          daemon listen address (default 127.0.0.1:4600)
+  Components — daemon, relay, web UI; turn each on or off independently:
+  --daemon / --no-daemon   the daemon + session holder (default on)
+  --relay / --no-relay     a bundled rendezvous relay (default off)
+  --ui / --no-ui           the managed Vite web UI (default on; --run-ui=BOOL)
+  --ui-only            just the UI: turns the daemon and relay off
+  --relay-only         just the relay: turns the daemon and UI off
+
   --data-dir DIR       persistent data dir (default ~/.local/share/asm)
   --runtime-dir DIR    sockets/pidfiles dir (default $XDG_RUNTIME_DIR/asm)
-  --label NAME         this node's label (default: hostname)
-  --release            build/run the release profile
+  --release / --debug  build/run the release / debug profile (default debug)
   -h, --help           show this help
 
-  Managed development UI (detached; enabled by default):
-  --ui                 explicitly enable/reconfigure the default UI
-  --no-ui              disable/stop it (same as --run-ui=false)
-  --ui-only            run ONLY the UI gateway; no relay, holder, or daemon
-  --ui-daemon URL      backend for UI-only mode (implies --ui-only)
-  --ui-daemon-token TOKEN
-                       bearer token injected into that backend proxy
-  --ui-host HOST       UI listen host (default 127.0.0.1; implies --ui)
-  --ui-port PORT       UI listen port (default 5273; implies --ui)
+  Daemon (each implies --daemon):
+  --bind ADDR          listen address (default 127.0.0.1:4600)
+  --label NAME         this node's label (default: hostname)
+  --enrollment-token TOKEN
+                       what new devices enter to enroll (≥16 chars; default: generated)
+
+  Managed web UI (host/port imply --ui):
+  --ui-host HOST       UI listen host (default 127.0.0.1)
+  --ui-port PORT       UI listen port (default 5273)
   --ui-allowed-host HOST
                        exact reverse-proxy hostname Vite may serve (repeatable)
+  --ui-daemon URL      off-host daemon the UI proxies to — only used without a
+                       local daemon, so it implies --no-daemon
+  --ui-daemon-token TOKEN
+                       bearer token injected into that proxy (implies --no-daemon)
+  --no-ui-daemon       no proxy target (without a daemon: a client shell)
 
-  A flagless run keeps the settings recorded from the previous launch (bind,
-  label, relay registration, bundled relay, managed UI) instead of reverting to
-  defaults; recorded settings beat inherited ASM_* env — pass flags to change them.
+  Saved settings: every run starts from $ASM_DATA_DIR/startup.conf (default
+  ~/.local/share/asm/startup.conf), which the web UI's Config dialog edits too.
+  Flags change just the settings they name and are saved back, so a flagless run
+  reproduces the last setup (and applies changes saved since, starting,
+  restarting, or stopping the daemon/relay/UI as needed — the holder and its
+  live sessions are never touched). Saved settings beat inherited ASM_* env.
+  stop.sh does not clear them.
 
   Relay host — a reachable box that NAT'd nodes register to:
-  --relay              run a bundled rendezvous relay here (alongside the daemon)
-  --relay-only         run ONLY the relay — no holder/daemon, no sessions on this box
   --relay-bind ADDR    relay listen address (default 0.0.0.0:4700; implies --relay)
   --relay-key KEY      shared relay access key
 
   NAT'd node — registers OUTBOUND to a relay (no relay runs here):
   --register URL       relay to register to, e.g. ws://relay-host:4700
   --relay-key KEY      the relay's access key
+  --no-register        stop registering to a relay
 
 Examples:
-  scripts/start.sh                                       # daemon + local persistent Vite UI
+  scripts/start.sh                                       # the saved setup (first run: daemon + local Vite UI)
   scripts/start.sh --no-ui                               # daemon/holder only
   scripts/start.sh --ui-only                             # UI shell/gateway, no local daemon
   scripts/start.sh --ui-only --ui-daemon http://host:4600
@@ -58,81 +74,65 @@ Examples:
   scripts/start.sh --bind 0.0.0.0:4600
   scripts/start.sh --relay --relay-key s3cret               # relay host + daemon
   scripts/start.sh --relay-only --relay-key s3cret          # just the relay, no daemon
+  scripts/start.sh --no-daemon --relay --relay-key s3cret   # relay + web UI, no daemon
   scripts/start.sh --register ws://192.168.122.1:4700 --relay-key s3cret
 USAGE
 }
 
 asm_parse_args "$@" || { usage; exit 2; }
 [ "${ASM_SHOW_HELP:-0}" = 1 ] && { usage; exit 0; }
-asm_configure
+asm_configure || exit 2
+asm_validate || exit 2
+log_config_origin
 
-# UI-only is a complete startup role, so restore it before daemon/relay state and
-# return without building or launching any Rust service.
-ui_load_recorded_config
-if ui_only; then
-  ui_enabled || { err "UI-only mode requires the UI to be enabled"; exit 2; }
-  [ "${ASM_RELAY_RECONFIG:-0}" = 1 ] && {
-    err "--ui-only cannot be combined with bundled relay options"
-    exit 2
-  }
-  [ "${ASM_DAEMON_RECONFIG:-0}" = 1 ] && {
-    err "--ui-only cannot be combined with daemon bind/label/registration options; use --ui-daemon URL"
-    exit 2
-  }
-  sync_ui
-  log "ready — UI-only gateway $(ui_url)  →  $(ui_daemon_url)"
-  log "logs  — $LOG_DIR/asm-ui.log"
-  log "next  — scripts/status.sh · scripts/stop.sh ui"
-  exit 0
-fi
+components=()
+daemon_enabled && components+=(daemon)
+relay_enabled && components+=(relay)
+ui_enabled && components+=("web UI")
+log "components — $(IFS=,; echo "${components[*]}" | sed 's/,/, /g')"
 
-# A normal flagless run restores bind/label/registration, bundled relay, and
-# relay-only-ness rather than reverting to defaults.
-daemon_load_recorded_config
-relay_load_recorded_config
-
-# Relay-only: build and start just the rendezvous relay — no holder, no daemon.
-if [ "${ASM_RELAY_ONLY:-0}" = 1 ]; then
-  relay_enabled || { err "--relay-only needs --relay-key KEY (the access key nodes present)"; exit 2; }
-  if ui_enabled; then
-    [ "${ASM_UI_RECONFIG:-0}" = 1 ] && {
-      err "--relay-only cannot run a UI because there is no daemon to proxy to"
-      exit 2
-    }
-    # Switching a previously UI-enabled full stack to relay-only implicitly
-    # retires that UI; there is no API on this host for it to use.
-    export ASM_RUN_UI=0 ASM_UI_RECONFIG=1
-  fi
-  # --no-ui, or the implicit transition above, retires an earlier managed UI.
-  [ "${ASM_UI_RECONFIG:-0}" = 1 ] && sync_ui
-  log "building asm-relay ($PROFILE)..."
-  cargo_build -p asm-relay
-  start_relay
-  log "ready — relay http://$ASM_RELAY_BIND (nodes register here; no sessions on this box)"
-  log "logs   — $LOG_DIR/asm-relay.log"
-  log "next   — scripts/status.sh · scripts/stop.sh relay"
-  exit 0
-fi
-
-build_targets=(-p asm-daemon -p asmux)
+build_targets=()
+daemon_enabled && build_targets+=(-p asm-daemon -p asmux)
 relay_enabled && build_targets+=(-p asm-relay)
-log "building asm-daemon + asmux$(relay_enabled && echo ' + asm-relay') ($PROFILE)..."
-cargo_build "${build_targets[@]}"
-
-start_relay
-start_asmux
-start_daemon
-sync_ui
-
-backend="$(command -v curl >/dev/null 2>&1 && curl -s "http://$ASM_BIND/health" | sed -n 's/.*"backend":"\([^"]*\)".*/\1/p' || true)"
-log "ready — http://$ASM_BIND (backend=${backend:-?})"
-# The daemon serves the packaged web client itself when ASM_STATIC_DIR points at
-# a build (auto-set from client/dist in _asm_common.sh) — no npm/vite needed.
-if [ -n "${ASM_STATIC_DIR:-}" ] && [ -d "$ASM_STATIC_DIR" ]; then
-  log "web UI — http://$ASM_BIND (served from ${ASM_STATIC_DIR#"$ROOT"/})"
+if [ ${#build_targets[@]} -gt 0 ]; then
+  log "building$(daemon_enabled && echo ' asm-daemon + asmux')$(daemon_enabled && relay_enabled && echo ' +')$(relay_enabled && echo ' asm-relay') ($PROFILE)..."
+  cargo_build "${build_targets[@]}"
 fi
-ui_enabled && log "dev UI — $(ui_url) → $(ui_daemon_url) (Vite; managed in the background)"
+config_save
+
+# Converge every component on the settings: start or restart what is on and
+# changed, stop what is off. The holder is never stopped here.
+sync_relay
+if daemon_enabled; then
+  start_asmux
+  start_daemon
+else
+  stop_disabled_daemon
+fi
+sync_ui
+applied_save
+
+if daemon_enabled; then
+  backend="$(command -v curl >/dev/null 2>&1 && curl -s "http://$ASM_BIND/health" | sed -n 's/.*"backend":"\([^"]*\)".*/\1/p' || true)"
+  log "ready — daemon http://$ASM_BIND (backend=${backend:-?})"
+  # The daemon serves the packaged web client itself when ASM_STATIC_DIR points
+  # at a build (auto-set from client/dist in _asm_common.sh) — no npm/vite needed.
+  if [ -n "${ASM_STATIC_DIR:-}" ] && [ -d "$ASM_STATIC_DIR" ]; then
+    log "web UI — http://$ASM_BIND (served from ${ASM_STATIC_DIR#"$ROOT"/})"
+  fi
+  [ -n "${ASM_RELAY_URL:-}" ] && log "node   — registering to $ASM_RELAY_URL"
+fi
+if ui_enabled; then
+  if daemon_enabled || [ -n "$(ui_proxy_daemon)" ]; then
+    log "dev UI — $(ui_url) → $(ui_daemon_url) (Vite; managed in the background)"
+  else
+    log "dev UI — $(ui_url) (Vite; no daemon here — add daemons or relays from manage)"
+  fi
+fi
 relay_enabled && log "relay  — http://$ASM_RELAY_BIND (nodes register here)"
-[ -n "${ASM_RELAY_URL:-}" ] && log "node   — registering to $ASM_RELAY_URL"
-log "logs   — $LOG_DIR/{asmux,asm-daemon$(ui_enabled && echo ',asm-ui')$(relay_enabled && echo ',asm-relay')}.log"
-log "next   — scripts/status.sh · scripts/restart-daemon.sh · scripts/stop.sh"
+logs=()
+daemon_enabled && logs+=(asmux asm-daemon)
+ui_enabled && logs+=(asm-ui)
+relay_enabled && logs+=(asm-relay)
+log "logs   — $LOG_DIR/{$(IFS=,; echo "${logs[*]}")}.log"
+log "next   — scripts/status.sh$(daemon_enabled && echo ' · scripts/restart-daemon.sh') · scripts/stop.sh"
