@@ -936,43 +936,52 @@ body.col-resizing iframe {
   width: 680px;
   color-scheme: dark;
 }
+/* The host picker: one row per host, like the Connections dialog's daemon list. */
 .config-hosts {
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+  flex-direction: column;
   margin: 7px 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
 }
 .config-host {
   display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
-  min-width: 0;
-  max-width: 100%;
-  padding: 7px 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-left: 2px solid transparent;
   background: var(--bg);
   color: var(--text);
   font: inherit;
   text-align: left;
   cursor: pointer;
 }
+.config-host:last-child {
+  border-bottom: 0;
+}
 .config-host:hover {
-  border-color: var(--accent);
+  background: var(--panel-2);
 }
 .config-host:focus-visible {
   outline: 2px solid var(--accent);
-  outline-offset: 2px;
+  outline-offset: -2px;
 }
 .config-host.on {
-  border-color: var(--accent);
+  border-left-color: var(--accent);
   background: var(--accent-2);
 }
-.config-host-name {
+.config-host-meta {
   display: flex;
-  align-items: center;
-  gap: 6px;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.config-host-name {
   font-weight: 600;
   overflow-wrap: anywhere;
 }
@@ -983,6 +992,13 @@ body.col-resizing iframe {
 }
 .config-host.on .config-host-sub {
   color: var(--text);
+}
+.config-host-tags {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
 }
 .config-tag {
   padding: 0 6px;

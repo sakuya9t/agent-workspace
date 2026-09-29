@@ -114,6 +114,7 @@ function ConfigDialogBody() {
   const qc = useQueryClient();
   const setShow = useUiStore((s) => s.setShowConfig);
   const daemons = useConnStore((s) => s.daemons);
+  const relays = useConnStore((s) => s.relays);
   const connected = useMemo(() => daemons.filter((d) => d.connected), [daemons]);
 
   const uiQ = useQuery({ queryKey: UI_QUERY_KEY, queryFn: getUiServerConfig, retry: false, staleTime: 0 });
@@ -172,6 +173,24 @@ function ConfigDialogBody() {
   const [notice, setNotice] = useState<string | null>(null);
 
   const selected = hosts.find((h) => h.key === selectedKey) ?? hosts[0];
+  /** What the host is and how it is reached — without repeating its name. */
+  const hostSub = (h: HostEntry) => {
+    const relay = h.daemon?.via ? relays.find((r) => r.id === h.daemon?.via) : undefined;
+    const parts = [
+      h.kind === "ui"
+        ? t("config.kindUi")
+        : h.kind === "both"
+          ? t("config.kindBoth")
+          : relay
+            ? t("config.kindRelayedNamed", { relay: relay.label })
+            : h.daemon?.via
+              ? t("config.kindRelayed")
+              : t("config.kindDaemon"),
+    ];
+    const host = h.view?.hostname;
+    if (host && !hostName(h).includes(host)) parts.push(host);
+    return parts.join(" · ");
+  };
   const hostName = (h: HostEntry) =>
     h.daemon ? daemonLabel(h.daemon) : t("config.uiServerNamed", { host: h.view?.hostname ?? "" });
   const isDirty = (h: HostEntry) =>
@@ -278,7 +297,12 @@ function ConfigDialogBody() {
         ) : (
           <>
             <div className="conn-add-step">{t("config.hostsLabel")}</div>
-            <div className="config-hosts" role="tablist" aria-label={t("config.hostTabs")}>
+            <div
+              className="config-hosts"
+              role="tablist"
+              aria-orientation="vertical"
+              aria-label={t("config.hostTabs")}
+            >
               {hosts.map((h) => (
                 <button
                   key={h.key}
@@ -288,20 +312,15 @@ function ConfigDialogBody() {
                   className={"config-host" + (h === selected ? " on" : "")}
                   onClick={() => pick(h.key)}
                 >
-                  <span className="config-host-name">
-                    {hostName(h)}
+                  <span className="tree-icon">⬢</span>
+                  <span className="config-host-meta">
+                    <span className="config-host-name">{hostName(h)}</span>
+                    <span className="config-host-sub">{hostSub(h)}</span>
+                  </span>
+                  <span className="config-host-tags">
                     {isDirty(h) && <span className="config-tag warn-tag">{t("config.unsaved")}</span>}
                     {!!h.view?.pending?.length && <span className="config-tag">{t("config.pendingTag")}</span>}
-                  </span>
-                  <span className="config-host-sub">
-                    {h.kind === "ui"
-                      ? t("config.kindUi")
-                      : h.kind === "both"
-                        ? t("config.kindBoth")
-                        : h.daemon?.via
-                          ? t("config.kindRelayed")
-                          : t("config.kindDaemon")}
-                    {h.view && <>{" · "}{h.view.hostname}</>}
+                    {!h.view && !h.loading && <span className="config-tag">{t("config.unavailableTag")}</span>}
                   </span>
                 </button>
               ))}
