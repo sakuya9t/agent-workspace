@@ -799,6 +799,9 @@ export const api = {
   getConfig: (t: Target) => req<ConfigView>(t, "/api/config"),
   putConfig: (t: Target, body: ConfigUpdate) =>
     req<ConfigView>(t, "/api/config", { method: "PUT", body: JSON.stringify(body) }),
+  /** Apply the host's saved settings now; the daemon may restart itself. */
+  applyConfig: (t: Target) =>
+    req<{ apply: ApplyStatus | null }>(t, "/api/config/apply", { method: "POST" }),
   enrollmentToken: (t: Target) =>
     req<{ enrollment_token: string }>(t, "/api/auth/enrollment-token").then(
       (r) => r.enrollment_token,
@@ -857,6 +860,24 @@ export interface ConfigView {
   pending: ConfigKey[] | null;
   /** UI server only: whether scripts/start.sh launched it. */
   managed?: boolean;
+  /**
+   * Whether this host can apply saved settings now (`POST …/apply`): only a
+   * process started by scripts/start.sh can. Absent on older hosts.
+   */
+  can_apply?: boolean;
+  /** The last apply on this host, or null if it never applied. */
+  apply?: ApplyStatus | null;
+}
+
+/** Progress of an "apply now" (scripts/apply-config.sh) on one host. */
+export interface ApplyStatus {
+  state: "running" | "ok" | "failed";
+  /** Unix seconds. */
+  started_at: number;
+  finished_at: number | null;
+  exit_code: number | null;
+  /** The end of the run's output, when it failed. */
+  log_tail: string | null;
 }
 
 export interface ConfigUpdate {
@@ -883,6 +904,25 @@ export async function getUiServerConfig(): Promise<ConfigView | null> {
   if (!res.ok || !(res.headers.get("content-type") ?? "").includes("application/json")) return null;
   const body = (await res.json().catch(() => null)) as ConfigView | null;
   return body?.source === "ui" ? body : null;
+}
+
+/** Apply the UI server's saved settings now (it may restart itself, reloading this page). */
+export async function applyUiServerConfig(): Promise<{ apply: ApplyStatus | null }> {
+  let res: Response;
+  try {
+    res = await fetch(`${UI_CONFIG_PATH}/apply`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+  } catch {
+    throw unreachableError("");
+  }
+  if (!res.ok) {
+    const { msg } = await errorMessage(res);
+    throw Object.assign(new Error(msg), { status: res.status });
+  }
+  return res.json() as Promise<{ apply: ApplyStatus | null }>;
 }
 
 export async function putUiServerConfig(body: ConfigUpdate): Promise<ConfigView> {

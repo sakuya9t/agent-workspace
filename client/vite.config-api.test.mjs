@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync }
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createConfigHandler, CONFIG_API_PATH } from "./vite.config-api.ts";
+import { createConfigHandler, CONFIG_API_PATH, APPLY_API_PATH } from "./vite.config-api.ts";
 import {
   CONFIG_KEYS,
   configRevision,
@@ -197,6 +197,51 @@ try {
     writeFileSync(join(env.ASM_RUNTIME_DIR, "startup.applied"), renderConfigFile({ ...applied, ASM_UI_HOST: "127.0.0.1" }));
     const got = await (await fetch(url)).json();
     assert.deepEqual(got.pending, ["ASM_UI_HOST"]);
+  });
+  await check("apply: refused when this server was not started by the scripts", async () => {
+    const got = await (await fetch(url)).json();
+    assert.equal(got.can_apply, false, "no ASM_SCRIPTS_DIR");
+    const res = await fetch(base + APPLY_API_PATH, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    assert.equal(res.status, 409);
+  });
+
+  await check("apply: runs apply-config.sh detached and reports its result", async () => {
+    const scripts = join(tmp, "scripts");
+    mkdirSync(scripts, { recursive: true });
+    // A stub with the real script's contract: record the result in the runtime dir.
+    writeFileSync(
+      join(scripts, "apply-config.sh"),
+      'while [ $# -gt 0 ]; do case "$1" in --runtime-dir) r=$2 ;; esac; shift; done\n' +
+        "sleep 0.3\n" +
+        "printf 'state=ok\\npid=%s\\nstarted=1\\nexit=0\\nfinished=2\\n' $$ > \"$r/startup.apply\"\n",
+    );
+    const managed = { ...env, ASM_SCRIPTS_DIR: scripts };
+    const h = createConfigHandler(managed);
+    const srv = createServer((req, res) => h(req, res, () => res.end()));
+    await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+    const b = `http://127.0.0.1:${srv.address().port}`;
+    try {
+      assert.equal((await (await fetch(b + CONFIG_API_PATH)).json()).can_apply, true);
+      const cross = await fetch(b + APPLY_API_PATH, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: "http://evil.example" },
+        body: "{}",
+      });
+      assert.equal(cross.status, 403, "cross-origin apply refused");
+      const res = await fetch(b + APPLY_API_PATH, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      assert.equal(res.status, 202);
+      assert.equal((await res.json()).apply.state, "running");
+      const again = await fetch(b + APPLY_API_PATH, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      assert.equal(again.status, 409, "one apply at a time");
+      let state = "running";
+      for (let i = 0; i < 50 && state === "running"; i++) {
+        await new Promise((r) => setTimeout(r, 100));
+        state = (await (await fetch(b + CONFIG_API_PATH)).json()).apply.state;
+      }
+      assert.equal(state, "ok");
+    } finally {
+      srv.close();
+    }
   });
 } finally {
   server.close();

@@ -304,8 +304,16 @@ running; turn the daemon back on and it re-adopts them.
 - **Edit it from the browser.** The web client's **config** button (top bar;
   next to **daemons** on phones) opens a dialog listing the UI host (the server
   that served the page) and every connected daemon, including ones reached
-  through a relay. Pick a host, edit, save: the file on *that* host changes and
-  applies the next time the scripts run there. The keys — the daemon's
+  through a relay. Pick a host, edit, and **Save & apply**: the file on *that*
+  host changes and the host runs a flagless `scripts/start.sh` right away
+  (`scripts/apply-config.sh`, launched detached by the daemon or the Vite
+  server), so only what changed restarts, the holder never does, and live
+  sessions survive. The dialog follows the host through its restart and shows
+  the result — on failure, the tail of `$ASM_DATA_DIR/logs/apply.log` (secret
+  values are never echoed there). Plain **Save** keeps the change for the next
+  run instead, and **Apply now** applies changes saved earlier. Only a daemon or
+  UI server that `start.sh` launched can apply (it is told where the scripts
+  are); for a hand-started one the dialog only saves. The keys — the daemon's
   enrollment token, its relay-registration key, the relay's accepted keys, and
   the UI proxy token — can be set, replaced, or cleared there but are
   write-only: the dialog shows whether each is set, never its value
@@ -314,7 +322,8 @@ running; turn the daemon back on and it re-adopts them.
   listed once.
 - **"Not applied yet."** Each run records what it applied in
   `$ASM_RUNTIME_DIR/startup.applied`; the dialog and `status.sh` list the saved
-  settings that differ ("run scripts/start.sh on this host to apply them").
+  settings that differ. The last apply's progress is in
+  `$ASM_RUNTIME_DIR/startup.apply`.
 - **Precedence:** flags > saved file > inherited `ASM_*` env > defaults. An
   install started by an older version of the scripts is migrated on its first
   run from the per-boot `.reg` records it left in the runtime dir. (The legacy
@@ -481,6 +490,7 @@ at registration; a mismatched client entry reads as unreachable.
 | POST | `/api/auth/devices/:id/revoke` | revoke a device |
 | GET | `/api/config` | this host's saved startup config (`startup.conf`); secrets reported only as set/unset, plus keys saved but not yet applied |
 | PUT | `/api/config` | change it (`{revision, values}`; a secret key left out keeps its value, `""` clears) — `409` if the file changed since `revision`, `400` on an invalid setting |
+| POST | `/api/config/apply` | apply it now: runs `scripts/apply-config.sh` (a flagless `start.sh`) detached and answers `202`; progress is `GET /api/config`'s `apply`. `409` if the daemon was not started by the scripts or an apply is running |
 | GET | `/api/fs/list?path=&show_hidden=` | browse host directories (for the picker) |
 | GET | `/api/plugins` | list agent plugins + binary detection |
 | GET | `/api/workspaces` | list registered workspaces |

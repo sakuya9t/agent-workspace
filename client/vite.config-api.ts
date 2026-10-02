@@ -1,4 +1,5 @@
-import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
@@ -22,7 +23,9 @@ import {
 // Vite dev server itself so the web client's Config dialog can edit the machine
 // it is served from even when no daemon runs there (a UI-only gateway). Daemons
 // serve their own host's file at `GET/PUT /api/config`; this is the same
-// contract (see crates/daemon/src/startup_config.rs) over the same file format.
+// contract (see crates/daemon/src/startup_config.rs) over the same file format,
+// including `POST …/apply`, which runs scripts/apply-config.sh detached to
+// apply it now.
 //
 // Anyone who can load this UI can already drive the daemon it proxies to
 // (loopback-trusted or token-injected), so the endpoint adds no reach — but it
@@ -31,17 +34,104 @@ import {
 // Secrets are write-only, as on the daemon.
 
 export const CONFIG_API_PATH = "/__asm/config";
+export const APPLY_API_PATH = `${CONFIG_API_PATH}/apply`;
 
 type Env = Record<string, string | undefined>;
 
 /** The same locations scripts/_asm_common.sh derives for this install. */
-export function configPaths(env: Env): { path: string; appliedPath: string } {
+export function configPaths(env: Env) {
   const dataDir = env.ASM_DATA_DIR || join(homedir(), ".local", "share", "asm");
   const runtimeDir = env.ASM_RUNTIME_DIR || join(env.XDG_RUNTIME_DIR || "/tmp", "asm");
   return {
+    dataDir,
+    runtimeDir,
     path: join(dataDir, CONFIG_FILE_NAME),
     appliedPath: join(runtimeDir, APPLIED_FILE_NAME),
+    applyStatusPath: join(runtimeDir, "startup.apply"),
+    applyLogPath: join(dataDir, "logs", "apply.log"),
   };
+}
+
+/** apply-config.sh, when scripts/start.sh launched this server (and said where it lives). */
+function applyScript(env: Env): string | null {
+  if (env.ASM_UI_MANAGED !== "1" || !env.ASM_SCRIPTS_DIR) return null;
+  const script = join(env.ASM_SCRIPTS_DIR, "apply-config.sh");
+  return existsSync(script) ? script : null;
+}
+
+interface ApplyStatus {
+  state: "running" | "ok" | "failed";
+  started_at: number;
+  finished_at: number | null;
+  exit_code: number | null;
+  log_tail: string | null;
+}
+
+const nowSecs = () => Math.floor(Date.now() / 1000);
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/** The last apply, as apply-config.sh records it (mirrors the daemon's reader). */
+function readApplyStatus(env: Env): ApplyStatus | null {
+  const { applyStatusPath, applyLogPath } = configPaths(env);
+  const text = readOptional(applyStatusPath);
+  if (text === null) return null;
+  const f: Record<string, string> = {};
+  for (const line of text.split("\n")) {
+    const eq = line.indexOf("=");
+    if (eq > 0) f[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+  }
+  const num = (k: string) => (f[k] !== undefined && /^-?\d+$/.test(f[k]) ? Number(f[k]) : null);
+  const started = num("started") ?? 0;
+  let state = (f.state as ApplyStatus["state"]) || "failed";
+  if (state === "running") {
+    const pid = num("pid") ?? 0;
+    // pid 0: written by the launcher before the script exists.
+    const gone = pid > 0 ? !pidAlive(pid) : nowSecs() - started > 30 * 60;
+    if (gone) state = "failed";
+  }
+  let logTail: string | null = null;
+  if (state === "failed") {
+    // eslint-disable-next-line no-control-regex
+    const plain = (readOptional(applyLogPath) ?? "").replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
+    logTail = plain.split("\n").filter((l, i, a) => i < a.length - 1 || l).slice(-40).join("\n");
+  }
+  return { state, started_at: started, finished_at: num("finished"), exit_code: num("exit"), log_tail: logTail };
+}
+
+/** Run apply-config.sh detached; it may restart this very server. */
+function startApply(env: Env): ApplyStatus | null {
+  const script = applyScript(env);
+  if (!script) {
+    throw new HttpError(
+      409,
+      "this UI server was not started by scripts/start.sh, so it cannot apply its settings itself — run scripts/start.sh on its host",
+    );
+  }
+  if (readApplyStatus(env)?.state === "running") throw new HttpError(409, "an apply is already running on this host");
+  const { dataDir, runtimeDir, applyStatusPath, applyLogPath } = configPaths(env);
+  const now = nowSecs();
+  // Before the script exists, so a read straight after never sees the last run's result.
+  writeAtomic(applyStatusPath, `state=running\npid=0\nstarted=${now}\n`);
+  const child = spawn("bash", [script, "--data-dir", dataDir, "--runtime-dir", runtimeDir], {
+    detached: true,
+    stdio: "ignore",
+    env: { ...process.env, ...env } as NodeJS.ProcessEnv,
+  });
+  child.on("error", (e) => {
+    mkdirSync(dirname(applyLogPath), { recursive: true });
+    writeFileSync(applyLogPath, `could not run ${script}: ${e.message}\n`);
+    writeAtomic(applyStatusPath, `state=failed\npid=0\nstarted=${now}\nexit=127\nfinished=${nowSecs()}\n`);
+  });
+  child.unref();
+  return readApplyStatus(env);
 }
 
 function readOptional(path: string): string | null {
@@ -99,6 +189,8 @@ function view(env: Env, snap: Snapshot) {
     // Launched by scripts/start.sh (which reads this file); a hand-run
     // `npm run dev` only picks the settings up once started that way.
     managed: env.ASM_UI_MANAGED === "1",
+    can_apply: applyScript(env) !== null,
+    apply: readApplyStatus(env),
   };
 }
 
@@ -192,8 +284,16 @@ function assertSameOrigin(req: IncomingMessage) {
 export function createConfigHandler(env: Env = process.env) {
   return async (req: IncomingMessage, res: ServerResponse, next: (err?: unknown) => void) => {
     const path = (req.url ?? "").split("?")[0];
-    if (path !== CONFIG_API_PATH) return next();
+    if (path !== CONFIG_API_PATH && path !== APPLY_API_PATH) return next();
     try {
+      if (path === APPLY_API_PATH) {
+        if (req.method !== "POST") {
+          res.setHeader("allow", "POST");
+          return send(res, 405, { error: "method not allowed" });
+        }
+        assertSameOrigin(req);
+        return send(res, 202, { apply: startApply(env) });
+      }
       if (req.method === "GET") return send(res, 200, view(env, load(env)));
       if (req.method === "PUT") {
         assertSameOrigin(req);

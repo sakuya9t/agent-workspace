@@ -197,9 +197,10 @@ fix through the daemon's own listener again.
 - **What:** `PUT /api/config` (daemon) and `PUT /__asm/config` (the Vite UI
   server) rewrite the host's saved startup config (`<data_dir>/startup.conf`):
   which components run, bind address, enrollment token, relay registration,
-  bundled relay, managed UI, build profile. The next `scripts/start.sh` on that
-  host applies it — e.g. rebinding to `0.0.0.0`, setting a known enrollment
-  token, or registering to an attacker-chosen relay.
+  bundled relay, managed UI, build profile — and `POST …/apply` makes the host
+  run a flagless `scripts/start.sh` on it right away (e.g. rebinding to
+  `0.0.0.0`, setting a known enrollment token, or registering to an
+  attacker-chosen relay).
 - **Current mitigation:** no reach beyond what the caller already has. The
   daemon endpoint sits behind the normal `/api` auth (loopback trust or an
   enrolled device token) — a caller that passes it can already spawn a shell on
@@ -207,9 +208,10 @@ fix through the daemon's own listener again.
   already drive the daemon it proxies to (loopback-trusted or token-injected);
   it refuses cross-origin and non-JSON writes (`Origin` must match `Host`,
   `Sec-Fetch-Site` must not be cross-site) so a foreign page in the user's
-  browser cannot post to it. Nothing restarts from the API — changes wait for
-  the owner's next script run, and the dialog/`status.sh` list them as "not
-  applied yet". Secrets (the enrollment token, relay keys, the UI proxy token)
+  browser cannot post to it (the same checks guard its `/apply`). Applying runs
+  only the install's own `scripts/apply-config.sh` → `start.sh` with no
+  caller-supplied arguments, and only in a process the scripts launched (a
+  hand-started daemon refuses); the holder is never restarted. Secrets (the enrollment token, relay keys, the UI proxy token)
   are write-only over both endpoints; the file is `0600` and git-ignored; a
   configured enrollment token must be ≥16 characters (the daemon refuses to
   start with a weaker one); and asmux strips all of them from agent session

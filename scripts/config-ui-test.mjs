@@ -13,7 +13,7 @@
 //   node scripts/config-ui-test.mjs        # sandboxed: 2 daemons + vite + chrome
 
 import { spawn } from "node:child_process";
-import { openSync, readFileSync, writeFileSync, appendFileSync, existsSync } from "node:fs";
+import { openSync, readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { createSandbox, checker, freePort, sleep, ROOT } from "./lib/testenv.mjs";
 
@@ -37,7 +37,24 @@ async function main() {
   if (!existsSync(viteBin)) throw new Error(`missing ${viteBin} — run (cd client && npm install)`);
 
   await sbA.startDaemon();
-  await sbB.startDaemon();
+  // B plays a host started by scripts/start.sh: it knows a scripts dir, whose
+  // apply-config.sh is a stub with the real one's contract (converge, then
+  // record the result) — or fails on demand.
+  const stubScripts = join(sbB.tmp, "scripts");
+  mkdirSync(stubScripts, { recursive: true });
+  writeFileSync(
+    join(stubScripts, "apply-config.sh"),
+    [
+      'while [ $# -gt 0 ]; do case "$1" in --data-dir) d=$2 ;; --runtime-dir) r=$2 ;; esac; shift; done',
+      "now=$(date +%s); sleep 1",
+      'if [ -f "$d/fail-next" ]; then rm -f "$d/fail-next"; mkdir -p "$d/logs"; echo "simulated failure: port in use" > "$d/logs/apply.log"',
+      '  printf "state=failed\\npid=%s\\nstarted=%s\\nexit=3\\nfinished=%s\\n" $$ "$now" "$(date +%s)" > "$r/startup.apply"; exit 3; fi',
+      'cp "$d/startup.conf" "$r/startup.applied"',
+      'printf "state=ok\\npid=%s\\nstarted=%s\\nexit=0\\nfinished=%s\\n" $$ "$now" "$(date +%s)" > "$r/startup.apply"',
+      "",
+    ].join("\n"),
+  );
+  await sbB.startDaemon("daemon", { ASM_SCRIPTS_DIR: stubScripts });
 
   const port = await freePort();
   const ui = `http://127.0.0.1:${port}`;
@@ -219,6 +236,31 @@ async function main() {
     "save after reload succeeds",
     await waitFor("/Saved on box-b/.test(document.querySelector('.config-modal').innerText)") &&
       parse(readFileSync(confB, "utf8")).ASM_NODE_LABEL === "beta",
+  );
+
+  // ── Save & apply (B can apply; the UI host here was not given its scripts) ──
+  const modalText = "document.querySelector('.config-modal').innerText";
+  check("a host that can apply offers Save & apply", await evalJs("!!__btn('.config-modal', 'Save & apply')"));
+  await evalJs("__set('ASM_NODE_LABEL', 'gamma')");
+  await evalJs("__btn('.config-modal', 'Save & apply').click()");
+  check("Save & apply shows progress", await waitFor(`/Applying on this host/.test(${modalText})`));
+  check(
+    "…then reports it applied, nothing pending",
+    await waitFor(`/Applied on box-b/.test(${modalText}) && !/not applied/.test(__chips()[1].innerText)`, 15000),
+  );
+  check("…having run against B's install", existsSync(join(sbB.runDir, "startup.applied")));
+  writeFileSync(join(sbB.dataDir, "fail-next"), "");
+  await evalJs("__set('ASM_NODE_LABEL', 'delta')");
+  await evalJs("__btn('.config-modal', 'Save & apply').click()");
+  check(
+    "a failed apply shows why, with a retry",
+    await waitFor(`/The last apply failed \\(exit 3\\)/.test(${modalText}) && /simulated failure/.test(${modalText}) && !!__btn('.config-modal', 'Try again')`, 15000),
+  );
+  check("…and the change stays pending", /not applied/.test(await evalJs("__chips()[1].innerText")));
+  await evalJs("__chips()[0].click()");
+  check(
+    "a host that cannot apply offers Save only, and says why",
+    await waitFor(`!__btn('.config-modal', 'Save & apply') && /was not started by scripts\\/start.sh/.test(${modalText})`),
   );
   await evalJs("__btn('.config-modal', 'Close').click()");
 

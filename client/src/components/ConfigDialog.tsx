@@ -1,8 +1,10 @@
-import { type ReactNode, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import {
   api,
+  applyUiServerConfig,
+  ApplyStatus,
   ConfigUpdate,
   ConfigView,
   getUiServerConfig,
@@ -26,9 +28,12 @@ import {
  * Startup settings for the hosts this client can reach: the UI server that
  * serves this page (Vite's `/__asm/config`) and every connected daemon
  * (`/api/config`). Each host keeps its own `startup.conf`, which
- * `scripts/start.sh` starts from; saving here changes what the NEXT start does
- * on that host — nothing restarts from the browser. A host serving this page
- * that also runs the daemon it proxies to shares one file, so it is listed once.
+ * `scripts/start.sh` starts from. "Save & apply" also runs that script on the
+ * host right away (`…/apply` → `scripts/apply-config.sh`): only what changed
+ * restarts, the session holder never does, and the dialog follows the host
+ * through its restart. Hosts not started by the scripts can only save. A host
+ * serving this page that also runs the daemon it proxies to shares one file,
+ * so it is listed once.
  */
 export function ConfigDialog() {
   const show = useUiStore((s) => s.showConfig);
@@ -51,7 +56,17 @@ interface HostEntry {
   loading: boolean;
   queryKey: readonly unknown[];
   save: (body: ConfigUpdate) => Promise<ConfigView>;
+  apply: () => Promise<{ apply: ApplyStatus | null }>;
 }
+
+/** Poll a host this often while an apply runs there (it may be restarting). */
+const APPLY_POLL_MS = 1500;
+
+const without = <T,>(rec: Record<string, T>, key: string): Record<string, T> => {
+  const rest = { ...rec };
+  delete rest[key];
+  return rest;
+};
 
 /** Edits in progress for one host. Secrets are replaced or cleared, never shown. */
 interface Draft {
@@ -117,13 +132,30 @@ function ConfigDialogBody() {
   const relays = useConnStore((s) => s.relays);
   const connected = useMemo(() => daemons.filter((d) => d.connected), [daemons]);
 
-  const uiQ = useQuery({ queryKey: UI_QUERY_KEY, queryFn: getUiServerConfig, retry: false, staleTime: 0 });
+  // Hosts with an apply this dialog started and has not seen finish, by entry
+  // key → the apply's start (Unix seconds). A ref too, for the poll intervals.
+  const [applying, setApplying] = useState<Record<string, number>>({});
+  const applyingRef = useRef(applying);
+  applyingRef.current = applying;
+  const pollWhileApplying = (key: string) => (q: { state: { data?: ConfigView | null } }) =>
+    q.state.data?.apply?.state === "running" || applyingRef.current[key] !== undefined
+      ? APPLY_POLL_MS
+      : false;
+
+  const uiQ = useQuery({
+    queryKey: UI_QUERY_KEY,
+    queryFn: getUiServerConfig,
+    retry: false,
+    staleTime: 0,
+    refetchInterval: pollWhileApplying("ui"),
+  });
   const daemonQs = useQueries({
     queries: connected.map((d) => ({
       queryKey: daemonQueryKey(d),
       queryFn: () => api.getConfig(targetOf(d)),
       retry: false,
       staleTime: 0,
+      refetchInterval: pollWhileApplying("d:" + d.id),
     })),
   });
 
@@ -146,6 +178,7 @@ function ConfigDialogBody() {
         loading: false,
         queryKey: UI_QUERY_KEY,
         save: putUiServerConfig,
+        apply: applyUiServerConfig,
       });
     }
     connected.forEach((d, i) => {
@@ -160,6 +193,7 @@ function ConfigDialogBody() {
         loading: !!q?.isLoading,
         queryKey: daemonQueryKey(d),
         save: (body) => api.putConfig(targetOf(d), body),
+        apply: () => api.applyConfig(targetOf(d)),
       });
     });
     return out;
@@ -242,38 +276,61 @@ function ConfigDialogBody() {
     return e ? t(`config.err.${e.code}`) : null;
   };
 
-  const save = async () => {
+  /** Run scripts/start.sh on the host now, then follow it through its restart. */
+  const runApply = async (h: HostEntry) => {
+    setErr(null);
+    setConflict(false);
+    try {
+      const { apply } = await h.apply();
+      const since = apply?.started_at ?? Math.floor(Date.now() / 1000);
+      setApplying((prev) => ({ ...prev, [h.key]: since }));
+      qc.setQueryData(h.queryKey, (v: ConfigView | null | undefined) => (v ? { ...v, apply } : v));
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  // An apply this dialog started is over once its host reports a finished run
+  // that began no earlier than it did.
+  useEffect(() => {
+    for (const h of hosts) {
+      const since = applying[h.key];
+      const a = h.view?.apply;
+      if (since === undefined || !a || a.started_at < since || a.state === "running") continue;
+      setApplying((prev) => without(prev, h.key));
+      if (a.state === "ok") setNotice(t("config.applied", { host: hostName(h) }));
+      // The daemon twin of a merged entry reads the same file.
+      qc.invalidateQueries({ queryKey: ["startup-config"] });
+    }
+  }, [hosts, applying]);
+
+  const save = async (andApply: boolean) => {
     if (!selected || !view || !draft) return;
+    const host = selected;
     setBusy(true);
     setErr(null);
     setConflict(false);
     setNotice(null);
     try {
-      const next = await selected.save({ revision: view.revision, values: changes(view, draft) });
-      qc.setQueryData(selected.queryKey, next);
+      const next = await host.save({ revision: view.revision, values: changes(view, draft) });
+      qc.setQueryData(host.queryKey, next);
       // A merged entry's daemon twin reads the same file; refresh it too.
       qc.invalidateQueries({ queryKey: ["startup-config"] });
-      setDrafts((prev) => {
-        const rest = { ...prev };
-        delete rest[selected.key];
-        return rest;
-      });
-      setNotice(t("config.saved", { host: hostName(selected) }));
+      setDrafts((prev) => without(prev, host.key));
+      setNotice(t("config.saved", { host: hostName(host) }));
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
       setConflict((e as { status?: number }).status === 409);
-    } finally {
       setBusy(false);
+      return;
     }
+    if (andApply) await runApply(host);
+    setBusy(false);
   };
 
   const reload = () => {
     if (!selected) return;
-    setDrafts((prev) => {
-      const rest = { ...prev };
-      delete rest[selected.key];
-      return rest;
-    });
+    setDrafts((prev) => without(prev, selected.key));
     setErr(null);
     setConflict(false);
     qc.invalidateQueries({ queryKey: selected.queryKey });
@@ -281,6 +338,9 @@ function ConfigDialogBody() {
 
   const stillLoading = uiQ.isLoading || daemonQs.some((q) => q.isLoading);
   const dirty = selected ? isDirty(selected) : false;
+  const isApplying = (h: HostEntry) => applying[h.key] !== undefined || h.view?.apply?.state === "running";
+  const canApply = !!view?.can_apply;
+  const selectedApplying = !!selected && isApplying(selected);
 
   return (
     <div className="modal-backdrop" onClick={close}>
@@ -320,6 +380,7 @@ function ConfigDialogBody() {
                   <span className="config-host-tags">
                     {isDirty(h) && <span className="config-tag warn-tag">{t("config.unsaved")}</span>}
                     {!!h.view?.pending?.length && <span className="config-tag">{t("config.pendingTag")}</span>}
+                    {isApplying(h) && <span className="config-tag">{t("config.applyingTag")}</span>}
                     {!h.view && !h.loading && <span className="config-tag">{t("config.unavailableTag")}</span>}
                   </span>
                 </button>
@@ -349,6 +410,8 @@ function ConfigDialogBody() {
                       update={update}
                       setSecret={setSecret}
                       errorFor={errorFor}
+                      applying={selectedApplying}
+                      onApply={() => runApply(selected)}
                     />
                   )
                 )}
@@ -375,11 +438,21 @@ function ConfigDialogBody() {
           </button>
           {view && (
             <button
-              className="btn primary"
+              className={"btn" + (canApply ? "" : " primary")}
               disabled={busy || !dirty || errors.length > 0}
-              onClick={save}
+              onClick={() => save(false)}
             >
               {busy ? t("config.saving") : t("config.save")}
+            </button>
+          )}
+          {view && canApply && (
+            <button
+              className="btn primary"
+              disabled={busy || !dirty || errors.length > 0 || selectedApplying}
+              onClick={() => save(true)}
+              title={t("config.saveApplyTitle")}
+            >
+              {t("config.saveApply")}
             </button>
           )}
         </div>
@@ -395,12 +468,15 @@ interface FormProps {
   update: (patch: Partial<Record<ConfigKey, string>>) => void;
   setSecret: (key: ConfigKey, value: string | null) => void;
   errorFor: (key: ConfigKey) => string | null;
+  /** An apply is running on this host (possibly mid-restart). */
+  applying: boolean;
+  onApply: () => void;
 }
 
 /** Settings edited through a labelled field (the component switches are cards). */
 type FieldKey = Exclude<ConfigKey, ComponentKey>;
 
-function ConfigForm({ entry, view, draft, update, setSecret, errorFor }: FormProps) {
+function ConfigForm({ entry, view, draft, update, setSecret, errorFor, applying, onApply }: FormProps) {
   const { t } = useTranslation();
   const v = draft.values;
   const daemon = componentOn(v, "ASM_RUN_DAEMON");
@@ -469,6 +545,8 @@ function ConfigForm({ entry, view, draft, update, setSecret, errorFor }: FormPro
   }
 
   const pending = view.pending ?? [];
+  const canApply = !!view.can_apply;
+  const lastApply = view.apply;
 
   return (
     <div className="config-form">
@@ -479,13 +557,49 @@ function ConfigForm({ entry, view, draft, update, setSecret, errorFor }: FormPro
       {view.source === "ui" && view.managed === false && (
         <div className="conn-callout">{t("config.notManaged")}</div>
       )}
-      {pending.length > 0 && (
-        <div className="conn-callout config-pending">
-          {t("config.pending", {
-            count: pending.length,
-            keys: pending.map((k) => t(`config.field.${k}`)).join(", "),
-          })}
+      {applying ? (
+        <div className="conn-callout config-applying" role="status">
+          {t("config.applying")}
+          {servesPage && <> {t("config.applyingReload")}</>}
         </div>
+      ) : (
+        <>
+          {lastApply?.state === "failed" && (
+            <div className="conn-callout config-apply-failed" role="alert">
+              <div className="config-apply-row">
+                <span>
+                  {lastApply.exit_code === null
+                    ? t("config.applyInterrupted")
+                    : t("config.applyFailed", { code: lastApply.exit_code })}
+                </span>
+                {canApply && (
+                  <button type="button" className="btn tiny" onClick={onApply}>
+                    {t("config.applyAgain")}
+                  </button>
+                )}
+              </div>
+              {lastApply.log_tail && <pre className="config-log">{lastApply.log_tail}</pre>}
+            </div>
+          )}
+          {pending.length > 0 && (
+            <div className="conn-callout config-pending">
+              <div className="config-apply-row">
+                <span>
+                  {t("config.pending", {
+                    count: pending.length,
+                    keys: pending.map((k) => t(`config.field.${k}`)).join(", "),
+                  })}{" "}
+                  {!canApply && t("config.pendingRun", { count: pending.length })}
+                </span>
+                {canApply && lastApply?.state !== "failed" && (
+                  <button type="button" className="btn tiny primary" onClick={onApply}>
+                    {t("config.applyNow")}
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+        </>
       )}
 
       <div className="conn-add-step config-step">{t("config.componentsLabel")}</div>
@@ -580,7 +694,13 @@ function ConfigForm({ entry, view, draft, update, setSecret, errorFor }: FormPro
           {w}
         </div>
       ))}
-      <div className="conn-hint dim small">{t("config.applyHint")}</div>
+      <div className="conn-hint dim small">
+        {canApply
+          ? t("config.applyHint")
+          : t("config.applyHintManual", {
+              what: view.source === "ui" ? t("config.whatUi") : t("config.whatDaemon"),
+            })}
+      </div>
     </div>
   );
 }

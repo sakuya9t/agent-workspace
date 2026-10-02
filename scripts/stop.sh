@@ -38,7 +38,7 @@ case "$what" in
     stop_one asmux "$ASMUX_PIDFILE"
     stop_one asm-relay "$RELAY_PIDFILE"; rm -f "$RELAY_STATE_FILE"
     # Nothing runs any more, so nothing is "applied" either.
-    rm -f "$ASM_APPLIED_FILE"
+    rm -f "$ASM_APPLIED_FILE" "$ASM_RUNTIME_DIR/startup.apply"
     ;;
   *) usage; exit 2 ;;
 esac

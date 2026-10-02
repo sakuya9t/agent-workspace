@@ -1028,6 +1028,38 @@ body.col-resizing iframe {
   border-left-color: #ff9e64;
   color: var(--text);
 }
+.config-apply-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.config-apply-row .btn {
+  flex: none;
+}
+.config-applying {
+  border-left-color: var(--accent);
+  color: var(--text);
+}
+.config-apply-failed {
+  border-left-color: #f7768e;
+  color: var(--text);
+}
+.config-log {
+  max-height: 220px;
+  margin: 8px 0 0;
+  padding: 8px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .config-step {
   margin-top: 12px;
 }

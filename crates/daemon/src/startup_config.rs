@@ -29,6 +29,11 @@ use std::path::{Path, PathBuf};
 
 pub const FILE_NAME: &str = "startup.conf";
 pub const APPLIED_FILE_NAME: &str = "startup.applied";
+/// `scripts/apply-config.sh`'s progress record, in the runtime dir.
+pub const APPLY_STATUS_FILE_NAME: &str = "startup.apply";
+/// Its output, under the data dir.
+pub const APPLY_LOG: &str = "logs/apply.log";
+pub const APPLY_SCRIPT: &str = "apply-config.sh";
 
 /// Every setting, in file order. Three independent components — the daemon
 /// (with its session holder), a bundled relay, and the managed web UI — each
@@ -312,6 +317,97 @@ pub fn validate(values: &Values) -> Result<(), InvalidSetting> {
     Ok(())
 }
 
+/// The last "apply now" of this install, as `apply-config.sh` records it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ApplyStatus {
+    /// `running`, `ok`, or `failed`.
+    pub state: String,
+    /// Unix seconds.
+    pub started_at: i64,
+    pub finished_at: Option<i64>,
+    pub exit_code: Option<i32>,
+    /// The end of the run's output, when it failed — what the dialog shows.
+    pub log_tail: Option<String>,
+}
+
+/// How long a `running` record without a live pid is believed. The launcher
+/// writes it before the script exists (pid 0), and some platforms cannot probe
+/// a pid at all.
+const APPLY_UNPROBED_GRACE_SECS: i64 = 30 * 60;
+
+fn pid_alive(pid: u32) -> Option<bool> {
+    if cfg!(target_os = "linux") {
+        Some(Path::new(&format!("/proc/{pid}")).exists())
+    } else {
+        None
+    }
+}
+
+/// Last `max_lines` of `text`, without terminal colour codes.
+fn tail_plain(text: &str, max_lines: usize) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    let lines: Vec<&str> = plain.lines().collect();
+    lines[lines.len().saturating_sub(max_lines)..].join("\n")
+}
+
+/// Read the apply record; `None` if this install never applied. A `running`
+/// record whose script is gone is reported as `failed` (it was killed).
+pub fn read_apply_status(runtime_dir: &Path, data_dir: &Path, now_secs: i64) -> Option<ApplyStatus> {
+    let text = std::fs::read_to_string(runtime_dir.join(APPLY_STATUS_FILE_NAME)).ok()?;
+    let mut fields = std::collections::HashMap::new();
+    for line in text.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            fields.insert(k.trim(), v.trim());
+        }
+    }
+    let num = |k: &str| fields.get(k).and_then(|v| v.parse::<i64>().ok());
+    let started_at = num("started").unwrap_or(0);
+    let mut status = ApplyStatus {
+        state: fields.get("state").copied().unwrap_or("failed").to_string(),
+        started_at,
+        finished_at: num("finished"),
+        exit_code: num("exit").map(|c| c as i32),
+        log_tail: None,
+    };
+    if status.state == "running" {
+        let pid = num("pid").unwrap_or(0);
+        let gone = match (pid > 0).then(|| pid_alive(pid as u32)).flatten() {
+            Some(alive) => !alive,
+            None => now_secs - started_at > APPLY_UNPROBED_GRACE_SECS,
+        };
+        if gone {
+            status.state = "failed".into();
+        }
+    }
+    if status.state == "failed" {
+        let log = std::fs::read_to_string(data_dir.join(APPLY_LOG)).unwrap_or_default();
+        status.log_tail = Some(tail_plain(&log, 40));
+    }
+    Some(status)
+}
+
+/// Record that an apply is starting, before the script exists — so a read
+/// straight after the request can never see the previous run's result.
+pub fn write_apply_started(runtime_dir: &Path, now_secs: i64) -> io::Result<()> {
+    write_atomic(
+        &runtime_dir.join(APPLY_STATUS_FILE_NAME),
+        &format!("state=running\npid=0\nstarted={now_secs}\n"),
+    )
+}
+
 /// Replace `path` atomically with owner-only permissions — it holds secrets.
 pub fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
     if let Some(dir) = path.parent() {
@@ -585,6 +681,47 @@ mod tests {
         // With the daemon off, a leftover registration (or relay key) is kept but unused.
         assert!(validate(&vals(&[register[0], ("ASM_RUN_DAEMON", "0")])).is_ok());
         assert!(validate(&vals(&[("ASM_RUN_RELAY", "0")])).is_ok());
+    }
+
+    #[test]
+    fn apply_status_is_read_back_and_a_dead_run_counts_as_failed() {
+        let dir = temp_dir();
+        let (runtime, data) = (dir.join("run"), dir.join("data"));
+        std::fs::create_dir_all(data.join("logs")).unwrap();
+        assert_eq!(read_apply_status(&runtime, &data, 100), None);
+
+        write_apply_started(&runtime, 100).unwrap();
+        let running = read_apply_status(&runtime, &data, 100).unwrap();
+        assert_eq!((running.state.as_str(), running.started_at), ("running", 100));
+
+        std::fs::write(
+            runtime.join(APPLY_STATUS_FILE_NAME),
+            "state=ok\npid=1\nstarted=100\nexit=0\nfinished=105\n",
+        )
+        .unwrap();
+        let ok = read_apply_status(&runtime, &data, 200).unwrap();
+        assert_eq!((ok.state.as_str(), ok.exit_code, ok.finished_at), ("ok", Some(0), Some(105)));
+        assert_eq!(ok.log_tail, None);
+
+        std::fs::write(data.join(APPLY_LOG), "\u{1b}[1;31m[asm]\u{1b}[0m invalid startup setting\n").unwrap();
+        std::fs::write(
+            runtime.join(APPLY_STATUS_FILE_NAME),
+            "state=failed\npid=1\nstarted=100\nexit=2\nfinished=101\n",
+        )
+        .unwrap();
+        let failed = read_apply_status(&runtime, &data, 200).unwrap();
+        assert_eq!(failed.log_tail.as_deref(), Some("[asm] invalid startup setting"));
+
+        if cfg!(target_os = "linux") {
+            // A pid that cannot exist: the run was killed mid-way.
+            std::fs::write(
+                runtime.join(APPLY_STATUS_FILE_NAME),
+                "state=running\npid=4194304999\nstarted=100\n",
+            )
+            .unwrap();
+            assert_eq!(read_apply_status(&runtime, &data, 101).unwrap().state, "failed");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

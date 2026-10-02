@@ -173,6 +173,45 @@ async function main() {
   check("…new token enrolls", (await enroll(TOKEN2)).ok);
   check("…old one no longer does", (await enroll(TOKEN1)).status === 401);
 
+  // ── "Save & apply": the daemon runs apply-config.sh and restarts itself ────
+  const pollApply = async () => {
+    let st = null;
+    for (let i = 0; i < 240; i++) {
+      try {
+        st = (await sb.api("/api/config")).apply;
+      } catch {
+        /* the daemon is restarting */
+      }
+      if (st && st.state !== "running") return st;
+      await sleep(500);
+    }
+    return st;
+  };
+  await putConfig({ ASM_NODE_LABEL: "applied-live" });
+  const beforeApply = pid("asm-daemon");
+  const started = await api("/api/config/apply", { method: "POST" });
+  check("POST /api/config/apply starts an apply", started.apply?.state === "running");
+  let st = await pollApply();
+  check("…which finishes ok", st?.state === "ok", JSON.stringify(st));
+  check("…having restarted the daemon with the saved label", (await health()).label === "applied-live" && pid("asm-daemon") !== beforeApply);
+  check("…holder untouched, nothing pending", pid("asmux") === holderPid && JSON.stringify((await api("/api/config")).pending) === "[]");
+  const s2 = await api(`/api/sessions/${session.id}`);
+  check("…live session survived", s2.session?.status === "running");
+
+  // A failing apply reports why — without echoing the secret it complains about.
+  const goodConf = readFileSync(conf, "utf8");
+  writeFileSync(conf, goodConf.replace(/^ASM_ENROLLMENT_TOKEN=.*$/m, "ASM_ENROLLMENT_TOKEN=has a space 0123456789"));
+  const steadyPid = pid("asm-daemon");
+  await api("/api/config/apply", { method: "POST" });
+  st = await pollApply();
+  check("a bad saved setting fails the apply", st?.state === "failed" && st.exit_code === 2, JSON.stringify(st?.state));
+  check(
+    "…its log tail names the setting but hides the value",
+    /invalid startup setting ASM_ENROLLMENT_TOKEN=\(hidden\)/.test(st?.log_tail ?? "") && !(st?.log_tail ?? "").includes("has a space"),
+  );
+  check("…and the running daemon is left alone", pid("asm-daemon") === steadyPid);
+  writeFileSync(conf, goodConf);
+
   // ── flags patch single settings ───────────────────────────────────────────
   r = run("start.sh", ["--label", "third"]);
   saved = parse(conf);

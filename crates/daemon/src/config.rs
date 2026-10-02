@@ -57,6 +57,10 @@ pub struct Config {
     /// Human label advertised to the relay and shown in clients
     /// (`ASM_NODE_LABEL`, default: hostname).
     pub node_label: String,
+    /// The repo's `scripts/` dir (`ASM_SCRIPTS_DIR`, set by `scripts/start.sh`).
+    /// With it the daemon can apply its saved startup config on request by
+    /// running `apply-config.sh`; without it (a hand-started daemon) it cannot.
+    pub scripts_dir: Option<PathBuf>,
     /// Enrollment token to use instead of the generated one
     /// (`ASM_ENROLLMENT_TOKEN`, from the saved startup config). Applied to the
     /// database at startup; unset keeps whatever token the database holds.
@@ -126,6 +130,7 @@ impl Config {
         let relay_key = env_nonempty("ASM_RELAY_KEY");
         let node_label = env_nonempty("ASM_NODE_LABEL").unwrap_or_else(hostname_label);
         let enrollment_token = env_nonempty("ASM_ENROLLMENT_TOKEN");
+        let scripts_dir = env_path("ASM_SCRIPTS_DIR").filter(|p| !p.as_os_str().is_empty());
         if let Some(token) = &enrollment_token {
             // The LAN's only gate to enrolling: refuse a weak one outright
             // rather than quietly running with it (or with the old one).
@@ -163,6 +168,7 @@ impl Config {
             relay_key,
             node_label,
             enrollment_token,
+            scripts_dir,
             relay_downstreams,
             relay_probe_interval,
         })

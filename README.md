@@ -105,7 +105,8 @@ Open Vite at `http://127.0.0.1:5273`. Use `--ui-host 0.0.0.0` to expose it on a
 trusted LAN. Settings are saved per install (`~/.local/share/asm/startup.conf`):
 flags change just what they name and stick, so later runs need no flags — and
 the web UI's **config** dialog edits the saved settings of the UI host and every
-connected daemon, applied on that host's next `start.sh`. The daemon, relay and
+connected daemon — **Save & apply** restarts just what changed on that host,
+live sessions intact. The daemon, relay and
 web UI are independent components: run any combination (`--no-daemon`,
 `--relay`, `--no-ui`, …). `--ui-only` runs that web gateway without a local daemon, holder,
 relay, or agent/SSH session layer; optionally point its same-origin proxy at a

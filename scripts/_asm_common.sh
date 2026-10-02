@@ -488,7 +488,11 @@ asm_configure() {
 
 # _bad KEY REASON — report an invalid resolved setting.
 _bad() {
-  err "invalid startup setting $1=${!1:-}: $2"
+  local shown="${!1:-}"
+  case "$1" in
+    ASM_ENROLLMENT_TOKEN|ASM_RELAY_KEY|ASM_RELAY_KEYS|ASM_UI_DAEMON_TOKEN) shown="(hidden)" ;;
+  esac
+  err "invalid startup setting $1=$shown: $2"
   err "  fix it with a flag (see --help), in the web UI's Config dialog, or in $ASM_CONFIG_FILE"
   return 2
 }
@@ -716,11 +720,12 @@ start_ui() {
   (
     cd "$ROOT/client"
     # ASM_UI_MANAGED tells the UI server's Config endpoint (vite.config-api.ts)
-    # that this start script owns it; it finds startup.conf via the inherited
-    # ASM_DATA_DIR / ASM_RUNTIME_DIR.
+    # that this start script owns it (and ASM_SCRIPTS_DIR where to find
+    # apply-config.sh); it finds startup.conf via the inherited ASM_DATA_DIR /
+    # ASM_RUNTIME_DIR.
     ASM_DAEMON="$(ui_daemon_url)" ASM_DAEMON_TOKEN="$(ui_proxy_token)" \
       ASM_CLIENT_HOST="$ASM_UI_HOST" ASM_CLIENT_ALLOWED_HOSTS="$ASM_UI_ALLOWED_HOSTS" \
-      ASM_UI_MANAGED=1 \
+      ASM_UI_MANAGED=1 ASM_SCRIPTS_DIR="$ROOT/scripts" \
       nohup "$UI_BIN" --host "$ASM_UI_HOST" --port "$ASM_UI_PORT" --strictPort \
       >>"$LOG_DIR/asm-ui.log" 2>&1 </dev/null &
     echo $! > "$UI_PIDFILE"
@@ -909,7 +914,9 @@ start_daemon() {
   fi
   [ -x "$DAEMON_BIN" ] || { err "missing $DAEMON_BIN — build first (cargo build -p asm-daemon)"; return 1; }
   log "starting asm-daemon (sidecar) on $ASM_BIND..."
-  ASM_BACKEND=sidecar ASM_ASMUX_AUTOSPAWN=0 \
+  # ASM_SCRIPTS_DIR lets the daemon run apply-config.sh for the Config dialog's
+  # "Save & apply" (POST /api/config/apply).
+  ASM_BACKEND=sidecar ASM_ASMUX_AUTOSPAWN=0 ASM_SCRIPTS_DIR="$ROOT/scripts" \
     nohup "$DAEMON_BIN" >>"$LOG_DIR/asm-daemon.log" 2>&1 </dev/null &
   echo $! > "$DAEMON_PIDFILE"
   daemon_reg_signature > "$DAEMON_STATE_FILE"

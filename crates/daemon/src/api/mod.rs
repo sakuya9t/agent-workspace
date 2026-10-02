@@ -56,6 +56,7 @@ pub fn router(state: AppState) -> Router {
             "/api/config",
             get(startup_config::get).put(startup_config::put),
         )
+        .route("/api/config/apply", post(startup_config::apply))
         .route("/api/fs/list", get(fs::list))
         .route("/api/fs/mkdir", post(fs::mkdir))
         .route("/api/plugins", get(list_plugins))
@@ -995,6 +996,10 @@ mod tests {
     use crate::util::now_millis;
 
     fn test_router() -> (axum::Router, std::path::PathBuf) {
+        test_router_with(None)
+    }
+
+    fn test_router_with(scripts_dir: Option<std::path::PathBuf>) -> (axum::Router, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("asm-api-{}", Uuid::new_v4()));
         let data_dir = dir.join("data");
         let config_dir = dir.join("config");
@@ -1017,6 +1022,7 @@ mod tests {
             relay_key: None,
             node_label: "test-node".into(),
             enrollment_token: None,
+            scripts_dir,
             relay_downstreams: vec![],
             relay_probe_interval: Duration::from_secs(5),
         };
@@ -1216,5 +1222,50 @@ mod tests {
 
         drop(app);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn apply_needs_the_scripts_and_runs_them_detached() {
+        // A hand-started daemon (no ASM_SCRIPTS_DIR) cannot restart itself.
+        let (app, dir) = test_router();
+        let refused = app.clone().oneshot(local("POST", "/api/config/apply", None)).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        let got = json(app.oneshot(local("GET", "/api/config", None)).await.unwrap()).await;
+        assert_eq!(got["can_apply"], false);
+        assert_eq!(got["apply"], Value::Null);
+        let _ = std::fs::remove_dir_all(dir);
+
+        // Started by the scripts: POST launches apply-config.sh (a stub here)
+        // with this install's dirs and answers before it finishes.
+        let scripts = std::env::temp_dir().join(format!("asm-scripts-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(
+            scripts.join(crate::startup_config::APPLY_SCRIPT),
+            "while [ $# -gt 0 ]; do case \"$1\" in --runtime-dir) r=$2 ;; esac; shift; done\n\
+             sleep 0.3\n\
+             printf 'state=ok\\npid=%s\\nstarted=1\\nexit=0\\nfinished=2\\n' $$ > \"$r/startup.apply\"\n",
+        )
+        .unwrap();
+        let (app, dir) = test_router_with(Some(scripts.clone()));
+        let started = app.clone().oneshot(local("POST", "/api/config/apply", None)).await.unwrap();
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+        assert_eq!(json(started).await["apply"]["state"], "running");
+        let again = app.clone().oneshot(local("POST", "/api/config/apply", None)).await.unwrap();
+        assert_eq!(again.status(), StatusCode::CONFLICT, "one apply at a time");
+
+        let mut state = String::new();
+        for _ in 0..50 {
+            let got = json(app.clone().oneshot(local("GET", "/api/config", None)).await.unwrap()).await;
+            assert_eq!(got["can_apply"], true);
+            state = got["apply"]["state"].as_str().unwrap_or("").to_string();
+            if state == "ok" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(state, "ok");
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(scripts);
     }
 }
