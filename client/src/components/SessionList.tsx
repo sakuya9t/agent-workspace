@@ -5,6 +5,7 @@ import { api, Session, SessionStatus, AttentionState, Workspace } from "../api";
 import { daemonLabel, Target, targetOf, useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
 import { useIsPhone } from "../useIsPhone";
+import { ConfigButton, ManageButton } from "./HostButtons";
 import { DaemonState, useDaemonPlugins, useDaemonStates } from "../useDaemons";
 import { canForkInto } from "./NewSessionDialog";
 import { StopSessionDialog } from "./StopSessionDialog";
@@ -55,8 +56,6 @@ export function SessionList() {
   const openNewWorkspace = useUiStore((s) => s.openNewWorkspace);
   const openBranchManager = useUiStore((s) => s.openBranchManager);
   const openFork = useUiStore((s) => s.openFork);
-  const setShowConnection = useUiStore((s) => s.setShowConnection);
-  const setShowConfig = useUiStore((s) => s.setShowConfig);
   // The desktop top bar carries its own config button; the phone header has no room.
   const isPhone = useIsPhone();
   const updateDaemon = useConnStore((s) => s.updateDaemon);
@@ -598,22 +597,8 @@ export function SessionList() {
       <div className="panel-header">
         <span>{t("sessionList.sessionsHeader")}</span>
         <div className="header-actions">
-          <button
-            className="btn tiny"
-            onClick={() => setShowConnection(true)}
-            title={t("sessionList.manageTitle")}
-          >
-            {t("sessionList.daemonsBtn")}
-          </button>
-          {isPhone && (
-            <button
-              className="btn tiny config-btn"
-              onClick={() => setShowConfig(true)}
-              title={t("app.configTitle")}
-            >
-              {t("app.config")}
-            </button>
-          )}
+          <ManageButton />
+          {isPhone && <ConfigButton />}
           <button className="btn primary" onClick={() => openNewSession(null, null)}>
             {t("sessionList.newBtn")}
           </button>

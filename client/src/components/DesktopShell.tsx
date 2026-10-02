@@ -12,6 +12,7 @@ import { RightPanel } from "./RightPanel";
 import { PanelResizer } from "./PanelResizer";
 import { UsageModal } from "./UsageModal";
 import { DeckModeLink } from "./DeckModeLink";
+import { ConfigButton, ManageButton } from "./HostButtons";
 
 /**
  * Desktop shell: the classic 3-pane workspace (session tree · terminal ·
@@ -20,8 +21,6 @@ import { DeckModeLink } from "./DeckModeLink";
  */
 export function DesktopShell() {
   const { t } = useTranslation();
-  const setShowConnection = useUiStore((s) => s.setShowConnection);
-  const setShowConfig = useUiStore((s) => s.setShowConfig);
   const leftWidth = useUiStore((s) => s.leftWidth);
   const rightWidth = useUiStore((s) => s.rightWidth);
   const setLeftWidth = useUiStore((s) => s.setLeftWidth);
@@ -58,20 +57,8 @@ export function DesktopShell() {
           <span className={"dot " + (reachable > 0 ? "ok" : "bad")} />
           {t("app.daemonSummary", { count: states.length, reachable, live: totalLive })}
           <DeckModeLink />
-          <button
-            className="btn tiny conn-btn"
-            onClick={() => setShowConnection(true)}
-            title={t("app.manageTitle")}
-          >
-            {t("app.manage")}
-          </button>
-          <button
-            className="btn tiny conn-btn config-btn"
-            onClick={() => setShowConfig(true)}
-            title={t("app.configTitle")}
-          >
-            {t("app.config")}
-          </button>
+          <ManageButton />
+          <ConfigButton />
         </div>
       </header>
 

@@ -61,6 +61,81 @@ body {
   background: #10201f;
   outline: none;
 }
+/* Icon-only buttons (manage, config) in the desktop top bar — matching the deck
+   switch beside them — and in the session list header. Their label shows as a
+   tip below on hover or keyboard focus: at once, unlike a native title, and
+   anchored right so it never runs off the viewport edge. Hover effects only
+   apply where a pointer can hover; on touch screens :hover sticks after a tap
+   and would leave the tip hanging. */
+.tip-icon-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 28px;
+  flex: none;
+  padding: 0;
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #0b0e14;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+.tip-icon-btn:focus-visible {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--panel-2);
+  outline: none;
+}
+.tip-icon-btn svg {
+  display: block;
+  width: 16px;
+  height: 16px;
+}
+.tip-icon-btn[data-tip]::after {
+  content: attr(data-tip);
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 20;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: normal;
+  line-height: 1.4;
+  text-transform: none;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(-2px);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+.tip-icon-btn:focus-visible::after {
+  opacity: 1;
+  transform: none;
+}
+@media (hover: hover) {
+  .tip-icon-btn:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: var(--panel-2);
+  }
+  .tip-icon-btn:hover::after {
+    opacity: 1;
+    transform: none;
+  }
+}
+/* Sized to the session list header's other controls (+ New). */
+.panel-header .tip-icon-btn {
+  width: 26px;
+  height: 24px;
+}
 .deck-link-icon {
   display: grid;
   grid-template-columns: repeat(3, 4px);
@@ -665,9 +740,6 @@ body.col-resizing iframe {
   letter-spacing: 0.4px;
 }
 
-.conn-btn {
-  margin-left: 10px;
-}
 .conn-current {
   margin-bottom: 10px;
 }
@@ -3584,6 +3656,16 @@ body.col-resizing iframe {
   .icon-btn {
     width: 36px;
     height: 32px;
+  }
+  /* Level with + New (36px), and a comfortable touch target. */
+  .tip-icon-btn,
+  .panel-header .tip-icon-btn {
+    width: 36px;
+    height: 36px;
+  }
+  .tip-icon-btn svg {
+    width: 18px;
+    height: 18px;
   }
   .session-row {
     padding: 12px;

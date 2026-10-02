@@ -118,6 +118,43 @@ async function main() {
   };
 
   check("config button in the top bar", await waitFor("!!document.querySelector('.topbar .config-btn')", 30000));
+  // manage + config are icon-only buttons whose label shows as a tip on hover
+  // or keyboard focus. Headless Chrome reports no hover-capable pointer (and CDP
+  // cannot emulate one), so the tip itself is exercised through keyboard focus
+  // — Tab from the deck switch — and the hover rule is checked in the CSSOM.
+  await evalJs("document.querySelector('.topbar .deck-mode-link').focus(); true");
+  for (const [cls, label] of [["manage-btn", "manage"], ["config-btn", "config"]]) {
+    const sel = `.topbar .${cls}`;
+    check(
+      `${label}: an svg icon, no visible text, labelled for tips and screen readers`,
+      await evalJs(`(() => { const b = document.querySelector('${sel}'); return !!b.querySelector('svg') &&
+        b.textContent.trim() === '' && b.getAttribute('aria-label') === '${label}' && b.dataset.tip === '${label}'; })()`),
+    );
+    const tipOpacity = `getComputedStyle(document.querySelector('${sel}'), '::after').opacity`;
+    check(`${label}: tip hidden until focused or hovered`, (await evalJs(tipOpacity)) === "0");
+    for (const type of ["keyDown", "keyUp"]) {
+      await S("Input.dispatchKeyEvent", { type, key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
+    }
+    await sleep(300);
+    check(
+      `${label}: keyboard focus shows the "${label}" tip`,
+      (await evalJs(`document.activeElement === document.querySelector('${sel}')`)) &&
+        (await evalJs(tipOpacity)) === "1" &&
+        (await evalJs(`getComputedStyle(document.querySelector('${sel}'), '::after').content`)) === `"${label}"`,
+    );
+  }
+  await evalJs("document.activeElement.blur(); true");
+  check(
+    "hover shows the tip only where a pointer can hover (no sticky tips after a tap)",
+    await evalJs(`[...document.styleSheets].some((sheet) => [...sheet.cssRules].some((rule) =>
+      rule instanceof CSSMediaRule && rule.conditionText === '(hover: hover)' &&
+      [...rule.cssRules].some((r) => r.selectorText === '.tip-icon-btn:hover::after' && r.style.opacity === '1')))`),
+  );
+  check(
+    "the session list header's manage is the same icon button",
+    await evalJs(`(() => { const b = document.querySelector('.sessions .panel-header .manage-btn');
+      return !!b && !!b.querySelector('svg') && b.textContent.trim() === '' && b.dataset.tip === 'manage'; })()`),
+  );
   check("dialog opens", await open());
   check(
     "two hosts: the UI server merged with daemon A, and daemon B",
@@ -266,8 +303,15 @@ async function main() {
 
   // ── mobile entry point ─────────────────────────────────────────────────────
   await S("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 2, mobile: true });
+
   await reload();
   check("phone: config button in the session list header", await waitFor("!!document.querySelector('.sessions .panel-header .config-btn')", 30000));
+  check(
+    "phone: manage + config are the same icon buttons, at least 32px to tap",
+    await evalJs(`['manage', 'config'].every((l) => { const b = document.querySelector('.sessions .panel-header .' + l + '-btn');
+      const r = b && b.getBoundingClientRect();
+      return !!b && !!b.querySelector('svg') && b.textContent.trim() === '' && b.getAttribute('aria-label') === l && r.height >= 32 && r.width >= 32; })`),
+  );
   check(
     "…fully on screen",
     await evalJs("(() => { const r = document.querySelector('.sessions .panel-header .config-btn').getBoundingClientRect(); return r.left >= 0 && r.right <= window.innerWidth; })()"),
