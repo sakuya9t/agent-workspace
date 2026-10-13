@@ -503,6 +503,13 @@ impl SessionManager {
     /// [`shutdown_all_live`](Self::shutdown_all_live)): it tears live sessions
     /// down unconditionally, which is correct — the process is going away either
     /// way, and refusing would leak children.
+    ///
+    /// Stop is also the one way out of `indeterminate`. Nothing else ever moves
+    /// a session out of that status (reconcile only revisits `starting`/
+    /// `running` rows), and archive refuses it, so without this an
+    /// indeterminate session sat in history forever. Stopping one kills
+    /// whatever the holder may still run under its id and records `stopped`:
+    /// the user, having checked the preserved output, decides it is over.
     pub fn stop_session(&self, id: &str, force: bool) -> Result<Session> {
         if !force {
             if let Some(s) = self.db.get_session(id)? {
@@ -532,10 +539,17 @@ impl SessionManager {
                     .db
                     .get_session(id)?
                     .ok_or_else(|| anyhow!("no such session"))?;
-                if !s.status.is_terminal() {
-                    // Not live and not terminal: reconcile to stopped.
-                    self.db
-                        .update_status(id, SessionStatus::Stopped, None, now_millis())?;
+                if !s.status.is_definitively_ended() {
+                    // No handle, yet not known to be over (`indeterminate`, or a
+                    // live row we hold no handle for). Stop means stop: end
+                    // anything the holder still runs under this id, then record
+                    // it as a deliberate stop. That includes dropping the
+                    // indeterminate advisory badge, as the monitor does for a
+                    // user-ended session.
+                    self.backend.kill_detached(id);
+                    let now = now_millis();
+                    self.db.update_status(id, SessionStatus::Stopped, None, now)?;
+                    self.db.set_attention(id, AttentionState::None, None, now)?;
                 }
             }
         }
@@ -1251,6 +1265,8 @@ mod tests {
         /// Make `create()` fail — the last thing that can go wrong after a
         /// worktree has already been built for the session.
         create_fails: bool,
+        /// Records `kill_detached` ids: holder kills issued without a handle.
+        detached_kills: Arc<Mutex<Vec<String>>>,
     }
 
     impl SessionBackend for MockBackend {
@@ -1292,6 +1308,9 @@ mod tests {
             self.end_calls
                 .lock()
                 .push((id.to_string(), kind.to_string()));
+        }
+        fn kill_detached(&self, id: &str) {
+            self.detached_kills.lock().push(id.to_string());
         }
     }
 
@@ -1646,6 +1665,52 @@ mod tests {
         let sh = manager.get_session("s-absent-shell").unwrap().unwrap();
         assert_eq!(sh.status, SessionStatus::Indeterminate);
         assert_eq!(sh.attention_state, AttentionState::None, "shells carry no badge");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Reconcile only revisits `starting`/`running` rows and archive refuses
+    /// `indeterminate`, so before stop handled it an indeterminate session could
+    /// never leave history (seen live: six rows stranded by one holder restart).
+    /// Stopping one is the user's call that it is over: it kills anything the
+    /// holder still runs under the id (adopt may have failed on a session the
+    /// holder still had alive), records `stopped`, and drops the advisory badge.
+    #[tokio::test]
+    async fn stopping_an_indeterminate_session_resolves_it() {
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            ..Default::default()
+        });
+        let kills = backend.detached_kills.clone();
+        let (manager, dir) = test_manager_with(backend);
+        insert_running_agent(&manager.db, "s-lost", "claude");
+        manager.startup_reconcile().unwrap();
+        let s = manager.get_session("s-lost").unwrap().unwrap();
+        assert_eq!(s.status, SessionStatus::Indeterminate);
+        assert_eq!(s.attention_state, AttentionState::LikelyBlocked);
+
+        // The advisory badge reads as "blocked", but there is no turn in flight
+        // to protect — the stop needs no force.
+        let s = manager.stop_session("s-lost", false).unwrap();
+        assert_eq!(s.status, SessionStatus::Stopped);
+        assert_eq!(s.attention_state, AttentionState::None);
+        assert_eq!(s.attention_reason, None);
+        assert_eq!(kills.lock().as_slice(), ["s-lost".to_string()]);
+
+        // Now definitively ended, and nothing reconciles it back.
+        manager.startup_reconcile().unwrap();
+        assert_eq!(
+            manager.get_session("s-lost").unwrap().unwrap().status,
+            SessionStatus::Stopped
+        );
+        assert_eq!(
+            manager.archive_session("s-lost", false).unwrap().status,
+            SessionStatus::Archived
+        );
+
+        // An already-ended session is left alone: no second kill, no rewrite.
+        let s = manager.stop_session("s-lost", false).unwrap();
+        assert_eq!(s.status, SessionStatus::Archived);
+        assert_eq!(kills.lock().len(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2127,9 +2192,10 @@ mod tests {
     /// An `indeterminate` session is unattachable but **not** known to be over —
     /// its holder died without a completion record, so the process may still be
     /// running as an orphan in its worktree. Every destructive path must refuse
-    /// it, which is what the client already assumes: `isTerminal` in
-    /// `client/src/status.ts` excludes `indeterminate`, so the UI offers neither
-    /// archive nor worktree cleanup. Before this, a direct API call did both.
+    /// it, matching `isTerminal` in `client/src/status.ts`, which excludes
+    /// `indeterminate`. Before this, a direct API call did both. The way out is
+    /// the user's explicit stop — the same call the client makes before
+    /// archiving one.
     #[tokio::test]
     async fn indeterminate_is_not_a_licence_to_discard_work() {
         let (manager, dir) = test_manager();
@@ -2182,11 +2248,12 @@ mod tests {
             SessionStatus::Indeterminate
         );
 
-        // Resolving the outcome unblocks all three.
-        manager
-            .db
-            .update_status(&s.id, SessionStatus::Stopped, None, now_millis())
-            .unwrap();
+        // Resolving the outcome — by stopping it, the only transition out of
+        // `indeterminate` — unblocks them.
+        assert_eq!(
+            manager.stop_session(&s.id, false).unwrap().status,
+            SessionStatus::Stopped
+        );
         assert_eq!(
             manager.archive_session(&s.id, true).unwrap().status,
             SessionStatus::Archived

@@ -72,10 +72,12 @@ impl SessionStatus {
     /// session lost its completion record when the holder died — the process may
     /// have finished, or may still be running as an orphan writing to that very
     /// worktree. Authorizing destruction on "not attachable" would delete a live
-    /// agent's branch. The client already draws this line (`isTerminal` in
-    /// `client/src/status.ts` excludes `indeterminate`, so the UI offers neither
-    /// archive nor cleanup); before this predicate existed, a direct API call
-    /// could do exactly what the UI called unsafe.
+    /// agent's branch. The client draws the same line (`isTerminal` in
+    /// `client/src/status.ts` excludes `indeterminate`); before this predicate
+    /// existed, a direct API call could do exactly what the UI called unsafe.
+    /// The way out is an explicit user decision, not a wider predicate: stopping
+    /// an indeterminate session (`stop_session`) records it `stopped`, and only
+    /// then may it be archived.
     ///
     /// RF-LIFE replaces both booleans with named per-transition capabilities;
     /// until then, use this one for anything destructive.

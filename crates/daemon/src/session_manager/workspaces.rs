@@ -633,7 +633,8 @@ impl SessionManager {
                 bail!(
                     "cannot archive a session whose outcome is unknown: its holder \
                      exited without a completion record, so the process may still be \
-                     running in this worktree. Stop it first."
+                     running in this worktree. Check its preserved output, then stop \
+                     it to mark it over before archiving."
                 );
             }
             bail!("cannot archive a live session; stop it first");

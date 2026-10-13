@@ -266,7 +266,12 @@ An `indeterminate` session carries an advisory:
 
 The two-tier recovery is what makes "check the preserved output" actionable: the
 SQLite cold tier (and the best-effort ring flush) hold the last-known screen and
-recent bytes to inspect. Normal `kill`/exit paths never get this marker — they
+recent bytes to inspect. Having checked, the user resolves it: **stop** on an
+`indeterminate` session kills anything the holder still runs under its id and
+records `stopped`. That is the only transition out — reconcile never revisits
+it, and archive refuses it — so the client's Archive button on such a row
+confirms with the advisory, then stops and archives
+(`scripts/indeterminate-archive-test.mjs`). Normal `kill`/exit paths never get this marker — they
 have a record. This adds one value to the daemon-side `SessionStatus` vocabulary
 (`starting/running/exited/failed/stopped/archived` **+ `indeterminate`**) with a
 matching UI treatment.

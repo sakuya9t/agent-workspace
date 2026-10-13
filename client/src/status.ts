@@ -8,8 +8,9 @@ import { AttentionState, SessionStatus } from "./api";
 // **neither** live nor terminal. It marks a session the daemon lost track of
 // across a restart/reconnect — the backing process may still be alive, so we
 // can't treat it as running (no input, no stop button) but we also can't treat
-// it as finished (no ended-summary, no worktree cleanup) until adoption
-// resolves it back to a live or terminal status.
+// it as finished (no ended-summary, no worktree cleanup). Adoption never
+// revisits it, so the only way out is the user deciding it is over: archiving
+// one stops it first, which the daemon records as `stopped`.
 
 /** Actively attached, or coming up. Accepts terminal input. */
 export function isLive(status: SessionStatus): boolean {

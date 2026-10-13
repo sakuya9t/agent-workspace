@@ -98,8 +98,14 @@ export function SessionList() {
   // is already confirmed; this second prompt is the escalation — the daemon
   // guards uncommitted/unmerged work with a 409, so name what would be lost and
   // retry with force only if the user still wants it gone.
+  //
+  // An `indeterminate` session (its holder died mid-run, outcome unknown) is
+  // never archivable as-is — the daemon refuses, since its process might still
+  // be running in the worktree. The user's confirm is the decision that it is
+  // over, and stopping it is how the daemon records that, so stop first.
   const archive = useMutation({
-    mutationFn: async ({ target, id }: MutArgs) => {
+    mutationFn: async ({ target, id, indeterminate }: MutArgs & { indeterminate: boolean }) => {
+      if (indeterminate) await api.stopSession(target, id);
       try {
         return await api.archiveSession(target, id);
       } catch (e) {
@@ -372,8 +378,12 @@ export function SessionList() {
               aria-label={t("sessionList.archiveTitle")}
               onClick={(e) => {
                 e.stopPropagation();
-                if (confirm(t("sessionList.confirmArchive", { name }))) {
-                  archive.mutate({ target, id: s.id });
+                const indeterminate = s.status === "indeterminate";
+                const prompt = indeterminate
+                  ? t("sessionList.confirmArchiveIndeterminate", { name })
+                  : t("sessionList.confirmArchive", { name });
+                if (confirm(prompt)) {
+                  archive.mutate({ target, id: s.id, indeterminate });
                 }
               }}
             >

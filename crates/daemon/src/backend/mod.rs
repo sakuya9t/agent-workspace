@@ -467,6 +467,13 @@ pub trait SessionBackend: Send + Sync {
     /// the holder is no longer running it (an exit missed while detached, or the
     /// holder was lost). No-op for backends that don't outlive the daemon.
     fn end_session_stream(&self, _id: &str, _outcome: StreamEnd) {}
+
+    /// Terminate whatever the holder may still be running under `id` when the
+    /// daemon holds no handle for it — an `indeterminate` row whose adopt
+    /// failed while the holder still had it alive. Fire-and-forget and
+    /// idempotent: an id the holder doesn't know is a no-op. No-op for backends
+    /// that don't outlive the daemon (their sessions die with it).
+    fn kill_detached(&self, _id: &str) {}
 }
 
 /// A single live session owned by a backend.

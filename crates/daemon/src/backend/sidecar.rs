@@ -176,6 +176,12 @@ impl SessionBackend for SidecarBackend {
         Ok(session.map(|s| s as Arc<dyn BackendSession>))
     }
 
+    fn kill_detached(&self, id: &str) {
+        // 0 => platform default terminate, as `stop()`; the holder ignores an
+        // unknown id.
+        self.client.kill(id, 0);
+    }
+
     fn end_session_stream(&self, id: &str, outcome: StreamEnd) {
         match outcome {
             // Drive the normal exit path through the drain (the monitor writes
