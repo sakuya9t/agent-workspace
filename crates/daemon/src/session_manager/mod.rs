@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
@@ -36,6 +36,7 @@ use crate::db::Db;
 use crate::domain::{
     AttentionState, Session, SessionStatus, SessionSummary, Workspace, WorkspaceInstance,
 };
+use crate::host_boot::BootInfo;
 use crate::plugins::usage::TranscriptContext;
 use crate::plugins::{attention, AgentContext, AgentPlugin, PluginRegistry};
 use crate::util::now_millis;
@@ -43,6 +44,7 @@ use crate::workspace;
 
 mod fork;
 mod monitor;
+mod resume;
 mod workspace_instructions;
 mod workspaces;
 
@@ -187,6 +189,10 @@ pub struct SessionManager {
     /// `false` until the startup reconcile pass has finished. See
     /// [`Self::wait_until_ready`].
     ready_tx: watch::Sender<bool>,
+    /// The host boot this daemon runs in. Stamped on every session whose
+    /// process starts, so a later boot can tell that process is gone (see
+    /// `resume.rs`).
+    boot: BootInfo,
 }
 
 impl SessionManager {
@@ -205,6 +211,18 @@ impl SessionManager {
             interactions: Mutex::new(HashMap::new()),
             reconcile_pass: Mutex::new(()),
             ready_tx: watch::channel(false).0,
+            boot: BootInfo::current().clone(),
+        }
+    }
+
+    /// Record that `id`'s process runs in this boot. Best-effort: without the
+    /// stamp a later boot cannot prove the process gone, and the session falls
+    /// back to `indeterminate` — today's behavior, not a failure.
+    fn stamp_boot(&self, id: &str) {
+        if let Some(boot) = &self.boot.id {
+            if let Err(e) = self.db.set_boot_id(id, boot) {
+                tracing::warn!(session = %id, "could not record the host boot: {e:#}");
+            }
         }
     }
 
@@ -424,6 +442,7 @@ impl SessionManager {
         };
 
         self.live.lock().insert(id.clone(), handle.clone());
+        self.stamp_boot(&id);
         self.db
             .update_status(&id, SessionStatus::Running, None, now_millis())?;
 
@@ -646,7 +665,9 @@ impl SessionManager {
     /// - Out-of-process holder: adopt-or-reconcile against `holder_list()` —
     ///   alive in the holder → **adopt** (re-attach, mark `running`); a real exit
     ///   record → `exited`/`failed`; absent from the holder → **`indeterminate`**
-    ///   (the holder itself died, so no completion record exists).
+    ///   (the holder itself died, so no completion record exists). Then every
+    ///   `indeterminate` session whose process provably died with an earlier
+    ///   boot of the host is **relaunched in place** (`resume.rs`).
     ///
     /// Blocking (holder RPCs); [`Self::spawn_startup_reconcile`] is how the
     /// daemon runs it.
@@ -676,7 +697,9 @@ impl SessionManager {
                 return Ok(());
             }
         };
-        self.reconcile_from_holder(holder)
+        let in_holder: HashSet<String> = holder.iter().map(|h| h.id.clone()).collect();
+        self.reconcile_from_holder(holder)?;
+        self.resume_lost_sessions(&in_holder)
     }
 
     /// Repair duplicates produced by the old Codex matcher, which fell back to
@@ -815,6 +838,9 @@ impl SessionManager {
                     match self.backend.adopt(&id, sess.rows, sess.cols) {
                         Ok(Some(handle)) => {
                             self.live.lock().insert(id.clone(), handle.clone());
+                            // Alive now, so it started in this boot. Also stamps
+                            // rows from before `boot_id` existed.
+                            self.stamp_boot(&id);
                             self.db
                                 .update_status(&id, SessionStatus::Running, None, now_millis())?;
                             self.clone().spawn_monitor(
@@ -1238,6 +1264,9 @@ mod tests {
         })
     }
 
+    /// One recorded `MockBackend::respawn`: the spec, and the banner it got.
+    type Respawn = (BackendSpawnSpec, Vec<u8>);
+
     /// A `SessionBackend` test double. `Default` is native-like — sessions die on
     /// shutdown and there is no holder. The holder knobs simulate an
     /// out-of-process asmux holder so the startup adopt/reconcile branches can be
@@ -1267,6 +1296,10 @@ mod tests {
         create_fails: bool,
         /// Records `kill_detached` ids: holder kills issued without a handle.
         detached_kills: Arc<Mutex<Vec<String>>>,
+        /// Records `respawn` calls: the spec and the banner it was given.
+        respawns: Arc<Mutex<Vec<Respawn>>>,
+        /// Make `respawn()` fail, as a full holder or a missing binary would.
+        respawn_fails: bool,
     }
 
     impl SessionBackend for MockBackend {
@@ -1312,6 +1345,17 @@ mod tests {
         fn kill_detached(&self, id: &str) {
             self.detached_kills.lock().push(id.to_string());
         }
+        fn respawn(
+            &self,
+            spec: BackendSpawnSpec,
+            banner: &[u8],
+        ) -> Result<Arc<dyn BackendSession>> {
+            self.respawns.lock().push((spec, banner.to_vec()));
+            if self.respawn_fails {
+                bail!("mock respawn failure");
+            }
+            Ok(mock_session())
+        }
     }
 
     fn test_manager() -> (Arc<SessionManager>, PathBuf) {
@@ -1319,17 +1363,22 @@ mod tests {
     }
 
     fn test_manager_with(backend: Arc<dyn SessionBackend>) -> (Arc<SessionManager>, PathBuf) {
+        test_manager_booted(backend, BootInfo::current().clone())
+    }
+
+    /// A manager that believes the host is in `boot` — so a test can stage a
+    /// reboot by stamping its sessions with some other boot id.
+    fn test_manager_booted(
+        backend: Arc<dyn SessionBackend>,
+        boot: BootInfo,
+    ) -> (Arc<SessionManager>, PathBuf) {
         let dir = std::env::temp_dir().join(format!("asm-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = Db::open(&dir.join("test.sqlite3")).unwrap();
         let registry = Arc::new(PluginRegistry::with_builtins());
-        let manager = Arc::new(SessionManager::new(
-            db,
-            registry,
-            backend,
-            dir.join("worktrees"),
-        ));
-        (manager, dir)
+        let mut manager = SessionManager::new(db, registry, backend, dir.join("worktrees"));
+        manager.boot = boot;
+        (Arc::new(manager), dir)
     }
 
     /// Seed a session row already marked `running` (as if a prior daemon left it
@@ -1339,8 +1388,13 @@ mod tests {
     }
 
     fn insert_running_agent(db: &Db, id: &str, agent: &str) {
+        insert_with(db, id, agent, |_| {});
+    }
+
+    /// [`insert_running_agent`], with the row adjusted by `edit` first.
+    fn insert_with(db: &Db, id: &str, agent: &str, edit: impl FnOnce(&mut Session)) {
         let now = now_millis();
-        db.insert_session(&Session {
+        let mut session = Session {
             id: id.to_string(),
             agent_plugin_id: agent.into(),
             command: "sh".into(),
@@ -1362,8 +1416,9 @@ mod tests {
             agent_session_id: None,
             forked_from: None,
             state_since: now,
-        })
-        .unwrap();
+        };
+        edit(&mut session);
+        db.insert_session(&session).unwrap();
     }
 
     fn holder_entry(id: &str, alive: bool, exit_code: i32, exit_signal: i32) -> HolderEntry {
@@ -2842,6 +2897,204 @@ mod tests {
             "last session deletes the branch"
         );
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- Relaunch after a host restart (resume.rs) --------------------------
+
+    /// The boot every reboot test runs "after".
+    fn rebooted() -> BootInfo {
+        BootInfo {
+            id: Some("boot-after".into()),
+            started_at_ms: Some(now_millis() - 3_600_000),
+        }
+    }
+
+    /// A holder backend that has just come up empty — what a reboot leaves.
+    fn fresh_holder() -> Arc<MockBackend> {
+        Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn a_session_lost_to_a_reboot_comes_back_in_place() {
+        let backend = fresh_holder();
+        let (manager, dir) = test_manager_booted(backend.clone(), rebooted());
+        insert_running(&manager.db, "s-shell");
+        manager.db.set_boot_id("s-shell", "boot-before").unwrap();
+
+        manager.startup_reconcile().unwrap();
+
+        // Same id, live again, and nothing left of the indeterminate advisory.
+        let s = manager.get_session("s-shell").unwrap().unwrap();
+        assert_eq!(s.status, SessionStatus::Running);
+        assert_eq!(s.attention_state, AttentionState::None);
+        assert!(manager.live_handle("s-shell").is_some());
+
+        let calls = backend.respawns.lock();
+        assert_eq!(calls.len(), 1);
+        let (spec, banner) = &calls[0];
+        assert_eq!(spec.session_id, "s-shell");
+        assert_eq!(spec.cwd, s.working_directory);
+        assert!(String::from_utf8_lossy(banner).contains("host restarted"));
+
+        // Restamped: the next restart in this boot adopts it, never relaunches it.
+        assert_eq!(
+            manager.db.get_boot_id("s-shell").unwrap().as_deref(),
+            Some("boot-after")
+        );
+        // The row records the line that is running now.
+        assert_eq!(s.command, spec.command);
+        assert_eq!(s.args, spec.args);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The holder died but the host did not: its children may still be running
+    /// in the worktree, so a relaunch could put two agents in one directory.
+    #[tokio::test]
+    async fn a_holder_lost_in_the_same_boot_is_not_relaunched() {
+        let backend = fresh_holder();
+        let (manager, dir) = test_manager_booted(backend.clone(), rebooted());
+        insert_running(&manager.db, "s-same-boot");
+        manager.db.set_boot_id("s-same-boot", "boot-after").unwrap();
+        // Unstamped and created after the boot: no proof either.
+        insert_running(&manager.db, "s-legacy-new");
+
+        manager.startup_reconcile().unwrap();
+
+        for id in ["s-same-boot", "s-legacy-new"] {
+            let s = manager.get_session(id).unwrap().unwrap();
+            assert_eq!(s.status, SessionStatus::Indeterminate, "{id}");
+        }
+        assert!(backend.respawns.lock().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Rows from before `boot_id` existed were spawned exactly once, at
+    /// `created_at`: created before this boot means gone. This is also how the
+    /// sessions already `indeterminate` when the daemon is upgraded come back.
+    #[tokio::test]
+    async fn an_unstamped_session_from_before_the_boot_is_relaunched() {
+        let backend = fresh_holder();
+        let (manager, dir) = test_manager_booted(backend.clone(), rebooted());
+        insert_with(&manager.db, "s-legacy", "shell", |s| {
+            s.status = SessionStatus::Indeterminate;
+            s.created_at = 1000;
+        });
+
+        manager.startup_reconcile().unwrap();
+
+        let s = manager.get_session("s-legacy").unwrap().unwrap();
+        assert_eq!(s.status, SessionStatus::Running);
+        assert_eq!(backend.respawns.lock().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A custom command acts the moment it starts, so it is never re-run
+    /// unattended — it stays indeterminate and says why.
+    #[tokio::test]
+    async fn a_custom_command_is_never_rerun_after_a_reboot() {
+        let backend = fresh_holder();
+        let (manager, dir) = test_manager_booted(backend.clone(), rebooted());
+        insert_running_agent(&manager.db, "s-custom", "custom_command");
+        manager.db.set_boot_id("s-custom", "boot-before").unwrap();
+
+        manager.startup_reconcile().unwrap();
+
+        let s = manager.get_session("s-custom").unwrap().unwrap();
+        assert_eq!(s.status, SessionStatus::Indeterminate);
+        assert!(
+            s.attention_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("never re-run unattended")),
+            "{:?}",
+            s.attention_reason
+        );
+        assert!(backend.respawns.lock().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Most reasons a relaunch fails pass (the binary isn't on PATH yet, the
+    /// holder is full), so the row is left exactly as it was and the next start
+    /// tries again.
+    #[tokio::test]
+    async fn a_failed_relaunch_is_retried_on_the_next_start() {
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            respawn_fails: true,
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_booted(backend.clone(), rebooted());
+        insert_running_agent(&manager.db, "s-flaky", "shell");
+        manager.db.set_boot_id("s-flaky", "boot-before").unwrap();
+        let before = manager.get_session("s-flaky").unwrap().unwrap();
+
+        manager.startup_reconcile().unwrap();
+        manager.startup_reconcile().unwrap();
+
+        let s = manager.get_session("s-flaky").unwrap().unwrap();
+        assert_eq!(s.status, SessionStatus::Indeterminate);
+        assert_eq!(s.args, before.args, "the old launch line is kept");
+        assert_eq!(
+            manager.db.get_boot_id("s-flaky").unwrap().as_deref(),
+            Some("boot-before"),
+            "still provably lost, so still a candidate"
+        );
+        assert_eq!(backend.respawns.lock().len(), 2, "tried on both starts");
+        assert!(manager.live_handle("s-flaky").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_directory_is_gone_is_not_relaunched() {
+        let backend = fresh_holder();
+        let (manager, dir) = test_manager_booted(backend.clone(), rebooted());
+        insert_with(&manager.db, "s-gone", "claude", |s| {
+            s.working_directory = "/nonexistent/asm-test".into();
+        });
+        manager.db.set_boot_id("s-gone", "boot-before").unwrap();
+
+        manager.startup_reconcile().unwrap();
+
+        let s = manager.get_session("s-gone").unwrap().unwrap();
+        assert_eq!(s.status, SessionStatus::Indeterminate);
+        assert!(s
+            .attention_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("working directory")));
+        assert!(backend.respawns.lock().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An agent with a recorded conversation is relaunched onto it — natively,
+    /// not forked, and with the flags it was started with.
+    #[tokio::test]
+    async fn an_agent_resumes_its_own_conversation_with_its_flags() {
+        if crate::plugins::builtin::ClaudePlugin.detect_binary().is_none() {
+            return; // building the launch line needs the binary
+        }
+        let backend = fresh_holder();
+        let (manager, dir) = test_manager_booted(backend.clone(), rebooted());
+        insert_with(&manager.db, "s-claude", "claude", |s| {
+            s.args = ["--dangerously-skip-permissions", "--model", "opus"]
+                .map(String::from)
+                .to_vec();
+            s.agent_session_id = Some("conv-1".into());
+        });
+        manager.db.set_boot_id("s-claude", "boot-before").unwrap();
+
+        manager.startup_reconcile().unwrap();
+
+        let calls = backend.respawns.lock();
+        let (spec, banner) = &calls[0];
+        let resume = spec.args.iter().position(|a| a == "--resume").unwrap();
+        assert_eq!(spec.args[resume + 1], "conv-1");
+        assert!(spec.args.iter().any(|a| a == "--dangerously-skip-permissions"));
+        assert!(spec.args.windows(2).any(|w| w == ["--model", "opus"]));
+        assert!(!spec.args.iter().any(|a| a == "--fork-session"));
+        assert!(String::from_utf8_lossy(banner).contains("resumed the Claude Code conversation"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

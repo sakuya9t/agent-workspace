@@ -13,7 +13,10 @@ raw-history ring from the daemon's SQLite cold history, then
 `attach FromCursor(consumed)` for the un-drained tail, with a visible gap marker
 when the ring wrapped — so a session whose output outgrew the 2 MiB holder ring is
 reconstructed exactly after a restart (proven: the cold-stitch discriminator in
-`durable-restart-test.mjs`). Remaining: M4 **Stage C** (soft-reboot, `purge`,
+`durable-restart-test.mjs`). **Host reboot** no longer strands sessions: the ones
+it provably killed are relaunched in place at startup, resuming their agents'
+own conversations ([Host reboot: resume in place](#host-reboot-resume-in-place),
+`scripts/reboot-resume-test.mjs`). Remaining: M4 **Stage C** (soft-reboot, `purge`,
 metadata RPCs, `readBuffer`, orphan UI, periodic snapshot store) and M5 Windows.
 Adapts the "acmux" design (from the agent-conductor project) to this codebase.
 
@@ -54,7 +57,7 @@ ANSI-repaint snapshots live in the daemon. So:
 | owns | PTY master fd, child pid, **raw-byte cursor ring buffer**, k/v metadata | `vt100` parser, ANSI-repaint snapshots, SQLite event log, all lifecycle logic |
 | survives daemon restart? | **yes** | n/a |
 | survives its own crash? | no (that's why it must never panic) | yes |
-| survives host reboot? | no | records persist; live PTYs gone |
+| survives host reboot? | no | records persist; live PTYs gone → sessions relaunched in place |
 
 Crucially, **`vt100` stays in the daemon, not the sidecar.** A malformed escape
 that panics `vt100` must never take down the process holding everyone's PTYs
@@ -92,9 +95,11 @@ rather than one sidecar per session. The cost is bounded so a boom loses
 
 On daemon start: reconnect to asmux → `session.list` → match each live session
 against its SQLite row → **adopt** (see below); reconcile the rest. If asmux
-itself is gone (host reboot), live sessions are truly dead → reconcile to
-`indeterminate` (the mid-flight outcome is unknown, not a proven failure — see
-[Reconciliation states](#reconciliation-states)).
+itself is gone, live sessions reconcile to `indeterminate` (the mid-flight
+outcome is unknown, not a proven failure — see
+[Reconciliation states](#reconciliation-states)) — and if it went because the
+host rebooted, they are then relaunched in place
+([Host reboot](#host-reboot-resume-in-place)).
 
 ### Adoption runs *behind* the listener
 
@@ -243,7 +248,7 @@ the client terminal continues with zero flicker.
 | asmux crash | live PTYs lost → rows reconciled **`indeterminate`** (no completion record; outcome unknown), **but history + last screen preserved** (SQLite cold tier; best-effort ring flush) |
 | user stops a session | `session.kill`; ring kept as a tombstone (bounded, LRU-evicted) for late reads until `purge` |
 | soft-reboot (binary drift) | daemon detects `binary_sha256` mismatch, warns "restart loses sessions", user confirms → `SIGTERM` asmux → respawn |
-| host reboot | everything hot gone; live SQLite records reconcile to **`indeterminate`** |
+| host reboot | everything hot gone; live SQLite records reconcile to **`indeterminate`**, then each one the reboot provably killed is **relaunched in place** — same id, worktree and history; agents resume their own conversation ([Host reboot](#host-reboot-resume-in-place)) |
 
 ## Reconciliation states
 
@@ -276,6 +281,61 @@ have a record. This adds one value to the daemon-side `SessionStatus` vocabulary
 (`starting/running/exited/failed/stopped/archived` **+ `indeterminate`**) with a
 matching UI treatment.
 
+## Host reboot: resume in place
+
+A reboot is the one holder loss with a certain outcome: nothing from the previous
+boot is still running. So the sessions it took down are not left
+`indeterminate` — startup relaunches each one **in place**, under its own id, in
+its own worktree, with its terminal history intact
+(`crates/daemon/src/session_manager/resume.rs`).
+
+**The proof** is the kernel's per-boot random id
+(`/proc/sys/kernel/random/boot_id`), stamped on a session (`sessions.boot_id`,
+SCHEMA_V10) whenever its process starts — create, adopt and relaunch. A session
+stamped with another boot provably died with it. A row from before the column
+existed was spawned exactly once, at `created_at`, so it counts as dead when it
+was created more than a minute before this boot (`/proc/stat` `btime`); the
+margin absorbs wall-clock correction. Without proof — the holder crashed or was
+killed in *this* boot, or the platform has no boot id (non-Linux today) —
+nothing changes: the session stays `indeterminate`, because its children can
+outlive the holder and a relaunch would put a second agent in the same worktree.
+
+**The relaunch**, for each `indeterminate` session that is proven dead and that
+the (new) holder doesn't know:
+
+| Session | Relaunched as |
+| --- | --- |
+| claude / codex / pi with a captured conversation id | its own conversation, natively and **not forked** — `claude --resume <id>`, `codex -C <cwd> resume <id>`, `pi --session <id>` (`AgentPlugin::build_resume`) |
+| any other agent, a shell | a fresh launch in the same directory |
+| custom command | **not relaunched** — stays `indeterminate`, saying why |
+
+Options and an explicit model are read back from the persisted launch line, each
+matched by the exact argv its plugin emits (`AgentPlugin::option_args` /
+`model_args`), so a skip-permissions session comes back skip-permissions; the
+workspace instructions are re-applied as on create, and the row's launch line is
+replaced by the one now running. Nothing is sent to the relaunched process: an
+agent comes back showing its history and **waits**. That is the rule that
+excludes custom commands — starting one is itself an action.
+
+**The terminal continues** rather than restarting (`SessionBackend::respawn`):
+the emulator is seeded from cold history like an adopt, a banner is written and
+persisted after it (`[asm: the host restarted · resumed the … conversation]`,
+preceded by a mode reset — main screen, scroll region, mouse/paste reporting off
+— with the cursor kept below the old output), and new output is numbered past
+the last persisted event. `backend_cursor` is reset to 0: the new holder stream
+starts over, and the cursor only ever advances, so the dead holder's value would
+otherwise point a later adopt past the new stream's end.
+
+**Failure is retried.** A relaunch that fails (agent binary not on the daemon's
+`PATH` yet, holder full, worktree gone) leaves the row exactly as it was —
+`indeterminate`, still stamped with the old boot, with the reason as its
+advisory — so the next daemon start tries again.
+
+Proof: `scripts/reboot-resume-test.mjs` (stages a reboot by killing the holder
+and rewinding `boot_id`; shell, fake-`claude` and custom-command sessions; then a
+plain daemon restart must adopt the relaunched session with its history exactly
+once) and the `resume` / `startup_reconcile` unit tests.
+
 ## Startup / reconnect state machine
 
 ```
@@ -293,6 +353,9 @@ for row in live_rows:
         reconcile from exit_code (exited/failed)
     else:                                      # asmux has no record (crash/reboot)
         reconcile (indeterminate)              # no completion record -> outcome unknown
+for row in DB sessions in ('indeterminate') not in sidecar:
+    if row.boot_id is from an earlier boot:    # the reboot killed it: nothing to orphan
+        relaunch in place (resume its conversation, else fresh; never a custom command)
 for s in sidecar:
     if s has no owning DB row:  surface as orphan; owner adopts or kills
 # on ANY later reconnect (not just startup): re-run session.list to catch missed exits

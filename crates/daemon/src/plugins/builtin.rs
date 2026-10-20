@@ -153,8 +153,14 @@ impl AgentPlugin for CodexPlugin {
             default: false,
         }]
     }
+    fn option_args(&self, key: &str) -> Vec<String> {
+        match key {
+            "bypass_approvals" => vec!["--dangerously-bypass-approvals-and-sandbox".into()],
+            _ => Vec::new(),
+        }
+    }
     fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
-        cli_launch(self, ctx, "bypass_approvals", "--dangerously-bypass-approvals-and-sandbox")
+        cli_launch(self, ctx)
     }
     /// `codex -C <cwd> fork <id> <prompt>` — `fork` is a subcommand (after the
     /// global cwd override), so unlike Claude's flags it has to precede the
@@ -175,6 +181,23 @@ impl AgentPlugin for CodexPlugin {
                     env: ctx.extra_env.clone(),
                     requires_approval: false,
                 }
+            },
+        ))
+    }
+    /// `codex -C <cwd> resume <id>` — the same shape as [`build_fork`], minus the
+    /// seed: `resume` carries the conversation on under its own id.
+    fn build_resume(
+        &self,
+        ctx: &AgentContext,
+        native_id: &str,
+        cwd: &Path,
+    ) -> Option<Result<LaunchSpec>> {
+        Some(self.detect_binary().ok_or_else(|| anyhow!("`codex` binary not found in PATH")).map(
+            |command| LaunchSpec {
+                command,
+                args: codex_resume_args(ctx, native_id, cwd),
+                env: ctx.extra_env.clone(),
+                requires_approval: false,
             },
         ))
     }
@@ -294,8 +317,14 @@ impl AgentPlugin for ClaudePlugin {
             default: false,
         }]
     }
+    fn option_args(&self, key: &str) -> Vec<String> {
+        match key {
+            "skip_permissions" => vec!["--dangerously-skip-permissions".into()],
+            _ => Vec::new(),
+        }
+    }
     fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
-        cli_launch(self, ctx, "skip_permissions", "--dangerously-skip-permissions")
+        cli_launch(self, ctx)
     }
     /// `claude --resume <id> --fork-session <prompt>`. `--fork-session` is what
     /// keeps this a fork: it gives the new session its own id, so the origin's
@@ -313,15 +342,7 @@ impl AgentPlugin for ClaudePlugin {
     ) -> Option<Result<LaunchSpec>> {
         Some(self.detect_binary().ok_or_else(|| anyhow!("`claude` binary not found in PATH")).map(
             |command| {
-                let mut args = Vec::new();
-                if ctx.opt("skip_permissions") {
-                    args.push("--dangerously-skip-permissions".to_string());
-                }
-                if let Some(model) = ctx.model.as_deref() {
-                    args.extend(self.model_args(model));
-                }
-                args.push("--resume".to_string());
-                args.push(native_id.to_string());
+                let mut args = claude_resume_args(ctx, native_id);
                 args.push("--fork-session".to_string());
                 args.push(seed.to_string());
                 LaunchSpec {
@@ -330,6 +351,25 @@ impl AgentPlugin for ClaudePlugin {
                     env: ctx.extra_env.clone(),
                     requires_approval: false,
                 }
+            },
+        ))
+    }
+    /// `claude --resume <id>`: without `--fork-session` Claude keeps the
+    /// conversation's own id and appends to its transcript. Like a fork, this
+    /// only finds the conversation from the session's own directory — which an
+    /// in-place resume is, by definition.
+    fn build_resume(
+        &self,
+        ctx: &AgentContext,
+        native_id: &str,
+        _cwd: &Path,
+    ) -> Option<Result<LaunchSpec>> {
+        Some(self.detect_binary().ok_or_else(|| anyhow!("`claude` binary not found in PATH")).map(
+            |command| LaunchSpec {
+                command,
+                args: claude_resume_args(ctx, native_id),
+                env: ctx.extra_env.clone(),
+                requires_approval: false,
             },
         ))
     }
@@ -403,8 +443,14 @@ impl AgentPlugin for OpencodePlugin {
             default: false,
         }]
     }
+    fn option_args(&self, key: &str) -> Vec<String> {
+        match key {
+            "auto_approve" => vec!["--auto".into()],
+            _ => Vec::new(),
+        }
+    }
     fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
-        cli_launch(self, ctx, "auto_approve", "--auto")
+        cli_launch(self, ctx)
     }
     fn seed_prompt_args(&self, prompt: &str) -> Option<Vec<String>> {
         // opencode's *positional* is a project directory, not a prompt — passing
@@ -518,6 +564,12 @@ impl AgentPlugin for PiPlugin {
             default: false,
         }]
     }
+    fn option_args(&self, key: &str) -> Vec<String> {
+        match key {
+            "read_only" => vec!["--tools".into(), PI_READ_ONLY_TOOLS.into()],
+            _ => Vec::new(),
+        }
+    }
     fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
         let command = self
             .detect_binary()
@@ -550,6 +602,25 @@ impl AgentPlugin for PiPlugin {
                 }),
         )
     }
+    /// `pi --session <id>`: reopens the conversation's own session file, which
+    /// `--session` looks up in the current project — the session's own cwd here.
+    fn build_resume(
+        &self,
+        ctx: &AgentContext,
+        native_id: &str,
+        _cwd: &Path,
+    ) -> Option<Result<LaunchSpec>> {
+        Some(
+            self.detect_binary()
+                .ok_or_else(|| anyhow!("`pi` binary not found in PATH"))
+                .map(|command| LaunchSpec {
+                    command,
+                    args: pi_resume_args(ctx, native_id),
+                    env: ctx.extra_env.clone(),
+                    requires_approval: false,
+                }),
+        )
+    }
     fn headless(&self, prompt: &str, _out: &Path) -> Option<HeadlessSpec> {
         // `-p` prints the final answer to stdout and exits. `--no-session` keeps
         // the summarizer out of pi's session store: the caller runs this in a
@@ -575,11 +646,7 @@ impl AgentPlugin for PiPlugin {
 /// Flags every pi launch opens with: the tool allowlist when the user asked for
 /// a read-only session (pi's own default set otherwise), then the model override.
 fn pi_common_args(ctx: &AgentContext) -> Vec<String> {
-    let mut args = Vec::new();
-    if ctx.opt("read_only") {
-        args.push("--tools".to_string());
-        args.push(PI_READ_ONLY_TOOLS.to_string());
-    }
+    let mut args = enabled_option_args(&PiPlugin, ctx);
     if let Some(model) = ctx.model.as_deref() {
         args.extend(PiPlugin.model_args(model));
     }
@@ -600,6 +667,14 @@ fn pi_fork_args(ctx: &AgentContext, native_id: &str, seed: &str) -> Vec<String> 
     args.push("--fork".to_string());
     args.push(native_id.to_string());
     args.push(seed.to_string());
+    args
+}
+
+/// `pi [--tools …] [--model …] --session <id>`.
+fn pi_resume_args(ctx: &AgentContext, native_id: &str) -> Vec<String> {
+    let mut args = pi_common_args(ctx);
+    args.push("--session".to_string());
+    args.push(native_id.to_string());
     args
 }
 
@@ -644,22 +719,25 @@ impl AgentPlugin for CustomCommandPlugin {
     }
 }
 
+/// The argv of every option toggle `ctx` enables, in the plugin's own order.
+fn enabled_option_args(plugin: &dyn AgentPlugin, ctx: &AgentContext) -> Vec<String> {
+    plugin
+        .options()
+        .iter()
+        .filter(|o| ctx.opt(&o.key))
+        .flat_map(|o| plugin.option_args(&o.key))
+        .collect()
+}
+
 /// The `build_launch` shape shared by the CLI agents (codex/claude/opencode):
-/// the detected binary, one optional danger flag, then the user's extra
-/// args/env. These plugins' ids double as their binary names.
-fn cli_launch(
-    plugin: &dyn AgentPlugin,
-    ctx: &AgentContext,
-    opt_key: &str,
-    flag: &str,
-) -> Result<LaunchSpec> {
+/// the detected binary, the enabled option flags (each has one, a danger
+/// flag), then the user's extra args/env. These plugins' ids double as their
+/// binary names.
+fn cli_launch(plugin: &dyn AgentPlugin, ctx: &AgentContext) -> Result<LaunchSpec> {
     let command = plugin
         .detect_binary()
         .ok_or_else(|| anyhow!("`{}` binary not found in PATH", plugin.id()))?;
-    let mut args = Vec::new();
-    if ctx.opt(opt_key) {
-        args.push(flag.to_string());
-    }
+    let mut args = enabled_option_args(plugin, ctx);
     if let Some(model) = ctx.model.as_deref() {
         args.extend(plugin.model_args(model));
     }
@@ -678,19 +756,44 @@ fn codex_fork_args(ctx: &AgentContext, native_id: &str, seed: &str, cwd: &Path) 
     // spawned the process in a new worktree: the TUI displays the source
     // directory and the agent edits and commits there. `-C` makes the session
     // manager's resolved fork destination win.
+    let mut args = codex_subcommand_args(ctx, "fork", cwd);
+    args.push(native_id.to_string());
+    args.push(seed.to_string());
+    args
+}
+
+/// `codex -C <cwd> resume [flags] <id>`. `-C` for the same reason as a fork:
+/// the rollout remembers a cwd, and the session manager's is the one that holds.
+fn codex_resume_args(ctx: &AgentContext, native_id: &str, cwd: &Path) -> Vec<String> {
+    let mut args = codex_subcommand_args(ctx, "resume", cwd);
+    args.push(native_id.to_string());
+    args
+}
+
+/// `-C <cwd> <subcommand> [option flags] [-m <model>]`, the head both of
+/// Codex's conversation-reloading launches share.
+fn codex_subcommand_args(ctx: &AgentContext, subcommand: &str, cwd: &Path) -> Vec<String> {
     let mut args = vec![
         "-C".to_string(),
         cwd.to_string_lossy().into_owned(),
-        "fork".to_string(),
+        subcommand.to_string(),
     ];
-    if ctx.opt("bypass_approvals") {
-        args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
-    }
+    args.extend(enabled_option_args(&CodexPlugin, ctx));
     if let Some(model) = ctx.model.as_deref() {
         args.extend(CodexPlugin.model_args(model));
     }
+    args
+}
+
+/// `[option flags] [--model <m>] --resume <id>` — a fork appends
+/// `--fork-session <seed>`, an in-place resume stops here.
+fn claude_resume_args(ctx: &AgentContext, native_id: &str) -> Vec<String> {
+    let mut args = enabled_option_args(&ClaudePlugin, ctx);
+    if let Some(model) = ctx.model.as_deref() {
+        args.extend(ClaudePlugin.model_args(model));
+    }
+    args.push("--resume".to_string());
     args.push(native_id.to_string());
-    args.push(seed.to_string());
     args
 }
 
@@ -1286,6 +1389,72 @@ mod tests {
         // No `-C`-style cwd override, unlike Codex: pi roots the forked session
         // at this process's cwd, which is already the destination worktree.
         assert!(!args.iter().any(|a| a.starts_with('/')), "{args:?}");
+    }
+
+    /// An in-place resume reloads the conversation under its own id and opens
+    /// waiting: no fork flag, no seed prompt — and the session's flags intact.
+    #[test]
+    fn resume_reloads_the_conversation_without_forking_or_prompting() {
+        let skip = AgentContext {
+            options: vec![("skip_permissions".into(), true)],
+            model: Some("opus".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            claude_resume_args(&skip, "conv-1"),
+            ["--dangerously-skip-permissions", "--model", "opus", "--resume", "conv-1"]
+        );
+
+        let bypass = AgentContext {
+            options: vec![("bypass_approvals".into(), true)],
+            model: Some("gpt-x".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            codex_resume_args(&bypass, "conv-2", Path::new("/w")),
+            [
+                "-C",
+                "/w",
+                "resume",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-m",
+                "gpt-x",
+                "conv-2"
+            ]
+        );
+
+        let read_only = AgentContext {
+            options: vec![("read_only".into(), true)],
+            ..Default::default()
+        };
+        assert_eq!(
+            pi_resume_args(&read_only, "conv-3"),
+            ["--tools", PI_READ_ONLY_TOOLS, "--session", "conv-3"]
+        );
+
+        // No conversation to reload: the caller relaunches these fresh.
+        for plugin in [&ShellPlugin as &dyn AgentPlugin, &OpencodePlugin, &CustomCommandPlugin] {
+            assert!(plugin
+                .build_resume(&AgentContext::default(), "x", Path::new("/w"))
+                .is_none());
+        }
+    }
+
+    /// Each option is spelled once, in `option_args`; the launch lines are built
+    /// from it, which is what lets a persisted line be read back for it.
+    #[test]
+    fn every_option_has_the_flag_its_launch_line_carries() {
+        for plugin in all() {
+            for option in plugin.options() {
+                let flag = plugin.option_args(&option.key);
+                assert!(!flag.is_empty(), "{}:{} has no flag", plugin.id(), option.key);
+                let ctx = AgentContext {
+                    options: vec![(option.key.clone(), true)],
+                    ..Default::default()
+                };
+                assert_eq!(enabled_option_args(plugin.as_ref(), &ctx), flag);
+            }
+        }
     }
 
     #[test]

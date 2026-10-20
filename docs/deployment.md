@@ -51,7 +51,8 @@ instance identity on its own).
 | **daemon image update** (recreate daemon container) | ✅ yes | asmux container lives; daemon re-adopts on reconnect |
 | daemon crash / restart | ✅ yes | same path as above |
 | **asmux image update** (recreate asmux container) | ❌ no | its RAM (rings + PTYs) is destroyed |
-| host reboot / migrate hosts | ❌ no | records persist on the `data` volume, reconcile to `failed` |
+| host reboot | ↻ relaunched | the processes are gone, but each session is relaunched in place at startup: agents resume their own conversation, shells start fresh under their old output ([durable-sessions.md → Host reboot](durable-sessions.md#host-reboot-resume-in-place)) |
+| migrate hosts | ↻ if the worktrees moved too | a new host is a different boot, so it relaunches like a reboot; a session whose working directory didn't come along stays `indeterminate` |
 
 The honest promise is **"daemon image updates don't break sessions."** Since
 essentially all change lands in the daemon, that covers the vast majority of
@@ -62,7 +63,8 @@ RAM loss (asmux update, host reboot) is the floor: making an *asmux* update
 non-disruptive would require passing live PTY master fds across processes
 (`SCM_RIGHTS`, roughly what tmux's server does). That fights the "keep asmux
 dumb and never-crash" ethos and is explicitly **out of scope**; SQLite records +
-`failed` reconciliation is the graceful landing.
+`indeterminate` reconciliation is the graceful landing — and after a host
+reboot, the in-place relaunch on top of it.
 
 ## Target: two containers
 

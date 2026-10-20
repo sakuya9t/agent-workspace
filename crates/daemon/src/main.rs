@@ -5,6 +5,7 @@ mod config;
 mod conflict_resolve;
 mod db;
 mod domain;
+mod host_boot;
 mod plugins;
 mod session_manager;
 mod source_control;

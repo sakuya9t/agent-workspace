@@ -98,7 +98,12 @@ pub(super) fn apply(
                 .or_insert_with(|| serde_json::json!([]))
                 .as_array_mut()
                 .ok_or_else(|| anyhow!("OpenCode instructions must be an array"))?;
-            instructions.push(serde_json::json!(instruction_file));
+            // A relaunch starts from the env it persisted, which already names
+            // this file.
+            let entry = serde_json::json!(instruction_file);
+            if !instructions.contains(&entry) {
+                instructions.push(entry);
+            }
             std::fs::create_dir_all(instruction_file.parent().unwrap())?;
             std::fs::write(instruction_file, instruction)?;
             launch.env.retain(|(k, _)| k != KEY);

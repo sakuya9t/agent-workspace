@@ -463,6 +463,19 @@ pub trait SessionBackend: Send + Sync {
         Ok(None)
     }
 
+    /// Start a new process for an existing session whose previous one is gone
+    /// (lost with the host), under the same id. Unlike [`create`](Self::create),
+    /// the session's terminal *continues*: the emulator is seeded from its cold
+    /// history, `banner` is written after it, and new output is persisted after
+    /// the last recorded event — so the old scrollback, a line saying what
+    /// happened, and the new process read as one stream.
+    ///
+    /// Only meaningful for a holder backend, the one whose sessions are expected
+    /// to outlive the daemon; the default refuses.
+    fn respawn(&self, _spec: BackendSpawnSpec, _banner: &[u8]) -> Result<Arc<dyn BackendSession>> {
+        anyhow::bail!("the {} backend cannot relaunch a session in place", self.id())
+    }
+
     /// End a live session's daemon-side stream after a reconnect `list` reveals
     /// the holder is no longer running it (an exit missed while detached, or the
     /// holder was lost). No-op for backends that don't outlive the daemon.

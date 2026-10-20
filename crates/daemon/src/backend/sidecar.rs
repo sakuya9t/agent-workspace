@@ -176,6 +176,60 @@ impl SessionBackend for SidecarBackend {
         Ok(session.map(|s| s as Arc<dyn BackendSession>))
     }
 
+    fn respawn(&self, spec: BackendSpawnSpec, banner: &[u8]) -> Result<Arc<dyn BackendSession>> {
+        let client = self.client.clone();
+        let events = self.events.clone();
+        let db = self.db.clone();
+        let sid = spec.session_id.clone();
+        let (cols, rows) = (spec.cols, spec.rows);
+
+        // Same continuation as a cold-stitch adopt — seed from everything
+        // persisted, carry on past the true max seq — except that the holder
+        // stream is brand new, so it is attached from its beginning and the old
+        // holder's cursor is dropped (see `Db::reset_backend_cursor`).
+        let seq_start = self.db.max_event_seq(&sid)?;
+        let cold = self.db.read_events_after(&sid, 0)?;
+
+        let session = block_on(async move {
+            client.create(&spec).await?;
+            let rx = client.route(&sid, 0);
+            match client.attach(&sid, wire::AttachMode::FromEarliest, 0).await {
+                Ok(_head) => {}
+                Err(AttachError::Gap { earliest }) => {
+                    tracing::warn!(session = %sid, earliest, "unexpected gap attaching respawned session");
+                }
+                Err(AttachError::Code(c)) => bail!("asmux attach failed (code {c})"),
+                Err(AttachError::Conn(e)) => return Err(e),
+            }
+            // Only once the new process exists, and before its drain can record
+            // a cursor: a failed relaunch leaves the row as it was.
+            db.reset_backend_cursor(&sid)?;
+            let (parser, history) = seed_from_cold(rows, cols, &cold);
+            let mut seq = seq_start;
+            if !banner.is_empty() {
+                parser.lock().process(banner);
+                history
+                    .lock()
+                    .push(Arc::from(banner.to_vec().into_boxed_slice()));
+                // Persisted like output, so every later attach and adopt replays
+                // it in place. `head_cursor: 0` leaves `backend_cursor` alone.
+                seq += 1;
+                events.send(EventMsg {
+                    session_id: sid.clone(),
+                    seq,
+                    ts_ms: now_millis(),
+                    stream: 0,
+                    bytes: banner.to_vec(),
+                    head_cursor: 0,
+                });
+            }
+            Ok(SidecarSession::spawn(
+                sid, client, events, rx, parser, history, 0, seq,
+            ))
+        })?;
+        Ok(session)
+    }
+
     fn kill_detached(&self, id: &str) {
         // 0 => platform default terminate, as `stop()`; the holder ignores an
         // unknown id.

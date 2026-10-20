@@ -289,6 +289,31 @@ pub trait AgentPlugin: Send + Sync {
         None
     }
 
+    /// Relaunch this agent continuing its *own* conversation `native_id`, in
+    /// place — the same session, after the host restarted under it. Not a fork:
+    /// the conversation carries on under its own id, because nothing else is
+    /// continuing it. `None` = no native resume; the session is relaunched fresh.
+    ///
+    /// No opening prompt. The agent comes back showing its history and waits:
+    /// whatever it was doing when the host went down, deciding to carry on is
+    /// the user's call.
+    fn build_resume(
+        &self,
+        _ctx: &AgentContext,
+        _native_id: &str,
+        _cwd: &Path,
+    ) -> Option<Result<LaunchSpec>> {
+        None
+    }
+
+    /// The argv an enabled option toggle (see [`options`](Self::options))
+    /// contributes to this agent's launch line. The one place each flag is
+    /// spelled, so that launches can add it and a persisted launch line can be
+    /// read back for it (`session_manager/resume.rs`).
+    fn option_args(&self, _key: &str) -> Vec<String> {
+        Vec::new()
+    }
+
     /// A compact, deterministic digest of the session's conversation: what the
     /// user asked for (verbatim), what the agent changed, and where it left off.
     ///

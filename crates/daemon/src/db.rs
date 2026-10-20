@@ -642,6 +642,70 @@ impl Db {
         }
     }
 
+    /// Start a session's holder stream over. A relaunched process is a fresh
+    /// stream in the holder, numbered from 0 again, and `backend_cursor` only
+    /// ever advances (`MAX` in the event writer) — left as is, it would point a
+    /// later adopt far past the new stream's end.
+    pub fn reset_backend_cursor(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("UPDATE sessions SET backend_cursor = 0 WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Stamp the host boot a session's process is running in (see `host_boot`).
+    pub fn set_boot_id(&self, id: &str, boot_id: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE sessions SET boot_id = ?2 WHERE id = ?1",
+            rusqlite::params![id, boot_id],
+        )?;
+        Ok(())
+    }
+
+    /// Replace a session's recorded launch line with the one its process was
+    /// relaunched with, so the row describes what is actually running.
+    pub fn update_launch(
+        &self,
+        id: &str,
+        command: &str,
+        args: &[String],
+        env: &[(String, String)],
+    ) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE sessions SET command = ?2, args = ?3, env = ?4 WHERE id = ?1",
+            rusqlite::params![
+                id,
+                command,
+                serde_json::to_string(args)?,
+                serde_json::to_string(env)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The host boot a session's process was last started in, if stamped.
+    pub fn get_boot_id(&self, id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT boot_id FROM sessions WHERE id = ?1")?;
+        let mut rows = stmt.query_map([id], |r| r.get::<_, Option<String>>(0))?;
+        match rows.next() {
+            Some(r) => Ok(r?),
+            None => Ok(None),
+        }
+    }
+
+    /// Ids of `indeterminate` sessions, oldest first — the candidates for a
+    /// relaunch once a reboot has proven their processes gone.
+    pub fn indeterminate_session_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM sessions WHERE status = 'indeterminate' ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
     /// Ids of sessions currently recorded live (`starting`/`running`) — the
     /// adopt-or-reconcile candidates at startup.
     pub fn live_session_ids(&self) -> Result<Vec<String>> {
@@ -796,6 +860,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA_V9)?;
         conn.pragma_update(None, "user_version", 9)?;
         tracing::info!("applied schema migration v9");
+    }
+    if version < 10 {
+        conn.execute_batch(SCHEMA_V10)?;
+        conn.pragma_update(None, "user_version", 10)?;
+        tracing::info!("applied schema migration v10");
     }
     Ok(())
 }
@@ -959,6 +1028,15 @@ CREATE TABLE session_titles (
 );
 "#;
 
+/// The host boot each session's current process was started in (see
+/// `host_boot`). A different boot now proves the process is gone, which is what
+/// lets startup relaunch a session lost to a reboot instead of leaving it
+/// `indeterminate`. Nullable with no backfill: an unstamped row is judged by its
+/// `created_at` against the boot time instead.
+const SCHEMA_V10: &str = r#"
+ALTER TABLE sessions ADD COLUMN boot_id TEXT;
+"#;
+
 /// Batches terminal events into transactions to keep write amplification low.
 fn event_writer_loop(mut conn: Connection, mut rx: UnboundedReceiver<EventMsg>) {
     // Block for the first event, then drain whatever else is queued.
@@ -1065,6 +1143,7 @@ mod tests {
             .execute_batch(
                 "ALTER TABLE sessions DROP COLUMN state_since;
                  ALTER TABLE sessions DROP COLUMN state_kind;
+                 ALTER TABLE sessions DROP COLUMN boot_id;
                  DROP TABLE session_titles;
                  PRAGMA user_version = 7;",
             )
