@@ -3,9 +3,11 @@ use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use parking_lot::Mutex;
-use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{
+    native_pty_system, Child, ChildKiller, CommandBuilder, ExitStatus, MasterPty, PtySize,
+};
 use tokio::sync::{broadcast, watch};
 
 use super::{
@@ -81,6 +83,8 @@ impl SessionBackend for NativePtyBackend {
         let killer = child.clone_killer();
         let reader = pair.master.try_clone_reader().context("clone pty reader")?;
         let writer = pair.master.take_writer().context("take pty writer")?;
+        let master: MasterSlot = Arc::new(Mutex::new(Some(pair.master)));
+        let final_status = exit_watch(child, master.clone(), &spec.session_id)?;
 
         let (tx, _rx) = broadcast::channel::<Arc<[u8]>>(BROADCAST_CAP);
         let (status_tx, status_rx) = watch::channel(BackendStatus::Running);
@@ -95,7 +99,7 @@ impl SessionBackend for NativePtyBackend {
             history: history.clone(),
             tx: tx.clone(),
             writer: Mutex::new(writer),
-            master: Mutex::new(pair.master),
+            master,
             killer: Mutex::new(killer),
             status_rx,
             seq: seq.clone(),
@@ -108,7 +112,17 @@ impl SessionBackend for NativePtyBackend {
         std::thread::Builder::new()
             .name(format!("asm-pty-{}", short(&session_id)))
             .spawn(move || {
-                reader_loop(reader, parser, history, tx, events, session_id, seq, status_tx, child);
+                reader_loop(
+                    reader,
+                    parser,
+                    history,
+                    tx,
+                    events,
+                    session_id,
+                    seq,
+                    status_tx,
+                    final_status,
+                );
             })
             .context("spawning pty reader thread")?;
 
@@ -116,12 +130,53 @@ impl SessionBackend for NativePtyBackend {
     }
 }
 
+/// The PTY master, shared with the Windows waiter (see [`exit_watch`]); `None`
+/// once the session has ended there.
+type MasterSlot = Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>;
+
+/// How the reader learns the child's exit status once output has ended. On
+/// Unix the reader waits the child itself after EOF.
+#[cfg(not(windows))]
+fn exit_watch(
+    mut child: Box<dyn Child + Send + Sync>,
+    _master: MasterSlot,
+    _session_id: &str,
+) -> Result<impl FnOnce() -> std::io::Result<ExitStatus> + Send + 'static> {
+    Ok(move || child.wait())
+}
+
+/// On Windows output never ends by itself: ConPTY holds the output pipe open
+/// until the pseudoconsole closes, i.e. until the master drops (the slave is
+/// already gone). So a waiter reaps the child and then drops the master; the
+/// reader's EOF follows once conhost has flushed. Same as asmux's holder — see
+/// `asmux::session`.
+#[cfg(windows)]
+fn exit_watch(
+    mut child: Box<dyn Child + Send + Sync>,
+    master: MasterSlot,
+    session_id: &str,
+) -> Result<impl FnOnce() -> std::io::Result<ExitStatus> + Send + 'static> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name(format!("asm-ptyw-{}", short(session_id)))
+        .spawn(move || {
+            let _ = tx.send(child.wait());
+            let closing = master.lock().take();
+            drop(closing); // outside the lock: closing waits on conhost
+        })
+        .context("spawning pty waiter thread")?;
+    Ok(move || {
+        rx.recv()
+            .unwrap_or_else(|_| Err(std::io::Error::other("pty waiter thread vanished")))
+    })
+}
+
 struct NativeSession {
     parser: Arc<Mutex<vt100::Parser>>,
     history: Arc<Mutex<HistoryRing>>,
     tx: broadcast::Sender<Arc<[u8]>>,
     writer: Mutex<Box<dyn Write + Send>>,
-    master: Mutex<Box<dyn MasterPty + Send>>,
+    master: MasterSlot,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     status_rx: watch::Receiver<BackendStatus>,
     seq: Arc<AtomicU64>,
@@ -154,6 +209,8 @@ impl BackendSession for NativeSession {
         {
             let master = self.master.lock();
             master
+                .as_ref()
+                .ok_or_else(|| anyhow!("session has ended"))?
                 .resize(PtySize {
                     rows,
                     cols,
@@ -167,7 +224,17 @@ impl BackendSession for NativeSession {
     }
 
     fn stop(&self) -> Result<()> {
-        self.killer.lock().kill().context("killing child process")?;
+        let result = self.killer.lock().kill();
+        if cfg!(windows) {
+            // portable-pty 0.8's Windows killer tests TerminateProcess's result
+            // backwards: success comes back as an error (carrying whatever
+            // GetLastError held — a tokio socket's WSAEWOULDBLOCK, say), and a
+            // real failure as Ok. The result says nothing either way; the
+            // waiter thread observes the exit and reports it.
+            let _ = result;
+            return Ok(());
+        }
+        result.context("killing child process")?;
         Ok(())
     }
 
@@ -190,7 +257,7 @@ fn reader_loop(
     session_id: String,
     seq: Arc<AtomicU64>,
     status_tx: watch::Sender<BackendStatus>,
-    mut child: Box<dyn Child + Send + Sync>,
+    final_status: impl FnOnce() -> std::io::Result<ExitStatus>,
 ) {
     let mut buf = [0u8; READ_BUF];
     let mut parser_ok = true;
@@ -241,7 +308,7 @@ fn reader_loop(
         }
     }
 
-    let status = match child.wait() {
+    let status = match final_status() {
         Ok(es) => {
             if es.success() {
                 BackendStatus::Exited(0)

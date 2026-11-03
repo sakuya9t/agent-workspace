@@ -9,12 +9,13 @@ terminal output.
 start agent → disconnect → agent keeps running → reconnect → resume the same live session
 ```
 
-> **Status (2026-07-24):** runnable **Unix/web alpha core**. The central
-> disconnect/reconnect loop, durable daemon restarts, mobile web UI, relay +
-> gateway connectivity, session fork/recovery, and Git workflows run end to end.
-> The formal Alpha/MVP gates are not yet met: Windows holder support, rich
-> rendering, workspace hooks/checkpoints, Electron packaging, and reliability /
-> security hardening remain. See the [cross-track backlog](docs/backlog.md) for
+> **Status (2026-11-03):** runnable **alpha core on Linux, macOS and Windows**.
+> The central disconnect/reconnect loop, durable daemon restarts, mobile web UI,
+> relay + gateway connectivity, session fork/recovery, and Git workflows run end
+> to end — on Windows natively, with ConPTY sessions held over a named pipe. The
+> formal Alpha/MVP gates are not yet met: rich rendering, workspace
+> hooks/checkpoints, Electron packaging, per-user service install, and
+> reliability / security hardening remain. See the [cross-track backlog](docs/backlog.md) for
 > current priority and the [MVP execution plan](docs/mvp-execution-plan.md) for
 > the original release definition.
 
@@ -101,6 +102,14 @@ scripts/start.sh          # daemon + holder + persistent local Vite UI
 scripts/start.sh --no-ui  # opt out of managed Vite
 ```
 
+On Windows, from PowerShell (installs Git, the MSVC Build Tools, rustup and
+Node via winget — see [Windows](docs/setup.md#windows)):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
+scripts\asm start         # the same start.sh, run under Git Bash
+```
+
 Open Vite at `http://127.0.0.1:5273`. Use `--ui-host 0.0.0.0` to expose it on a
 trusted LAN. Settings are saved per install (`~/.local/share/asm/startup.conf`):
 flags change just what they name and stick, so later runs need no flags — and
@@ -117,6 +126,7 @@ choices, durable-session flags, the HTTP API, and tests, see
 
 ```text
 crates/daemon/   Rust control-plane daemon (asm-daemon) + asmux PTY holder
+crates/asm-launch/  detached-process launcher (Windows service scripts, holder autospawn)
 client/          React 19 + Vite + xterm.js control center (web now, Electron later)
 docs/            requirements, architecture, durability & connectivity plans, setup
 scripts/         setup / start / stop / status / wizard / smoke & durability tests

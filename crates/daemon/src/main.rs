@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
                 .await
                 .context("connecting to asmux holder")?;
             tracing::info!(
-                socket = %config.asmux_socket.display(),
+                socket = %asmux::socket::endpoint(&config.asmux_socket),
                 instance_id = %client.instance_id,
                 holder_pid = client.server_pid,
                 "session backend: asmux holder (sessions survive daemon restart)"
@@ -359,11 +359,9 @@ fn probe_health(url: &str) -> Option<(String, String)> {
 
 /// Poll the holder socket until something answers, or `wait` elapses.
 async fn wait_for_asmux(socket: &std::path::Path, wait: Duration) -> bool {
-    use tokio::net::UnixStream;
-
     let deadline = tokio::time::Instant::now() + wait;
     loop {
-        if UnixStream::connect(socket).await.is_ok() {
+        if asmux::socket::connect(socket).await.is_ok() {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -382,9 +380,7 @@ async fn wait_for_asmux(socket: &std::path::Path, wait: Duration) -> bool {
 /// silent boot failure on 2026-07-12 (two dead boots, and not one ERROR line in
 /// the log, because `bail!` from `main` only prints a bare `Error:` to stderr).
 async fn ensure_asmux(config: &Config) -> Result<()> {
-    use tokio::net::UnixStream;
-
-    if UnixStream::connect(&config.asmux_socket).await.is_ok() {
+    if asmux::socket::connect(&config.asmux_socket).await.is_ok() {
         return Ok(());
     }
 
@@ -423,15 +419,12 @@ async fn ensure_asmux(config: &Config) -> Result<()> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    // Detach into its own process group so a signal aimed at the daemon's group
-    // (or the daemon dying) does not take the holder with it. Escaping a systemd
-    // cgroup needs `systemd-run --user --scope` — see docs/deployment.md (M4).
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    cmd.spawn()
+    // Detach (its own process group; on Windows also its own console and, where
+    // allowed, out of our job) so a signal aimed at the daemon's group, its
+    // console closing, or the daemon dying does not take the holder with it.
+    // Escaping a systemd cgroup needs `systemd-run --user --scope` — see
+    // docs/deployment.md (M4).
+    asm_launch::detach(&mut cmd)
         .with_context(|| format!("spawning asmux binary at {}", bin.display()))?;
 
     if wait_for_asmux(&config.asmux_socket, config.asmux_wait).await {
@@ -455,7 +448,8 @@ fn resolve_asmux_bin(config: &Config) -> PathBuf {
         return p.clone();
     }
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(sib) = exe.parent().map(|d| d.join("asmux")) {
+        let name = format!("asmux{}", std::env::consts::EXE_SUFFIX);
+        if let Some(sib) = exe.parent().map(|d| d.join(&name)) {
             if sib.exists() {
                 return sib;
             }
@@ -465,7 +459,8 @@ fn resolve_asmux_bin(config: &Config) -> PathBuf {
 }
 
 /// Resolve when the process is asked to terminate (Ctrl-C / SIGINT, or SIGTERM
-/// from a service manager). SIGTERM is Unix-only.
+/// from a service manager). SIGTERM is Unix-only; Windows gets Ctrl-Break, the
+/// one console signal a process started in its own group still receives.
 async fn shutdown_signal() {
     use tokio::signal;
 
@@ -485,7 +480,19 @@ async fn shutdown_signal() {
             }
         }
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let terminate = async {
+        match signal::windows::ctrl_break() {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!("could not install Ctrl-Break handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(any(unix, windows)))]
     let terminate = std::future::pending::<()>();
 
     tokio::select! {

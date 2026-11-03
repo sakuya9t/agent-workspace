@@ -1,5 +1,6 @@
 //! Async, **reconnecting** client for the asmux holder (the daemon is the
-//! *client*; asmux is the *server*). One `UnixStream` multiplexes every session.
+//! *client*; asmux is the *server*). One holder connection (a UDS, or a named
+//! pipe on Windows — see `asmux::socket`) multiplexes every session.
 //!
 //! A single **supervisor task** owns the socket lifecycle: dial → `hello` →
 //! re-attach every routed session → drain the command channel to the writer,
@@ -24,12 +25,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::io::AsyncWriteExt;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::UnixStream;
 use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
 
 use asmux::frame::{self, code, ord, Incoming};
+use asmux::socket::{ClientRead as OwnedReadHalf, ClientWrite as OwnedWriteHalf};
 use asmux::wire;
 use planus::ReadAsRoot;
 
@@ -405,11 +405,11 @@ struct Hello {
 /// Dial a fresh socket, spawn its reader, and return the write half + reader
 /// handle. Stamps `last_frame_ms` so the watchdog starts from "just connected".
 async fn dial(sock: &Path, shared: &Arc<Shared>) -> Result<(OwnedWriteHalf, JoinHandle<()>)> {
-    let stream = UnixStream::connect(sock)
+    let stream = asmux::socket::connect(sock)
         .await
         .with_context(|| format!("connecting to asmux at {}", sock.display()))?;
     shared.last_frame_ms.store(now_millis(), Ordering::Relaxed);
-    let (rd, wr) = stream.into_split();
+    let (rd, wr) = asmux::socket::split_client(stream);
     let reader = tokio::spawn(reader_task(rd, shared.clone()));
     Ok((wr, reader))
 }
@@ -758,7 +758,6 @@ mod tests {
     use asmux::registry::Registry;
     use asmux::server::{serve, ServerCtx};
     use asmux::MEMORY_LIMIT_DEFAULT_BYTES;
-    use tokio::net::UnixListener;
 
     /// Await the next non-empty `Output` chunk on a route, or `None` on timeout.
     async fn next_output(
@@ -779,12 +778,12 @@ mod tests {
         .flatten()
     }
 
-    /// A forced connection drop reconnects to the still-alive holder and resumes
-    /// the same session's stream (no daemon restart, no lost PTY).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn reconnects_and_resumes_stream_after_forced_drop() {
-        let sock = std::env::temp_dir().join(format!("asmux-reconn-{}.sock", uuid::Uuid::new_v4()));
-        let listener = UnixListener::bind(&sock).unwrap();
+    /// An in-process holder on a private socket (its own dir: binding tightens
+    /// the parent's permissions, which must never be the shared temp dir).
+    async fn start_holder(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("asmux-{tag}-{}", uuid::Uuid::new_v4()));
+        let sock = dir.join("asmux.sock");
+        let (listener, _) = asmux::socket::bind(&sock, false).await.unwrap();
         let registry = Arc::new(Registry::new(
             "test-instance".to_string(),
             0,
@@ -792,15 +791,65 @@ mod tests {
         ));
         let ctx = ServerCtx::new(registry, std::process::id() as i32, String::new());
         tokio::spawn(serve(listener, ctx));
+        (dir, sock)
+    }
+
+    /// A command that prints a numbered line every 50 ms, forever.
+    fn ticker() -> (String, Vec<String>) {
+        if cfg!(windows) {
+            (
+                "powershell.exe".to_string(),
+                vec![
+                    "-NoProfile".to_string(),
+                    "-Command".to_string(),
+                    r#"$i=0; while ($true) { "line$i"; $i++; Start-Sleep -Milliseconds 50 }"#
+                        .to_string(),
+                ],
+            )
+        } else {
+            (
+                "sh".to_string(),
+                vec![
+                    "-c".to_string(),
+                    "i=0; while true; do echo line$i; i=$((i+1)); sleep 0.05; done".to_string(),
+                ],
+            )
+        }
+    }
+
+    /// A command whose only output is the terminal echoing what is typed.
+    /// Unix: `cat` (the PTY's echo plus `cat`'s copy). Windows: a `cmd.exe`
+    /// prompt, fed `rem` comments by [`typed`] — echoed, never run, so no error
+    /// message repeats the word.
+    fn echoer() -> (String, Vec<String>) {
+        if cfg!(windows) {
+            ("cmd.exe".to_string(), vec!["/d".to_string(), "/q".to_string()])
+        } else {
+            ("cat".to_string(), vec![])
+        }
+    }
+
+    /// The bytes that type `word` at [`echoer`].
+    fn typed(word: &str) -> Vec<u8> {
+        if cfg!(windows) {
+            format!("rem {word}\r").into_bytes()
+        } else {
+            format!("{word}\n").into_bytes()
+        }
+    }
+
+    /// A forced connection drop reconnects to the still-alive holder and resumes
+    /// the same session's stream (no daemon restart, no lost PTY).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconnects_and_resumes_stream_after_forced_drop() {
+        let (dir, sock) = start_holder("reconn").await;
 
         let client = AsmuxClient::connect(&sock).await.unwrap();
+        let (command, args) = ticker();
         let spec = BackendSpawnSpec {
             session_id: "reconn".to_string(),
-            command: "sh".to_string(),
-            args: vec![
-                "-c".to_string(),
-                "i=0; while true; do echo line$i; i=$((i+1)); sleep 0.05; done".to_string(),
-            ],
+            command,
+            args,
             env: vec![],
             cwd: std::env::temp_dir().to_string_lossy().into_owned(),
             rows: 24,
@@ -813,9 +862,9 @@ mod tests {
             Err(_) => panic!("initial attach failed"),
         }
 
-        // Output flows before the drop.
+        // Output flows before the drop. (Generous: PowerShell is slow to start.)
         assert!(
-            next_output(&mut rx, Duration::from_secs(3)).await.is_some(),
+            next_output(&mut rx, Duration::from_secs(10)).await.is_some(),
             "output before drop"
         );
 
@@ -834,7 +883,7 @@ mod tests {
         );
 
         client.kill("reconn", 9);
-        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A drop in the window *before* a freshly-adopted route has delivered
@@ -847,25 +896,18 @@ mod tests {
     /// (only the SQLite persist is gated), so the session's scrollback doubled —
     /// on exactly the path cold-stitch adopt exists to make exact.
     ///
-    /// `cat` is the fixture because its output is entirely under the test's
+    /// An echoer is the fixture because its output is entirely under the test's
     /// control: whatever comes back after the drop is what the holder replayed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_drop_before_first_output_resumes_from_the_adopt_cursor() {
-        let sock = std::env::temp_dir().join(format!("asmux-adopt-{}.sock", uuid::Uuid::new_v4()));
-        let listener = UnixListener::bind(&sock).unwrap();
-        let registry = Arc::new(Registry::new(
-            "test-instance".to_string(),
-            0,
-            MEMORY_LIMIT_DEFAULT_BYTES,
-        ));
-        let ctx = ServerCtx::new(registry, std::process::id() as i32, String::new());
-        tokio::spawn(serve(listener, ctx));
+        let (dir, sock) = start_holder("adopt").await;
 
         let client = AsmuxClient::connect(&sock).await.unwrap();
+        let (command, args) = echoer();
         let spec = BackendSpawnSpec {
             session_id: "adopted".to_string(),
-            command: "cat".to_string(),
-            args: vec![],
+            command,
+            args,
             env: vec![],
             cwd: std::env::temp_dir().to_string_lossy().into_owned(),
             rows: 24,
@@ -879,10 +921,10 @@ mod tests {
             .attach("adopted", wire::AttachMode::FromEarliest, 0)
             .await
             .unwrap_or_else(|_| panic!("initial attach failed"));
-        client.send_input("adopted", b"BEFORE\n");
+        client.send_input("adopted", &typed("BEFORE"));
         let mut before = Vec::new();
         while !String::from_utf8_lossy(&before).contains("BEFORE") {
-            let chunk = next_output(&mut rx, Duration::from_secs(3))
+            let chunk = next_output(&mut rx, Duration::from_secs(10))
                 .await
                 .expect("echo before adopt");
             before.extend_from_slice(&chunk);
@@ -890,7 +932,7 @@ mod tests {
         // Drain to quiescence first: a PTY echoes the line and `cat` writes it
         // back, so the cursor mid-echo is not the end of what has been produced —
         // and a resume from there would legitimately replay the rest.
-        while next_output(&mut rx, Duration::from_millis(300)).await.is_some() {}
+        while next_output(&mut rx, Duration::from_millis(500)).await.is_some() {}
         let consumed = client.stream_cursor("adopted");
         assert!(consumed > 0, "cursor must have advanced");
 
@@ -912,7 +954,7 @@ mod tests {
 
         // Phase 3: only post-adopt output may arrive. Anything from before the
         // adopt cursor is a replay the emulator would render a second time.
-        client.send_input("adopted", b"AFTER\n");
+        client.send_input("adopted", &typed("AFTER"));
         let mut seen = Vec::new();
         while !String::from_utf8_lossy(&seen).contains("AFTER") {
             let chunk = next_output(&mut rx, Duration::from_secs(5))
@@ -927,6 +969,6 @@ mod tests {
         );
 
         client.kill("adopted", 9);
-        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

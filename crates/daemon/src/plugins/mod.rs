@@ -466,33 +466,138 @@ pub fn current_platform() -> &'static str {
 }
 
 /// Minimal cross-platform PATH search (the `which` behaviour we need).
+///
+/// On Windows a bare name is tried with each launchable `PATHEXT` extension
+/// (`claude` → `claude.exe`, `codex` → `codex.cmd`), and a name that already
+/// has one (`git.exe`) is also tried as given.
 pub fn find_in_path(program: &str) -> Option<String> {
+    let exts = launch_extensions(program);
+    let found = |base: &std::path::Path| {
+        exts.iter()
+            .map(|ext| {
+                let mut candidate = base.as_os_str().to_owned();
+                candidate.push(ext);
+                PathBuf::from(candidate)
+            })
+            .find(|c| is_executable(c))
+            .map(|c| c.to_string_lossy().into_owned())
+    };
+
     // Absolute or relative path: check directly.
     let direct = PathBuf::from(program);
     if direct.components().count() > 1 || direct.is_absolute() {
-        return is_executable(&direct).then(|| direct.to_string_lossy().into_owned());
+        return found(&direct);
     }
 
     let path = std::env::var_os("PATH")?;
-    let exts: Vec<String> = if cfg!(target_os = "windows") {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".to_string())
-            .split(';')
-            .map(|s| s.to_string())
-            .collect()
-    } else {
-        vec![String::new()]
-    };
+    std::env::split_paths(&path).find_map(|dir| found(&dir.join(program)))
+}
 
-    for dir in std::env::split_paths(&path) {
-        for ext in &exts {
-            let candidate = dir.join(format!("{program}{ext}"));
-            if is_executable(&candidate) {
-                return Some(candidate.to_string_lossy().into_owned());
-            }
+/// How to start `command` with `args` so every argument reaches the program
+/// verbatim.
+///
+/// On Windows `codex`, `opencode` and `pi` install through npm as `.cmd`
+/// shims, and Windows runs a `.cmd` only through `cmd.exe` — which re-parses
+/// the whole command line, so `&`, `|`, `^` and `%VAR%` inside an argument are
+/// cmd syntax to it. The daemon passes free text as arguments (workspace
+/// instructions, a fork's handoff brief, a summary prompt), so an npm shim is
+/// resolved to what it wraps — `node <script>`, or the binary it points at —
+/// and that is launched instead. Anything else, and everything on Unix, is
+/// returned as given.
+pub fn direct_launch(command: &str, args: Vec<String>) -> (String, Vec<String>) {
+    #[cfg(windows)]
+    if let Some((program, mut lead)) = npm_shim_target(std::path::Path::new(command)) {
+        lead.extend(args);
+        return (program, lead);
+    }
+    (command.to_string(), args)
+}
+
+/// A `std::process::Command` for an agent binary, via [`direct_launch`].
+pub fn agent_command(program: &str, args: &[String]) -> std::process::Command {
+    let (program, args) = direct_launch(program, args.to_vec());
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    cmd
+}
+
+/// The program (and leading arguments) an npm cmd-shim runs, or `None` for a
+/// file that is not one we can see through.
+#[cfg(windows)]
+fn npm_shim_target(shim: &std::path::Path) -> Option<(String, Vec<String>)> {
+    let ext = shim.extension()?.to_str()?.to_ascii_lowercase();
+    if ext != "cmd" && ext != "bat" {
+        return None;
+    }
+    let text = std::fs::read_to_string(shim).ok()?;
+    let dir = shim.parent()?;
+    let target = crate::util::canonicalize(&dir.join(parse_npm_shim(&text)?)).ok()?;
+    if !target.is_file() {
+        return None;
+    }
+    let target_str = target.to_string_lossy().into_owned();
+    if target
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+    {
+        return Some((target_str, Vec::new()));
+    }
+    // A script: only a shim that runs it with node is one we can replay
+    // (cmd-shim also wraps `sh` scripts, which we leave to the shim).
+    if !text.to_ascii_lowercase().contains("node") {
+        return None;
+    }
+    // The shim prefers a node.exe sitting beside it, then PATH's.
+    let local = dir.join("node.exe");
+    let node = if local.is_file() {
+        local.to_string_lossy().into_owned()
+    } else {
+        find_in_path("node")?
+    };
+    Some((node, vec![target_str]))
+}
+
+/// The target of an npm cmd-shim: the last `"%dp0%\…"` (npm ≥ 7) or
+/// `"%~dp0\…"` (older) quoted path on a line that forwards `%*`.
+#[cfg(any(windows, test))]
+fn parse_npm_shim(text: &str) -> Option<String> {
+    for line in text.lines().rev().filter(|l| l.contains("%*")) {
+        let found = ["\"%dp0%\\", "\"%~dp0\\"]
+            .iter()
+            .filter_map(|prefix| line.rfind(prefix).map(|at| (at, prefix.len())))
+            .max_by_key(|(at, _)| *at);
+        if let Some((at, len)) = found {
+            let rest = &line[at + len..];
+            let end = rest.find('"')?;
+            return Some(rest[..end].to_string());
         }
     }
     None
+}
+
+/// The suffixes [`find_in_path`] tries after `program`: just `""` on Unix. On
+/// Windows, the `PATHEXT` entries a console can launch directly — never
+/// `.js`/`.vbs`/… script associations, which `CreateProcess` cannot run — and
+/// `""` first when `program` already ends in one of them.
+fn launch_extensions(program: &str) -> Vec<String> {
+    if !cfg!(windows) {
+        return vec![String::new()];
+    }
+    const LAUNCHABLE: [&str; 4] = [".COM", ".EXE", ".BAT", ".CMD"];
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| LAUNCHABLE.join(";"));
+    // Matched case-insensitively, but spelled lowercase: the filesystem doesn't
+    // care, and `claude.exe` is what the file is actually called.
+    let mut exts: Vec<String> = pathext
+        .split(';')
+        .map(|e| e.trim().to_ascii_uppercase())
+        .filter(|e| LAUNCHABLE.contains(&e.as_str()))
+        .map(|e| e.to_ascii_lowercase())
+        .collect();
+    let upper = program.to_ascii_uppercase();
+    if LAUNCHABLE.iter().any(|e| upper.ends_with(e)) {
+        exts.insert(0, String::new());
+    }
+    exts
 }
 
 fn is_executable(path: &std::path::Path) -> bool {
@@ -559,5 +664,74 @@ mod tests {
         // /bin/sh exists on any POSIX host.
         assert_eq!(find_in_path("/bin/sh"), Some("/bin/sh".to_string()));
         assert!(find_in_path("/nonexistent/binary/xyz").is_none());
+    }
+
+    #[test]
+    fn npm_shim_targets_are_parsed_from_both_shim_formats() {
+        // npm ≥ 7 (cmd-shim 4+).
+        let modern = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\nIF EXIST \"%dp0%\\node.exe\" (\r\n  SET \"_prog=%dp0%\\node.exe\"\r\n) ELSE (\r\n  SET \"_prog=node\"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js\" %*\r\n";
+        assert_eq!(
+            parse_npm_shim(modern).as_deref(),
+            Some("node_modules\\@openai\\codex\\bin\\codex.js")
+        );
+        // npm 6.
+        let legacy = "@IF EXIST \"%~dp0\\node.exe\" (\r\n  \"%~dp0\\node.exe\"  \"%~dp0\\..\\pi\\dist\\cli.js\" %*\r\n) ELSE (\r\n  @SETLOCAL\r\n  @SET PATHEXT=%PATHEXT:;.JS;=;%\r\n  node  \"%~dp0\\..\\pi\\dist\\cli.js\" %*\r\n)\r\n";
+        assert_eq!(parse_npm_shim(legacy).as_deref(), Some("..\\pi\\dist\\cli.js"));
+        // Not a shim at all.
+        assert_eq!(parse_npm_shim("@echo off\r\necho hi %*\r\n"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_npm_shim_launches_its_script_under_node_with_args_untouched() {
+        let dir = std::env::temp_dir().join(format!("asm-npm-shim-{}", uuid::Uuid::new_v4()));
+        let pkg = dir.join("node_modules").join("@acme").join("agent").join("bin");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("agent.js"), "// the agent").unwrap();
+        std::fs::write(dir.join("node.exe"), "").unwrap(); // the shim's own node
+        std::fs::write(
+            dir.join("agent.cmd"),
+            "@ECHO off\r\nSETLOCAL\r\nSET dp0=%~dp0\r\nIF EXIST \"%dp0%\\node.exe\" (SET \"_prog=%dp0%\\node.exe\") ELSE (SET \"_prog=node\")\r\n\"%_prog%\"  \"%dp0%\\node_modules\\@acme\\agent\\bin\\agent.js\" %*\r\n",
+        )
+        .unwrap();
+        let shim = dir.join("agent.cmd").to_string_lossy().into_owned();
+        let tricky = "a & b | c %PATH% ^ \"quoted\"".to_string();
+        let (program, args) = direct_launch(&shim, vec!["-p".into(), tricky.clone()]);
+        assert!(program.to_ascii_lowercase().ends_with("node.exe"), "{program}");
+        assert_eq!(args.len(), 3);
+        assert!(args[0].to_ascii_lowercase().ends_with("agent.js"), "{:?}", args);
+        assert_eq!(&args[1..], &["-p".to_string(), tricky]);
+
+        // A plain executable, or a .cmd that is not an npm shim, is left alone.
+        assert_eq!(direct_launch("C:\\x\\claude.exe", vec![]).0, "C:\\x\\claude.exe");
+        std::fs::write(dir.join("plain.cmd"), "@echo off\r\necho %*\r\n").unwrap();
+        let plain = dir.join("plain.cmd").to_string_lossy().into_owned();
+        assert_eq!(direct_launch(&plain, vec!["x".into()]), (plain.clone(), vec!["x".to_string()]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn find_in_path_applies_pathext_on_windows() {
+        let cmd = find_in_path("cmd").expect("cmd.exe is on every Windows PATH");
+        assert!(cmd.to_ascii_lowercase().ends_with("cmd.exe"), "{cmd}");
+        // Already carrying its extension: found as given, not as `cmd.exe.EXE`.
+        let exact = find_in_path("cmd.exe").expect("cmd.exe by its full name");
+        assert!(exact.to_ascii_lowercase().ends_with("cmd.exe"), "{exact}");
+        // An absolute path without its extension still resolves.
+        let stem = exact.trim_end_matches(|c| c != '.').trim_end_matches('.');
+        assert_eq!(find_in_path(stem).map(|s| s.to_ascii_lowercase()), Some(exact.to_ascii_lowercase()));
+        assert!(find_in_path(r"C:\nonexistent\binary\xyz").is_none());
+
+        // Script associations in PATHEXT are not launchable by CreateProcess.
+        let dir = std::env::temp_dir().join(format!("asm-pathext-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("asm-only-js.js"), "// not a program").unwrap();
+        std::fs::write(dir.join("asm-shim.cmd"), "@echo off").unwrap();
+        let base = dir.join("asm-only-js");
+        assert!(find_in_path(&base.to_string_lossy()).is_none());
+        let shim = find_in_path(&dir.join("asm-shim").to_string_lossy()).unwrap();
+        assert!(shim.to_ascii_lowercase().ends_with("asm-shim.cmd"), "{shim}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

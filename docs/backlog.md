@@ -419,7 +419,7 @@ pick it up**.
 | MVP-RICH | Rich output pipeline (viewer/diff/markdown/transcripts) | **P2** | client-stack decision DEC-1; RF-QUERY; RF-WSPROTO (server→client frame type) | mvp-execution-plan.md → Workstream 4 |
 | MVP-HOOKS | Workspace setup hooks (copy/symlink/bootstrap) | **P3** | — | mvp-execution-plan.md → Workstream 6 |
 | MVP-CKPT | Checkpoints + "New segment" | **P3** | — | mvp-execution-plan.md → Workstream 7 |
-| M5 | Windows support (ConPTY, transport, ACLs) | **P3** | M4 (sequenced) | durable-sessions.md → M5 |
+| M5 | Windows support (ConPTY, transport, ACLs) — core **landed** 2026-11-03; pipe DACL hardening open | **P3** | M4 (sequenced) | durable-sessions.md → M5 |
 | MVP-PKG | Electron shell + packaging + service install | **P3** | DEC-1; M5 for the Windows gate | mvp-execution-plan.md → Workstreams 3/11 |
 | SEC-7 | Auth rate limiting + lifecycle audit log | **P3** | overlaps R5 | security-followups.md → 7 (LOW) |
 | SEC-8 | Terminal-escape policy at capture/replay + fuzzing | **P3** | — | security-followups.md → 8 (LOW) |
@@ -736,14 +736,28 @@ exists in the daemon today.
 
 ### M5 — Windows (P3)
 
-ConPTY via portable_pty, AF_UNIX-or-named-pipe transport (tokio has no AF_UNIX
-on Windows), `0600` → owner-only ACL. Note the R-track deliberately added no
-new UDS surface, so M5 scope did not grow. Prerequisite for the MVP gate's
-"works on Windows" and for MVP-PKG's Windows packaging. 2026-07-12 note:
-AF_UNIX is hard-typed on the daemon side with no transport seam
-(`main.rs:344-433` probe/spawn; `asmux_client.rs` read/write halves) —
-budget a small `HolderTransport` (probe/connect) abstraction into the
-estimate; not worth pre-building at P3. refactoring-plan.md → §6.6.
+**Landed 2026-11-03 (core).** The transport seam is `asmux::socket`: a UDS on
+Unix, a named pipe on Windows (`\\.\pipe\asmux-<hash of the socket path>`, so
+`ASMUX_SOCK`/runtime-dir sandboxing is unchanged), used by the holder, the
+daemon client, `asmux probe` and the e2e tests. ConPTY sessions get a waiter
+thread that reaps the child and closes the pseudoconsole — ConPTY otherwise
+never EOFs, and a finished session stayed "alive" forever — in both the holder
+and the native backend. The service scripts run under Git Bash, starting
+components through the new `asm-launch` (own console, process group and job;
+real Windows pids) and renaming locked `.exe`s aside so rebuild-while-running
+works; `scripts\asm.cmd` and `scripts\setup.ps1` are the PowerShell entry
+points. Also fixed on the way: `\\?\` canonical paths, git's `C:/` worktree
+paths, rooted-relative paths escaping `guard_path`, PATHEXT lookup, and npm
+`.cmd` shims (agents are launched as the `node <script>` they wrap, so prompt
+arguments never pass through `cmd.exe`). PowerShell is the Windows Shell agent.
+All of `cargo test`, smoke, durable-restart, startup-config and the browser
+tests pass on Windows. See setup.md → Windows.
+
+Still open: an explicit owner-only pipe DACL plus server-identity check
+(security-followups.md → 13); per-user startup (Task Scheduler) and Windows
+packaging, which are MVP-PKG; and graceful stop (the scripts terminate
+outright — harmless today, since the holder-backed daemon's clean exit does
+nothing extra).
 
 ### MVP-PKG — Electron + packaging (P3)
 

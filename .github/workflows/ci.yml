@@ -72,3 +72,61 @@ jobs:
         env:
           CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
         run: node scripts/config-ui-test.mjs
+
+  # Native Windows: ConPTY sessions, the named-pipe holder transport, and the
+  # service scripts under Git Bash (preinstalled on the runner, as is Chrome).
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Build Rust workspace
+        run: cargo build --workspace --locked
+
+      - name: Lint Rust workspace
+        run: cargo clippy --workspace --all-targets --locked
+
+      - name: Test Rust workspace
+        run: cargo test --workspace --locked
+
+      - name: Install client dependencies
+        working-directory: client
+        run: npm ci
+
+      - name: Build and lint client
+        working-directory: client
+        run: npm run build
+
+      - name: Test client
+        working-directory: client
+        run: npm test
+
+      - name: Test core session loop
+        run: node scripts/smoke.mjs
+
+      - name: Test sessions survive a daemon restart
+        run: node scripts/durable-restart-test.mjs
+
+      - name: Test mobile shell
+        run: node scripts/mobile-shell-test.mjs
+
+      - name: Test saved startup config through the service scripts
+        run: node scripts/startup-config-test.mjs
+
+      - name: Test Config dialog
+        run: node scripts/config-ui-test.mjs

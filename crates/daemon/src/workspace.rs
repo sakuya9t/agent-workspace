@@ -181,7 +181,7 @@ pub fn list_worktrees(root: &Path) -> Result<Vec<WorktreeEntry>> {
             continue;
         }
         if let Some(p) = line.strip_prefix("worktree ") {
-            path = Some(p.to_string());
+            path = Some(crate::util::native_separators(p));
         } else if let Some(b) = line.strip_prefix("branch ") {
             branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
         }
@@ -312,6 +312,9 @@ mod tests {
         git(&root, &["init", "-b", "main"]).unwrap();
         git(&root, &["config", "user.email", "asm-tests@example.invalid"]).unwrap();
         git(&root, &["config", "user.name", "ASM Tests"]).unwrap();
+        // Byte-exact checkouts whatever the host says (Git for Windows ships a
+        // system-wide `core.autocrlf=true`).
+        git(&root, &["config", "core.autocrlf", "false"]).unwrap();
         fs::write(root.join("tracked.txt"), "initial\n").unwrap();
         git(&root, &["add", "tracked.txt"]).unwrap();
         git(&root, &["commit", "-m", "initial"]).unwrap();
@@ -357,7 +360,11 @@ mod tests {
         let error = attach_branch(&worktree, "feature/deploy-me")
             .unwrap_err()
             .to_string();
-        assert!(error.contains("already checked out"), "{error}");
+        // Git ≥ 2.42 words it "already used by worktree".
+        assert!(
+            error.contains("already checked out") || error.contains("already used by worktree"),
+            "{error}"
+        );
 
         // Verification may advance the branch. Reattaching is still safe when
         // the session's detached commit is an ancestor of the new branch tip.

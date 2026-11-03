@@ -54,7 +54,13 @@ impl AgentPlugin for ShellPlugin {
     fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
         let command = default_shell();
         let args = if cfg!(target_os = "windows") {
-            ctx.extra_args.clone()
+            // PowerShell's copyright/upgrade banner is noise in a session.
+            let mut a = Vec::new();
+            if is_powershell(&command) {
+                a.push("-NoLogo".to_string());
+            }
+            a.extend(ctx.extra_args.clone());
+            a
         } else {
             // Interactive login shell.
             let mut a = vec!["-i".to_string()];
@@ -694,12 +700,26 @@ fn codex_fork_args(ctx: &AgentContext, native_id: &str, seed: &str, cwd: &Path) 
     args
 }
 
+/// The interactive shell a "Shell" session runs. On Windows that is PowerShell
+/// (7 if installed, else the inbox 5.1), not `%COMSPEC%` — which is `cmd.exe`
+/// on every Windows host, whatever the user actually works in. `cmd.exe` stays
+/// the last resort; any other shell (Git Bash, nushell…) is a custom command.
 fn default_shell() -> String {
     if cfg!(target_os = "windows") {
-        std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_string())
+        find_in_path("pwsh")
+            .or_else(|| find_in_path("powershell"))
+            .or_else(|| std::env::var("COMSPEC").ok())
+            .unwrap_or_else(|| "cmd.exe".to_string())
     } else {
         std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
     }
+}
+
+fn is_powershell(command: &str) -> bool {
+    let stem = Path::new(command)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase());
+    matches!(stem.as_deref(), Some("pwsh" | "powershell"))
 }
 
 // ---- Model detection (which model each agent is configured to default to) ----
@@ -889,8 +909,7 @@ fn list_codex_models(binary: Option<&str>) -> Vec<AgentModel> {
         return Vec::new();
     };
 
-    let mut child = match Command::new(bin)
-        .arg("app-server")
+    let mut child = match super::agent_command(bin, &["app-server".to_string()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1043,8 +1062,7 @@ fn list_opencode_models(binary: Option<&str>) -> Vec<AgentModel> {
     let Some(bin) = binary else {
         return Vec::new();
     };
-    let mut cmd = Command::new(bin);
-    cmd.arg("models");
+    let cmd = super::agent_command(bin, &["models".to_string()]);
     match run_capture(cmd, Duration::from_secs(10)) {
         Some(out) => parse_opencode_models_output(&out),
         None => Vec::new(),
@@ -1070,8 +1088,7 @@ fn list_pi_models(binary: Option<&str>) -> Vec<AgentModel> {
     let Some(bin) = binary else {
         return Vec::new();
     };
-    let mut cmd = Command::new(bin);
-    cmd.arg("--list-models");
+    let cmd = super::agent_command(bin, &["--list-models".to_string()]);
     // pi refreshes provider catalogs over the network before listing, with its
     // own 15s bound; allow for that plus startup.
     match run_capture(cmd, Duration::from_secs(25)) {

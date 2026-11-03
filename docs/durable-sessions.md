@@ -299,9 +299,9 @@ asmux runs on all three OSes, which is a concrete win over tmux:
 
 | | Linux/macOS | Windows |
 | --- | --- | --- |
-| PTY | `portable_pty` openpty | ConPTY |
-| IPC | `tokio::net::UnixListener` | AF_UNIX via `uds_windows`/`std` **or a named pipe** (tokio has no AF_UNIX on Windows); `0600` becomes an owner-only ACL |
-| detach | `setsid` via `pre_exec` | `DETACHED_PROCESS` + new group |
+| PTY | `portable_pty` openpty | ConPTY (via `portable_pty`); a waiter thread reaps the child and closes the pseudoconsole, since ConPTY never EOFs on its own |
+| IPC | `tokio::net::UnixListener` | a **named pipe** (tokio has no AF_UNIX on Windows), `\\.\pipe\asmux-<hash of the socket path>`; first-instance + reject-remote; default DACL (owner/SYSTEM/admins write) — see security-followups.md → 13 |
+| detach | new process group (`asm_launch::detach`) | `CREATE_NO_WINDOW` + new group + job breakaway where allowed (`asm_launch::detach`) |
 | kill | `nix::sys::signal::kill` (safe wrapper; **not** `libc::kill` under `forbid(unsafe)`) | `portable_pty` `Child::kill` / `TerminateProcess` |
 
 A `tmux` backend can still exist as a *peer* (not nested) behind the same trait
@@ -396,7 +396,10 @@ sessions instead of dropping them — see [`deployment.md`](deployment.md).
   - **Stage C — pending.** Soft-reboot (hash drift + confirm), orphan
     surfacing/adopt, `purge`, metadata RPCs, `readBuffer`/`readLog`, and the
     periodic `(snapshot, cursor)` store.
-- **M5 — Windows.** ConPTY + AF_UNIX/named-pipe transport + ACL socket perms.
+- **M5 — Windows. _Core done (2026-11-03)._** ConPTY sessions + named-pipe
+  transport behind `asmux::socket`; adopt-on-restart verified on Windows by
+  `scripts/durable-restart-test.mjs`. Explicit owner-only pipe ACL pending
+  (security-followups.md → 13). See setup.md → Windows.
 
 ## Decisions
 

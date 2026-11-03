@@ -25,7 +25,7 @@
 //!   decides from the actual file state (unresolved files → the op aborts).
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -130,8 +130,7 @@ fn prompt_for(ctx: &ConflictContext) -> String {
 /// `Ok`, because the git layer verifies the actual files and is the real arbiter
 /// of whether the conflict was resolved.
 fn run(command: &str, args: &[String], cwd: &Path, deadline: Duration) -> Result<()> {
-    let mut child = Command::new(command)
-        .args(args)
+    let mut child = crate::plugins::agent_command(command, args)
         .current_dir(cwd)
         // See the module docs: closed stdin, discarded output.
         .stdin(Stdio::null())

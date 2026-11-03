@@ -8,6 +8,7 @@ the design rationale start with [`architecture.md`](architecture.md) and
 ## Contents
 
 - [Clean-machine setup](#clean-machine-setup)
+- [Windows](#windows)
 - [Running the daemon](#running-the-daemon)
   - [Native (quick start)](#native-quick-start)
   - [Durable sessions (daemon + asmux)](#durable-sessions-daemon--asmux)
@@ -31,7 +32,73 @@ ASM_NO_CLIENT=1 scripts/setup.sh  # skip the web client (npm) step
 
 Afterwards run `source "$HOME/.cargo/env"` in your current shell (new shells get
 cargo automatically), then `scripts/start.sh`. If you already have Rust, skip
-straight to the sections below.
+straight to the sections below. On Windows, see [Windows](#windows) instead.
+
+## Windows
+
+Everything runs natively on Windows 10 1809+ / Windows 11 — no WSL. The holder
+keeps its sessions in ConPTY pseudoconsoles and the daemon reaches it over a
+named pipe, so sessions survive daemon restarts exactly as on Linux/macOS.
+
+**Setup.** From PowerShell, one idempotent script installs what is missing via
+winget — Git for Windows (git + Git Bash), Visual Studio 2022 Build Tools (the
+MSVC C++ workload Rust links with), rustup, and Node.js LTS — then builds the
+workspace and the web client:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup.ps1             # prerequisites + debug build
+powershell -ExecutionPolicy Bypass -File scripts\setup.ps1 -Release    # release build
+powershell -ExecutionPolicy Bypass -File scripts\setup.ps1 -NoClient   # skip Node / the web client
+```
+
+The Build Tools, Git and Node installers each raise a UAC prompt. Open a new
+terminal afterwards so it sees the updated `PATH`.
+
+**Running.** The service scripts are the same bash scripts as everywhere else,
+run under Git Bash. From PowerShell or cmd, `scripts\asm` forwards to them (it
+finds Git Bash itself and works under the default script execution policy):
+
+```powershell
+scripts\asm start            # = scripts/start.sh  (daemon + holder + Vite UI)
+scripts\asm start --no-ui    # every start.sh flag passes through
+scripts\asm status
+scripts\asm restart-daemon
+scripts\asm token
+scripts\asm stop
+```
+
+From a Git Bash prompt, run `scripts/start.sh` and friends directly. Do not use
+a bare `bash scripts/start.sh` from PowerShell: `bash` there can be the WSL
+launcher, which would run the scripts inside Linux.
+
+Defaults are the same as on Unix, read through Git Bash's eyes: data in
+`%USERPROFILE%\.local\share\asm`, runtime files (pidfiles, `.reg` records) in
+`%TEMP%\asm`. The Shell agent is PowerShell (7 if installed, else Windows
+PowerShell); use a custom command for Git Bash or cmd sessions.
+
+**How it differs under the hood** (useful when diagnosing):
+
+- *Holder transport.* The socket path (`<runtime_dir>\asmux.sock`) names a
+  named pipe, `\\.\pipe\asmux-<hash of the path>`; no file is created. The
+  holder's log line shows both. `asmux probe` works as on Unix. A pipe vanishes
+  with its owner, so there is no stale-socket state, and the kernel refuses a
+  second holder on the same name (`ASMUX_TAKEOVER` cannot apply).
+- *Starting and stopping.* `nohup … &` has no Windows equivalent, so the
+  scripts start each component through `asm-launch`, which gives it a console
+  of its own (no window), its own process group and, where the parent job
+  allows, its own job — Ctrl-C in your terminal, or closing it, leaves the
+  stack running. Pidfiles hold real Windows pids, checked against the expected
+  executable so a recycled pid is never mistaken for ours. There is no
+  SIGTERM: `stop.sh` terminates outright, which every component tolerates (on
+  the holder backend the daemon's clean exit does nothing extra anyway).
+- *Rebuilding while running.* Windows will not overwrite a running `.exe`, but
+  will rename one. Before each build the scripts rename any locked binary to
+  `*.exe.running-*` (the process carries on from it) and delete leftovers once
+  their process has exited — so `restart-daemon.sh` can rebuild the daemon,
+  and `start.sh` the holder, while they run.
+- *Agent CLIs installed by npm* (`codex`, `opencode`, `pi`) are `.cmd` shims;
+  the daemon launches the `node <script>` they wrap directly, so prompts and
+  instructions passed as arguments never go through `cmd.exe`'s parser.
 
 ## Running the daemon
 

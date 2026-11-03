@@ -18,6 +18,18 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# ── platform ───────────────────────────────────────────────────────────────
+# On Windows these scripts run under Git Bash (MSYS2), but the binaries they
+# manage are native Windows programs, which changes how a script starts, finds
+# and stops them: a backgrounded program's `$!` is an MSYS pid no Windows tool
+# knows, there are no signals to send, and the holder listens on a named pipe,
+# not a socket file. asm_spawn / pid_alive / stop_one / wait_socket below hide
+# the difference; everything else is shared.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) ASM_WINDOWS=1; EXE=.exe ;;
+  *)                    ASM_WINDOWS=0; EXE= ;;
+esac
+
 log() { printf '\033[1;36m[asm]\033[0m %s\n' "$*"; }
 err() { printf '\033[1;31m[asm]\033[0m %s\n' "$*" >&2; }
 
@@ -387,7 +399,13 @@ asm_configure() {
   # enabled|host|port|daemon-bind|no-local-daemon|proxy-url|proxy-token|allowed-hosts.
   # Recorded independently because Vite can stay up while the daemon is rebuilt.
   UI_STATE_FILE="$ASM_RUNTIME_DIR/asm-ui.reg"
-  UI_BIN="$ROOT/client/node_modules/.bin/vite"
+  # Windows runs Vite's entry script under node directly: npm's `.bin/vite` is a
+  # shell shim there, and its pid would not be the server's.
+  if [ "$ASM_WINDOWS" = 1 ]; then
+    UI_BIN="$ROOT/client/node_modules/vite/bin/vite.js"
+  else
+    UI_BIN="$ROOT/client/node_modules/.bin/vite"
+  fi
   ASM_CONFIG_FILE="$ASM_DATA_DIR/startup.conf"
   ASM_APPLIED_FILE="$ASM_RUNTIME_DIR/startup.applied"
 
@@ -412,9 +430,11 @@ asm_configure() {
   fi
   export ASM_PROFILE="$PROFILE"
   BIN_DIR="$ROOT/target/$PROFILE"
-  DAEMON_BIN="$BIN_DIR/asm-daemon"
-  ASMUX_BIN="$BIN_DIR/asmux"
-  RELAY_BIN="$BIN_DIR/asm-relay"
+  DAEMON_BIN="$BIN_DIR/asm-daemon$EXE"
+  ASMUX_BIN="$BIN_DIR/asmux$EXE"
+  RELAY_BIN="$BIN_DIR/asm-relay$EXE"
+  # Windows only: starts a component detached from this terminal (see asm_spawn).
+  LAUNCH_BIN="$BIN_DIR/asm-launch$EXE"
 
   export ASM_BIND="${ASM_BIND:-127.0.0.1:4600}"
   export ASM_NODE_LABEL="${ASM_NODE_LABEL:-}"
@@ -563,21 +583,115 @@ pid_alive() {
   local f="$1" p
   [ -f "$f" ] || return 1
   p="$(cat "$f" 2>/dev/null || true)"
-  [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+  [ -n "$p" ] || return 1
+  if [ "$ASM_WINDOWS" = 1 ]; then
+    win_pid_alive "$p" "$(pid_image "$f")"
+  else
+    kill -0 "$p" 2>/dev/null
+  fi
+}
+
+# Run a Windows command-line tool. Its /switches must reach it verbatim, not
+# be rewritten into paths by MSYS's argument conversion.
+win_tool() { MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$@"; }
+
+# The executable a pidfile's process runs (Windows), so a pid is only believed
+# while it still names the program we started: Windows recycles pids quickly,
+# and a stale pidfile must never get an unrelated process stopped.
+pid_image() {
+  case "$(basename "$1" .pid)" in
+    asm-ui) printf 'node.exe' ;;
+    *)      printf '%s.exe' "$(basename "$1" .pid)" ;;
+  esac
+}
+
+# win_pid_alive PID IMAGE — is Windows pid PID alive and running IMAGE?
+win_pid_alive() {
+  win_tool tasklist /FI "PID eq $1" /FO CSV /NH 2>/dev/null | tr -d '\r' \
+    | grep -qiF "\"$2\",\"$1\","
+}
+
+# asm_spawn LOG PIDFILE [--cwd DIR] -- PROGRAM [ARG...] — start PROGRAM in the
+# background so it outlives this script and the terminal running it, with
+# stdin closed, stdout+stderr appended to LOG and its pid written to PIDFILE.
+# Prefix assignments (`VAR=x asm_spawn …`) reach PROGRAM's environment.
+#
+# Unix: `nohup … &`. Windows: asm-launch, which gives the program a console of
+# its own (no window), its own process group and — where allowed — its own job,
+# so Ctrl-C in this terminal, or closing it, does not take it down; and which
+# reports the real Windows pid (`$!` under MSYS is not one).
+asm_spawn() {
+  local log="$1" pidfile="$2" cwd=""
+  shift 2
+  if [ "${1:-}" = --cwd ]; then cwd="$2"; shift 2; fi
+  if [ "${1:-}" = -- ]; then shift; fi
+  if [ "$ASM_WINDOWS" = 1 ]; then
+    [ -x "$LAUNCH_BIN" ] || { err "missing $LAUNCH_BIN — build first (cargo build -p asm-launch)"; return 1; }
+    "$LAUNCH_BIN" --log "$log" --pid-file "$pidfile" ${cwd:+--cwd "$cwd"} -- "$@" >/dev/null
+  else
+    (
+      if [ -n "$cwd" ]; then cd "$cwd"; fi
+      nohup "$@" >>"$log" 2>&1 </dev/null &
+      echo $! > "$pidfile"
+    )
+  fi
 }
 
 cargo_build() {
+  local rc=0
+  if [ "$ASM_WINDOWS" = 1 ]; then move_running_binaries_aside; fi
   if [ "$PROFILE" = release ]; then
-    ( cd "$ROOT" && cargo build --release "$@" )
+    ( cd "$ROOT" && cargo build --release "$@" ) || rc=$?
   else
-    ( cd "$ROOT" && cargo build "$@" )
+    ( cd "$ROOT" && cargo build "$@" ) || rc=$?
   fi
+  if [ "$ASM_WINDOWS" = 1 ]; then restore_unbuilt_binaries; fi
+  return "$rc"
+}
+
+# Windows will not let cargo overwrite an executable that is running — and a
+# rebuild while the holder (or the daemon, or the relay) runs is the normal
+# case: restart-daemon.sh rebuilds before it restarts, and the holder outlives
+# every daemon. It does let a running executable be *renamed*, so move each
+# locked binary aside: the process keeps running from the renamed file and
+# cargo writes a fresh one in its place. A binary this build did not produce
+# (restart-daemon.sh builds no holder) is moved back afterwards — the scripts
+# need asmux.exe in place to probe the holder. Leftovers whose process has
+# exited are deleted on the next build (a still-running one fails to delete).
+ASM_MOVED_BINARIES=()
+move_running_binaries_aside() {
+  local b moved
+  ASM_MOVED_BINARIES=()
+  for b in "$BIN_DIR"/*.exe.running-*; do
+    if [ -e "$b" ]; then rm -f "$b" 2>/dev/null || true; fi
+  done
+  for b in "$DAEMON_BIN" "$ASMUX_BIN" "$RELAY_BIN" "$LAUNCH_BIN"; do
+    [ -f "$b" ] || continue
+    # Opening it for append (writing nothing) fails only while it is in use.
+    if ! ( : >>"$b" ) 2>/dev/null; then
+      moved="$b.running-$(date +%s)-$$"
+      if mv -f "$b" "$moved" 2>/dev/null; then ASM_MOVED_BINARIES+=("$b|$moved"); fi
+    fi
+  done
+}
+
+restore_unbuilt_binaries() {
+  local pair
+  for pair in ${ASM_MOVED_BINARIES[@]+"${ASM_MOVED_BINARIES[@]}"}; do
+    if [ ! -e "${pair%%|*}" ]; then mv -f "${pair#*|}" "${pair%%|*}" 2>/dev/null || true; fi
+  done
+  ASM_MOVED_BINARIES=()
 }
 
 wait_socket() {
   local i
   for i in $(seq 1 60); do
-    if [ -S "$ASMUX_SOCK" ]; then return 0; fi
+    if [ "$ASM_WINDOWS" = 1 ]; then
+      # A named pipe leaves no file to test for; ask the holder itself.
+      if holder_live; then return 0; fi
+    elif [ -S "$ASMUX_SOCK" ]; then
+      return 0
+    fi
     sleep 0.1
   done
   return 1
@@ -707,24 +821,22 @@ start_ui() {
     err "managed UI needs Node.js; install Node 20+ or pass --no-ui for daemon-only/packaged UI"
     return 1
   }
-  [ -x "$UI_BIN" ] || {
+  [ -f "$UI_BIN" ] || {
     err "missing $UI_BIN — install client dependencies first: (cd client && npm install)"
     return 1
   }
+  local ui_cmd=("$UI_BIN")
+  if [ "$ASM_WINDOWS" = 1 ]; then ui_cmd=(node "$UI_BIN"); fi
 
   log "starting Vite web UI on $ASM_UI_HOST:$ASM_UI_PORT..."
-  (
-    cd "$ROOT/client"
-    # ASM_UI_MANAGED tells the UI server's Config endpoint (vite.config-api.ts)
-    # that this start script owns it; it finds startup.conf via the inherited
-    # ASM_DATA_DIR / ASM_RUNTIME_DIR.
-    ASM_DAEMON="$(ui_daemon_url)" ASM_DAEMON_TOKEN="$(ui_proxy_token)" \
-      ASM_CLIENT_HOST="$ASM_UI_HOST" ASM_CLIENT_ALLOWED_HOSTS="$ASM_UI_ALLOWED_HOSTS" \
-      ASM_UI_MANAGED=1 \
-      nohup "$UI_BIN" --host "$ASM_UI_HOST" --port "$ASM_UI_PORT" --strictPort \
-      >>"$LOG_DIR/asm-ui.log" 2>&1 </dev/null &
-    echo $! > "$UI_PIDFILE"
-  )
+  # ASM_UI_MANAGED tells the UI server's Config endpoint (vite.config-api.ts)
+  # that this start script owns it; it finds startup.conf via the inherited
+  # ASM_DATA_DIR / ASM_RUNTIME_DIR.
+  ASM_DAEMON="$(ui_daemon_url)" ASM_DAEMON_TOKEN="$(ui_proxy_token)" \
+    ASM_CLIENT_HOST="$ASM_UI_HOST" ASM_CLIENT_ALLOWED_HOSTS="$ASM_UI_ALLOWED_HOSTS" \
+    ASM_UI_MANAGED=1 \
+    asm_spawn "$LOG_DIR/asm-ui.log" "$UI_PIDFILE" --cwd "$ROOT/client" -- \
+    "${ui_cmd[@]}" --host "$ASM_UI_HOST" --port "$ASM_UI_PORT" --strictPort
   record_ui_state
   if wait_ui; then
     log "web UI up (pid $(cat "$UI_PIDFILE"))  $(ui_url)"
@@ -777,8 +889,7 @@ start_relay() {
   [ -x "$RELAY_BIN" ] || { err "missing $RELAY_BIN — build first (cargo build -p asm-relay)"; return 1; }
   log "starting asm-relay on $ASM_RELAY_BIND..."
   ASM_RELAY_BIND="$ASM_RELAY_BIND" ASM_RELAY_KEYS="$ASM_RELAY_KEYS" \
-    nohup "$RELAY_BIN" >>"$LOG_DIR/asm-relay.log" 2>&1 </dev/null &
-  echo $! > "$RELAY_PIDFILE"
+    asm_spawn "$LOG_DIR/asm-relay.log" "$RELAY_PIDFILE" -- "$RELAY_BIN"
   printf '%s|%s|%s' "$ASM_RELAY_BIND" "$ASM_RELAY_KEYS" "$(daemon_enabled && echo 0 || echo 1)" > "$RELAY_STATE_FILE"
   if wait_relay; then
     log "relay up (pid $(cat "$RELAY_PIDFILE"))  http://$ASM_RELAY_BIND"
@@ -835,15 +946,18 @@ start_asmux() {
     err "is owned by something else, or rebinding failed. Its sessions CANNOT be attached, and"
     err "killing it will lose them. Inspect first:  $LOG_DIR/asmux.log"
     err "To force a clean holder anyway (THIS KILLS ITS SESSIONS):"
-    err "    kill $p && scripts/start.sh"
+    if [ "$ASM_WINDOWS" = 1 ]; then
+      err "    taskkill //F //PID $p && scripts/start.sh"
+    else
+      err "    kill $p && scripts/start.sh"
+    fi
     return 1
   fi
 
   [ -x "$ASMUX_BIN" ] || { err "missing $ASMUX_BIN — build first (cargo build -p asmux)"; return 1; }
   log "starting asmux holder..."
   ASM_RUNTIME_DIR="$ASM_RUNTIME_DIR" ASMUX_SOCK="$ASMUX_SOCK" \
-    nohup "$ASMUX_BIN" >>"$LOG_DIR/asmux.log" 2>&1 </dev/null &
-  echo $! > "$ASMUX_PIDFILE"
+    asm_spawn "$LOG_DIR/asmux.log" "$ASMUX_PIDFILE" -- "$ASMUX_BIN"
   if wait_socket; then
     log "asmux up (pid $(cat "$ASMUX_PIDFILE"))  socket=$ASMUX_SOCK"
   else
@@ -910,8 +1024,7 @@ start_daemon() {
   [ -x "$DAEMON_BIN" ] || { err "missing $DAEMON_BIN — build first (cargo build -p asm-daemon)"; return 1; }
   log "starting asm-daemon (sidecar) on $ASM_BIND..."
   ASM_BACKEND=sidecar ASM_ASMUX_AUTOSPAWN=0 \
-    nohup "$DAEMON_BIN" >>"$LOG_DIR/asm-daemon.log" 2>&1 </dev/null &
-  echo $! > "$DAEMON_PIDFILE"
+    asm_spawn "$LOG_DIR/asm-daemon.log" "$DAEMON_PIDFILE" -- "$DAEMON_BIN"
   daemon_reg_signature > "$DAEMON_STATE_FILE"
   if wait_health; then
     log "daemon up (pid $(cat "$DAEMON_PIDFILE"))  http://$ASM_BIND"
@@ -922,8 +1035,29 @@ start_daemon() {
 }
 
 # SIGTERM a pidfile's process, escalate to SIGKILL if it lingers.
+#
+# Windows has no SIGTERM: a console process with no window can only be ended
+# outright. Every component tolerates that — Unix escalates to SIGKILL too —
+# and a daemon on the holder backend does nothing on a clean exit anyway (its
+# sessions stay in the holder and its state is in SQLite).
 stop_one() {
   local name="$1" f="$2" p i
+  if [ "$ASM_WINDOWS" = 1 ]; then
+    if pid_alive "$f"; then
+      p="$(cat "$f")"
+      log "stopping $name (pid $p)..."
+      win_tool taskkill /F /PID "$p" >/dev/null 2>&1 || true
+      for i in $(seq 1 40); do
+        if ! pid_alive "$f"; then break; fi
+        sleep 0.1
+      done
+      if pid_alive "$f"; then err "$name (pid $p) did not stop"; fi
+    else
+      log "$name not running"
+    fi
+    rm -f "$f"
+    return 0
+  fi
   if pid_alive "$f"; then
     p="$(cat "$f")"
     log "stopping $name (pid $p)..."

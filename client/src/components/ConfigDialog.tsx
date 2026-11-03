@@ -131,10 +131,16 @@ function ConfigDialogBody() {
     const out: HostEntry[] = [];
     const ui = uiQ.data ?? null;
     // The daemon whose config file IS the UI server's (same host, same file).
+    // Hostnames compare case-insensitively: on Windows the daemon reports the
+    // computer name (`GPDWIN4`) while Node reports the DNS name (`gpdwin4`).
     const twin = ui
       ? connected.findIndex((_, i) => {
           const v = daemonQs[i]?.data;
-          return v && v.hostname === ui.hostname && v.path === ui.path;
+          return (
+            v &&
+            v.hostname.toLowerCase() === ui.hostname.toLowerCase() &&
+            v.path === ui.path
+          );
         })
       : -1;
     if (ui) {

@@ -94,8 +94,10 @@ log "components — $(IFS=,; echo "${components[*]}" | sed 's/,/, /g')"
 build_targets=()
 daemon_enabled && build_targets+=(-p asm-daemon -p asmux)
 relay_enabled && build_targets+=(-p asm-relay)
+# Windows starts every component — the Vite UI too — through asm-launch.
+if [ "$ASM_WINDOWS" = 1 ]; then build_targets+=(-p asm-launch); fi
 if [ ${#build_targets[@]} -gt 0 ]; then
-  log "building$(daemon_enabled && echo ' asm-daemon + asmux')$(daemon_enabled && relay_enabled && echo ' +')$(relay_enabled && echo ' asm-relay') ($PROFILE)..."
+  log "building$(daemon_enabled && echo ' asm-daemon + asmux')$(daemon_enabled && relay_enabled && echo ' +')$(relay_enabled && echo ' asm-relay')$([ "$ASM_WINDOWS" = 1 ] && echo ' (+ asm-launch)') ($PROFILE)..."
   cargo_build "${build_targets[@]}"
 fi
 config_save

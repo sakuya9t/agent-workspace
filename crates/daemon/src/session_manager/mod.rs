@@ -392,10 +392,13 @@ impl SessionManager {
             self.db.insert_instance(inst)?;
         }
 
+        // The stored session keeps the command as resolved (`codex.cmd`); what
+        // is spawned bypasses an npm shim's cmd.exe (see `direct_launch`).
+        let (command, args) = crate::plugins::direct_launch(&launch.command, launch.args);
         let spec = BackendSpawnSpec {
             session_id: id.clone(),
-            command: launch.command,
-            args: launch.args,
+            command,
+            args,
             env: launch.env,
             cwd: resolved_cwd.to_string(),
             rows: req.rows,
@@ -996,7 +999,7 @@ impl SessionManager {
 
 /// Best-effort path canonicalization for allowlist comparisons.
 fn canonical(p: &str) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p))
+    crate::util::canonicalize(std::path::Path::new(p)).unwrap_or_else(|_| PathBuf::from(p))
 }
 
 /// What an orphan-worktree cleanup removed and what it left (needing `force`).
@@ -1896,6 +1899,15 @@ mod tests {
                 let text = if plugin_id == "opencode" {
                     let config: serde_json::Value = serde_json::from_str(&stored.env[0].1).unwrap();
                     std::fs::read_to_string(config["instructions"][0].as_str().unwrap()).unwrap()
+                } else if plugin_id == "codex" {
+                    // A TOML string value: decode it, or a Windows cwd's escaped
+                    // backslashes never match the plain path.
+                    let value = stored
+                        .args
+                        .iter()
+                        .find_map(|a| a.strip_prefix("developer_instructions="))
+                        .expect("codex gets developer_instructions");
+                    serde_json::from_str::<String>(value).unwrap()
                 } else {
                     stored.args.join(" ")
                 };

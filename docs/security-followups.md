@@ -217,3 +217,28 @@ fix through the daemon's own listener again.
 - **Guidance:** when item 6 ("always require a token") lands, gate these
   endpoints like the rest of `/api`; consider logging config writes in the item-7
   audit log.
+
+## 13. Windows holder pipe: default DACL, and the name can be squatted — LOW (multi-user hosts only)
+
+- **What:** on Windows the daemon↔asmux transport is a named pipe,
+  `\.\pipe\asmux-<hash of the socket path>` (see `asmux::socket`). It is
+  created with the default security descriptor rather than an explicit
+  owner-only ACL, and its name is predictable. Another local account could
+  create that name *before* the holder starts; the holder would then refuse to
+  start (it requires the first instance), but a daemon started meanwhile would
+  connect to the impostor and send it session `create` requests — commands,
+  args, cwd and env.
+- **Current mitigation:** remote (SMB) clients are rejected. The default DACL
+  grants full control only to the creating user, SYSTEM and Administrators and
+  *read* to everyone else; driving the holder needs write access to send
+  `hello`, so no other non-admin account can control a live holder — the
+  practical equivalent of the Unix socket's `0600`. The first pipe instance is
+  created with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so nobody can attach a second
+  server to a live holder's name. Squatting needs a second interactive account
+  on the same machine, and on a single-user workstation there is none.
+- **Guidance:** before supporting shared Windows hosts, (a) create the pipe
+  with an explicit DACL for the current user SID only, and (b) have the daemon
+  verify the server end (`GetNamedPipeServerProcessId` → that process's token
+  user equals ours) before sending anything. Both need Win32 FFI the
+  `#![forbid(unsafe_code)]` holder cannot host, so they belong in a small
+  sibling crate, the way `asmux-wire` hosts the generated FlatBuffers code.

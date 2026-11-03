@@ -76,6 +76,8 @@ fi
 # restart would drop every connected node), one that DIED while recorded is
 # revived, and one that was stopped (no record) stays stopped.
 build_targets=(-p asm-daemon)
+# Windows starts the daemon (and any revived relay/UI) through asm-launch.
+if [ "$ASM_WINDOWS" = 1 ]; then build_targets+=(-p asm-launch); fi
 restart_relay=0
 if relay_enabled && [ -f "$RELAY_STATE_FILE" ] && ! pid_alive "$RELAY_PIDFILE"; then
   restart_relay=1

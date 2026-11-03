@@ -33,8 +33,10 @@ const confA = join(sbA.dataDir, "startup.conf");
 const confB = join(sbB.dataDir, "startup.conf");
 
 async function main() {
-  const viteBin = join(ROOT, "client", "node_modules", ".bin", "vite");
-  if (!existsSync(viteBin)) throw new Error(`missing ${viteBin} — run (cd client && npm install)`);
+  // Vite's own entry script, run under this node: npm's `.bin/vite` is a POSIX
+  // shell shim on Windows, which spawn() cannot execute.
+  const viteJs = join(ROOT, "client", "node_modules", "vite", "bin", "vite.js");
+  if (!existsSync(viteJs)) throw new Error(`missing ${viteJs} — run (cd client && npm install)`);
 
   await sbA.startDaemon();
   await sbB.startDaemon();
@@ -42,7 +44,7 @@ async function main() {
   const port = await freePort();
   const ui = `http://127.0.0.1:${port}`;
   const log = openSync(join(sbA.tmp, "vite.log"), "a");
-  vite = spawn(viteBin, ["--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
+  vite = spawn(process.execPath, [viteJs, "--host", "127.0.0.1", "--port", String(port), "--strictPort"], {
     cwd: join(ROOT, "client"),
     env: sbA.env({ ASM_DAEMON: sbA.http, ASM_CLIENT_HOST: "127.0.0.1", ASM_UI_MANAGED: "1" }),
     stdio: ["ignore", log, log],
@@ -117,7 +119,10 @@ async function main() {
   await evalJs("__set('ASM_NODE_LABEL', 'alpha')");
   check("an edit enables Save and tags the host unsaved", await waitFor("!__save().disabled && /unsaved/.test(__chips()[0].innerText)"));
   await evalJs("__save().click()");
-  check("saved notice", await waitFor("/Saved on/.test(document.querySelector('.config-modal').innerText)"));
+  // The post-save notice ("Saved on <host>."), not the dialog's subtitle
+  // ("Saved on each host and…"), which is always there: matching that let the
+  // checks below race the write — and lose it on a slower (Windows) disk.
+  check("saved notice", await waitFor("/Saved on (?!each host)/.test(document.querySelector('.config-modal').innerText)"));
   check("file written on the UI host", existsSync(confA) && parse(readFileSync(confA, "utf8")).ASM_NODE_LABEL === "alpha");
   const aView = await sbA.api("/api/config");
   check("daemon A reads the same saved value", aView.values.ASM_NODE_LABEL === "alpha");

@@ -39,7 +39,7 @@ pub async fn list(
     } else {
         PathBuf::from(&params.path)
     };
-    let canonical = std::fs::canonicalize(&base).unwrap_or(base);
+    let canonical = crate::util::canonicalize(&base).unwrap_or(base);
     if !canonical.is_dir() {
         return Err(AppError(
             StatusCode::BAD_REQUEST,
@@ -120,7 +120,7 @@ pub async fn mkdir(
     }
 
     let parent = PathBuf::from(&body.parent);
-    let canonical = std::fs::canonicalize(&parent).map_err(|e| {
+    let canonical = crate::util::canonicalize(&parent).map_err(|e| {
         AppError(
             StatusCode::BAD_REQUEST,
             format!("cannot resolve {}: {e}", parent.display()),
@@ -147,8 +147,5 @@ pub async fn mkdir(
 }
 
 fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+    crate::util::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
