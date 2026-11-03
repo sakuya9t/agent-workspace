@@ -862,11 +862,18 @@ mod tests {
             Err(_) => panic!("initial attach failed"),
         }
 
-        // Output flows before the drop. (Generous: PowerShell is slow to start.)
-        assert!(
-            next_output(&mut rx, Duration::from_secs(10)).await.is_some(),
-            "output before drop"
-        );
+        // The ticker itself is running before the drop. Any chunk is not enough:
+        // ConPTY writes its mode preamble (`ESC[?9001h ESC[?1004h`) the moment
+        // the pseudoconsole opens, before PowerShell has even started — and a
+        // cold PowerShell on a loaded runner can take longer than the post-drop
+        // wait below. (Generous: PowerShell is slow to start.)
+        let mut before = Vec::new();
+        while !String::from_utf8_lossy(&before).contains("line") {
+            let chunk = next_output(&mut rx, Duration::from_secs(10))
+                .await
+                .expect("ticker output before drop");
+            before.extend_from_slice(&chunk);
+        }
 
         // Force the connection down and expect a reconnect notification.
         let mut reconnects = client.reconnect_events();

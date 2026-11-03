@@ -175,7 +175,8 @@ pub struct SessionManager {
     registry: Arc<PluginRegistry>,
     backend: Arc<dyn SessionBackend>,
     live: Mutex<HashMap<String, Arc<dyn BackendSession>>>,
-    /// Base directory under which per-session Git worktrees are created.
+    /// Base directory under which per-session Git worktrees are created,
+    /// spelled the way git reports it (see [`resolve_worktree_root`]).
     worktree_root: PathBuf,
     /// Per-session interaction signals, keyed by session id (see [`Interaction`]).
     interactions: Mutex<HashMap<String, Arc<Interaction>>>,
@@ -201,7 +202,7 @@ impl SessionManager {
             registry,
             backend,
             live: Mutex::new(HashMap::new()),
-            worktree_root,
+            worktree_root: resolve_worktree_root(worktree_root),
             interactions: Mutex::new(HashMap::new()),
             reconcile_pass: Mutex::new(()),
             ready_tx: watch::channel(false).0,
@@ -995,6 +996,21 @@ impl SessionManager {
             sig.reset.store(true, Ordering::Relaxed);
         }
     }
+}
+
+/// Spell the worktree root the way git will report the worktrees under it.
+///
+/// Instances are matched to worktrees by path *string*: a session sharing a
+/// branch's worktree records the path `git worktree list` prints, and both the
+/// ownership it inherits and the last-one-out reclaim look that path up against
+/// the one the creating session stored. Git prints the real path — symlinks
+/// resolved and, on Windows, 8.3 short names (`C:\Users\RUNNER~1\…`) expanded.
+/// Built from a root spelled any other way, the owner and its sharers disagree,
+/// and archiving the owner reclaims a worktree a sharer is still working in.
+fn resolve_worktree_root(root: PathBuf) -> PathBuf {
+    // Only an existing path canonicalizes; the first worktree would create it.
+    let _ = std::fs::create_dir_all(&root);
+    crate::util::canonicalize(&root).unwrap_or(root)
 }
 
 /// Best-effort path canonicalization for allowlist comparisons.
@@ -2321,7 +2337,12 @@ mod tests {
         let s = manager.create_session(req).unwrap();
         let inst = manager.get_instance_for_session(&s.id).unwrap().unwrap();
         assert_eq!(inst.isolation, "shared");
-        assert_eq!(Path::new(&inst.path), theirs.as_path());
+        // Where git says it is: the real path, which a temp dir need not be
+        // spelled as (Windows runners' `%TEMP%` is under `C:\Users\RUNNER~1`).
+        assert_eq!(
+            Path::new(&inst.path),
+            crate::util::canonicalize(&theirs).unwrap().as_path()
+        );
         assert!(!inst.owns_worktree && !inst.owns_branch);
 
         manager.stop_session(&s.id, false).unwrap();
@@ -2746,6 +2767,33 @@ mod tests {
     #[tokio::test]
     async fn shared_worktree_survives_until_last_session_leaves() {
         let (manager, dir) = test_manager();
+        assert_shared_worktree_survives_until_last_session_leaves(&manager, &dir).await;
+    }
+
+    /// Git reports worktree paths resolved, so a worktree root reached through
+    /// a symlink (as through an 8.3 short name on Windows) is not how git spells
+    /// the worktrees under it. The owner and its sharer must still record one
+    /// path, or archiving the owner reclaims the worktree out from under the
+    /// sharer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_worktree_survives_under_a_symlinked_worktree_root() {
+        let dir = std::env::temp_dir().join(format!("asm-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+        let manager = Arc::new(SessionManager::new(
+            Db::open(&dir.join("test.sqlite3")).unwrap(),
+            Arc::new(PluginRegistry::with_builtins()),
+            Arc::new(MockBackend::default()),
+            dir.join("link").join("worktrees"),
+        ));
+        assert_shared_worktree_survives_until_last_session_leaves(&manager, &dir).await;
+    }
+
+    async fn assert_shared_worktree_survives_until_last_session_leaves(
+        manager: &Arc<SessionManager>,
+        dir: &Path,
+    ) {
         let repo = dir.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         git_init(&repo);
