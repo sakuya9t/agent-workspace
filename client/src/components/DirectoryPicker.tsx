@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import { api } from "../api";
 import { Target } from "../connectionStore";
@@ -26,12 +26,16 @@ export function DirectoryPicker({ target, initialPath, title, onPick, onClose }:
   // Single-clicked entry in the list; takes precedence over the listed
   // directory when confirming, so "c" clicked inside /a/b picks /a/b/c.
   const [selected, setSelected] = useState<string | null>(null);
+  // Inline "new folder" row: null = hidden, string = name being typed.
+  const [newName, setNewName] = useState<string | null>(null);
 
   const navigate = (p: string) => {
     setSelected(null);
+    setNewName(null);
     setPath(p);
   };
 
+  const qc = useQueryClient();
   const { data, error, isFetching } = useQuery({
     queryKey: ["fs", target.baseUrl, path, showHidden],
     queryFn: () => api.fsList(target, path, showHidden),
@@ -45,6 +49,22 @@ export function DirectoryPicker({ target, initialPath, title, onPick, onClose }:
 
   const current = data?.path ?? path;
   const chosen = selected ?? current;
+
+  const mkdir = useMutation({
+    mutationFn: (name: string) => api.fsMkdir(target, current, name),
+    onSuccess: (created) => {
+      setNewName(null);
+      // Land on the freshly created folder so "Use this folder" picks it.
+      setSelected(created);
+      setManual(created);
+      qc.invalidateQueries({ queryKey: ["fs", target.baseUrl, path] });
+    },
+  });
+
+  const submitNewFolder = () => {
+    const name = (newName ?? "").trim();
+    if (name && !mkdir.isPending) mkdir.mutate(name);
+  };
 
   return (
     <div
@@ -94,6 +114,13 @@ export function DirectoryPicker({ target, initialPath, title, onPick, onClose }:
           <button className="btn tiny" onClick={() => navigate("")}>
             {t("directoryPicker.homeBtn")}
           </button>
+          <button
+            className="btn tiny"
+            disabled={!data || newName !== null}
+            onClick={() => setNewName("")}
+          >
+            {t("directoryPicker.newFolderBtn")}
+          </button>
           <label className="checkbox small">
             <input
               type="checkbox"
@@ -105,7 +132,46 @@ export function DirectoryPicker({ target, initialPath, title, onPick, onClose }:
           {isFetching && <span className="dim small">{t("directoryPicker.loading")}</span>}
         </div>
 
+        {newName !== null && (
+          <div className="picker-path-row">
+            <input
+              className="input mono"
+              autoFocus
+              value={newName}
+              spellCheck={false}
+              placeholder={t("directoryPicker.newFolderPlaceholder")}
+              onChange={(e) => setNewName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") submitNewFolder();
+                if (e.key === "Escape") {
+                  // Keep the dialog open; only dismiss the inline row.
+                  e.stopPropagation();
+                  setNewName(null);
+                  mkdir.reset();
+                }
+              }}
+            />
+            <button
+              className="btn"
+              disabled={!newName.trim() || mkdir.isPending}
+              onClick={submitNewFolder}
+            >
+              {t("directoryPicker.createBtn")}
+            </button>
+            <button
+              className="btn"
+              onClick={() => {
+                setNewName(null);
+                mkdir.reset();
+              }}
+            >
+              {t("common.cancel")}
+            </button>
+          </div>
+        )}
+
         {error && <div className="error">{String(error)}</div>}
+        {mkdir.error != null && <div className="error">{String(mkdir.error)}</div>}
 
         <div className="picker-list">
           {data?.entries.length === 0 && (

@@ -82,8 +82,10 @@ impl Db {
             "INSERT INTO sessions (
                 id, agent_plugin_id, command, args, env, working_directory, workspace_id,
                 status, rows, cols, last_event_seq, exit_code, attention_state, attention_reason,
-                created_at, updated_at, last_activity_at, risky, agent_session_id, forked_from
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                created_at, updated_at, last_activity_at, risky, agent_session_id, forked_from,
+                state_since, state_kind
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,
+                      ?21, ?8 || '/' || ?13)",
             rusqlite::params![
                 s.id,
                 s.agent_plugin_id,
@@ -105,24 +107,85 @@ impl Db {
                 s.risky as i64,
                 s.agent_session_id,
                 s.forked_from,
+                s.state_since,
             ],
         )?;
         Ok(())
     }
 
     /// Record the agent's own conversation id for a live session. Written once —
-    /// the first successful capture wins, and later ticks must not overwrite it
-    /// with a re-derived guess (see [`Session::agent_session_id`]). The
-    /// `IS NULL` guard makes that a property of the statement rather than of
-    /// every caller.
+    /// the first successful unique capture wins, and later ticks must not
+    /// overwrite it with a re-derived guess (see [`Session::agent_session_id`]).
+    /// The guards make both properties atomic: another ASM session using the
+    /// same agent cannot claim an id that is already on record.
     pub fn set_agent_session_id(&self, id: &str, native_id: &str) -> Result<bool> {
         let conn = self.conn.lock();
         let n = conn.execute(
             "UPDATE sessions SET agent_session_id = ?2
-             WHERE id = ?1 AND agent_session_id IS NULL",
+             WHERE id = ?1 AND agent_session_id IS NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM sessions AS other
+                 WHERE other.id != ?1
+                   AND other.agent_plugin_id = sessions.agent_plugin_id
+                   AND other.agent_session_id = ?2
+               )",
             rusqlite::params![id, native_id],
         )?;
         Ok(n > 0)
+    }
+
+    /// Replace a binding that the owning plugin proved belongs to another
+    /// session. The compare-and-swap guard prevents a stale repair from
+    /// overwriting a newer capture, while the uniqueness guard preserves the
+    /// same invariant as [`Self::set_agent_session_id`]. Any generated title was
+    /// based on the old conversation and must be discarded with it.
+    pub fn replace_agent_session_id(
+        &self,
+        id: &str,
+        previous: &str,
+        replacement: &str,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let n = tx.execute(
+            "UPDATE sessions SET agent_session_id = ?3
+             WHERE id = ?1 AND agent_session_id = ?2
+               AND NOT EXISTS (
+                 SELECT 1 FROM sessions AS other
+                 WHERE other.id != ?1
+                   AND other.agent_plugin_id = sessions.agent_plugin_id
+                   AND other.agent_session_id = ?3
+               )",
+            rusqlite::params![id, previous, replacement],
+        )?;
+        if n > 0 {
+            tx.execute("DELETE FROM session_titles WHERE session_id = ?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
+    /// Persist the user-requested session-list title generated from this
+    /// session's conversation. It intentionally lives apart from the agent's
+    /// own automatic title so regenerating can replace it without modifying the
+    /// agent CLI's private session store.
+    pub fn set_session_title(&self, id: &str, title: &str, updated_at: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO session_titles (session_id, title, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id) DO UPDATE
+             SET title = excluded.title, updated_at = excluded.updated_at",
+            rusqlite::params![id, title, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_session_title(&self, id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT title FROM session_titles WHERE session_id = ?1")?;
+        let mut rows = stmt.query_map([id], |row| row.get(0))?;
+        rows.next().transpose().map_err(Into::into)
     }
 
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
@@ -130,7 +193,8 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT id, agent_plugin_id, command, args, env, working_directory, workspace_id,
                     status, rows, cols, last_event_seq, exit_code, attention_state, attention_reason,
-                    created_at, updated_at, last_activity_at, risky, agent_session_id, forked_from
+                    created_at, updated_at, last_activity_at, risky, agent_session_id, forked_from,
+                    state_since
              FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
@@ -142,7 +206,8 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT id, agent_plugin_id, command, args, env, working_directory, workspace_id,
                     status, rows, cols, last_event_seq, exit_code, attention_state, attention_reason,
-                    created_at, updated_at, last_activity_at, risky, agent_session_id, forked_from
+                    created_at, updated_at, last_activity_at, risky, agent_session_id, forked_from,
+                    state_since
              FROM sessions WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map([id], row_to_session)?;
@@ -158,7 +223,12 @@ impl Db {
     ) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
-            "UPDATE sessions SET status = ?2, exit_code = ?3, updated_at = ?4 WHERE id = ?1",
+            "UPDATE sessions
+             SET status = ?2, exit_code = ?3, updated_at = ?4,
+                 state_since = CASE WHEN state_kind = ?2 || '/' || attention_state
+                                    THEN state_since ELSE ?4 END,
+                 state_kind = ?2 || '/' || attention_state
+             WHERE id = ?1",
             rusqlite::params![id, status.as_str(), exit_code, updated_at],
         )?;
         Ok(())
@@ -176,7 +246,10 @@ impl Db {
         conn.execute(
             "UPDATE sessions
              SET last_event_seq = ?2, last_activity_at = ?3, updated_at = ?3,
-                 attention_state = ?4, attention_reason = ?5
+                 attention_state = ?4, attention_reason = ?5,
+                 state_since = CASE WHEN state_kind = status || '/' || ?4
+                                    THEN state_since ELSE ?3 END,
+                 state_kind = status || '/' || ?4
              WHERE id = ?1",
             rusqlite::params![
                 id,
@@ -198,8 +271,32 @@ impl Db {
     ) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
-            "UPDATE sessions SET attention_state = ?2, attention_reason = ?3, updated_at = ?4 WHERE id = ?1",
+            "UPDATE sessions
+             SET attention_state = ?2, attention_reason = ?3, updated_at = ?4,
+                 state_since = CASE WHEN state_kind = status || '/' || ?2
+                                    THEN state_since ELSE ?4 END,
+                 state_kind = status || '/' || ?2
+             WHERE id = ?1",
             rusqlite::params![id, attention.as_str(), reason, updated_at],
+        )?;
+        Ok(())
+    }
+
+    /// Clear the badge because the user *looked* at the session.
+    ///
+    /// Deliberately the one attention write that leaves `state_since`/`state_kind`
+    /// alone: viewing a session doesn't change what it is doing, and the clock the
+    /// list shows is meant to answer "how long has it been blocked" — an answer
+    /// that must survive being looked at. It also survives the *return* of the
+    /// badge a moment later: an agent that is still blocked re-classifies to the
+    /// state `state_kind` already records, so the CASE above finds no change and
+    /// the original timestamp stands.
+    pub fn clear_attention_for_view(&self, id: &str, updated_at: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE sessions SET attention_state = 'none', attention_reason = NULL, updated_at = ?2
+             WHERE id = ?1",
+            rusqlite::params![id, updated_at],
         )?;
         Ok(())
     }
@@ -359,6 +456,26 @@ impl Db {
         rows.next().transpose().map_err(Into::into)
     }
 
+    /// Every active workspace instance for `workspace_id`, newest first. Backs the
+    /// workspace branch-overview's session→branch grouping (the sessions table has
+    /// no branch column; `workspace_instances.branch` is the sole link). Covered by
+    /// `idx_instances_workspace`.
+    pub fn list_active_instances_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<WorkspaceInstance>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, workspace_id, session_id, path, branch, isolation, status, created_at,
+                    owns_worktree, owns_branch
+             FROM workspace_instances
+             WHERE workspace_id = ?1 AND status = 'active'
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([workspace_id], row_to_instance)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
     /// The `(owns_worktree, owns_branch)` flags recorded for the newest instance
     /// at `path`, or `None` if no session has ever run there. Ownership belongs
     /// to the resource rather than to whoever is currently sharing it, so a
@@ -422,6 +539,22 @@ impl Db {
     /// (server_id, enrollment_token). Identity is created at startup.
     pub fn identity(&self) -> Result<(String, String)> {
         read_identity(&self.conn.lock())
+    }
+
+    /// Make `configured` the enrollment token, if it is not already. The
+    /// startup config (`ASM_ENROLLMENT_TOKEN`) sets it; without one, the
+    /// generated token stands. Enrolled devices keep their own device tokens,
+    /// so this only changes what a NEW device must enter. Returns the token now
+    /// in effect.
+    pub fn apply_enrollment_token(&self, configured: Option<&str>) -> Result<String> {
+        let conn = self.conn.lock();
+        if let Some(token) = configured {
+            conn.execute(
+                "UPDATE server_identity SET enrollment_token = ?1 WHERE id = 1",
+                rusqlite::params![token],
+            )?;
+        }
+        Ok(read_identity(&conn)?.1)
     }
 
     pub fn insert_device(&self, d: &Device) -> Result<()> {
@@ -569,6 +702,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         risky: row.get::<_, i64>(17)? != 0,
         agent_session_id: row.get(18)?,
         forked_from: row.get(19)?,
+        state_since: row.get(20)?,
     })
 }
 
@@ -652,6 +786,16 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA_V7)?;
         conn.pragma_update(None, "user_version", 7)?;
         tracing::info!("applied schema migration v7");
+    }
+    if version < 8 {
+        conn.execute_batch(SCHEMA_V8)?;
+        conn.pragma_update(None, "user_version", 8)?;
+        tracing::info!("applied schema migration v8");
+    }
+    if version < 9 {
+        conn.execute_batch(SCHEMA_V9)?;
+        conn.pragma_update(None, "user_version", 9)?;
+        tracing::info!("applied schema migration v9");
     }
     Ok(())
 }
@@ -786,6 +930,35 @@ ALTER TABLE sessions ADD COLUMN agent_session_id TEXT;
 ALTER TABLE sessions ADD COLUMN forked_from TEXT;
 "#;
 
+/// When the session entered the state it is in now, and which state that is.
+///
+/// `last_activity_at` answers "when did this last print something", which is not
+/// what the list's clock is for: a blocked agent redraws its TUI forever, so that
+/// timestamp resets every few hundred milliseconds and reads "just now" no matter
+/// how long the session has been waiting on you. `state_since` is only moved when
+/// `state_kind` — the `status/attention` pair — actually changes.
+///
+/// Backfilled from `last_activity_at` rather than left at 0, so sessions that
+/// predate the column report something plausible instead of 1970.
+const SCHEMA_V8: &str = r#"
+ALTER TABLE sessions ADD COLUMN state_since INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN state_kind TEXT NOT NULL DEFAULT '';
+UPDATE sessions
+   SET state_since = last_activity_at,
+       state_kind = status || '/' || attention_state;
+"#;
+
+/// User-requested session-list titles. A separate table keeps this optional
+/// presentation metadata out of the lifecycle row and lets old sessions gain a
+/// generated title without rewriting them.
+const SCHEMA_V9: &str = r#"
+CREATE TABLE session_titles (
+    session_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+"#;
+
 /// Batches terminal events into transactions to keep write amplification low.
 fn event_writer_loop(mut conn: Connection, mut rx: UnboundedReceiver<EventMsg>) {
     // Block for the first event, then drain whatever else is queued.
@@ -851,10 +1024,66 @@ mod tests {
     use super::*;
     use crate::domain::{AttentionState, Session, SessionStatus};
 
+    #[test]
+    fn a_configured_enrollment_token_replaces_the_generated_one() {
+        let (db, dir) = temp_db();
+        let (_, generated) = db.get_or_create_identity("sid", "generated-token", 1).unwrap();
+        assert_eq!(generated, "generated-token");
+        assert_eq!(db.apply_enrollment_token(None).unwrap(), "generated-token");
+        assert_eq!(
+            db.apply_enrollment_token(Some("configured-token-123")).unwrap(),
+            "configured-token-123"
+        );
+        // It sticks: a later start with no configured token keeps it, and a
+        // re-run of identity creation never regenerates it.
+        let (sid, token) = db.get_or_create_identity("other", "other-token", 2).unwrap();
+        assert_eq!((sid.as_str(), token.as_str()), ("sid", "configured-token-123"));
+        assert_eq!(db.apply_enrollment_token(None).unwrap(), "configured-token-123");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn temp_db() -> (Db, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("asm-db-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         (Db::open(&dir.join("t.sqlite3")).unwrap(), dir)
+    }
+
+    /// Upgrading an existing install, not just creating a fresh one: a session
+    /// row written before the state clock existed must come back with a
+    /// plausible timestamp rather than the epoch.
+    #[test]
+    fn migration_backfills_the_state_clock_for_existing_sessions() {
+        let (db, dir) = temp_db();
+        let path = dir.join("t.sqlite3");
+        seed_session(&db, "old");
+        db.update_activity("old", 1, 5_000, AttentionState::Idle, None)
+            .unwrap();
+
+        // Rewind the file to exactly what a v7 daemon would have left behind.
+        db.conn
+            .lock()
+            .execute_batch(
+                "ALTER TABLE sessions DROP COLUMN state_since;
+                 ALTER TABLE sessions DROP COLUMN state_kind;
+                 DROP TABLE session_titles;
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
+        drop(db);
+
+        let db = Db::open(&path).unwrap();
+        let s = db.get_session("old").unwrap().unwrap();
+        assert_eq!(
+            s.state_since, 5_000,
+            "backfilled from last_activity_at, not left at 0",
+        );
+        // And the backfilled `state_kind` has to match the row, or the very next
+        // write would read as a change and restart a clock that didn't move.
+        db.update_activity("old", 2, 9_000, AttentionState::Idle, None)
+            .unwrap();
+        assert_eq!(db.get_session("old").unwrap().unwrap().state_since, 5_000);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn seed_session(db: &Db, id: &str) {
@@ -879,8 +1108,62 @@ mod tests {
             risky: false,
             agent_session_id: None,
             forked_from: None,
+            state_since: 1,
         })
         .unwrap();
+    }
+
+    #[test]
+    fn regenerated_session_title_is_persisted_and_replaced() {
+        let (db, dir) = temp_db();
+        seed_session(&db, "s1");
+        assert_eq!(db.get_session_title("s1").unwrap(), None);
+
+        db.set_session_title("s1", "First title", 10).unwrap();
+        assert_eq!(db.get_session_title("s1").unwrap().as_deref(), Some("First title"));
+
+        db.set_session_title("s1", "Better title", 20).unwrap();
+        assert_eq!(db.get_session_title("s1").unwrap().as_deref(), Some("Better title"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn native_id_capture_is_unique_and_repair_discards_the_stale_title() {
+        let (db, dir) = temp_db();
+        seed_session(&db, "s1");
+        seed_session(&db, "s2");
+
+        assert!(db.set_agent_session_id("s1", "native-old").unwrap());
+        assert!(!db.set_agent_session_id("s2", "native-old").unwrap());
+        assert_eq!(db.get_session("s2").unwrap().unwrap().agent_session_id, None);
+
+        // Simulate a duplicate written by an older daemon, before the unique
+        // capture guard existed.
+        db.conn
+            .lock()
+            .execute(
+                "UPDATE sessions SET agent_session_id = 'native-old' WHERE id = 's2'",
+                [],
+            )
+            .unwrap();
+        db.set_session_title("s2", "Title from the wrong conversation", 10)
+            .unwrap();
+
+        assert!(db
+            .replace_agent_session_id("s2", "native-old", "native-correct")
+            .unwrap());
+        assert_eq!(
+            db.get_session("s2")
+                .unwrap()
+                .unwrap()
+                .agent_session_id
+                .as_deref(),
+            Some("native-correct")
+        );
+        assert_eq!(db.get_session_title("s2").unwrap(), None);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The exact cold-stitch anchor: after a batch flush, `backend_cursor` equals
@@ -920,6 +1203,48 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(250));
         assert_eq!(db.get_backend_cursor("s1").unwrap(), 550);
         assert_eq!(db.max_event_seq("s1").unwrap(), 4);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The clock the session list shows: how long the session has been in the
+    /// state it is in, not how long since it last printed something.
+    #[test]
+    fn state_since_holds_through_redraws_and_moves_on_a_real_change() {
+        let (db, dir) = temp_db();
+        seed_session(&db, "s1");
+        let since = || db.get_session("s1").unwrap().unwrap().state_since;
+
+        // Blocked at 1_000. Every redraw after that repeats the same verdict, and
+        // the whole point is that they don't restart the clock — otherwise a
+        // session that has waited fifteen minutes reads "just now".
+        db.update_activity("s1", 1, 1_000, AttentionState::ApprovalNeeded, None)
+            .unwrap();
+        assert_eq!(since(), 1_000);
+        db.update_activity("s1", 2, 5_000, AttentionState::ApprovalNeeded, None)
+            .unwrap();
+        assert_eq!(since(), 1_000, "a redraw is not a state change");
+        assert_eq!(
+            db.get_session("s1").unwrap().unwrap().last_activity_at,
+            5_000,
+            "activity still tracks the last output — only the state clock holds",
+        );
+
+        // Viewing clears the badge but must not restart the clock, and neither
+        // must the badge coming back when the agent is still blocked.
+        db.clear_attention_for_view("s1", 6_000).unwrap();
+        assert_eq!(since(), 1_000, "looking at a session is not a state change");
+        db.update_activity("s1", 3, 7_000, AttentionState::ApprovalNeeded, None)
+            .unwrap();
+        assert_eq!(since(), 1_000, "the same block, re-reported after a view");
+
+        // Answering it is a real change; so is exiting.
+        db.update_activity("s1", 4, 8_000, AttentionState::Activity, None)
+            .unwrap();
+        assert_eq!(since(), 8_000);
+        db.update_status("s1", SessionStatus::Exited, Some(0), 9_000)
+            .unwrap();
+        assert_eq!(since(), 9_000, "the lifecycle status counts as state too");
 
         let _ = std::fs::remove_dir_all(dir);
     }

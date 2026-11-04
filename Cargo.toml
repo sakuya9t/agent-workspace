@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/daemon", "crates/asmux", "crates/asmux-wire", "crates/asm-relay"]
+members = ["crates/daemon", "crates/asmux", "crates/asmux-wire", "crates/asm-relay", "crates/asm-launch"]
 
 [workspace.package]
 version = "0.1.0"

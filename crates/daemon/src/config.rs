@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use directories::ProjectDirs;
 
 /// Runtime configuration and platform-specific directory resolution.
@@ -57,6 +57,10 @@ pub struct Config {
     /// Human label advertised to the relay and shown in clients
     /// (`ASM_NODE_LABEL`, default: hostname).
     pub node_label: String,
+    /// Enrollment token to use instead of the generated one
+    /// (`ASM_ENROLLMENT_TOKEN`, from the saved startup config). Applied to the
+    /// database at startup; unset keeps whatever token the database holds.
+    pub enrollment_token: Option<String>,
     /// Egress-less downstreams this daemon bridges as a gateway
     /// (`ASM_RELAY_DOWNSTREAMS`, comma-separated `host:port`). Each is probed on
     /// `/health` for its `node_id`/`label`, then advertised to the relay so a
@@ -104,10 +108,11 @@ impl Config {
         std::fs::create_dir_all(&runtime_dir)
             .with_context(|| format!("creating runtime dir {}", runtime_dir.display()))?;
 
-        let backend = match std::env::var("ASM_BACKEND").as_deref() {
-            Ok("sidecar") => BackendKind::Sidecar,
-            _ => BackendKind::Native,
-        };
+        let backend = parse_backend(
+            std::env::var_os("ASM_BACKEND")
+                .map(|v| v.to_string_lossy().into_owned())
+                .as_deref(),
+        )?;
         let asmux_socket = env_path("ASMUX_SOCK").unwrap_or_else(|| runtime_dir.join("asmux.sock"));
         let asmux_autospawn = !matches!(std::env::var("ASM_ASMUX_AUTOSPAWN").as_deref(), Ok("0"));
         let asmux_wait = std::env::var("ASM_ASMUX_WAIT_MS")
@@ -120,6 +125,13 @@ impl Config {
         let relay_url = env_nonempty("ASM_RELAY_URL");
         let relay_key = env_nonempty("ASM_RELAY_KEY");
         let node_label = env_nonempty("ASM_NODE_LABEL").unwrap_or_else(hostname_label);
+        let enrollment_token = env_nonempty("ASM_ENROLLMENT_TOKEN");
+        if let Some(token) = &enrollment_token {
+            // The LAN's only gate to enrolling: refuse a weak one outright
+            // rather than quietly running with it (or with the old one).
+            crate::startup_config::validate_value("ASM_ENROLLMENT_TOKEN", token)
+                .map_err(|e| anyhow::anyhow!("invalid {e}"))?;
+        }
         let relay_downstreams = env_nonempty("ASM_RELAY_DOWNSTREAMS")
             .map(|s| {
                 s.split(',')
@@ -150,6 +162,7 @@ impl Config {
             relay_url,
             relay_key,
             node_label,
+            enrollment_token,
             relay_downstreams,
             relay_probe_interval,
         })
@@ -157,6 +170,28 @@ impl Config {
 
     pub fn db_path(&self) -> PathBuf {
         self.data_dir.join("asm.sqlite3")
+    }
+}
+
+/// `ASM_BACKEND` → [`BackendKind`]. Unset (or empty) keeps the documented
+/// default; every other value must be one we recognise.
+///
+/// Rejecting is the point. This used to match `sidecar` and send *everything
+/// else* to the in-process backend, so `ASM_BACKEND=sidcar` — or any other
+/// typo — booted a green, healthy daemon that had quietly given up
+/// restart-survival: the sessions it holds die with the process, and nobody
+/// finds out until the restart that was supposed to adopt them. A deployment
+/// that asks for a backend by name and gets a different one is a failure to
+/// report, not a default to fall back on.
+fn parse_backend(raw: Option<&str>) -> Result<BackendKind> {
+    match raw.map(str::trim) {
+        None | Some("") | Some("native") => Ok(BackendKind::Native),
+        Some("sidecar") => Ok(BackendKind::Sidecar),
+        Some(other) => bail!(
+            "invalid ASM_BACKEND {other:?}: expected `native` or `sidecar` \
+             (unset means `native`). Refusing to start rather than silently \
+             running without session durability."
+        ),
     }
 }
 
@@ -174,4 +209,40 @@ fn hostname_label() -> String {
     env_nonempty("HOSTNAME")
         .or_else(|| env_nonempty("COMPUTERNAME"))
         .unwrap_or_else(|| "asm-node".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unset_or_empty_backend_keeps_the_documented_default() {
+        assert_eq!(parse_backend(None).unwrap(), BackendKind::Native);
+        assert_eq!(parse_backend(Some("")).unwrap(), BackendKind::Native);
+        assert_eq!(parse_backend(Some("  ")).unwrap(), BackendKind::Native);
+    }
+
+    #[test]
+    fn both_backends_are_selectable_by_name() {
+        assert_eq!(parse_backend(Some("native")).unwrap(), BackendKind::Native);
+        assert_eq!(parse_backend(Some("sidecar")).unwrap(), BackendKind::Sidecar);
+        // Surrounding whitespace is an env-file artefact, not a typo.
+        assert_eq!(
+            parse_backend(Some(" sidecar ")).unwrap(),
+            BackendKind::Sidecar
+        );
+    }
+
+    #[test]
+    fn a_typo_is_rejected_rather_than_silently_dropping_durability() {
+        // The exact failure this guards: `sidcar` used to boot green as the
+        // non-durable in-process backend.
+        for bad in ["sidcar", "Sidecar", "asmux", "true", "1"] {
+            let err = parse_backend(Some(bad)).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid ASM_BACKEND") && err.contains(bad),
+                "{bad:?} must be rejected by name, got: {err}"
+            );
+        }
+    }
 }

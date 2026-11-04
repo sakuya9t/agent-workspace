@@ -1,3 +1,21 @@
+//! Getting a client's bytes onto the daemon host, where a session's agent can
+//! read them. Two endpoints, differing only in *where* the file lands and how
+//! predictable its name is:
+//!
+//! - [`upload`] (`/paste`) — a pasted, dropped, or 📎-picked **attachment**. It
+//!   goes to `.asm/pastes/` under a uuid-suffixed name and the client injects
+//!   the path into the prompt. Collisions are impossible, and the file is
+//!   git-ignored, because it is a one-shot reference, not working material.
+//! - [`upload_workspace`] (`/upload`) — a file the user is **putting in the
+//!   workspace** from the Details panel. It goes to `uploads/` under the exact
+//!   name given, so the agent can find it by listing the directory rather than
+//!   being handed a path. That predictability is the whole point, which is why
+//!   this one has to answer the question the paste path defines away: what to do
+//!   when the name is already taken (see [`upload_workspace`]).
+//!
+//! Both share the size cap and, more importantly, [`safe_stem_ext`] — the
+//! client-supplied filename is untrusted input on either path.
+
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -187,6 +205,158 @@ pub async fn upload(
     })))
 }
 
+/// Where a workspace upload lands, relative to the session's working directory.
+///
+/// Deliberately a plain, visible directory and **not** `.asm/` — an uploaded
+/// file is working material the user expects to see in `ls` and in `git status`,
+/// and may well want to commit. That is the opposite of an attachment, which
+/// self-ignores precisely because it should never reach the repo.
+const UPLOAD_DIR: &str = "uploads";
+
+/// The client's filename plus an explicit opt-in to replace an existing file.
+#[derive(Deserialize)]
+pub struct WorkspaceUploadQuery {
+    name: Option<String>,
+    /// `force=true`. Absent means "fail on collision", which is the default the
+    /// client relies on to prompt before it clobbers anything.
+    #[serde(default)]
+    force: bool,
+}
+
+/// The exact leaf name a workspace upload will be stored under.
+///
+/// Unlike the paste path there is **no uuid**: a predictable path is the entire
+/// point, since the agent finds this file by listing `uploads/` rather than by
+/// being handed a path. That makes [`safe_stem_ext`] load-bearing here — it is
+/// the only thing between a client-supplied string and the name we write.
+///
+/// An extension-less name is preserved as-is (`Makefile` must not become
+/// `Makefile.bin`); the sniffed-extension fallback applies only when there is no
+/// usable name at all, which for this endpoint means the client sent none or the
+/// one it sent sanitised away entirely.
+fn workspace_filename(name: Option<&str>, body: &[u8]) -> String {
+    let (stem, ext) = name.map(safe_stem_ext).unwrap_or_default();
+    if stem.is_empty() {
+        let ext = if ext.is_empty() {
+            sniff_image_ext(body).unwrap_or("bin")
+        } else {
+            &ext
+        };
+        return format!("upload.{ext}");
+    }
+    if ext.is_empty() {
+        stem
+    } else {
+        format!("{stem}.{ext}")
+    }
+}
+
+/// Store a file in the session's workspace under `uploads/<name>`, so its agent
+/// can reach it by path *or* by listing the directory.
+///
+/// This is the "put this file on the box" counterpart to [`upload`]: the user
+/// hands the session a spec, a dataset, or a log bundle and then talks about it
+/// by name. Because the stored name is the one the client gave — no uuid — the
+/// path is predictable, and that forces a policy on collisions:
+///
+/// - An occupied name is a `409`, and the client turns that into a "replace?"
+///   prompt and retries with `force=true`. Silently overwriting would be a real
+///   hazard here in a way it never was for `.asm/pastes/`: this directory sits
+///   inside the user's checkout, so a careless `main.rs` upload could destroy
+///   source. Silently uniquifying would be worse than useless — it would hand
+///   back a name the user didn't ask for, defeating the predictability.
+/// - A *directory* in the way is a `400`, not a `409`: there is no confirm that
+///   makes it work, so offering the retry would just loop.
+///
+/// A forced replace **unlinks first** rather than writing through the existing
+/// entry. An agent running in this very session could have left a symlink at
+/// `uploads/<name>` pointing anywhere on the host, and `fs::write` follows
+/// symlinks; removing the entry first means a replace can only ever create a
+/// regular file at that path.
+///
+/// The directory is derived entirely from the server-side session record, and
+/// the leaf name is reduced to a single safe component, so — as with `paste` —
+/// nothing the client sends can escape `uploads/`. Auth is the router's standard
+/// bearer/loopback gate.
+pub async fn upload_workspace(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<WorkspaceUploadQuery>,
+    body: Bytes,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = state
+        .manager
+        .get_session(&id)?
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "no such session".into()))?;
+
+    if body.is_empty() {
+        return Err(AppError(StatusCode::BAD_REQUEST, "empty upload body".into()));
+    }
+    if body.len() > MAX_PASTE_BYTES {
+        return Err(AppError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "file too large: {} bytes (max {MAX_PASTE_BYTES})",
+                body.len()
+            ),
+        ));
+    }
+
+    let filename = workspace_filename(q.name.as_deref(), &body);
+    let rel = format!("{UPLOAD_DIR}/{filename}");
+
+    // `Path` in this module is axum's extractor, hence the fully-qualified type.
+    let dir = std::path::Path::new(&session.working_directory).join(UPLOAD_DIR);
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        AppError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("create upload dir: {e}"),
+        )
+    })?;
+    let abs = dir.join(&filename);
+
+    // `symlink_metadata`, not `exists`: a dangling symlink reports as absent to
+    // `exists` but still occupies the name, and a live one must be seen as an
+    // occupant rather than silently written through.
+    match std::fs::symlink_metadata(&abs) {
+        Ok(md) if md.is_dir() => {
+            return Err(AppError(
+                StatusCode::BAD_REQUEST,
+                format!("{rel} is a directory"),
+            ));
+        }
+        Ok(_) if !q.force => {
+            return Err(AppError(
+                StatusCode::CONFLICT,
+                format!("{rel} already exists"),
+            ));
+        }
+        Ok(_) => {
+            std::fs::remove_file(&abs).map_err(|e| {
+                AppError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("replace {rel}: {e}"),
+                )
+            })?;
+        }
+        Err(_) => {}
+    }
+
+    std::fs::write(&abs, &body).map_err(|e| {
+        AppError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("write upload: {e}"),
+        )
+    })?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "path": abs.to_string_lossy(),
+        "relative_path": rel,
+        "filename": filename,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +412,46 @@ mod tests {
         );
         assert_eq!(safe_stem_ext(".."), (String::new(), String::new()));
         assert_eq!(safe_stem_ext(""), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn workspace_upload_keeps_the_name_the_user_picked() {
+        // The predictable path is the feature: no uuid, no rewriting. A user who
+        // uploads `spec.pdf` has to be able to say "read spec.pdf".
+        assert_eq!(workspace_filename(Some("spec.pdf"), b"x"), "spec.pdf");
+        assert_eq!(
+            workspace_filename(Some("my-data_v2.tar.gz"), b"x"),
+            "my-data_v2.tar.gz"
+        );
+        // An extension-less name is a real name, not a missing one — forcing
+        // `.bin` onto it would break the file for every build system there is.
+        assert_eq!(workspace_filename(Some("Makefile"), b"x"), "Makefile");
+    }
+
+    #[test]
+    fn workspace_upload_cannot_be_talked_out_of_its_directory() {
+        // No uuid means the sanitiser is the only guard on the stored name, so
+        // the traversal cases matter more here than they do for a paste.
+        assert_eq!(
+            workspace_filename(Some("../../etc/passwd"), b"x"),
+            "passwd"
+        );
+        assert_eq!(
+            workspace_filename(Some(r"C:\Users\me\evil.exe"), b"x"),
+            "evil.exe"
+        );
+        assert_eq!(workspace_filename(Some("a/b/c.txt"), b"x"), "c.txt");
+    }
+
+    #[test]
+    fn workspace_upload_falls_back_only_when_there_is_no_usable_name() {
+        // A name that sanitises away entirely still has to land somewhere
+        // nameable rather than failing the upload.
+        assert_eq!(workspace_filename(Some(".."), b"junk"), "upload.bin");
+        assert_eq!(workspace_filename(None, b"junk"), "upload.bin");
+        // Unnamed image blobs get their type from the bytes, as with paste.
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0];
+        assert_eq!(workspace_filename(None, &png), "upload.png");
     }
 
     #[test]

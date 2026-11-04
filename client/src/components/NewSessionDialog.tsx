@@ -16,7 +16,7 @@ type SessionTarget = { kind: "workspace"; id: string } | { kind: "path" };
  * When none of these is installed on a host, its sessions cannot be forked and
  * the Fork action is disabled — see `canForkInto`.
  */
-export const FORKABLE_AGENTS = ["claude", "codex", "opencode"];
+export const FORKABLE_AGENTS = ["claude", "codex", "opencode", "pi"];
 
 /** Sentinel dropdown value that reveals the free-text model field. */
 const CUSTOM_MODEL = "__custom__";
@@ -99,8 +99,9 @@ export function NewSessionDialog() {
   });
 
   // The selected agent's models, resolved per-host. Kept off the plugins list
-  // because it can be slow (opencode shells out to enumerate), so it is only
-  // fetched for the agent actually in front of the user, and cached per agent.
+  // because it can be slow (Codex queries app-server; opencode shells out), so
+  // it is only fetched for the agent actually in front of the user and cached
+  // per agent.
   const { data: modelInfo } = useQuery({
     queryKey: ["models", conn.baseUrl, pluginId],
     queryFn: () => api.listModels(conn, pluginId),

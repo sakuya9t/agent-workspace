@@ -9,16 +9,23 @@ terminal output.
 start agent → disconnect → agent keeps running → reconnect → resume the same live session
 ```
 
-> **Status:** runnable MVP core (Alpha Gate). The daemon proves the central loop
-> end to end; the Electron shell and rich output rendering are next. See the
-> [MVP execution plan](docs/mvp-execution-plan.md) for what's landed and what's coming.
+> **Status (2026-11-03):** runnable **alpha core on Linux, macOS and Windows**.
+> The central disconnect/reconnect loop, durable daemon restarts, mobile web UI,
+> relay + gateway connectivity, session fork/recovery, and Git workflows run end
+> to end — on Windows natively, with ConPTY sessions held over a named pipe. The
+> formal Alpha/MVP gates are not yet met: rich rendering, workspace
+> hooks/checkpoints, Electron packaging, per-user service install, and
+> reliability / security hardening remain. See the [cross-track backlog](docs/backlog.md) for
+> current priority and the [MVP execution plan](docs/mvp-execution-plan.md) for
+> the original release definition.
 
 ## Architecture
 
 The **client** is a thin view; the **daemon** owns everything. Sessions are durable
 server-side objects, terminal state lives in a server-side VT100 emulator (so a
-fresh client resumes the current screen without replaying history), and live PTYs
-are held by an out-of-process **asmux** holder that survives daemon restarts.
+fresh client resumes a coherent screen; normal-buffer agents also receive
+bounded raw-history replay for scrollback), and live PTYs are held by an
+out-of-process **asmux** holder that survives daemon restarts.
 
 ![Agent Session Manager architecture](docs/architecture.png)
 
@@ -35,13 +42,21 @@ Full design in [`docs/architecture.md`](docs/architecture.md); durability model 
   across a daemon restart; the daemon re-adopts them on start. No silent relaunch —
   a dead agent is recorded as `exited`/`failed`/`indeterminate`, never faked.
 - **Run any CLI agent.** Built-in plugins for `shell`, `codex`, `claude`,
-  `opencode`, and approved `custom` commands — the new-session dialog only offers
-  agents whose CLI is actually installed on that host.
+  `opencode`, `pi`, and approved `custom` commands — the new-session dialog only
+  offers agents whose CLI is actually installed on that host.
 - **Isolate concurrent agents.** Each session gets its own Git worktree (auto-named
   branch, a new branch off a base, or an existing branch), so multiple agents on one
   repo never share a working tree.
-- **Track changes.** Per-session SCM panel: status, diffs, log, branches, and
-  fast-forward pull / rebase / merge of the session branch.
+- **Keep agents on the tracked branch.** Git sessions receive workspace and
+  branch instructions covering planning and implementation: keep edits and
+  commits on the assigned branch unless the user explicitly requests a move.
+  Applied to fresh and forked Codex, Claude Code, Pi, and OpenCode launches;
+  this is agent guidance, not a Git lock. Already-running agents need a new
+  launch to receive it.
+- **Track and integrate changes.** Per-session SCM: status, diffs, log, remote
+  tips, fetch/pull/push, rebase/merge, branch attach/detach, and agent-driven
+  commit. Workspace branch management can inspect, delete, merge or rebase
+  branches, with agent-assisted conflict resolution where appropriate.
 - **Aggregate many hosts.** Connect to several daemons at once; one left-panel tree
   shows every host → workspace → agent. Attention signals flag sessions that are
   active, likely blocked, need approval, or failed.
@@ -83,17 +98,35 @@ New machine? One idempotent script installs the toolchain and does a first build
 
 ```bash
 scripts/setup.sh          # prerequisites + debug build
-scripts/start.sh          # start the daemon (+ asmux holder), serve the client
+scripts/start.sh          # daemon + holder + persistent local Vite UI
+scripts/start.sh --no-ui  # opt out of managed Vite
 ```
 
-Then open the daemon's address (`http://127.0.0.1:4600` by default). For the guided
-wizard, durable-session flags, remote/relay connectivity, the HTTP API, and tests,
-see **[`docs/setup.md`](docs/setup.md)**.
+On Windows, from PowerShell (installs Git, the MSVC Build Tools, rustup and
+Node via winget — see [Windows](docs/setup.md#windows)):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup.ps1
+scripts\asm start         # the same start.sh, run under Git Bash
+```
+
+Open Vite at `http://127.0.0.1:5273`. Use `--ui-host 0.0.0.0` to expose it on a
+trusted LAN. Settings are saved per install (`~/.local/share/asm/startup.conf`):
+flags change just what they name and stick, so later runs need no flags — and
+the web UI's **config** dialog edits the saved settings of the UI host and every
+connected daemon, applied on that host's next `start.sh`. The daemon, relay and
+web UI are independent components: run any combination (`--no-daemon`,
+`--relay`, `--no-ui`, …). `--ui-only` runs that web gateway without a local daemon, holder,
+relay, or agent/SSH session layer; optionally point its same-origin proxy at a
+daemon with `--ui-daemon http://host:4600`. For guided UI/relay/connectivity
+choices, durable-session flags, the HTTP API, and tests, see
+**[`docs/setup.md`](docs/setup.md)**.
 
 ## Layout
 
 ```text
 crates/daemon/   Rust control-plane daemon (asm-daemon) + asmux PTY holder
+crates/asm-launch/  detached-process launcher (Windows service scripts, holder autospawn)
 client/          React 19 + Vite + xterm.js control center (web now, Electron later)
 docs/            requirements, architecture, durability & connectivity plans, setup
 scripts/         setup / start / stop / status / wizard / smoke & durability tests

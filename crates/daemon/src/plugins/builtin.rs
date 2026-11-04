@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -12,8 +12,8 @@ use super::fork;
 use super::title;
 use super::usage::{self, AgentUsage, TranscriptContext};
 use super::{
-    attention, find_in_path, AgentContext, AgentModel, AgentOption, AgentPlugin, HeadlessSpec,
-    LaunchSpec,
+    attention, find_in_path, AgentContext, AgentModel, AgentOption, AgentPlugin,
+    ConflictResolveSpec, HeadlessSpec, LaunchSpec,
 };
 use crate::domain::AttentionState;
 
@@ -26,6 +26,7 @@ pub fn all() -> Vec<Arc<dyn AgentPlugin>> {
         Arc::new(CodexPlugin),
         Arc::new(ClaudePlugin),
         Arc::new(OpencodePlugin),
+        Arc::new(PiPlugin),
         Arc::new(CustomCommandPlugin),
     ]
 }
@@ -53,7 +54,13 @@ impl AgentPlugin for ShellPlugin {
     fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
         let command = default_shell();
         let args = if cfg!(target_os = "windows") {
-            ctx.extra_args.clone()
+            // PowerShell's copyright/upgrade banner is noise in a session.
+            let mut a = Vec::new();
+            if is_powershell(&command) {
+                a.push("-NoLogo".to_string());
+            }
+            a.extend(ctx.extra_args.clone());
+            a
         } else {
             // Interactive login shell.
             let mut a = vec!["-i".to_string()];
@@ -91,8 +98,12 @@ impl AgentPlugin for CodexPlugin {
     fn model_args(&self, model: &str) -> Vec<String> {
         vec!["-m".to_string(), model.to_string()]
     }
-    // Codex has no CLI to enumerate its models, so `models()` stays empty: the
-    // dropdown offers the configured default plus a free-text "Custom…".
+    fn models(&self) -> Vec<AgentModel> {
+        // This is the same catalog the TUI's `/model` picker reads. The app
+        // server accounts for the installed Codex version, auth and rollout
+        // state, so a curated list here would inevitably drift.
+        list_codex_models(self.detect_binary().as_deref())
+    }
     fn detect_default_model(&self) -> Option<String> {
         detect_codex_model()
     }
@@ -124,11 +135,15 @@ impl AgentPlugin for CodexPlugin {
     fn native_session_id(&self, cx: &TranscriptContext) -> Option<String> {
         fork::codex_native_id(cx)
     }
+    fn replacement_native_session_id(&self, cx: &TranscriptContext) -> Option<String> {
+        usage::codex_replacement_native_id(cx)
+    }
     fn digest(&self, cx: &TranscriptContext) -> Option<String> {
         fork::codex_digest(cx)
     }
-    fn accepts_seed_prompt(&self) -> bool {
-        true
+    fn seed_prompt_args(&self, prompt: &str) -> Option<Vec<String>> {
+        // `codex <prompt>` — a bare positional is the opening message.
+        Some(vec![prompt.to_string()])
     }
     // `native_fork_requires_same_cwd` stays false: rollouts live under
     // `~/.codex/sessions/**` and are addressed by uuid, so unlike Claude, Codex
@@ -147,30 +162,22 @@ impl AgentPlugin for CodexPlugin {
     fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
         cli_launch(self, ctx, "bypass_approvals", "--dangerously-bypass-approvals-and-sandbox")
     }
-    /// `codex fork <id> <prompt>` — a subcommand, so unlike Claude's flags it has
-    /// to *lead* argv, ahead of the danger flag. This is the reason forking is a
-    /// whole plugin method rather than a few extra args contributed to
-    /// `build_launch`.
+    /// `codex -C <cwd> fork <id> <prompt>` — `fork` is a subcommand (after the
+    /// global cwd override), so unlike Claude's flags it has to precede the
+    /// danger/model flags and positionals. This is the reason forking is a whole
+    /// plugin method rather than a few extra args contributed to `build_launch`.
     fn build_fork(
         &self,
         ctx: &AgentContext,
         native_id: &str,
         seed: &str,
+        cwd: &Path,
     ) -> Option<Result<LaunchSpec>> {
         Some(self.detect_binary().ok_or_else(|| anyhow!("`codex` binary not found in PATH")).map(
             |command| {
-                let mut args = vec!["fork".to_string()];
-                if ctx.opt("bypass_approvals") {
-                    args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
-                }
-                if let Some(model) = ctx.model.as_deref() {
-                    args.extend(self.model_args(model));
-                }
-                args.push(native_id.to_string());
-                args.push(seed.to_string());
                 LaunchSpec {
                     command,
-                    args,
+                    args: codex_fork_args(ctx, native_id, seed, cwd),
                     env: ctx.extra_env.clone(),
                     requires_approval: false,
                 }
@@ -180,10 +187,13 @@ impl AgentPlugin for CodexPlugin {
     fn headless(&self, prompt: &str, out: &Path) -> Option<HeadlessSpec> {
         // `-o` writes just the final message. Without it the answer arrives on
         // stdout wrapped in progress output and a token-usage footer.
+        // Summaries run in an empty temporary directory, deliberately outside
+        // any repository. Codex otherwise refuses before generating an answer.
         Some(HeadlessSpec {
             command: self.detect_binary()?,
             args: vec![
                 "exec".into(),
+                "--skip-git-repo-check".into(),
                 "--color".into(),
                 "never".into(),
                 "-o".into(),
@@ -191,6 +201,20 @@ impl AgentPlugin for CodexPlugin {
                 prompt.to_string(),
             ],
             output_file: Some(out.to_path_buf()),
+        })
+    }
+    fn conflict_resolver(&self, prompt: &str) -> Option<ConflictResolveSpec> {
+        // `exec` is codex's non-interactive mode; the bypass flag lets it edit the
+        // conflicted files and run git in the worktree without stopping to ask.
+        Some(ConflictResolveSpec {
+            command: self.detect_binary()?,
+            args: vec![
+                "exec".into(),
+                "--dangerously-bypass-approvals-and-sandbox".into(),
+                "--color".into(),
+                "never".into(),
+                prompt.to_string(),
+            ],
         })
     }
 }
@@ -256,8 +280,9 @@ impl AgentPlugin for ClaudePlugin {
     fn digest(&self, cx: &TranscriptContext) -> Option<String> {
         fork::claude_digest(cx)
     }
-    fn accepts_seed_prompt(&self) -> bool {
-        true
+    fn seed_prompt_args(&self, prompt: &str) -> Option<Vec<String>> {
+        // `claude <prompt>` — a bare positional is the opening message.
+        Some(vec![prompt.to_string()])
     }
     // `~/.claude/projects/<encoded-cwd>/`: a resume from a different directory
     // looks in a different project and finds nothing.
@@ -290,6 +315,7 @@ impl AgentPlugin for ClaudePlugin {
         ctx: &AgentContext,
         native_id: &str,
         seed: &str,
+        _cwd: &Path,
     ) -> Option<Result<LaunchSpec>> {
         Some(self.detect_binary().ok_or_else(|| anyhow!("`claude` binary not found in PATH")).map(
             |command| {
@@ -319,6 +345,18 @@ impl AgentPlugin for ClaudePlugin {
             command: self.detect_binary()?,
             args: vec!["-p".into(), prompt.to_string()],
             output_file: None,
+        })
+    }
+    fn conflict_resolver(&self, prompt: &str) -> Option<ConflictResolveSpec> {
+        // `-p` runs headless; skip-permissions lets it rewrite the conflicted
+        // files and run git in the worktree without prompting.
+        Some(ConflictResolveSpec {
+            command: self.detect_binary()?,
+            args: vec![
+                "-p".into(),
+                prompt.to_string(),
+                "--dangerously-skip-permissions".into(),
+            ],
         })
     }
 }
@@ -374,8 +412,12 @@ impl AgentPlugin for OpencodePlugin {
     fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
         cli_launch(self, ctx, "auto_approve", "--auto")
     }
-    fn accepts_seed_prompt(&self) -> bool {
-        true
+    fn seed_prompt_args(&self, prompt: &str) -> Option<Vec<String>> {
+        // opencode's *positional* is a project directory, not a prompt — passing
+        // the brief there makes it `chdir` into the prompt text and die with
+        // "Failed to change directory to …". The opening message goes through the
+        // TUI's `--prompt` flag instead.
+        Some(vec!["--prompt".to_string(), prompt.to_string()])
     }
     // No `digest` / `native_session_id`: opencode keeps its conversation in a
     // SQLite db rather than a per-cwd transcript, so both need a schema read we
@@ -389,7 +431,193 @@ impl AgentPlugin for OpencodePlugin {
             output_file: None,
         })
     }
+    fn conflict_resolver(&self, prompt: &str) -> Option<ConflictResolveSpec> {
+        // `run` is opencode's non-interactive mode; `--auto` auto-approves the
+        // edits and git commands it needs to resolve the conflict in the worktree.
+        Some(ConflictResolveSpec {
+            command: self.detect_binary()?,
+            args: vec!["run".into(), "--auto".into(), prompt.to_string()],
+        })
+    }
 }
+
+/// pi CLI agent (the `pi` TUI in the session's cwd).
+///
+/// pi is the odd one out on guardrails: it has **no sandbox and no per-tool
+/// approval prompts** — its built-in `bash`, `edit` and `write` tools run with
+/// the user's own permissions the moment the model calls them (see pi's
+/// `docs/security.md`). There is therefore no danger flag to offer, because
+/// there is no guardrail to disable; the toggle below runs in the other
+/// direction, handing pi a read-only tool set.
+pub struct PiPlugin;
+
+impl AgentPlugin for PiPlugin {
+    fn id(&self) -> &'static str {
+        "pi"
+    }
+    fn display_name(&self) -> &'static str {
+        "pi"
+    }
+    fn supported_platforms(&self) -> &'static [&'static str] {
+        ALL_PLATFORMS
+    }
+    fn detect_binary(&self) -> Option<String> {
+        find_in_path("pi")
+    }
+    fn supports_models(&self) -> bool {
+        true
+    }
+    fn model_args(&self, model: &str) -> Vec<String> {
+        // `--model` also accepts a bare pattern and a `:<thinking>` suffix, so a
+        // free-text "Custom…" entry works as well as a listed `provider/id`.
+        vec!["--model".to_string(), model.to_string()]
+    }
+    // Like opencode, pi fronts many providers and can list what this host is
+    // actually logged into (`pi --list-models`), so the dropdown shows the real
+    // catalog rather than a curated guess.
+    fn models(&self) -> Vec<AgentModel> {
+        list_pi_models(self.detect_binary().as_deref())
+    }
+    fn detect_default_model(&self) -> Option<String> {
+        detect_pi_model()
+    }
+    // `bell_means_attention` stays off: every 0x07 pi emits terminates an OSC
+    // sequence (OSC 133 prompt marks, OSC 52 clipboard writes) — it never rings
+    // a real bell. See `attention::pi`.
+    fn attention_uses_screen(&self) -> bool {
+        true
+    }
+    fn attention(&self, screen: &str, bell: bool) -> (AttentionState, Option<String>) {
+        attention::pi_attention(screen, bell)
+    }
+    fn usage(&self, cx: &TranscriptContext) -> Option<AgentUsage> {
+        usage::pi_usage(cx)
+    }
+    fn conversation(&self, cx: &TranscriptContext) -> Option<String> {
+        conversation::pi_conversation(cx)
+    }
+    fn title(&self, cx: &TranscriptContext) -> Option<String> {
+        title::pi_session_title(cx)
+    }
+    fn native_session_id(&self, cx: &TranscriptContext) -> Option<String> {
+        fork::pi_native_id(cx)
+    }
+    fn digest(&self, cx: &TranscriptContext) -> Option<String> {
+        fork::pi_digest(cx)
+    }
+    fn seed_prompt_args(&self, prompt: &str) -> Option<Vec<String>> {
+        // `pi <prompt>` — trailing positionals are the opening message(s).
+        Some(vec![prompt.to_string()])
+    }
+    // `native_fork_requires_same_cwd` stays false: `pi --fork <id>` looks the id
+    // up in the current project first and then across every project, so a fork
+    // resolves from a brand-new worktree.
+    fn options(&self) -> Vec<AgentOption> {
+        vec![AgentOption {
+            key: "read_only".into(),
+            label: "Read-only tools".into(),
+            description: "Launch with --tools read,grep,find,ls: pi can inspect the repo but \
+                          cannot edit files or run commands. pi has no sandbox or approval \
+                          prompts, so without this its edits and shell commands run unattended."
+                .into(),
+            danger: false,
+            default: false,
+        }]
+    }
+    fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
+        let command = self
+            .detect_binary()
+            .ok_or_else(|| anyhow!("`{}` binary not found in PATH", self.id()))?;
+        Ok(LaunchSpec {
+            command,
+            args: pi_launch_args(ctx),
+            env: ctx.extra_env.clone(),
+            requires_approval: false,
+        })
+    }
+    /// `pi --fork <id> <prompt>`: `--fork` copies the origin's conversation into
+    /// a *new* session file rooted at this process's cwd, so the origin's own
+    /// file is never appended to and the fork records the worktree it now runs in.
+    fn build_fork(
+        &self,
+        ctx: &AgentContext,
+        native_id: &str,
+        seed: &str,
+        _cwd: &Path,
+    ) -> Option<Result<LaunchSpec>> {
+        Some(
+            self.detect_binary()
+                .ok_or_else(|| anyhow!("`pi` binary not found in PATH"))
+                .map(|command| LaunchSpec {
+                    command,
+                    args: pi_fork_args(ctx, native_id, seed),
+                    env: ctx.extra_env.clone(),
+                    requires_approval: false,
+                }),
+        )
+    }
+    fn headless(&self, prompt: &str, _out: &Path) -> Option<HeadlessSpec> {
+        // `-p` prints the final answer to stdout and exits. `--no-session` keeps
+        // the summarizer out of pi's session store: the caller runs this in a
+        // throwaway directory, so the file it would leave behind is a session
+        // directory named after a temp path that no longer exists.
+        Some(HeadlessSpec {
+            command: self.detect_binary()?,
+            args: pi_headless_args(prompt),
+            output_file: None,
+        })
+    }
+    fn conflict_resolver(&self, prompt: &str) -> Option<ConflictResolveSpec> {
+        // No bypass flag to pass — pi's edit/write/bash tools never stop to ask.
+        // The session is kept (unlike `headless`): this runs in the user's real
+        // worktree, so `pi -c` there replays what the auto-resolve did.
+        Some(ConflictResolveSpec {
+            command: self.detect_binary()?,
+            args: vec!["-p".into(), prompt.to_string()],
+        })
+    }
+}
+
+/// Flags every pi launch opens with: the tool allowlist when the user asked for
+/// a read-only session (pi's own default set otherwise), then the model override.
+fn pi_common_args(ctx: &AgentContext) -> Vec<String> {
+    let mut args = Vec::new();
+    if ctx.opt("read_only") {
+        args.push("--tools".to_string());
+        args.push(PI_READ_ONLY_TOOLS.to_string());
+    }
+    if let Some(model) = ctx.model.as_deref() {
+        args.extend(PiPlugin.model_args(model));
+    }
+    args
+}
+
+/// `pi [--tools …] [--model …] <extra args>`.
+fn pi_launch_args(ctx: &AgentContext) -> Vec<String> {
+    let mut args = pi_common_args(ctx);
+    args.extend(ctx.extra_args.clone());
+    args
+}
+
+/// `pi [--tools …] [--model …] --fork <id> <seed>`. The seed is a trailing
+/// positional, so every flag has to precede it.
+fn pi_fork_args(ctx: &AgentContext, native_id: &str, seed: &str) -> Vec<String> {
+    let mut args = pi_common_args(ctx);
+    args.push("--fork".to_string());
+    args.push(native_id.to_string());
+    args.push(seed.to_string());
+    args
+}
+
+/// `pi -p --no-session <prompt>`: print the answer and exit, saving nothing.
+fn pi_headless_args(prompt: &str) -> Vec<String> {
+    vec!["-p".into(), "--no-session".into(), prompt.to_string()]
+}
+
+/// pi's built-in tools that cannot change anything: no `edit`, `write` or `bash`.
+/// `grep`/`find`/`ls` are off in pi's own default set, so naming them here buys
+/// back the searching a read-only session still needs.
+const PI_READ_ONLY_TOOLS: &str = "read,grep,find,ls";
 
 /// Arbitrary user-provided command. Requires explicit approval to launch.
 pub struct CustomCommandPlugin;
@@ -450,12 +678,48 @@ fn cli_launch(
     })
 }
 
+fn codex_fork_args(ctx: &AgentContext, native_id: &str, seed: &str, cwd: &Path) -> Vec<String> {
+    // A persisted Codex conversation includes its original cwd. Without an
+    // explicit override, `codex fork` restores that cwd even though the daemon
+    // spawned the process in a new worktree: the TUI displays the source
+    // directory and the agent edits and commits there. `-C` makes the session
+    // manager's resolved fork destination win.
+    let mut args = vec![
+        "-C".to_string(),
+        cwd.to_string_lossy().into_owned(),
+        "fork".to_string(),
+    ];
+    if ctx.opt("bypass_approvals") {
+        args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+    }
+    if let Some(model) = ctx.model.as_deref() {
+        args.extend(CodexPlugin.model_args(model));
+    }
+    args.push(native_id.to_string());
+    args.push(seed.to_string());
+    args
+}
+
+/// The interactive shell a "Shell" session runs. On Windows that is PowerShell
+/// (7 if installed, else the inbox 5.1), not `%COMSPEC%` — which is `cmd.exe`
+/// on every Windows host, whatever the user actually works in. `cmd.exe` stays
+/// the last resort; any other shell (Git Bash, nushell…) is a custom command.
 fn default_shell() -> String {
     if cfg!(target_os = "windows") {
-        std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_string())
+        find_in_path("pwsh")
+            .or_else(|| find_in_path("powershell"))
+            .or_else(|| std::env::var("COMSPEC").ok())
+            .unwrap_or_else(|| "cmd.exe".to_string())
     } else {
         std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
     }
+}
+
+fn is_powershell(command: &str) -> bool {
+    let stem = Path::new(command)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase());
+    matches!(stem.as_deref(), Some("pwsh" | "powershell"))
 }
 
 // ---- Model detection (which model each agent is configured to default to) ----
@@ -507,6 +771,28 @@ fn detect_opencode_model() -> Option<String> {
         }
     }
     None
+}
+
+/// pi's default model: `defaultModel` from its global settings, qualified with
+/// `defaultProvider` when there is one (`--model` takes `provider/id`). pi also
+/// reads a project-local `.pi/settings.json`, but the daemon can't know the
+/// eventual cwd here, so the user default is the best "current model" to
+/// preselect.
+fn detect_pi_model() -> Option<String> {
+    let text = std::fs::read_to_string(usage::pi_agent_dir()?.join("settings.json")).ok()?;
+    parse_pi_settings_model(&text)
+}
+
+/// Pull `defaultModel` (and `defaultProvider`) out of pi's `settings.json`.
+fn parse_pi_settings_model(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let model = non_empty(v.get("defaultModel")?.as_str()?)?;
+    match v.get("defaultProvider").and_then(|p| p.as_str()).and_then(non_empty) {
+        // Already qualified (`anthropic/claude-sonnet-4-5`) — don't double it up.
+        Some(_) if model.contains('/') => Some(model),
+        Some(provider) => Some(format!("{provider}/{model}")),
+        None => Some(model),
+    }
 }
 
 /// Pull `"model"` out of Claude's `settings.json`.
@@ -610,6 +896,163 @@ fn strip_jsonc_comments(text: &str) -> String {
     out
 }
 
+// ---- Codex model enumeration (`codex app-server`, `model/list`) ----
+
+/// Ask Codex's app server for the picker-visible catalog used by `/model`.
+///
+/// The server is a long-lived JSONL process, so this cannot use `run_capture`:
+/// initialize the connection, page through `model/list`, then terminate it once
+/// all pages arrive. Empty on an absent/older Codex, protocol error or timeout;
+/// the dialog still retains its detected default and "Custom…" escape hatch.
+fn list_codex_models(binary: Option<&str>) -> Vec<AgentModel> {
+    let Some(bin) = binary else {
+        return Vec::new();
+    };
+
+    let mut child = match super::agent_command(bin, &["app-server".to_string()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return Vec::new(),
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Vec::new();
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Vec::new();
+    };
+
+    let (tx, rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) {
+                if tx.send(message).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let result = (|| {
+        write_json_line(
+            &mut stdin,
+            &serde_json::json!({
+                "method": "initialize",
+                "id": 0,
+                "params": {
+                    "clientInfo": {
+                        "name": "agent_session_manager",
+                        "title": "Agent Session Manager",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }
+            }),
+        )?;
+        write_json_line(
+            &mut stdin,
+            &serde_json::json!({ "method": "initialized", "params": {} }),
+        )?;
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut request_id = 1_i64;
+        let mut cursor: Option<String> = None;
+        let mut models = Vec::new();
+
+        loop {
+            let mut params = serde_json::json!({
+                "limit": 100,
+                "includeHidden": false
+            });
+            if let Some(cursor) = &cursor {
+                params["cursor"] = serde_json::Value::String(cursor.clone());
+            }
+            write_json_line(
+                &mut stdin,
+                &serde_json::json!({
+                    "method": "model/list",
+                    "id": request_id,
+                    "params": params
+                }),
+            )?;
+
+            let response = loop {
+                let remaining = deadline.checked_duration_since(Instant::now())?;
+                let message = rx.recv_timeout(remaining).ok()?;
+                if message.get("id").and_then(|id| id.as_i64()) == Some(request_id) {
+                    break message;
+                }
+            };
+            if response.get("error").is_some() {
+                return None;
+            }
+
+            let (page, next_cursor) = parse_codex_model_page(response.get("result")?)?;
+            for model in page {
+                if !models.iter().any(|existing: &AgentModel| existing.id == model.id) {
+                    models.push(model);
+                }
+            }
+            let Some(next_cursor) = next_cursor else {
+                return Some(models);
+            };
+            cursor = Some(next_cursor);
+            request_id += 1;
+        }
+    })();
+
+    // Closing stdin and killing the long-lived server both unblock its stdout
+    // reader. Always reap it so a model-dropdown request cannot leak a process.
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader.join();
+    result.unwrap_or_default()
+}
+
+fn write_json_line(stdin: &mut impl Write, value: &serde_json::Value) -> Option<()> {
+    serde_json::to_writer(&mut *stdin, value).ok()?;
+    stdin.write_all(b"\n").ok()?;
+    stdin.flush().ok()
+}
+
+/// Parse one `model/list` result. Use `model` as the CLI flag value (falling
+/// back to `id` for older catalogs) and `displayName` as the friendly label.
+fn parse_codex_model_page(
+    result: &serde_json::Value,
+) -> Option<(Vec<AgentModel>, Option<String>)> {
+    let models = result
+        .get("data")?
+        .as_array()?
+        .iter()
+        .filter(|entry| entry.get("hidden").and_then(|v| v.as_bool()) != Some(true))
+        .filter_map(|entry| {
+            let id = entry
+                .get("model")
+                .and_then(|v| v.as_str())
+                .or_else(|| entry.get("id").and_then(|v| v.as_str()))
+                .and_then(non_empty)?;
+            let label = entry
+                .get("displayName")
+                .and_then(|v| v.as_str())
+                .and_then(non_empty)
+                .unwrap_or_else(|| id.clone());
+            Some(AgentModel { id, label })
+        })
+        .collect();
+    let cursor = result
+        .get("nextCursor")
+        .and_then(|v| v.as_str())
+        .and_then(non_empty);
+    Some((models, cursor))
+}
+
 // ---- opencode model enumeration (`opencode models`) ----
 
 /// List opencode's available models by running `opencode models`. Empty on any
@@ -619,8 +1062,7 @@ fn list_opencode_models(binary: Option<&str>) -> Vec<AgentModel> {
     let Some(bin) = binary else {
         return Vec::new();
     };
-    let mut cmd = Command::new(bin);
-    cmd.arg("models");
+    let cmd = super::agent_command(bin, &["models".to_string()]);
     match run_capture(cmd, Duration::from_secs(10)) {
         Some(out) => parse_opencode_models_output(&out),
         None => Vec::new(),
@@ -634,6 +1076,46 @@ fn parse_opencode_models_output(stdout: &str) -> Vec<AgentModel> {
         .map(str::trim)
         .filter(|l| !l.is_empty() && l.contains('/') && !l.contains(char::is_whitespace))
         .map(AgentModel::plain)
+        .collect()
+}
+
+// ---- pi model enumeration (`pi --list-models`) ----
+
+/// List the models pi can reach on this host by running `pi --list-models`.
+/// Empty on any failure (missing binary, error exit, timeout) — the dropdown
+/// then falls back to the detected default plus a free-text "Custom…".
+fn list_pi_models(binary: Option<&str>) -> Vec<AgentModel> {
+    let Some(bin) = binary else {
+        return Vec::new();
+    };
+    let cmd = super::agent_command(bin, &["--list-models".to_string()]);
+    // pi refreshes provider catalogs over the network before listing, with its
+    // own 15s bound; allow for that plus startup.
+    match run_capture(cmd, Duration::from_secs(25)) {
+        Some(out) => parse_pi_models_output(&out),
+        None => Vec::new(),
+    }
+}
+
+/// Parse `pi --list-models` stdout: a padded table whose rows are
+/// `provider  model  context  max-out  thinking  images`. Only the provider and
+/// model matter — joined into the `provider/id` form `--model` takes.
+///
+/// The `thinking`/`images` columns are the anchor: they are always `yes`/`no`,
+/// which the header row and pi's "no models available" advice are not, so a
+/// column count alone can't mistake either for a model.
+fn parse_pi_models_output(stdout: &str) -> Vec<AgentModel> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            let [provider, model, _context, _max_out, thinking, images] = cols[..] else {
+                return None;
+            };
+            let flag = |c: &str| c == "yes" || c == "no";
+            (flag(thinking) && flag(images))
+                .then(|| AgentModel::plain(&format!("{provider}/{model}")))
+        })
         .collect()
 }
 
@@ -705,9 +1187,28 @@ mod tests {
         assert_eq!(ClaudePlugin.model_args("opus"), vec!["--model", "opus"]);
         assert_eq!(OpencodePlugin.model_args("a/b"), vec!["--model", "a/b"]);
         assert_eq!(CodexPlugin.model_args("gpt-5"), vec!["-m", "gpt-5"]);
+        assert_eq!(PiPlugin.model_args("a/b"), vec!["--model", "a/b"]);
         // A plain shell has no model selector.
         assert!(ShellPlugin.model_args("x").is_empty());
         assert!(!ShellPlugin.supports_models());
+    }
+
+    #[test]
+    fn seed_prompt_encoding_is_per_agent() {
+        // Claude and Codex read a bare positional as the opening message.
+        assert_eq!(ClaudePlugin.seed_prompt_args("read the brief"), Some(vec!["read the brief".into()]));
+        assert_eq!(CodexPlugin.seed_prompt_args("read the brief"), Some(vec!["read the brief".into()]));
+        // opencode's positional is a project *directory*: a bare prompt would be
+        // taken as a path and the launch would die with "Failed to change
+        // directory to …", so its seed must go through `--prompt`.
+        assert_eq!(
+            OpencodePlugin.seed_prompt_args("read the brief"),
+            Some(vec!["--prompt".into(), "read the brief".into()])
+        );
+        // pi reads trailing positionals as the opening message, like Claude/Codex.
+        assert_eq!(PiPlugin.seed_prompt_args("read the brief"), Some(vec!["read the brief".into()]));
+        // A shell must not be seeded at all — it would run the brief as a script.
+        assert_eq!(ShellPlugin.seed_prompt_args("read the brief"), None);
     }
 
     #[test]
@@ -737,7 +1238,7 @@ mod tests {
             return;
         }
         let spec = ClaudePlugin
-            .build_fork(&ctx_with_model("opus"), "conv-1", "hi")
+            .build_fork(&ctx_with_model("opus"), "conv-1", "hi", Path::new("/workspace/fork"))
             .unwrap()
             .unwrap();
         let model_at = spec.args.iter().position(|a| a == "--model").unwrap();
@@ -747,21 +1248,112 @@ mod tests {
     }
 
     #[test]
-    fn codex_fork_puts_model_before_positionals() {
-        if CodexPlugin.detect_binary().is_none() {
+    fn codex_fork_forces_the_resolved_cwd_and_puts_model_before_positionals() {
+        let args = codex_fork_args(
+            &ctx_with_model("gpt-x"),
+            "conv-1",
+            "hi",
+            Path::new("/workspace/fork"),
+        );
+        // `codex -C <new-worktree> fork -m <model> <id> <seed>`: the explicit
+        // cwd overrides the source conversation's persisted cwd, and -m remains
+        // before the id/seed positionals.
+        let m = args.iter().position(|a| a == "-m").unwrap();
+        let id = args.iter().position(|a| a == "conv-1").unwrap();
+        assert_eq!(&args[..3], ["-C", "/workspace/fork", "fork"]);
+        assert!(m < id);
+        assert_eq!(args[m + 1], "gpt-x");
+    }
+
+    #[test]
+    fn pi_read_only_option_swaps_the_tool_set() {
+        // Off (the default): pi launches with its own tool set, no allowlist.
+        assert!(pi_launch_args(&AgentContext::default()).is_empty());
+
+        let ctx = AgentContext {
+            options: vec![("read_only".into(), true)],
+            model: Some("anthropic/claude-sonnet-4-5".into()),
+            ..Default::default()
+        };
+        let args = pi_launch_args(&ctx);
+        let tools = args.iter().position(|a| a == "--tools").expect("has --tools");
+        // No edit/write/bash in the allowlist — that is the point of the toggle.
+        assert_eq!(args[tools + 1], "read,grep,find,ls");
+        let model = args.iter().position(|a| a == "--model").unwrap();
+        assert!(tools < model, "tool set precedes the model flag: {args:?}");
+    }
+
+    #[test]
+    fn pi_launch_never_requires_approval() {
+        if PiPlugin.detect_binary().is_none() {
             return;
         }
-        let spec = CodexPlugin
-            .build_fork(&ctx_with_model("gpt-x"), "conv-1", "hi")
-            .unwrap()
-            .unwrap();
-        // `codex fork -m <model> <id> <seed>`: -m sits after the `fork` subcommand
-        // and before the id/seed positionals.
-        let m = spec.args.iter().position(|a| a == "-m").unwrap();
-        let id = spec.args.iter().position(|a| a == "conv-1").unwrap();
-        assert_eq!(spec.args[0], "fork");
-        assert!(m < id);
-        assert_eq!(spec.args[m + 1], "gpt-x");
+        assert!(!PiPlugin.build_launch(&AgentContext::default()).unwrap().requires_approval);
+    }
+
+    #[test]
+    fn pi_fork_passes_the_origin_id_then_the_seed() {
+        let args = pi_fork_args(&ctx_with_model("openai/gpt-4o"), "conv-1", "hi");
+        let fork_at = args.iter().position(|a| a == "--fork").unwrap();
+        let model_at = args.iter().position(|a| a == "--model").unwrap();
+        assert!(model_at < fork_at, "model flag must precede --fork: {args:?}");
+        // `--fork <id>` then the opening message, which pi reads as a positional.
+        assert_eq!(args[fork_at + 1], "conv-1");
+        assert_eq!(args[fork_at + 2], "hi");
+        // No `-C`-style cwd override, unlike Codex: pi roots the forked session
+        // at this process's cwd, which is already the destination worktree.
+        assert!(!args.iter().any(|a| a.starts_with('/')), "{args:?}");
+    }
+
+    #[test]
+    fn pi_headless_keeps_the_summarizer_out_of_the_session_store() {
+        // The caller runs this in a throwaway directory, so a saved session would
+        // leave a session dir named after a temp path that no longer exists.
+        let args = pi_headless_args("summarize this");
+        assert_eq!(args, vec!["-p", "--no-session", "summarize this"]);
+    }
+
+    #[test]
+    fn parse_pi_settings_qualifies_the_model_with_its_provider() {
+        assert_eq!(
+            parse_pi_settings_model(r#"{"defaultProvider":"anthropic","defaultModel":"claude-sonnet-4-5"}"#)
+                .as_deref(),
+            Some("anthropic/claude-sonnet-4-5")
+        );
+        // Already qualified — not doubled up.
+        assert_eq!(
+            parse_pi_settings_model(r#"{"defaultProvider":"openai","defaultModel":"openai/gpt-4o"}"#)
+                .as_deref(),
+            Some("openai/gpt-4o")
+        );
+        // Model alone is still usable: `--model` takes a bare pattern too.
+        assert_eq!(
+            parse_pi_settings_model(r#"{"defaultModel":"sonnet"}"#).as_deref(),
+            Some("sonnet")
+        );
+        assert_eq!(parse_pi_settings_model(r#"{"theme":"dark"}"#), None);
+        assert_eq!(parse_pi_settings_model("not json"), None);
+    }
+
+    #[test]
+    fn parse_pi_models_reads_the_table_and_skips_its_header() {
+        let out = "\
+provider   model              context  max-out  thinking  images
+anthropic  claude-sonnet-4-5  200K     64K      yes       yes
+openai     gpt-4o             128K     16K      no        yes
+";
+        let ids: Vec<_> = parse_pi_models_output(out)
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
+        assert_eq!(ids, vec!["anthropic/claude-sonnet-4-5", "openai/gpt-4o"]);
+    }
+
+    #[test]
+    fn parse_pi_models_ignores_advice_when_nothing_is_logged_in() {
+        // What `pi --list-models` actually prints with no provider configured.
+        let out = "No models available. Use /login to log into a provider via OAuth or API key. See:\n  /x/docs/providers.md\n";
+        assert!(parse_pi_models_output(out).is_empty());
     }
 
     #[test]
@@ -819,5 +1411,88 @@ mod tests {
         let models = parse_opencode_models_output(out);
         let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["opencode/big-pickle", "ollama-cloud/glm-5"]);
+    }
+
+    #[test]
+    fn parse_codex_model_list_uses_cli_ids_and_display_names() {
+        let result = serde_json::json!({
+            "data": [
+                {
+                    "id": "catalog-entry-1",
+                    "model": "gpt-5.4",
+                    "displayName": "GPT-5.4",
+                    "hidden": false,
+                    "isDefault": true
+                },
+                {
+                    "id": "gpt-5.4-mini",
+                    "displayName": null,
+                    "hidden": false
+                },
+                {
+                    "id": "internal-model",
+                    "displayName": "Internal",
+                    "hidden": true
+                },
+                {
+                    "id": "",
+                    "displayName": "Invalid"
+                }
+            ],
+            "nextCursor": "page-2"
+        });
+        let (models, cursor) = parse_codex_model_page(&result).unwrap();
+        assert_eq!(cursor.as_deref(), Some("page-2"));
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "gpt-5.4");
+        assert_eq!(models[0].label, "GPT-5.4");
+        assert_eq!(models[1].id, "gpt-5.4-mini");
+        assert_eq!(models[1].label, "gpt-5.4-mini");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_models_uses_initialized_app_server_and_follows_pages() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("asm-codex-models-{}", uuid::Uuid::new_v4()));
+        let binary = dir.join("codex");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &binary,
+            r#"#!/bin/sh
+state=0
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) state=1 ;;
+    *'"method":"initialized"'*) [ "$state" = 1 ] || exit 2; state=2 ;;
+    *'"method":"model/list"'*)
+      [ "$state" = 2 ] || exit 3
+      case "$line" in
+        *'"cursor":"page-2"'*)
+          printf '%s\n' '{"id":2,"result":{"data":[{"id":"gpt-b","displayName":"GPT B"}],"nextCursor":null}}'
+          exit 0
+          ;;
+        *)
+          printf '%s\n' '{"id":1,"result":{"data":[{"id":"gpt-a","displayName":"GPT A"}],"nextCursor":"page-2"}}'
+          ;;
+      esac
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).unwrap();
+
+        let models = list_codex_models(binary.to_str());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["gpt-a", "gpt-b"]);
+        assert_eq!(models[0].label, "GPT A");
+        assert_eq!(models[1].label, "GPT B");
     }
 }

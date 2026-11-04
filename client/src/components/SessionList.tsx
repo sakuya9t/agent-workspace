@@ -4,11 +4,14 @@ import { useTranslation } from "react-i18next";
 import { api, Session, SessionStatus, AttentionState, Workspace } from "../api";
 import { daemonLabel, Target, targetOf, useConnStore } from "../connectionStore";
 import { useUiStore } from "../store";
+import { useIsPhone } from "../useIsPhone";
 import { DaemonState, useDaemonPlugins, useDaemonStates } from "../useDaemons";
 import { canForkInto } from "./NewSessionDialog";
-import { isLive } from "../status";
+import { StopSessionDialog } from "./StopSessionDialog";
+import { isBusy, isLive } from "../status";
 import { relTime } from "../i18n/time";
 import { attentionLabel, endedLabel, statusLabel } from "../i18n/labels";
+import i18n from "../i18n";
 
 const STATUS_COLOR: Record<SessionStatus, string> = {
   starting: "#e0af68",
@@ -33,6 +36,16 @@ const ATTENTION_COLOR: Partial<Record<AttentionState, string>> = {
 
 type MutArgs = { target: Target; id: string };
 
+/** The session the stop dialog is confirming, plus how it was reached. */
+type StopTarget = {
+  daemonId: string;
+  target: Target;
+  session: Session;
+  name: string;
+  /** Sticky once the daemon has answered 409, even if the row looks idle. */
+  forceRequired: boolean;
+};
+
 export function SessionList() {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -40,11 +53,16 @@ export function SessionList() {
   const setActive = useUiStore((s) => s.setActive);
   const openNewSession = useUiStore((s) => s.openNewSession);
   const openNewWorkspace = useUiStore((s) => s.openNewWorkspace);
+  const openBranchManager = useUiStore((s) => s.openBranchManager);
   const openFork = useUiStore((s) => s.openFork);
   const setShowConnection = useUiStore((s) => s.setShowConnection);
+  const setShowConfig = useUiStore((s) => s.setShowConfig);
+  // The desktop top bar carries its own config button; the phone header has no room.
+  const isPhone = useIsPhone();
   const updateDaemon = useConnStore((s) => s.updateDaemon);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [stopTarget, setStopTarget] = useState<StopTarget | null>(null);
 
   const states = useDaemonStates();
   const pluginsByDaemon = useDaemonPlugins();
@@ -58,9 +76,24 @@ export function SessionList() {
   const isOpen = (id: string) => !collapsed.has(id);
   const refresh = () => qc.invalidateQueries({ queryKey: ["daemon"] });
 
+  // Stopping is confirmed in a dialog rather than a native `confirm()` because
+  // a working/blocked session needs the force-stop checkbox (see
+  // StopSessionDialog). The daemon guards the same rule, so a 409 here means the
+  // row was stale — keep the dialog open and make it the force variant instead
+  // of failing the click.
   const stop = useMutation({
-    mutationFn: ({ target, id }: MutArgs) => api.stopSession(target, id),
-    onSuccess: refresh,
+    mutationFn: ({ target, id, force }: MutArgs & { force: boolean }) =>
+      api.stopSession(target, id, force),
+    onSuccess: () => {
+      setStopTarget(null);
+      refresh();
+    },
+    onError: (e) => {
+      if ((e as { status?: number }).status === 409) {
+        setStopTarget((prev) => (prev ? { ...prev, forceRequired: true } : prev));
+      }
+      refresh();
+    },
   });
   // Archiving removes the session from history and deletes its branch. The click
   // is already confirmed; this second prompt is the escalation — the daemon
@@ -95,6 +128,16 @@ export function SessionList() {
     },
     onError: (e) =>
       alert(t("sessionList.saveError", { message: e instanceof Error ? e.message : String(e) })),
+  });
+  const regenerateTitle = useMutation({
+    mutationFn: ({ target, id }: MutArgs) => api.regenerateSessionTitle(target, id),
+    onSuccess: refresh,
+    onError: (e) =>
+      alert(
+        t("sessionList.regenerateError", {
+          message: e instanceof Error ? e.message : String(e),
+        }),
+      ),
   });
   const ack = useMutation({
     mutationFn: ({ target, id }: MutArgs) => api.ackAttention(target, id),
@@ -145,6 +188,16 @@ export function SessionList() {
     }
   }
   history.sort((a, b) => b.s.last_activity_at - a.s.last_activity_at);
+
+  // Re-read the session the stop dialog is open on from the latest poll: a
+  // session that starts working *while* the dialog sits open must grow the
+  // checkbox, not be stopped by the click the user already aimed at an idle row.
+  const stopCurrent = stopTarget
+    ? (states
+        .find((st) => st.daemon.id === stopTarget.daemonId)
+        ?.data?.sessions.find((x) => x.id === stopTarget.session.id) ??
+      stopTarget.session)
+    : null;
 
   const row = (
     daemonId: string,
@@ -202,19 +255,33 @@ export function SessionList() {
             {s.agent_plugin_id}
             {ctx?.workspaceName ? ` · ${ctx.workspaceName}` : ""}
           </span>
-          <span className="dim">{relTime(s.last_activity_at)}</span>
+          {/* How long it has been in this state — "blocked 8m", not "8m since
+              it last drew a frame". An old daemon sends no `state_since`, so
+              fall back to the activity stamp it does send. */}
+          <span className="dim" title={stateSinceTitle(s)}>
+            {relTime(s.state_since ?? s.last_activity_at)}
+          </span>
         </div>
         <div className="session-actions">
           {isLive(s.status) ? (
             <button
               className="icon-btn"
-              title={t("sessionList.stopTitle")}
+              title={
+                isBusy(s.attention_state)
+                  ? t("sessionList.stopBusyTitle")
+                  : t("sessionList.stopTitle")
+              }
               aria-label={t("sessionList.stopTitle")}
               onClick={(e) => {
                 e.stopPropagation();
-                if (confirm(t("sessionList.confirmStop", { name }))) {
-                  stop.mutate({ target, id: s.id });
-                }
+                stop.reset();
+                setStopTarget({
+                  daemonId,
+                  target,
+                  session: s,
+                  name,
+                  forceRequired: isBusy(s.attention_state),
+                });
               }}
             >
               <span className="action-icon action-icon-stop" aria-hidden="true" />
@@ -254,6 +321,33 @@ export function SessionList() {
               }}
             >
               <span className="action-icon action-icon-fork" aria-hidden="true" />
+            </button>
+          )}
+          {/* Re-run the compact title generator against this exact session's
+              conversation. It can take several seconds because a real installed
+              coding agent writes the title headlessly. */}
+          {s.status !== "archived" && (
+            <button
+              className="icon-btn"
+              title={t("sessionList.regenerateTitle")}
+              aria-label={t("sessionList.regenerateTitle")}
+              disabled={
+                regenerateTitle.isPending && regenerateTitle.variables?.id === s.id
+              }
+              onClick={(e) => {
+                e.stopPropagation();
+                regenerateTitle.mutate({ target, id: s.id });
+              }}
+            >
+              <span
+                className={
+                  "action-icon action-icon-regenerate-title" +
+                  (regenerateTitle.isPending && regenerateTitle.variables?.id === s.id
+                    ? " is-pending"
+                    : "")
+                }
+                aria-hidden="true"
+              />
             </button>
           )}
           {/* Save works for any non-archived session (live or ended); archived
@@ -330,6 +424,16 @@ export function SessionList() {
           )}
           <div className="tree-actions">
             {sessions.length > 0 && <span className="tree-badge">{sessions.length}</span>}
+            {w.is_git && (
+              <button
+                className="info-btn"
+                title={t("sessionList.branchesTitle")}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openBranchManager(daemonId, w.id);
+                }}
+              />
+            )}
             <button
               className="tree-add"
               title={t("sessionList.newSessionTitle")}
@@ -501,6 +605,15 @@ export function SessionList() {
           >
             {t("sessionList.daemonsBtn")}
           </button>
+          {isPhone && (
+            <button
+              className="btn tiny config-btn"
+              onClick={() => setShowConfig(true)}
+              title={t("app.configTitle")}
+            >
+              {t("app.config")}
+            </button>
+          )}
           <button className="btn primary" onClick={() => openNewSession(null, null)}>
             {t("sessionList.newBtn")}
           </button>
@@ -526,6 +639,23 @@ export function SessionList() {
             </div>
           )}
         </div>
+      )}
+
+      {stopTarget && stopCurrent && (
+        <StopSessionDialog
+          name={stopTarget.name}
+          busy={stopTarget.forceRequired || isBusy(stopCurrent.attention_state)}
+          attention={stopCurrent.attention_state}
+          pending={stop.isPending}
+          error={stop.error ? String((stop.error as Error).message) : null}
+          onCancel={() => {
+            stop.reset();
+            setStopTarget(null);
+          }}
+          onConfirm={(force) =>
+            stop.mutate({ target: stopTarget.target, id: stopTarget.session.id, force })
+          }
+        />
       )}
     </div>
   );
@@ -624,6 +754,29 @@ function sessionTitle(s: Session, workspaceName?: string): string {
  */
 function sessionLabel(s: Session, workspaceName?: string): string {
   return `${s.agent_plugin_id} · ${sessionTitle(s, workspaceName)}`;
+}
+
+/**
+ * Spells out what the row's relative time is counting, since "8m" alone can't
+ * say whether that is eight minutes of being blocked or eight minutes since the
+ * session was last touched. Names the state and gives the absolute moment.
+ */
+function stateSinceTitle(s: Session): string {
+  const at = s.state_since ?? s.last_activity_at;
+  const state = isLive(s.status)
+    ? s.attention_state !== "none"
+      ? attentionLabel(s.attention_state)
+      : statusLabel(s.status)
+    : endedLabel(s.status);
+  return i18n.t("sessionList.stateSinceTitle", { state, since: absTime(at) });
+}
+
+function absTime(ms: number): string {
+  try {
+    return new Date(ms).toLocaleString();
+  } catch {
+    return "";
+  }
 }
 
 /**

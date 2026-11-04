@@ -71,7 +71,9 @@ async function main() {
     await waitFor("document.querySelectorAll('.session-row').length >= 2");
     await evalJs(`document.querySelectorAll('.session-row')[${i}].click()`);
     await waitFor("!!document.querySelector('.mobile-term-header')");
-    await waitFor("(document.querySelector('.terminal-host')?.innerText||'').trim().length > 0");
+    await waitFor(
+      "!document.querySelector('.terminal-loading') && (document.querySelector('.terminal-mount .xterm-rows')?.innerText||'').trim().length > 0",
+    );
   };
   const enter = async () => {
     await S("Input.dispatchKeyEvent", {

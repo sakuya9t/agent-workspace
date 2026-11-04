@@ -69,10 +69,14 @@ fix through the daemon's own listener again.
   device browse the daemon host's directory tree (directories only, but
   arbitrary paths). Combined with workspace registration (any client can
   register any root) and `custom_command`, this is broad host access.
+  `/api/fs/mkdir` (the picker's "new folder" button) shares the trust model and
+  adds a write: any authed client can create a directory anywhere the daemon
+  user can (single path component, no traversal — but the parent is arbitrary).
 - **Guidance:** constrain browsing + workspace registration to a server-side
   configured set of allowed roots that a client cannot expand without host-side
   approval; treat "browse anywhere" as an explicit, host-granted capability.
   Enforce the workspace allowlist for the picker, not just for raw-cwd sessions.
+  The same allowed-roots check must gate `mkdir`'s parent.
 - **Related (image preview):** `GET /api/sessions/:id/scm/file` serves a changed
   file's raw bytes so the diff panel can show image previews. It is deliberately
   narrow: `guard_path` blocks `..`/absolute paths, the working-tree read is
@@ -85,7 +89,10 @@ fix through the daemon's own listener again.
 ## 3. Enrollment token is a static, non-expiring shared secret — MEDIUM
 
 - **What:** one long-lived enrollment token mints device tokens for anyone who
-  can reach `POST /api/auth/enroll` with it. No expiry, rotation, or use limit.
+  can reach `POST /api/auth/enroll` with it. No expiry or use limit.
+- **Partial mitigation (2026-09-28):** it can now be *rotated by hand* — set
+  `ASM_ENROLLMENT_TOKEN` (Config dialog, `--enrollment-token`, or
+  `startup.conf`, ≥16 chars) and restart; already-enrolled devices keep working.
 - **Guidance:** one-time / short-TTL enrollment codes, an owner-approval step
   for new devices, token rotation, and rate-limiting on the enroll endpoint.
 
@@ -116,8 +123,11 @@ fix through the daemon's own listener again.
 
 ## 7. No auth rate-limiting / lifecycle audit log — LOW
 
-- **What:** enroll and token checks aren't rate-limited; lifecycle audit events
-  (create/attach/input/stop/delete) listed in the docs aren't emitted yet.
+- **What:** enroll and token checks aren't rate-limited; persisted lifecycle
+  audit events (create/attach/input/stop/delete) listed in the docs aren't
+  emitted yet. Partial progress on 2026-07-21: terminal attachment open/close
+  lifetimes are now logged at DEBUG for diagnosis, but they are not the durable,
+  queryable audit log this item requires.
 - **Guidance:** add rate-limiting on `/api/auth/*`; emit and persist the
   lifecycle audit events; surface them in diagnostics.
 
@@ -181,3 +191,54 @@ fix through the daemon's own listener again.
 - **Guidance:** ship the item-6 "always require a token" mode and recommend it on
   any downstream that shares a host (or loopback range) with its gateway; fold
   into item 1's off-loopback story.
+
+## 12. Startup config is editable over the API — LOW (no new reach)
+
+- **What:** `PUT /api/config` (daemon) and `PUT /__asm/config` (the Vite UI
+  server) rewrite the host's saved startup config (`<data_dir>/startup.conf`):
+  which components run, bind address, enrollment token, relay registration,
+  bundled relay, managed UI, build profile. The next `scripts/start.sh` on that
+  host applies it — e.g. rebinding to `0.0.0.0`, setting a known enrollment
+  token, or registering to an attacker-chosen relay.
+- **Current mitigation:** no reach beyond what the caller already has. The
+  daemon endpoint sits behind the normal `/api` auth (loopback trust or an
+  enrolled device token) — a caller that passes it can already spawn a shell on
+  the host. The Vite endpoint is reachable by whoever can load that UI, who can
+  already drive the daemon it proxies to (loopback-trusted or token-injected);
+  it refuses cross-origin and non-JSON writes (`Origin` must match `Host`,
+  `Sec-Fetch-Site` must not be cross-site) so a foreign page in the user's
+  browser cannot post to it. Nothing restarts from the API — changes wait for
+  the owner's next script run, and the dialog/`status.sh` list them as "not
+  applied yet". Secrets (the enrollment token, relay keys, the UI proxy token)
+  are write-only over both endpoints; the file is `0600` and git-ignored; a
+  configured enrollment token must be ≥16 characters (the daemon refuses to
+  start with a weaker one); and asmux strips all of them from agent session
+  environments (they used to leak there via the scripts' exports).
+- **Guidance:** when item 6 ("always require a token") lands, gate these
+  endpoints like the rest of `/api`; consider logging config writes in the item-7
+  audit log.
+
+## 13. Windows holder pipe: default DACL, and the name can be squatted — LOW (multi-user hosts only)
+
+- **What:** on Windows the daemon↔asmux transport is a named pipe,
+  `\.\pipe\asmux-<hash of the socket path>` (see `asmux::socket`). It is
+  created with the default security descriptor rather than an explicit
+  owner-only ACL, and its name is predictable. Another local account could
+  create that name *before* the holder starts; the holder would then refuse to
+  start (it requires the first instance), but a daemon started meanwhile would
+  connect to the impostor and send it session `create` requests — commands,
+  args, cwd and env.
+- **Current mitigation:** remote (SMB) clients are rejected. The default DACL
+  grants full control only to the creating user, SYSTEM and Administrators and
+  *read* to everyone else; driving the holder needs write access to send
+  `hello`, so no other non-admin account can control a live holder — the
+  practical equivalent of the Unix socket's `0600`. The first pipe instance is
+  created with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so nobody can attach a second
+  server to a live holder's name. Squatting needs a second interactive account
+  on the same machine, and on a single-user workstation there is none.
+- **Guidance:** before supporting shared Windows hosts, (a) create the pipe
+  with an explicit DACL for the current user SID only, and (b) have the daemon
+  verify the server end (`GetNamedPipeServerProcessId` → that process's token
+  user equals ours) before sending anything. Both need Win32 FFI the
+  `#![forbid(unsafe_code)]` holder cannot host, so they belong in a small
+  sibling crate, the way `asmux-wire` hosts the generated FlatBuffers code.

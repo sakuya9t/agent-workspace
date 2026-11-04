@@ -27,6 +27,53 @@ body {
   font-size: 13px;
 }
 
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Six-key outline used as the mode switch in both regular shells. */
+.deck-mode-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 28px;
+  flex: none;
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #0b0e14;
+  text-decoration: none;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+.deck-mode-link:hover,
+.deck-mode-link:focus-visible {
+  color: #75e6d3;
+  border-color: #27645e;
+  background: #10201f;
+  outline: none;
+}
+.deck-link-icon {
+  display: grid;
+  grid-template-columns: repeat(3, 4px);
+  gap: 2px;
+}
+.deck-link-icon i {
+  display: block;
+  width: 4px;
+  height: 4px;
+  border: 1px solid currentColor;
+  border-radius: 1px;
+}
+
 .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Cascadia Code", monospace;
 }
@@ -173,6 +220,77 @@ body.col-resizing iframe {
   touch-action: none;
   overscroll-behavior: contain;
   -webkit-touch-callout: none;
+}
+/* Initial attach can take several seconds after a daemon restart while durable
+   sessions are adopted. A blank xterm looks dead; this covers it until the
+   server's first snapshot arrives. Reconnects after a successful paint use the
+   smaller badge below so useful terminal contents remain visible. */
+.terminal-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 8;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  padding: 24px;
+  color: var(--text);
+  background:
+    radial-gradient(circle at center, rgba(122, 162, 247, 0.08), transparent 42%),
+    #0b0e14;
+  text-align: center;
+}
+.terminal-loading-spinner {
+  width: 28px;
+  height: 28px;
+  border: 2px solid var(--accent-2);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: terminal-loading-spin 0.9s linear infinite;
+}
+.terminal-loading-spinner.small {
+  width: 13px;
+  height: 13px;
+  border-width: 1.5px;
+}
+.terminal-loading-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+.terminal-loading-hint {
+  max-width: 290px;
+  color: var(--dim);
+  font-size: 11px;
+  line-height: 1.4;
+}
+.terminal-reconnecting {
+  position: absolute;
+  top: 9px;
+  left: 50%;
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 10px;
+  color: var(--text);
+  border: 1px solid var(--accent-2);
+  border-radius: 999px;
+  background: rgba(15, 19, 28, 0.94);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+  font-size: 11px;
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+@keyframes terminal-loading-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .terminal-loading-spinner {
+    animation: none;
+  }
 }
 /* Transient attachment-upload status, floated over the terminal's top-right. */
 .paste-status {
@@ -812,6 +930,200 @@ body.col-resizing iframe {
 .conn-node-error {
   padding: 8px 0 0;
 }
+
+/* ---- startup settings (Config dialog) ---- */
+.config-modal {
+  width: 680px;
+  color-scheme: dark;
+}
+/* The host picker: one row per host, like the Connections dialog's daemon list. */
+.config-hosts {
+  display: flex;
+  flex-direction: column;
+  margin: 7px 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.config-host {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-left: 2px solid transparent;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.config-host:last-child {
+  border-bottom: 0;
+}
+.config-host:hover {
+  background: var(--panel-2);
+}
+.config-host:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.config-host.on {
+  border-left-color: var(--accent);
+  background: var(--accent-2);
+}
+.config-host-meta {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.config-host-name {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.config-host-sub {
+  color: var(--dim);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.config-host.on .config-host-sub {
+  color: var(--text);
+}
+.config-host-tags {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+}
+.config-tag {
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--dim);
+  font-size: 10px;
+  font-weight: 500;
+}
+.config-tag.warn-tag {
+  border-color: #ff9e64;
+  color: #ff9e64;
+}
+.config-body {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.config-meta {
+  overflow-wrap: anywhere;
+}
+.config-form .conn-callout {
+  margin-top: 8px;
+}
+.config-pending {
+  border-left-color: #ff9e64;
+  color: var(--text);
+}
+.config-step {
+  margin-top: 12px;
+}
+.config-components {
+  grid-template-columns: repeat(3, 1fr);
+  background: var(--bg);
+}
+.config-component .conn-type-tab-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  width: 100%;
+}
+.config-component .config-key {
+  margin-top: 4px;
+}
+.config-state {
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--dim);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+.config-state.on {
+  border-color: #9ece6a;
+  color: #9ece6a;
+}
+.config-subhint {
+  margin: 4px 0 2px;
+  line-height: 1.4;
+}
+.config-section {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.config-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 12px;
+}
+.config-field {
+  min-width: 0;
+}
+.config-field .input {
+  margin-bottom: 3px;
+}
+.config-field.invalid .input {
+  border-color: #f7768e;
+}
+.config-hint,
+.config-field-error {
+  margin-bottom: 6px;
+  font-size: 11px;
+  line-height: 1.35;
+}
+.config-field-error {
+  color: #f7768e;
+}
+.config-key {
+  color: var(--dim);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  letter-spacing: 0;
+  text-transform: none;
+  opacity: 0.75;
+}
+.config-toggle {
+  margin: 8px 0 4px;
+}
+.config-secret {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+.config-secret .input {
+  flex: 1;
+  min-width: 0;
+}
+.config-secret .btn {
+  margin-top: 5px;
+}
+.config-notice {
+  margin-top: 10px;
+  color: #9ece6a;
+  font-size: 12px;
+}
+@media (max-width: 560px) {
+  .config-grid,
+  .config-components {
+    grid-template-columns: 1fr;
+  }
+}
 .selectable {
   user-select: all;
   color: var(--accent);
@@ -1148,6 +1460,16 @@ body.col-resizing iframe {
   padding: 2px 8px;
   font-size: 11px;
 }
+/* Destructive confirm (stop / force stop). Red enough to read as "this ends
+   something", but still a plain button so it sits level with Cancel rather than
+   inviting the click the way `.primary` does. */
+.btn.danger {
+  color: #f7768e;
+  border-color: #5a2b34;
+}
+.btn.danger:hover:not(:disabled) {
+  border-color: #f7768e;
+}
 .btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
@@ -1281,6 +1603,55 @@ body.col-resizing iframe {
   margin: 4px 0 10px;
 }
 
+/* Upload into the session workspace. The panel body remains the generous drop
+   target, while the persistent dashed box makes the affordance visible before
+   a drag begins. */
+.details.dropping {
+  outline: 2px dashed var(--accent);
+  outline-offset: -6px;
+}
+.upload-box {
+  border: 1px dashed var(--dim);
+  border-radius: 8px;
+  padding: 9px 10px;
+  margin: 4px 0 10px;
+  background: color-mix(in srgb, var(--accent) 4%, transparent);
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.details.dropping .upload-box {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.upload-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.upload-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.upload-icon {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.upload-result {
+  margin-top: 8px;
+}
+.drop-hint {
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
 /* source control */
 .scm-actions {
   display: flex;
@@ -1338,6 +1709,23 @@ body.col-resizing iframe {
   mask-image: url("/icons/actions/save-transcript.png");
   -webkit-mask-image: url("/icons/actions/save-transcript.png");
 }
+.action-icon-regenerate-title {
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M13.2 5.2A5.8 5.8 0 0 0 3.1 3.7L1.8 5.2'/%3E%3Cpath d='M1.8 2.3v2.9h2.9M2.8 10.8a5.8 5.8 0 0 0 10.1 1.5l1.3-1.5'/%3E%3Cpath d='M14.2 13.7v-2.9h-2.9'/%3E%3C/svg%3E");
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M13.2 5.2A5.8 5.8 0 0 0 3.1 3.7L1.8 5.2'/%3E%3Cpath d='M1.8 2.3v2.9h2.9M2.8 10.8a5.8 5.8 0 0 0 10.1 1.5l1.3-1.5'/%3E%3Cpath d='M14.2 13.7v-2.9h-2.9'/%3E%3C/svg%3E");
+}
+.action-icon-regenerate-title.is-pending {
+  animation: regenerate-title-spin 0.9s linear infinite;
+}
+@keyframes regenerate-title-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .action-icon-regenerate-title.is-pending {
+    animation: none;
+  }
+}
 /* Fork: a branch splitting off a line of work. Inline SVG rather than a PNG like
    its neighbours only because the hand-drawn set has no fork glyph yet — it masks
    to currentColor identically, and a matching PNG can drop in here later.
@@ -1347,9 +1735,33 @@ body.col-resizing iframe {
   mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='4' cy='3' r='1.7'/%3E%3Ccircle cx='4' cy='13' r='1.7'/%3E%3Ccircle cx='12' cy='3' r='1.7'/%3E%3Cpath d='M4 4.7v6.6'/%3E%3Cpath d='M12 4.7v1.6a3 3 0 0 1-3 3H4'/%3E%3C/svg%3E");
   -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='4' cy='3' r='1.7'/%3E%3Ccircle cx='4' cy='13' r='1.7'/%3E%3Ccircle cx='12' cy='3' r='1.7'/%3E%3Cpath d='M4 4.7v6.6'/%3E%3Cpath d='M12 4.7v1.6a3 3 0 0 1-3 3H4'/%3E%3C/svg%3E");
 }
+/* The pair on every changed-file row needs different silhouettes at 12px:
+   changed lines (+/-) for the diff, and a sheet of text for the whole file.
+   Inline SVG for the same reason as the fork above: the hand-drawn PNG set has
+   no glyph for either. */
+.action-icon-diff {
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.6' stroke-linecap='round'%3E%3Cpath d='M1.8 4.5h4M3.8 2.5v4M8 4.5h6.2M1.8 11.5h4M8 11.5h6.2'/%3E%3C/svg%3E");
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.6' stroke-linecap='round'%3E%3Cpath d='M1.8 4.5h4M3.8 2.5v4M8 4.5h6.2M1.8 11.5h4M8 11.5h6.2'/%3E%3C/svg%3E");
+}
+.action-icon-file {
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.5 1.5h5.6l3.4 3.4v9.6h-9z'/%3E%3Cpath d='M9.1 1.7v3.4h3.2M5.7 8h4.6M5.7 10.5h4.6M5.7 13h2.7'/%3E%3C/svg%3E");
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.5 1.5h5.6l3.4 3.4v9.6h-9z'/%3E%3Cpath d='M9.1 1.7v3.4h3.2M5.7 8h4.6M5.7 10.5h4.6M5.7 13h2.7'/%3E%3C/svg%3E");
+}
+.action-icon-discard {
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 5h10M6 5V3h4v2M4.5 5l.6 9h5.8l.6-9M7 7.5v4M9 7.5v4'/%3E%3C/svg%3E");
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23000' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 5h10M6 5V3h4v2M4.5 5l.6 9h5.8l.6-9M7 7.5v4M9 7.5v4'/%3E%3C/svg%3E");
+}
+.discard-file-btn:hover:not(:disabled) {
+  border-color: #f7768e;
+  color: #f7768e;
+}
 .action-icon-git-merge {
   mask-image: url("/icons/actions/git-merge.png");
   -webkit-mask-image: url("/icons/actions/git-merge.png");
+}
+.action-icon-git-commit {
+  mask-image: url("/icons/actions/git-commit.png");
+  -webkit-mask-image: url("/icons/actions/git-commit.png");
 }
 .action-icon-git-rebase {
   mask-image: url("/icons/actions/git-rebase.png");
@@ -1599,6 +2011,14 @@ body.col-resizing iframe {
 .ref-count.behind {
   color: #e0af68;
 }
+/* A session can touch hundreds of files. Cap the list and scroll it in place so
+   the panel's own height stays bounded and the history below stays reachable;
+   `contain` keeps a flick at the end of the list from scrolling the panel. */
+.changed-files {
+  max-height: 30vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
 .changed-file {
   display: flex;
   align-items: center;
@@ -1617,19 +2037,46 @@ body.col-resizing iframe {
   font-family: ui-monospace, monospace;
   flex: none;
 }
+/* Takes the row's free width so the trailing dot and actions sit hard right and
+   a long path ellipsizes rather than pushing them off the edge. */
 .change-path {
+  flex: 1;
+  min-width: 0;
   font-size: 12px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .staged-dot {
-  margin-left: auto;
   width: 7px;
   height: 7px;
   border-radius: 50%;
   background: var(--accent);
   flex: none;
+}
+
+/* Per-file actions are present at rest rather than hover-revealed, because a
+   touch device never hovers; dimmed so a long changeset does not read as a
+   wall of buttons. */
+.file-actions {
+  display: flex;
+  flex: none;
+  gap: 3px;
+  opacity: 0.5;
+  transition: opacity 0.12s ease;
+}
+.changed-file:hover .file-actions,
+.commit-file:hover .file-actions,
+.file-actions:focus-within {
+  opacity: 1;
+}
+.file-actions .icon-btn {
+  width: 22px;
+  height: 20px;
+}
+.file-actions .action-icon {
+  width: 12px;
+  height: 12px;
 }
 
 /* commit graph (single-lane MVP history) */
@@ -1752,9 +2199,44 @@ body.col-resizing iframe {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 12px;
   flex: none;
   padding: 14px 16px;
   margin-bottom: 0;
+}
+/* The path can be long; the controls must never be pushed out of reach. */
+.diff-modal .modal-title > .mono {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.diff-modal-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+/* Diff / Whole file / Markdown preview: one joined mode control. */
+.mode-toggle {
+  display: flex;
+}
+.mode-toggle .btn {
+  border-radius: 0;
+}
+.mode-toggle .btn:first-child {
+  border-radius: 6px 0 0 6px;
+}
+.mode-toggle .btn:last-child {
+  border-radius: 0 6px 6px 0;
+  margin-left: -1px;
+}
+.mode-toggle .btn.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  /* Lift the selected half so its shared edge isn't drawn over by its sibling. */
+  position: relative;
+  z-index: 1;
 }
 .diff-view {
   flex: 1;
@@ -1784,6 +2266,186 @@ body.col-resizing iframe {
 }
 .diff-line.meta {
   color: var(--dim);
+}
+
+/* Whole-file mode. Gutter numbers are unselectable so copying a range of lines
+   yields the code alone, the way it would out of an editor. */
+.file-line {
+  display: flex;
+  gap: 12px;
+  white-space: pre;
+}
+.file-lineno {
+  flex: none;
+  min-width: 3.5ch;
+  text-align: right;
+  color: var(--dim);
+  user-select: none;
+  -webkit-user-select: none;
+}
+.file-code {
+  /* The gutter must stay put when a long line scrolls the view sideways. */
+  flex: 1;
+  min-width: 0;
+}
+.file-note {
+  padding: 4px;
+  font-style: italic;
+}
+
+/* Rendered Markdown stays within a readable measure while the surrounding diff
+   surface owns scrolling. Raw HTML is never injected by the renderer. */
+.diff-view.diff-markdown-view {
+  padding: 0;
+  font-size: 14px;
+  line-height: 1.65;
+}
+.markdown-preview {
+  max-width: 780px;
+  min-height: 100%;
+  margin: 0 auto;
+  padding: 28px 36px 48px;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+.markdown-preview > :first-child {
+  margin-top: 0;
+}
+.markdown-preview > :last-child {
+  margin-bottom: 0;
+}
+.markdown-preview h1,
+.markdown-preview h2,
+.markdown-preview h3,
+.markdown-preview h4,
+.markdown-preview h5,
+.markdown-preview h6 {
+  margin: 1.4em 0 0.55em;
+  line-height: 1.25;
+  color: #e4e9f2;
+}
+.markdown-preview h1 {
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--border);
+  font-size: 2em;
+}
+.markdown-preview h2 {
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--border);
+  font-size: 1.5em;
+}
+.markdown-preview h3 {
+  font-size: 1.25em;
+}
+.markdown-preview h4 {
+  font-size: 1.08em;
+}
+.markdown-preview h5,
+.markdown-preview h6 {
+  font-size: 1em;
+}
+.markdown-preview p {
+  margin: 0 0 1em;
+}
+.markdown-preview a {
+  color: var(--accent);
+  text-decoration: none;
+}
+.markdown-preview a:hover {
+  text-decoration: underline;
+}
+.markdown-preview code {
+  padding: 0.15em 0.35em;
+  border: 1px solid #232c40;
+  border-radius: 4px;
+  background: var(--panel-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Cascadia Code", monospace;
+  font-size: 0.9em;
+}
+.markdown-preview pre {
+  margin: 0 0 1em;
+  padding: 14px 16px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #080b10;
+  line-height: 1.5;
+}
+.markdown-preview pre code {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-size: 12px;
+  white-space: pre;
+}
+.markdown-preview blockquote {
+  margin: 0 0 1em;
+  padding: 0.1em 1em;
+  border-left: 3px solid var(--accent-2);
+  color: var(--dim);
+}
+.markdown-preview blockquote > :last-child {
+  margin-bottom: 0;
+}
+.markdown-preview ul,
+.markdown-preview ol {
+  margin: 0 0 1em;
+  padding-left: 2em;
+}
+.markdown-preview li + li {
+  margin-top: 0.25em;
+}
+.markdown-preview .task-list {
+  padding-left: 0.25em;
+  list-style: none;
+}
+.markdown-preview .task-list-item {
+  display: flex;
+  align-items: baseline;
+  gap: 0.55em;
+}
+.markdown-preview .task-list > li:not(.task-list-item) {
+  margin-left: 1.75em;
+  list-style: disc;
+}
+.markdown-preview .task-list-item input {
+  accent-color: var(--accent);
+}
+.markdown-preview hr {
+  height: 1px;
+  margin: 1.75em 0;
+  border: 0;
+  background: var(--border);
+}
+.markdown-table-wrap {
+  max-width: 100%;
+  margin: 0 0 1em;
+  overflow-x: auto;
+}
+.markdown-preview table {
+  width: 100%;
+  border-spacing: 0;
+  border-collapse: collapse;
+}
+.markdown-preview th,
+.markdown-preview td {
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+}
+.markdown-preview th {
+  background: var(--panel-2);
+  color: #e4e9f2;
+}
+.markdown-preview tbody tr:nth-child(even) {
+  background: rgba(19, 24, 38, 0.55);
+}
+.markdown-preview img {
+  display: block;
+  max-width: 100%;
+  max-height: 65vh;
+  margin: 1em auto;
+  border-radius: 6px;
 }
 
 /* Image preview: center the picture(s) in the scroll area instead of the
@@ -1913,6 +2575,8 @@ body.col-resizing iframe {
   justify-content: flex-end;
 }
 .commit-file-path {
+  flex: 1;
+  min-width: 0;
   font-size: 12px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1947,6 +2611,106 @@ body.col-resizing iframe {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 14px;
+}
+
+/* ---- workspace branch management ---- */
+/* The (i) on a workspace row opens a dialog (unlike the session-row info popover),
+   so it reads as clickable rather than the help cursor .info-btn defaults to. */
+.tree-actions .info-btn {
+  cursor: pointer;
+}
+.branch-modal {
+  width: 640px;
+}
+.branch-modal .modal-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.branch-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: min(60vh, 560px);
+  overflow-y: auto;
+  margin: 4px 0 2px;
+}
+.branch-row {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: var(--panel-2);
+}
+.branch-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.branch-name {
+  font-weight: 600;
+  word-break: break-all;
+}
+.branch-tag {
+  flex: none;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--dim);
+}
+.branch-tag.current {
+  color: var(--accent);
+  border-color: var(--accent-2);
+}
+.branch-tag.warn {
+  color: #ff9e64;
+  border-color: #6b4a2e;
+}
+.branch-meta {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 5px;
+  font-size: 12px;
+}
+.branch-base {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.branch-commit {
+  margin-top: 4px;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.branch-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+.branch-picker {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.branch-picker .input {
+  min-width: 160px;
+  padding: 3px 6px;
+}
+.branch-foot {
+  margin-top: 10px;
+}
+.btn.tiny.danger {
+  color: #f7768e;
+  border-color: #5a2b34;
 }
 
 /* ---- session usage ---- */
@@ -2047,6 +2811,570 @@ body.col-resizing iframe {
 }
 .usage-src {
   word-break: break-all;
+}
+
+/* ===================================================================
+   Agent Deck — a mobile-first, button-addressable control surface.
+   Every interactive key carries data-deck-action; the responsive shell is
+   presentation only, mirroring the structured actions hardware will consume.
+   =================================================================== */
+.deck-shell {
+  --deck-bg: #080b0e;
+  --deck-surface: #10151a;
+  --deck-edge: #242d35;
+  --deck-ink: #e8f0f2;
+  --deck-muted: #7f9097;
+  --deck-mint: #5ee2c6;
+  --deck-amber: #ffb454;
+  --deck-red: #ff6b64;
+  position: relative;
+  min-height: 100dvh;
+  overflow-x: hidden;
+  color: var(--deck-ink);
+  background:
+    radial-gradient(circle at 50% -20%, rgba(47, 140, 127, 0.17), transparent 46%),
+    linear-gradient(rgba(255, 255, 255, 0.012) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.012) 1px, transparent 1px),
+    var(--deck-bg);
+  background-size: auto, 22px 22px, 22px 22px, auto;
+  font-family: "Avenir Next", Avenir, ui-sans-serif, system-ui, sans-serif;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right)
+    env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+.deck-shell::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.35;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.8' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.025'/%3E%3C/svg%3E");
+}
+.deck-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  min-height: 58px;
+  padding: 8px clamp(12px, 3vw, 28px);
+  border-bottom: 1px solid rgba(135, 163, 169, 0.13);
+  background: rgba(8, 11, 14, 0.87);
+  backdrop-filter: blur(18px) saturate(120%);
+}
+.deck-exit {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  width: fit-content;
+  color: var(--deck-muted);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  text-decoration: none;
+}
+.deck-exit > span:first-child {
+  color: var(--deck-mint);
+  font-size: 25px;
+  font-weight: 300;
+  line-height: 0;
+  transform: translateY(-1px);
+}
+.deck-exit-chevron::before {
+  content: "‹";
+}
+.deck-exit:hover,
+.deck-exit:focus-visible {
+  color: var(--deck-ink);
+  outline: none;
+}
+.deck-wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 12px;
+  font-weight: 760;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.deck-wordmark-mark {
+  display: grid;
+  grid-template-columns: repeat(2, 5px);
+  gap: 2px;
+  transform: rotate(45deg);
+}
+.deck-wordmark-mark i {
+  width: 5px;
+  height: 5px;
+  border-radius: 1px;
+  background: var(--deck-mint);
+  box-shadow: 0 0 8px rgba(94, 226, 198, 0.45);
+}
+.deck-wordmark-mark i:nth-child(2),
+.deck-wordmark-mark i:nth-child(3) {
+  opacity: 0.45;
+}
+.deck-head-actions {
+  justify-self: end;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.deck-online {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--deck-muted);
+  font-family: ui-monospace, monospace;
+  font-size: 10px;
+}
+.deck-online i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #526068;
+}
+.deck-online i.online {
+  background: var(--deck-mint);
+  box-shadow: 0 0 8px rgba(94, 226, 198, 0.7);
+}
+.deck-layout-button {
+  height: 30px;
+  min-width: 58px;
+  padding: 0 9px;
+  color: var(--deck-ink);
+  border: 1px solid var(--deck-edge);
+  border-radius: 7px;
+  background: #12181d;
+  font: 650 10px/1 ui-monospace, monospace;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+}
+.deck-layout-button:hover,
+.deck-layout-button:focus-visible,
+.deck-layout-button[aria-expanded="true"] {
+  border-color: #37675f;
+  outline: none;
+}
+.deck-layout-menu {
+  position: absolute;
+  top: calc(100% - 2px);
+  right: clamp(12px, 3vw, 28px);
+  display: flex;
+  flex-direction: column;
+  width: 172px;
+  padding: 6px;
+  border: 1px solid #29343b;
+  border-radius: 10px;
+  background: #11171c;
+  box-shadow: 0 16px 50px rgba(0, 0, 0, 0.5);
+}
+.deck-layout-menu button {
+  display: grid;
+  grid-template-columns: 60px 1fr;
+  align-items: center;
+  gap: 11px;
+  min-height: 42px;
+  color: var(--deck-muted);
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  font: 600 11px/1 ui-monospace, monospace;
+  text-align: left;
+  cursor: pointer;
+}
+.deck-layout-menu button:hover,
+.deck-layout-menu button.active {
+  color: var(--deck-ink);
+  background: #1a2228;
+}
+.deck-mini-grid {
+  display: grid;
+  gap: 2px;
+  width: 51px;
+  max-height: 26px;
+}
+.deck-mini-grid i {
+  min-height: 3px;
+  aspect-ratio: 1;
+  border-radius: 1px;
+  background: currentColor;
+  opacity: 0.55;
+}
+.deck-stage {
+  position: relative;
+  z-index: 1;
+  width: min(100%, 1080px);
+  margin: 0 auto;
+  padding: clamp(14px, 3.5vw, 34px);
+}
+.deck-overview-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 0 2px 11px;
+  color: var(--deck-muted);
+  font: 650 9px/1 ui-monospace, monospace;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+.deck-overview-label span:last-child {
+  letter-spacing: 0.05em;
+}
+.deck-grid {
+  display: grid;
+  width: 100%;
+  gap: clamp(6px, 1.5vw, 14px);
+}
+.deck-key,
+.deck-empty-key {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  aspect-ratio: 1;
+  border-radius: clamp(8px, 1.7vw, 16px);
+}
+.deck-key {
+  padding: 0;
+  color: var(--deck-ink);
+  border: 1px solid #28323a;
+  background: linear-gradient(145deg, #202931, #0b0f13 68%);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.08) inset,
+    0 -3px 7px rgba(0, 0, 0, 0.72) inset,
+    0 7px 16px rgba(0, 0, 0, 0.42);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+  transition: transform 90ms ease, border-color 150ms ease, filter 150ms ease;
+}
+.deck-key::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.035);
+  border-radius: calc(clamp(8px, 1.7vw, 16px) - 3px);
+  pointer-events: none;
+}
+.deck-key:not(:disabled):hover {
+  filter: brightness(1.12);
+  border-color: #44535c;
+}
+.deck-key:not(:disabled):active {
+  transform: translateY(3px) scale(0.975);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.04) inset,
+    0 -1px 5px rgba(0, 0, 0, 0.75) inset,
+    0 2px 6px rgba(0, 0, 0, 0.38);
+}
+.deck-key:focus-visible {
+  outline: 2px solid var(--deck-mint);
+  outline-offset: 2px;
+}
+.deck-key:disabled {
+  cursor: default;
+}
+.deck-key-face {
+  position: absolute;
+  inset: clamp(7px, 1.4vw, 14px);
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 3px;
+  min-width: 0;
+  overflow: hidden;
+  text-align: left;
+}
+.deck-key--working {
+  border-color: rgba(94, 226, 198, 0.27);
+  background:
+    radial-gradient(circle at 18% 12%, rgba(94, 226, 198, 0.13), transparent 47%),
+    linear-gradient(145deg, #1c2728, #0a1011 70%);
+}
+.deck-key--blocked {
+  border-color: rgba(255, 180, 84, 0.58);
+  background:
+    radial-gradient(circle at 18% 12%, rgba(255, 180, 84, 0.22), transparent 50%),
+    linear-gradient(145deg, #2a2117, #110d09 72%);
+  box-shadow:
+    0 1px 0 rgba(255, 229, 190, 0.1) inset,
+    0 -3px 7px rgba(0, 0, 0, 0.75) inset,
+    0 0 20px rgba(255, 145, 48, 0.1),
+    0 7px 16px rgba(0, 0, 0, 0.42);
+}
+.deck-key--idle {
+  color: #839198;
+  border-color: #222a30;
+  background: linear-gradient(145deg, #171d22, #0a0d10 74%);
+}
+.deck-key--nav,
+.deck-key--terminal {
+  background: linear-gradient(145deg, #1b242b, #0b0f13 72%);
+}
+.deck-key--nav:disabled {
+  opacity: 0.3;
+}
+.deck-key--approve {
+  border-color: rgba(94, 226, 198, 0.5);
+  background: radial-gradient(circle at 15% 12%, rgba(94, 226, 198, 0.24), transparent 52%), #0d1817;
+}
+.deck-key--persistent {
+  border-color: rgba(255, 180, 84, 0.5);
+  background: radial-gradient(circle at 15% 12%, rgba(255, 180, 84, 0.23), transparent 52%), #1a140d;
+}
+.deck-key--deny {
+  border-color: rgba(255, 107, 100, 0.52);
+  background: radial-gradient(circle at 15% 12%, rgba(255, 107, 100, 0.22), transparent 52%), #190d0d;
+}
+.deck-key--choice {
+  border-color: rgba(117, 160, 255, 0.43);
+  background: radial-gradient(circle at 15% 12%, rgba(117, 160, 255, 0.2), transparent 52%), #0e121b;
+}
+.deck-empty-key {
+  border: 1px solid rgba(114, 132, 141, 0.07);
+  background: rgba(8, 11, 14, 0.28);
+  box-shadow: 0 3px 12px rgba(0, 0, 0, 0.18) inset;
+}
+.deck-tile-topline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--deck-muted);
+  font: 700 clamp(7px, 1.1vw, 10px)/1 ui-monospace, monospace;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.deck-key--blocked .deck-tile-topline {
+  color: var(--deck-amber);
+}
+.deck-key--working .deck-tile-topline {
+  color: var(--deck-mint);
+}
+.deck-state-glyph {
+  position: relative;
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+}
+.deck-state-glyph.working {
+  border: 1px solid var(--deck-mint);
+  border-right-color: transparent;
+  animation: deck-spin 1.2s linear infinite;
+}
+.deck-state-glyph.blocked {
+  background: var(--deck-amber);
+  box-shadow: 0 0 9px rgba(255, 180, 84, 0.7);
+  animation: deck-pulse 1.8s ease-in-out infinite;
+}
+@keyframes deck-spin { to { transform: rotate(360deg); } }
+@keyframes deck-pulse { 50% { opacity: 0.5; box-shadow: 0 0 3px rgba(255, 180, 84, 0.35); } }
+.deck-marquee {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  color: #f0f5f5;
+  font-size: clamp(9px, 1.75vw, 16px);
+  font-weight: 670;
+  line-height: 1.15;
+  white-space: nowrap;
+  mask-image: linear-gradient(90deg, transparent, #000 5%, #000 92%, transparent);
+}
+.deck-marquee-track {
+  display: flex;
+  width: max-content;
+  animation: deck-marquee 14s linear infinite;
+}
+.deck-marquee-track > span {
+  display: block;
+  padding-right: 34px;
+}
+@keyframes deck-marquee {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+.deck-key:hover .deck-marquee-track,
+.deck-key:focus-visible .deck-marquee-track {
+  animation-play-state: paused;
+}
+.deck-tile-meta {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  color: var(--deck-muted);
+  font: 500 clamp(6px, 0.95vw, 9px)/1.2 ui-monospace, monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.deck-idle-number {
+  color: #b3c0c3;
+  font: 350 clamp(22px, 5vw, 48px)/0.9 ui-monospace, monospace;
+}
+.deck-idle-label {
+  color: var(--deck-muted);
+  font: 700 clamp(8px, 1.25vw, 11px)/1 ui-monospace, monospace;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+.deck-nav-arrow {
+  color: var(--deck-mint);
+  font: 300 clamp(18px, 4vw, 38px)/1 ui-monospace, monospace;
+}
+.deck-nav-arrow--previous::before {
+  content: "←";
+}
+.deck-nav-arrow--next::before {
+  content: "→";
+}
+.deck-key--nav .deck-key-face > span:last-child,
+.deck-key--terminal .deck-key-face > span:last-child {
+  color: var(--deck-muted);
+  font: 650 clamp(7px, 1.1vw, 10px)/1.15 ui-monospace, monospace;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.deck-approval-stage {
+  display: flex;
+  flex-direction: column;
+  gap: clamp(14px, 3vw, 26px);
+}
+.deck-prompt-card {
+  min-height: 120px;
+  padding: clamp(15px, 3vw, 28px);
+  border: 1px solid rgba(255, 180, 84, 0.28);
+  border-radius: 14px;
+  background:
+    radial-gradient(circle at 92% 0, rgba(255, 180, 84, 0.11), transparent 42%),
+    rgba(15, 19, 22, 0.88);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.28);
+}
+.deck-prompt-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+  color: var(--deck-amber);
+  font: 700 9px/1.2 ui-monospace, monospace;
+  letter-spacing: 0.12em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.deck-prompt-card h1 {
+  max-width: 900px;
+  margin: 13px 0 0;
+  font-size: clamp(17px, 3.1vw, 29px);
+  font-weight: 590;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+}
+.deck-prompt-why {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  gap: 12px;
+  margin-top: 16px;
+  padding-top: 13px;
+  border-top: 1px solid rgba(136, 155, 160, 0.12);
+}
+.deck-prompt-why > span {
+  color: var(--deck-muted);
+  font: 700 8px/1.4 ui-monospace, monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.deck-prompt-why pre {
+  max-height: 120px;
+  margin: 0;
+  overflow: auto;
+  color: #c4d0d2;
+  font: 500 clamp(9px, 1.4vw, 12px)/1.45 ui-monospace, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.deck-prompt-error {
+  margin-top: 12px;
+  color: var(--deck-red);
+  font: 500 11px/1.4 ui-monospace, monospace;
+}
+.deck-action-grid {
+  align-self: center;
+}
+.deck-option-number {
+  color: var(--deck-muted);
+  font: 550 clamp(11px, 2vw, 18px)/1 ui-monospace, monospace;
+}
+.deck-option-label {
+  display: -webkit-box;
+  width: 100%;
+  overflow: hidden;
+  font-size: clamp(8px, 1.45vw, 13px);
+  font-weight: 650;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+}
+.deck-selected-label {
+  color: var(--deck-muted);
+  font: 650 clamp(6px, 0.9vw, 8px)/1 ui-monospace, monospace;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.deck-terminal-icon {
+  color: var(--deck-mint);
+  font: 500 clamp(17px, 3.5vw, 30px)/1 ui-monospace, monospace;
+}
+.deck-terminal-icon::before {
+  content: "›_";
+}
+
+@media (max-width: 520px) {
+  .deck-header {
+    min-height: 52px;
+    grid-template-columns: 1fr auto 1fr;
+  }
+  .deck-exit > span:last-child,
+  .deck-online {
+    display: none;
+  }
+  .deck-wordmark {
+    gap: 7px;
+    font-size: 10px;
+    letter-spacing: 0.13em;
+  }
+  .deck-stage {
+    padding: 15px 10px 22px;
+  }
+  .deck-grid {
+    gap: 7px;
+  }
+  .deck-key-face {
+    inset: 7px;
+  }
+  .deck-prompt-card {
+    padding: 15px;
+    border-radius: 11px;
+  }
+  .deck-prompt-why {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+  .deck-prompt-why pre {
+    max-height: 90px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .deck-state-glyph,
+  .deck-marquee-track {
+    animation: none !important;
+  }
+  .deck-marquee-track > span[aria-hidden="true"] {
+    display: none;
+  }
 }
 
 /* ===================================================================
@@ -2238,6 +3566,20 @@ body.col-resizing iframe {
   .changed-file {
     padding: 9px 4px;
   }
+  /* `.file-actions .icon-btn` out-specifies the `.icon-btn` rule above, so the
+     row buttons need the touch size restated or they would stay at 22px. */
+  .file-actions .icon-btn {
+    width: 36px;
+    height: 32px;
+  }
+  .file-actions .action-icon {
+    width: 15px;
+    height: 15px;
+  }
+  /* Nothing hovers on a phone, so actions cannot be dimmed-until-hover there. */
+  .file-actions {
+    opacity: 1;
+  }
   .commit-row {
     min-height: 44px;
   }
@@ -2315,8 +3657,21 @@ body.col-resizing iframe {
     padding: 0;
     overflow: hidden;
   }
+  /* Three Markdown modes plus Close do not fit beside a useful filename on a
+     narrow phone, so the controls get their own row. */
+  .diff-modal .modal-title {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .diff-modal-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
   .diff-view {
     font-size: 11px;
+  }
+  .markdown-preview {
+    padding: 22px 18px 40px;
   }
   /* Commit sheet inherits the generic padded/scrolling .modal sheet; just tame
      its inner scroll regions to the sheet height. */
@@ -2397,6 +3752,7 @@ body.col-resizing iframe {
 /* Paste target for contexts with no clipboard read (see PasteSheet.tsx). */
 .paste-sheet {
   width: 420px;
+  max-width: 100%;
 }
 .paste-sheet-input {
   width: 100%;
@@ -2412,6 +3768,25 @@ body.col-resizing iframe {
 .paste-sheet-input:focus {
   outline: none;
   border-color: var(--accent);
+}
+
+/* This has to follow `.paste-sheet { width: 420px }`: that desktop width is
+   declared after the generic phone modal rule and would otherwise win the
+   cascade, pushing 30px past each side of a 390px phone viewport. Keep the
+   textarea at 16px too: iOS Safari zooms focused form controls below that size,
+   narrowing the visual viewport and making a correctly sized sheet look wider
+   than the screen. */
+@media (max-width: 599px), (max-height: 599px) and (pointer: coarse) {
+  .paste-sheet {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+  }
+  .paste-sheet-input {
+    min-width: 0;
+    max-width: 100%;
+    font-size: 16px;
+  }
 }
 
 /* Touch-gesture tracer (`?gesturelog=1`, see gestureLog.ts). Debug-only, and it

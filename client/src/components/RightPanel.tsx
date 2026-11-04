@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { DragEvent, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
-import { api, BaseCommit, ChangedFile, Commit, Session } from "../api";
+import { api, BaseCommit, ChangedFile, Commit, MAX_ATTACHMENT_BYTES, Session } from "../api";
 import { Target } from "../connectionStore";
+import { formatBytes } from "../format";
 import { buildVscodeLaunch, launchVscode, vscodeReachable, VscodeLaunch } from "../vscode";
 import { relTime } from "../i18n/time";
 import { attentionLabel, instanceStatusLabel, isolationLabel, statusLabel } from "../i18n/labels";
@@ -10,12 +11,51 @@ import { isTerminal } from "../status";
 import { useIsPhone } from "../useIsPhone";
 import { shortPath } from "../paths";
 import { copyText } from "../clipboard";
-import { DiffModal } from "./DiffModal";
+import { PromptSubmitter } from "../terminalTypes";
+import { DiffModal, DiffMode } from "./DiffModal";
 import { CommitModal } from "./CommitModal";
+import { FileViewActions } from "./FileViewActions";
 
 interface Props {
   target: Target | undefined;
   session: Session | undefined;
+  /** Capture the initiating session's terminal before starting an async operation. */
+  preparePrompt?: () => PromptSubmitter;
+}
+
+type ConflictOperation = "merge" | "rebase";
+
+type ConflictError = Error & { status?: number; promptSubmitted?: boolean };
+
+async function handoffConflict(
+  error: ConflictError,
+  operation: ConflictOperation,
+  target: string,
+  submit?: PromptSubmitter,
+) {
+  if (error.status !== 409) return;
+  // Store the result on this mutation's error, never on a different session's
+  // panel state if the user switches while Git or the delayed Enter is pending.
+  error.promptSubmitted = false;
+  try {
+    error.promptSubmitted = (await submit?.(conflictResolutionPrompt(operation, target))) ?? false;
+  } catch {
+    // A lost terminal connection leaves the Git conflict available for manual retry.
+  }
+}
+
+/**
+ * Ask the session that owns this worktree to retry a conflicted operation.
+ * Keep the operation as the first sentence so it is immediately actionable,
+ * while explicitly leaving ambiguous decisions to the user instead of inviting
+ * the agent to guess merely to make Git clean.
+ */
+export function conflictResolutionPrompt(operation: ConflictOperation, target: string): string {
+  const action =
+    operation === "merge"
+      ? `merge current branch to target branch ${target}, resolving conflicts`
+      : `rebase current branch onto target branch ${target}, resolving conflicts`;
+  return `${action}. Be careful: preserve the intent of both sides, and if any conflict is difficult or ambiguous, stop and leave it for a human rather than guessing.`;
 }
 
 type VscodeState =
@@ -23,6 +63,12 @@ type VscodeState =
   | { phase: "launching" }
   | { phase: "opened"; launch: VscodeLaunch }
   | { phase: "not-installed"; launch: VscodeLaunch }
+  | { phase: "error"; message: string };
+
+type UploadState =
+  | { phase: "idle" }
+  | { phase: "busy"; message: string }
+  | { phase: "done"; paths: string[] }
   | { phase: "error"; message: string };
 
 const STATUS_COLOR: Record<string, string> = {
@@ -39,13 +85,14 @@ const STATUS_COLOR: Record<string, string> = {
  * Right control-center panel: session metadata, the structural summary once a
  * session ends, and the Git changed-files list with click-to-diff.
  */
-export function RightPanel({ target, session }: Props) {
+export function RightPanel({ target, session, preparePrompt }: Props) {
   const { t } = useTranslation();
   // On a phone there's no local VS Code for the vscode:// deep link to reach, so
   // the whole "Continue in VS Code" affordance is hidden (mobile shell only).
   const isPhone = useIsPhone();
   const qc = useQueryClient();
-  const [diffTarget, setDiffTarget] = useState<ChangedFile | null>(null);
+  // The file the viewer is open on, and which of its two views it opened in.
+  const [diffTarget, setDiffTarget] = useState<{ file: ChangedFile; mode: DiffMode } | null>(null);
   const [commitTarget, setCommitTarget] = useState<string | null>(null);
   const [rebaseOpen, setRebaseOpen] = useState(false);
   const [rebaseOnto, setRebaseOnto] = useState("");
@@ -98,6 +145,108 @@ export function RightPanel({ target, session }: Props) {
     } catch (e) {
       setVscode({ phase: "error", message: String(e) });
     }
+  };
+
+  // Upload a file into the session's workspace, so the agent can reach it by
+  // listing `uploads/` rather than needing a path pasted into the prompt.
+  const [upload, setUpload] = useState<UploadState>({ phase: "idle" });
+  const [dropping, setDropping] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  // dragenter/dragleave fire for every child element the pointer crosses, so a
+  // plain boolean flickers as the cursor moves over the panel's contents. Count
+  // the enters instead and only clear when the last one is matched.
+  const dragDepth = useRef(0);
+  useEffect(() => {
+    setUpload({ phase: "idle" });
+    setDropping(false);
+    dragDepth.current = 0;
+  }, [session?.id, base]);
+
+  /**
+   * Upload files one at a time. Sequential rather than parallel so the progress
+   * line names a single file and — more importantly — so two replace prompts can
+   * never race each other for the user's attention.
+   */
+  const uploadFiles = async (files: File[]) => {
+    if (!files.length || !target || !session) return;
+    const stored: string[] = [];
+    for (const [i, file] of files.entries()) {
+      // Pre-check the cap the daemon enforces anyway, so an oversize file fails
+      // instantly and legibly instead of after a long upload ending in a 413.
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        setUpload({
+          phase: "error",
+          message: t("rightPanel.upload.tooLarge", {
+            name: file.name,
+            size: formatBytes(file.size),
+            max: formatBytes(MAX_ATTACHMENT_BYTES),
+          }),
+        });
+        return;
+      }
+      setUpload({
+        phase: "busy",
+        message: t("rightPanel.upload.busy", {
+          name: file.name,
+          index: i + 1,
+          total: files.length,
+        }),
+      });
+      try {
+        let result;
+        try {
+          result = await api.uploadToWorkspace(target, session.id, file, file.name);
+        } catch (e) {
+          // 409 is the daemon declining to clobber an existing file. Anything
+          // else — including a directory in the way (400) — is a real failure.
+          if ((e as { status?: number }).status !== 409) throw e;
+          if (!confirm(t("rightPanel.upload.confirmReplace", { name: file.name }))) continue;
+          result = await api.uploadToWorkspace(target, session.id, file, file.name, true);
+        }
+        stored.push(result.relative_path);
+      } catch (e) {
+        setUpload({
+          phase: "error",
+          message: t("rightPanel.upload.failed", {
+            name: file.name,
+            message: (e as Error).message,
+          }),
+        });
+        return;
+      }
+    }
+    // Every replace was declined: say nothing rather than claim a success.
+    setUpload(stored.length ? { phase: "done", paths: stored } : { phase: "idle" });
+    // An upload lands inside the checkout, so it shows up as an untracked file.
+    qc.invalidateQueries({ queryKey: ["scm", base, session.id] });
+  };
+
+  // Only engage for an actual file drag — dragging selected text or a link
+  // across the panel must not light up a drop target that would reject it.
+  const isFileDrag = (e: DragEvent) => e.dataTransfer.types.includes("Files");
+
+  const onDragEnter = (e: DragEvent) => {
+    if (!isFileDrag(e)) return;
+    dragDepth.current += 1;
+    setDropping(true);
+  };
+  const onDragLeave = (e: DragEvent) => {
+    if (!isFileDrag(e)) return;
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDropping(false);
+  };
+  const onDragOver = (e: DragEvent) => {
+    if (!isFileDrag(e)) return;
+    // Without this the browser refuses the drop and navigates to the file.
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  };
+  const onDrop = (e: DragEvent) => {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    dragDepth.current = 0;
+    setDropping(false);
+    void uploadFiles(Array.from(e.dataTransfer.files));
   };
 
   const { data: summary } = useQuery({
@@ -156,19 +305,32 @@ export function RightPanel({ target, session }: Props) {
 
   const rebase = useMutation({
     mutationFn: (onto: string) => api.scmRebase(target!, session!.id, onto),
+    onMutate: () => ({ submit: preparePrompt?.() }),
     onSuccess: () => {
       setRebaseOpen(false);
       setRebaseOnto("");
       refreshScm();
     },
+    onError: (error, onto, context) => handoffConflict(error, "rebase", onto, context?.submit),
   });
 
   const merge = useMutation({
     mutationFn: (targetBranch: string) => api.scmMerge(target!, session!.id, targetBranch),
+    onMutate: () => ({ submit: preparePrompt?.() }),
     onSuccess: () => {
       setMergeOpen(false);
       setMergeTarget("");
       refreshScm();
+    },
+    onError: (error, targetBranch, context) =>
+      handoffConflict(error, "merge", targetBranch, context?.submit),
+  });
+
+  const discardFile = useMutation({
+    mutationFn: (path: string) => api.scmDiscard(target!, session!.id, path),
+    onSuccess: (path) => {
+      if (diffTarget?.file.path === path) setDiffTarget(null);
+      qc.invalidateQueries({ queryKey: ["scm", base, session?.id] });
     },
   });
 
@@ -211,7 +373,7 @@ export function RightPanel({ target, session }: Props) {
     resetScmOps();
     branchAttachment.mutate(attached);
   };
-  const scmBusy = scmOps.some((op) => op.isPending);
+  const scmBusy = scmOps.some((op) => op.isPending) || discardFile.isPending;
 
   const recordedBranch = instance?.branch ?? null;
   const canToggleBranchAttachment =
@@ -228,6 +390,7 @@ export function RightPanel({ target, session }: Props) {
     setMergeOpen(false);
     setMergeTarget("");
     resetScmOps();
+    discardFile.reset();
   }, [session?.id, base]);
 
   if (!session || !target) {
@@ -244,7 +407,16 @@ export function RightPanel({ target, session }: Props) {
   return (
     <div className="panel right">
       <div className="panel-header">{t("rightPanel.header")}</div>
-      <div className="panel-body details">
+      {/* The whole panel is the drop target, not just the button's row: a
+          6px-tall strip is a miserable thing to aim a dragged file at. */}
+      <div
+        className={"panel-body details" + (dropping ? " dropping" : "")}
+        onDragEnter={onDragEnter}
+        onDragLeave={onDragLeave}
+        onDragOver={onDragOver}
+        onDrop={onDrop}
+      >
+        {dropping && <div className="drop-hint">{t("rightPanel.upload.dropHint")}</div>}
         {!isPhone && (
           <>
             <button
@@ -321,6 +493,55 @@ export function RightPanel({ target, session }: Props) {
           mono
         />
         <Field label={t("rightPanel.fieldDirectory")} value={session.working_directory} mono />
+        {/* Sits directly under the path it writes into, so "where does this go?"
+            is answered by the layout rather than by the help text. */}
+        <div className="upload-box">
+          <div className="upload-row">
+            <button
+              className="btn tiny upload-button"
+              disabled={upload.phase === "busy"}
+              onClick={() => fileInputRef.current?.click()}
+              title={t("rightPanel.upload.title")}
+            >
+              <svg
+                className="upload-icon"
+                viewBox="0 0 16 16"
+                fill="none"
+                aria-hidden="true"
+                focusable="false"
+              >
+                <path d="M8 10V2M8 2 4.75 5.25M8 2l3.25 3.25" />
+                <path d="M3 9.5V12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V9.5" />
+              </svg>
+              <span>{t("rightPanel.upload.button")}</span>
+            </button>
+            {/* There is no drag-and-drop on a phone, so don't offer it there. */}
+            {!isPhone && <span className="dim small">{t("rightPanel.upload.hint")}</span>}
+          </div>
+          {/* No `accept` — any file type is worth handing an agent, bounded by
+              size alone; `multiple` because collecting a few files at once is the
+              normal case for this action. */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            hidden
+            onChange={(e) => {
+              void uploadFiles(Array.from(e.target.files ?? []));
+              e.target.value = ""; // let the same file be picked again next time
+            }}
+          />
+          {upload.phase === "busy" && (
+            <div className="dim small upload-result">{upload.message}</div>
+          )}
+          {upload.phase === "done" && (
+            <div className="dim small upload-result">
+              {t("rightPanel.upload.done", { count: upload.paths.length })}
+              <div className="mono">{upload.paths.join(", ")}</div>
+            </div>
+          )}
+          {upload.phase === "error" && <div className="error upload-result">{upload.message}</div>}
+        </div>
         {instance && (
           <>
             <Field
@@ -350,7 +571,6 @@ export function RightPanel({ target, session }: Props) {
             {cleanup.error && <div className="error">{String(cleanup.error)}</div>}
           </>
         )}
-        <Field label={t("rightPanel.fieldSize")} value={`${session.cols}×${session.rows}`} />
         {session.exit_code !== null && (
           <Field label={t("rightPanel.fieldExitCode")} value={String(session.exit_code)} />
         )}
@@ -511,30 +731,68 @@ export function RightPanel({ target, session }: Props) {
           <div className="dim small">{t("rightPanel.treeClean")}</div>
         )}
 
-        {scm?.is_repo &&
-          scm.changed_files.map((f) => (
-            <div
-              key={f.path}
-              className="changed-file"
-              onClick={() => setDiffTarget(f)}
-              title={t("rightPanel.viewDiff")}
-            >
-              <span
-                className="change-badge"
-                style={{ color: STATUS_COLOR[f.status] ?? "#c7d0e0" }}
+        {/* A big changeset would otherwise push the history and its actions far
+            below the fold, so the list scrolls within its own bounded box. */}
+        {scm?.is_repo && scm.changed_files.length > 0 && (
+          <div className="changed-files">
+            {scm.changed_files.map((f) => (
+              <div
+                key={f.path}
+                className="changed-file"
+                onClick={() => setDiffTarget({ file: f, mode: "diff" })}
+                title={t("rightPanel.viewDiff")}
               >
-                {f.status}
-              </span>
-              <span className="mono change-path">{shortPath(f.path)}</span>
-              {f.staged && <span className="staged-dot" title={t("rightPanel.staged")} />}
-            </div>
-          ))}
+                <span
+                  className="change-badge"
+                  style={{ color: STATUS_COLOR[f.status] ?? "#c7d0e0" }}
+                >
+                  {f.status}
+                </span>
+                <span className="mono change-path">{shortPath(f.path)}</span>
+                {f.staged && <span className="staged-dot" title={t("rightPanel.staged")} />}
+                <FileViewActions
+                  onOpen={(mode) => setDiffTarget({ file: f, mode })}
+                  onDiscard={() => {
+                    discardFile.reset();
+                    if (confirm(t("rightPanel.confirmDiscard", { path: f.path }))) {
+                      discardFile.mutate(f.path);
+                    }
+                  }}
+                  discardDisabled={scmBusy}
+                />
+              </div>
+            ))}
+          </div>
+        )}
+
+        {discardFile.error && (
+          <ScmOpNotice
+            status="error"
+            title={t("rightPanel.discardFailed")}
+            summary={scmErrorSummary(discardFile.error)}
+            details={scmErrorDetails(discardFile.error)}
+            onDismiss={discardFile.reset}
+          />
+        )}
 
         {scm?.is_repo && (
           <>
             <div className="section-title with-actions">
               <span>{t("rightPanel.historyHeader")}</span>
               <span className="scm-actions">
+                {!scm.detached && (
+                  <button
+                    className="icon-btn"
+                    disabled={
+                      !preparePrompt || scmBusy || scm.changed_files.length === 0
+                    }
+                    onClick={() => preparePrompt?.()("commit the changes")}
+                    title={t("rightPanel.commitTitle")}
+                    aria-label={t("rightPanel.commitTitle")}
+                  >
+                    <span className="action-icon action-icon-git-commit" aria-hidden="true" />
+                  </button>
+                )}
                 {/* Fetch only reads the remotes, so unlike the rest it is just as
                     valid on a detached HEAD as on a branch. */}
                 <button
@@ -729,7 +987,15 @@ export function RightPanel({ target, session }: Props) {
               <ScmOpNotice
                 status="error"
                 title={t("rightPanel.rebaseFailed")}
-                summary={scmErrorSummary(rebase.error)}
+                summary={
+                  (rebase.error as { status?: number }).status === 409
+                    ? t(
+                        (rebase.error as ConflictError).promptSubmitted
+                          ? "rightPanel.rebaseConflictSummary"
+                          : "rightPanel.conflictManualSummary",
+                      )
+                    : scmErrorSummary(rebase.error)
+                }
                 details={scmErrorDetails(rebase.error)}
                 onDismiss={rebase.reset}
               />
@@ -740,7 +1006,11 @@ export function RightPanel({ target, session }: Props) {
                 title={t("rightPanel.mergeFailed")}
                 summary={
                   (merge.error as { status?: number }).status === 409
-                    ? t("rightPanel.mergeConflictSummary")
+                    ? t(
+                        (merge.error as ConflictError).promptSubmitted
+                          ? "rightPanel.mergeConflictSummary"
+                          : "rightPanel.conflictManualSummary",
+                      )
                     : scmErrorSummary(merge.error)
                 }
                 details={scmErrorDetails(merge.error)}
@@ -880,8 +1150,9 @@ export function RightPanel({ target, session }: Props) {
         <DiffModal
           target={target}
           sessionId={session.id}
-          path={diffTarget.path}
-          untracked={diffTarget.untracked}
+          path={diffTarget.file.path}
+          untracked={diffTarget.file.untracked}
+          mode={diffTarget.mode}
           onClose={() => setDiffTarget(null)}
         />
       )}

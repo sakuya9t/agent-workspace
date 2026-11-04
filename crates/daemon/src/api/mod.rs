@@ -9,7 +9,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 use tower_http::cors::CorsLayer;
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::config::Config;
 use crate::plugins::{current_platform, PluginModels};
@@ -21,6 +21,7 @@ mod auth;
 mod fs;
 mod paste;
 mod scm;
+mod startup_config;
 pub mod ws;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -51,7 +52,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/enrollment-token", get(auth::enrollment_token))
         .route("/api/auth/devices", get(auth::list_devices))
         .route("/api/auth/devices/:id/revoke", post(auth::revoke_device))
+        .route(
+            "/api/config",
+            get(startup_config::get).put(startup_config::put),
+        )
         .route("/api/fs/list", get(fs::list))
+        .route("/api/fs/mkdir", post(fs::mkdir))
         .route("/api/plugins", get(list_plugins))
         .route("/api/plugins/:id/models", get(list_plugin_models))
         .route("/api/workspaces", get(list_workspaces).post(add_workspace))
@@ -62,9 +68,31 @@ pub fn router(state: AppState) -> Router {
             post(cleanup_workspace_worktrees),
         )
         .route("/api/workspaces/:id/branches", get(list_workspace_branches))
+        .route(
+            "/api/workspaces/:id/branches/overview",
+            get(workspace_branch_overview),
+        )
+        // Branch names contain `/` (`asm-session/…`), so the branch travels in the
+        // JSON body rather than as a `:name` path segment.
+        .route(
+            "/api/workspaces/:id/branches/delete",
+            post(delete_workspace_branch),
+        )
+        .route(
+            "/api/workspaces/:id/branches/merge",
+            post(merge_workspace_branches),
+        )
+        .route(
+            "/api/workspaces/:id/branches/rebase",
+            post(rebase_workspace_branches),
+        )
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:id", get(get_session))
         .route("/api/sessions/:id/summary", get(get_summary))
+        .route(
+            "/api/sessions/:id/title/regenerate",
+            post(regenerate_session_title),
+        )
         .route("/api/sessions/:id/transcript", get(get_transcript))
         .route("/api/sessions/:id/usage", get(get_session_usage))
         .route("/api/sessions/:id/workspace", get(get_session_workspace))
@@ -81,12 +109,27 @@ pub fn router(state: AppState) -> Router {
             post(paste::upload)
                 .layer(axum::extract::DefaultBodyLimit::max(paste::MAX_PASTE_BYTES + 512 * 1024)),
         )
+        .route(
+            "/api/sessions/:id/upload",
+            // Same two-tier limit as `paste`, for the same reason: the transport
+            // cap sits above the enforced one so the handler answers an oversize
+            // upload with a clean 413.
+            post(paste::upload_workspace)
+                .layer(axum::extract::DefaultBodyLimit::max(paste::MAX_PASTE_BYTES + 512 * 1024)),
+        )
         .route("/api/sessions/:id/ack", post(ack_attention))
+        .route("/api/sessions/:id/deck", get(get_deck_prompt))
+        .route(
+            "/api/sessions/:id/deck/respond",
+            post(respond_to_deck_prompt),
+        )
         .route("/api/sessions/:id/vscode-target", get(vscode_target))
         .route("/api/sessions/:id/stream", get(ws::stream))
         .route("/api/sessions/:id/scm/status", get(scm::status))
+        .route("/api/sessions/:id/scm/discard", post(scm::discard))
         .route("/api/sessions/:id/scm/diff", get(scm::diff))
         .route("/api/sessions/:id/scm/file", get(scm::file))
+        .route("/api/sessions/:id/scm/content", get(scm::content))
         .route("/api/sessions/:id/scm/log", get(scm::log))
         .route("/api/sessions/:id/scm/commit", get(scm::commit))
         .route("/api/sessions/:id/scm/branches", get(scm::branches))
@@ -101,7 +144,14 @@ pub fn router(state: AppState) -> Router {
     // Optionally serve a packaged web client.
     if let Some(dir) = static_dir {
         if dir.is_dir() {
-            app = app.fallback_service(ServeDir::new(dir));
+            // `/deck` is a real, bookmarkable client-side route. Serve the SPA
+            // entry at that exact path while preserving honest 404s for unknown
+            // API paths (a catch-all SPA fallback would answer those with HTML).
+            let index = dir.join("index.html");
+            app = app
+                .route_service("/deck", ServeFile::new(index.clone()))
+                .route_service("/deck/", ServeFile::new(index))
+                .fallback_service(ServeDir::new(dir));
         }
     }
 
@@ -128,12 +178,16 @@ const READY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Session sub-resources that resolve a *live* backend handle, and so mean
 /// nothing until the startup reconcile pass has adopted the survivors.
-const LIVE_ROUTES: [&str; 4] = ["stream", "stop", "resize", "paste"];
+const LIVE_ROUTES: [&str; 5] = ["stream", "stop", "resize", "paste", "deck"];
 
 fn needs_live_session(path: &str) -> bool {
     path.strip_prefix("/api/sessions/")
         .and_then(|rest| rest.split_once('/'))
-        .is_some_and(|(_, sub)| LIVE_ROUTES.contains(&sub))
+        .is_some_and(|(_, sub)| {
+            sub.split('/')
+                .next()
+                .is_some_and(|resource| LIVE_ROUTES.contains(&resource))
+        })
 }
 
 /// Park requests that need a live session until adoption has run.
@@ -202,9 +256,9 @@ async fn list_plugins(State(state): State<AppState>) -> Json<serde_json::Value> 
 }
 
 /// The models a client can pick for one agent, for the new-session / fork
-/// dropdown. Kept off `/api/plugins` because it can be slow — opencode shells out
-/// to `opencode models` — so it is only paid when the dialog needs it. Runs on a
-/// blocking thread for the same reason.
+/// dropdown. Kept off `/api/plugins` because it can be slow — Codex queries its
+/// app server and opencode shells out to `opencode models` — so it is only paid
+/// when the dialog needs it. Runs on a blocking thread for the same reason.
 async fn list_plugin_models(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -290,6 +344,93 @@ async fn list_workspace_branches(
     Ok(Json(json!({ "branches": branches, "head": head })))
 }
 
+/// Rich per-branch overview for the workspace branch-management dialog. Git-heavy
+/// (per-branch reflog + rev-list), so it runs on a blocking thread.
+async fn workspace_branch_overview(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let overview = tokio::task::spawn_blocking(move || state.manager.workspace_branch_overview(&id))
+        .await
+        .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("task join: {e}")))??;
+    Ok(Json(json!({ "overview": overview })))
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteBranchBody {
+    branch: String,
+    #[serde(default)]
+    force: bool,
+}
+
+async fn delete_workspace_branch(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<DeleteBranchBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let DeleteBranchBody { branch, force } = body;
+    let res = tokio::task::spawn_blocking(move || {
+        state.manager.delete_workspace_branch(&id, &branch, force)
+    })
+    .await
+    .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("task join: {e}")))?;
+    match res {
+        Ok(()) => Ok(Json(json!({ "ok": true }))),
+        // Unmerged branch: 409 so the client can confirm and retry with force.
+        Err(e) if e.downcast_ref::<crate::session_manager::NeedsForce>().is_some() => {
+            Err(AppError(StatusCode::CONFLICT, format!("{e:#}")))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct MergeBranchesBody {
+    source: String,
+    target: String,
+}
+
+async fn merge_workspace_branches(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<MergeBranchesBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let MergeBranchesBody { source, target } = body;
+    let res = tokio::task::spawn_blocking(move || {
+        state.manager.merge_workspace_branches(&id, &source, &target)
+    })
+    .await
+    .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("task join: {e}")))?;
+    match res {
+        Ok(output) => Ok(Json(json!({ "output": output }))),
+        // A conflicting merge is aborted; 409 so the client shows "resolve manually".
+        Err(e) if e.downcast_ref::<crate::source_control::MergeConflict>().is_some() => {
+            Err(AppError(StatusCode::CONFLICT, format!("{e:#}")))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RebaseBranchBody {
+    branch: String,
+    onto: String,
+}
+
+async fn rebase_workspace_branches(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RebaseBranchBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let RebaseBranchBody { branch, onto } = body;
+    let output = tokio::task::spawn_blocking(move || {
+        state.manager.rebase_workspace_branch(&id, &branch, &onto)
+    })
+    .await
+    .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("task join: {e}")))??;
+    Ok(Json(json!({ "output": output })))
+}
+
 async fn get_session_workspace(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -333,19 +474,28 @@ async fn list_sessions(State(state): State<AppState>) -> Result<Json<serde_json:
 
 /// Serialize a session plus what the list view derives at read time: `attached`
 /// (is a live client currently on it? — so the UI can prompt for takeover
-/// instead of silently stealing it), the agent's own `title` for the session,
-/// and the `branch` its workspace instance holds. Blocking: a title-cache miss
-/// reads the agent's transcript.
+/// instead of silently stealing it), the persisted regenerated title or the
+/// agent's own `title` for the session, and the `branch` its workspace instance
+/// holds. Blocking: a title-cache miss reads the agent's transcript.
 fn session_json(s: &crate::domain::Session, state: &AppState) -> serde_json::Value {
     let mut v = serde_json::to_value(s).unwrap_or_else(|_| json!({}));
     if let Some(obj) = v.as_object_mut() {
         obj.insert("attached".into(), json!(state.attachments.is_attached(&s.id)));
-        let title = state.manager.registry().get(&s.agent_plugin_id).and_then(|p| {
-            p.title(&crate::plugins::usage::TranscriptContext {
-                cwd: std::path::PathBuf::from(&s.working_directory),
-                started_at_ms: s.created_at,
-            })
-        });
+        let title = state
+            .manager
+            .db()
+            .get_session_title(&s.id)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                state.manager.registry().get(&s.agent_plugin_id).and_then(|p| {
+                    p.title(&crate::plugins::usage::TranscriptContext {
+                        cwd: std::path::PathBuf::from(&s.working_directory),
+                        started_at_ms: s.created_at,
+                        native_session_id: s.agent_session_id.clone(),
+                    })
+                })
+            });
         obj.insert("title".into(), json!(title));
         let branch = state
             .manager
@@ -506,6 +656,89 @@ async fn get_summary(
     }
 }
 
+/// Re-name a session from its bound conversation. This deliberately uses the
+/// compact deterministic digest rather than feeding a potentially enormous raw
+/// transcript to the model. The generated title is persisted by ASM and takes
+/// precedence over the agent CLI's own automatic title on future list polls.
+async fn regenerate_session_title(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let session = state
+        .manager
+        .get_session(&id)?
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "no such session".into()))?;
+    let manager = state.manager.clone();
+    let title = tokio::task::spawn_blocking(move || {
+        let plugin = manager
+            .registry()
+            .get(&session.agent_plugin_id)
+            .ok_or_else(|| anyhow::anyhow!("session agent is unavailable"))?;
+        let cx = crate::plugins::usage::TranscriptContext {
+            cwd: std::path::PathBuf::from(&session.working_directory),
+            started_at_ms: session.created_at,
+            native_session_id: session.agent_session_id.clone(),
+        };
+        let digest = plugin
+            .digest(&cx)
+            .ok_or_else(|| anyhow::anyhow!("this session has no readable conversation digest"))?;
+        let title = crate::summarize::session_title(
+            manager.registry(),
+            &session.agent_plugin_id,
+            &digest,
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no installed coding agent could generate a session title"
+            )
+        })?;
+        manager
+            .db()
+            .set_session_title(&session.id, &title, now_millis())?;
+        Ok::<_, anyhow::Error>(title)
+    })
+    .await
+    .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("title task: {e}")))??;
+
+    Ok(Json(json!({ "title": title })))
+}
+
+/// Structured approval data for button-based controllers. `prompt: null` means
+/// the session needs attention but its current screen cannot be answered safely
+/// as numbered buttons; controllers should offer the full terminal instead.
+async fn get_deck_prompt(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let prompt = state.manager.deck_prompt(&id)?;
+    Ok(Json(json!({ "prompt": prompt })))
+}
+
+#[derive(Debug, Deserialize)]
+struct DeckResponseBody {
+    revision: String,
+    option_id: usize,
+}
+
+/// Drive the same arrow+Enter input the terminal menu expects, without opening
+/// a WebSocket attachment (and therefore without taking over another viewer).
+async fn respond_to_deck_prompt(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<DeckResponseBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    match state
+        .manager
+        .respond_to_deck_prompt(&id, &body.revision, body.option_id)
+    {
+        Ok(session) => Ok(Json(json!({ "session": session }))),
+        Err(e) if e.downcast_ref::<crate::session_manager::StaleDeckPrompt>().is_some() => {
+            Err(AppError(StatusCode::CONFLICT, format!("{e:#}")))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// `?format=raw` opts out of the rendered conversation.
 #[derive(Debug, Default, Deserialize)]
 struct TranscriptQuery {
@@ -552,6 +785,7 @@ async fn get_transcript(
                 p.conversation(&crate::plugins::usage::TranscriptContext {
                     cwd: std::path::PathBuf::from(&sess.working_directory),
                     started_at_ms: sess.created_at,
+                    native_session_id: sess.agent_session_id.clone(),
                 })
             })
         })
@@ -622,6 +856,7 @@ async fn get_session_usage(
             p.usage(&crate::plugins::usage::TranscriptContext {
                 cwd: std::path::PathBuf::from(&s.working_directory),
                 started_at_ms: s.created_at,
+                native_session_id: s.agent_session_id.clone(),
             })
         })
     })
@@ -634,12 +869,21 @@ async fn get_session_usage(
     Ok(Json(json!({ "usage": usage })))
 }
 
+/// Stop a session. Refused with `409` while the agent is working or blocked on
+/// a prompt — a turn is in flight and killing it loses that work. `?force=true`
+/// (the client's "force stop" checkbox) overrides.
 async fn stop_session(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<CleanupParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let s = state.manager.stop_session(&id)?;
-    Ok(Json(json!({ "session": s })))
+    match state.manager.stop_session(&id, params.force) {
+        Ok(s) => Ok(Json(json!({ "session": s }))),
+        Err(e) if e.downcast_ref::<crate::session_manager::SessionBusy>().is_some() => {
+            Err(AppError(StatusCode::CONFLICT, format!("{e:#}")))
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 async fn archive_session(
@@ -730,7 +974,76 @@ impl From<anyhow::Error> for AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::{needs_live_session, normalize_model};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::body::{to_bytes, Body};
+    use axum::extract::ConnectInfo;
+    use axum::http::{Request, StatusCode};
+    use serde_json::Value;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    use super::{needs_live_session, normalize_model, router, AppState};
+    use crate::backend::native::NativePtyBackend;
+    use crate::config::{BackendKind, Config};
+    use crate::db::Db;
+    use crate::plugins::PluginRegistry;
+    use crate::session_manager::SessionManager;
+    use crate::source_control::GitSourceControl;
+    use crate::util::now_millis;
+
+    fn test_router() -> (axum::Router, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("asm-api-{}", Uuid::new_v4()));
+        let data_dir = dir.join("data");
+        let config_dir = dir.join("config");
+        let runtime_dir = dir.join("run");
+        for path in [&data_dir, &config_dir, &runtime_dir] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let config = Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            data_dir: data_dir.clone(),
+            config_dir,
+            runtime_dir: runtime_dir.clone(),
+            static_dir: None,
+            backend: BackendKind::Native,
+            asmux_socket: runtime_dir.join("asmux.sock"),
+            asmux_autospawn: false,
+            asmux_wait: Duration::from_millis(10),
+            asmux_bin: None,
+            relay_url: None,
+            relay_key: None,
+            node_label: "test-node".into(),
+            enrollment_token: None,
+            relay_downstreams: vec![],
+            relay_probe_interval: Duration::from_secs(5),
+        };
+        let db = Db::open(&config.db_path()).unwrap();
+        let backend = Arc::new(NativePtyBackend::new(db.events()));
+        let manager = Arc::new(SessionManager::new(
+            db,
+            Arc::new(PluginRegistry::with_builtins()),
+            backend,
+            data_dir.join("worktrees"),
+        ));
+        let app = router(AppState {
+            manager,
+            config: Arc::new(config),
+            scm: Arc::new(GitSourceControl),
+            started_at: now_millis(),
+            node_id: "test-node-id".into(),
+            node_label: "test-node".into(),
+            attachments: super::ws::Attachments::new(),
+        });
+        (app, dir)
+    }
+
+    async fn json(response: axum::response::Response) -> Value {
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
 
     #[test]
     fn normalize_model_treats_blank_as_no_override() {
@@ -748,13 +1061,160 @@ mod tests {
         assert!(needs_live_session("/api/sessions/abc/stop"));
         assert!(needs_live_session("/api/sessions/abc/resize"));
         assert!(needs_live_session("/api/sessions/abc/paste"));
+        assert!(needs_live_session("/api/sessions/abc/deck"));
+        assert!(needs_live_session("/api/sessions/abc/deck/respond"));
 
         // Pure DB/git reads, and session creation — none of them touch `live`,
         // so they must not wait on adoption.
         assert!(!needs_live_session("/api/sessions"));
         assert!(!needs_live_session("/api/sessions/abc"));
         assert!(!needs_live_session("/api/sessions/abc/transcript"));
+        // A workspace upload only reads the session record and writes a file —
+        // no `live` handle — so it must not be parked behind adoption either.
+        assert!(!needs_live_session("/api/sessions/abc/upload"));
         assert!(!needs_live_session("/api/sessions/abc/scm/status"));
         assert!(!needs_live_session("/health"));
+    }
+
+    #[tokio::test]
+    async fn router_health_uses_real_app_state() {
+        let (app, dir) = test_router();
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json(response).await;
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["node_id"], "test-node-id");
+        assert_eq!(body["backend"], "native-pty");
+        assert_eq!(body["active_sessions"], 0);
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn router_enforces_auth_and_serves_local_session_list() {
+        let (app, dir) = test_router();
+
+        let remote = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/sessions")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(remote.status(), StatusCode::UNAUTHORIZED);
+
+        let mut local_request = Request::builder()
+            .uri("/api/sessions")
+            .body(Body::empty())
+            .unwrap();
+        local_request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+        ));
+        let local = app.clone().oneshot(local_request).await.unwrap();
+        assert_eq!(local.status(), StatusCode::OK);
+        assert_eq!(json(local).await["sessions"], serde_json::json!([]));
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn local(method: &str, uri: &str, body: Option<Value>) -> Request<Body> {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+        ));
+        req
+    }
+
+    #[tokio::test]
+    async fn startup_config_round_trips_with_write_only_secrets() {
+        use crate::startup_config as sc;
+        let (app, dir) = test_router();
+        let path = dir.join("data").join(sc::FILE_NAME);
+
+        // Remote callers without a device token are refused like any /api call.
+        let remote = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(remote.status(), StatusCode::UNAUTHORIZED);
+
+        // Start from a complete (all-default) file so the ambient ASM_* env of
+        // whoever runs the tests cannot leak into the expected values.
+        let initial = sc::render(&sc::Values::new());
+        std::fs::write(&path, &initial).unwrap();
+        let got = json(app.clone().oneshot(local("GET", "/api/config", None)).await.unwrap()).await;
+        assert_eq!(got["source"], "daemon");
+        assert_eq!(got["exists"], true);
+        assert_eq!(got["path"], path.display().to_string());
+        assert_eq!(got["revision"], sc::revision(&initial));
+        assert_eq!(got["pending"], Value::Null);
+
+        let put = app
+            .clone()
+            .oneshot(local(
+                "PUT",
+                "/api/config",
+                Some(serde_json::json!({
+                    "revision": got["revision"],
+                    "values": {
+                        "ASM_NODE_LABEL": "box",
+                        "ASM_RELAY_URL": "ws://relay:4700",
+                        "ASM_RELAY_KEY": "s3cret",
+                    },
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK);
+        let saved = json(put).await;
+        assert_eq!(saved["values"]["ASM_NODE_LABEL"], "box");
+        assert!(saved["values"].get("ASM_RELAY_KEY").is_none(), "secret must not be echoed");
+        assert_eq!(saved["secrets"]["ASM_RELAY_KEY"], true);
+        assert_eq!(saved["secrets"]["ASM_UI_DAEMON_TOKEN"], false);
+        let on_disk = sc::parse(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(on_disk.get("ASM_RELAY_KEY").unwrap(), "s3cret");
+
+        // A stale revision is a conflict; an invalid value is a 400. Neither writes.
+        let stale = app
+            .clone()
+            .oneshot(local(
+                "PUT",
+                "/api/config",
+                Some(serde_json::json!({ "revision": got["revision"], "values": { "ASM_UI_PORT": "8080" } })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let invalid = app
+            .clone()
+            .oneshot(local(
+                "PUT",
+                "/api/config",
+                Some(serde_json::json!({ "revision": saved["revision"], "values": { "ASM_BIND": "nowhere" } })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert!(json(invalid).await["error"].as_str().unwrap().contains("ASM_BIND"));
+        assert_eq!(sc::parse(&std::fs::read_to_string(&path).unwrap()), on_disk);
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

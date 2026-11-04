@@ -36,6 +36,13 @@ export interface Session {
   created_at: number;
   updated_at: number;
   last_activity_at: number;
+  /**
+   * When the session entered the state it is in now — what the row's clock
+   * counts from, so "blocked 8m" means eight minutes of being blocked. Unlike
+   * `last_activity_at` it isn't moved by a redraw, nor by viewing the session.
+   * (Absent on old daemons; fall back to `last_activity_at`.)
+   */
+  state_since?: number;
   risky: boolean;
   /** Whether a live client is currently attached (for takeover prompts). */
   attached?: boolean;
@@ -51,6 +58,21 @@ export interface Session {
    * written summary. (Absent on old daemons.)
    */
   has_agent_conversation?: boolean;
+}
+
+/** One numbered choice exposed by a live agent approval menu. */
+export interface DeckOption {
+  id: number;
+  label: string;
+}
+
+/** Provider-neutral approval model consumed by web or hardware button decks. */
+export interface DeckPrompt {
+  revision: string;
+  question: string;
+  detail: string;
+  options: DeckOption[];
+  selected: number;
 }
 
 export interface AgentOption {
@@ -116,6 +138,7 @@ export interface SessionUsage {
   model: string | null;
   context_tokens: number | null;
   context_window: number | null;
+  model_max_context_window?: number | null;
   input_tokens: number | null;
   cached_input_tokens: number | null;
   output_tokens: number | null;
@@ -172,6 +195,16 @@ export interface Commit {
   author: string;
   timestamp: number;
   parents: string[];
+}
+
+/** Whole-file text for the diff viewer's file mode. */
+export interface FileContent {
+  path: string;
+  content: string;
+  /** The daemon refuses to render bytes it read as binary; `content` is empty. */
+  binary: boolean;
+  /** Cut at the daemon's size cap — what's shown is the head of the file. */
+  truncated: boolean;
 }
 
 export interface CommitFileStat {
@@ -294,6 +327,39 @@ export interface BranchList {
   head: string | null;
 }
 
+/** The branch tip's short hash / subject / commit time, for display. */
+export interface BranchCommitMeta {
+  short: string;
+  subject: string;
+  timestamp: number;
+}
+
+/** One branch's row in the workspace branch-management overview. */
+export interface BranchOverview {
+  name: string;
+  /** The workspace repo's current (checked-out) branch. */
+  is_current: boolean;
+  /** Ids of active sessions whose worktree sits on this branch. */
+  session_ids: string[];
+  /** How many of `session_ids` are live right now. */
+  live_count: number;
+  /** Where the branch is based + how far it advanced (same as the right panel). */
+  base: BaseCommit | null;
+  /** Commits merged onto no other ref — work lost if the branch is deleted. */
+  unmerged_commits: number;
+  /** Worktree path holding this branch, if any (deletion is blocked while set). */
+  checked_out_path: string | null;
+  /** Whether ASM created this branch (advisory). */
+  owns_branch: boolean;
+  last_commit: BranchCommitMeta | null;
+}
+
+export interface WorkspaceBranches {
+  is_git: boolean;
+  head: string | null;
+  branches: BranchOverview[];
+}
+
 /** Where a client-side VS Code should connect to reach a session's workspace. */
 export interface VscodeTarget {
   path: string;
@@ -303,6 +369,7 @@ export interface VscodeTarget {
 
 import { Target } from "./connectionStore";
 import i18n from "./i18n";
+import type { ConfigKey } from "./startupConfig";
 
 /** Base URL with any trailing slash stripped ("" targets the local origin). */
 function baseOf(baseUrl: string): string {
@@ -525,6 +592,11 @@ export const api = {
     req<{ sessions: Session[] }>(t, "/api/sessions").then((r) => r.sessions),
   getSummary: (t: Target, id: string) =>
     req<{ summary: SessionSummary }>(t, `/api/sessions/${id}/summary`).then((r) => r.summary),
+  /** Generate and persist a new compact session-list title from the conversation. */
+  regenerateSessionTitle: (t: Target, id: string) =>
+    req<{ title: string }>(t, `/api/sessions/${id}/title/regenerate`, {
+      method: "POST",
+    }).then((r) => r.title),
   /**
    * Full conversation as a raw terminal transcript (ANSI included), as a Blob so
    * the browser can save it. No delta — always the complete recorded stream.
@@ -548,10 +620,17 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }).then((r) => r.session),
-  stopSession: (t: Target, id: string) =>
-    req<{ session: Session }>(t, `/api/sessions/${id}/stop`, { method: "POST" }).then(
-      (r) => r.session,
-    ),
+  /**
+   * End a session. The daemon refuses with 409 while the agent is working or
+   * blocked on a prompt (a turn is in flight); `force` is the deliberate
+   * override the stop dialog's "force stop" checkbox sends.
+   */
+  stopSession: (t: Target, id: string, force = false) =>
+    req<{ session: Session }>(
+      t,
+      `/api/sessions/${id}/stop${force ? "?force=true" : ""}`,
+      { method: "POST" },
+    ).then((r) => r.session),
   archiveSession: (t: Target, id: string, force = false) =>
     req<{ session: Session }>(
       t,
@@ -562,6 +641,20 @@ export const api = {
     req<{ session: Session }>(t, `/api/sessions/${id}/ack`, { method: "POST" }).then(
       (r) => r.session,
     ),
+  deckPrompt: (t: Target, id: string) =>
+    req<{ prompt: DeckPrompt | null }>(t, `/api/sessions/${id}/deck`).then(
+      (r) => r.prompt,
+    ),
+  respondToDeckPrompt: (
+    t: Target,
+    id: string,
+    revision: string,
+    optionId: number,
+  ) =>
+    req<{ session: Session }>(t, `/api/sessions/${id}/deck/respond`, {
+      method: "POST",
+      body: JSON.stringify({ revision, option_id: optionId }),
+    }).then((r) => r.session),
   resizeSession: (t: Target, id: string, rows: number, cols: number) =>
     req<{ ok: boolean }>(t, `/api/sessions/${id}/resize`, {
       method: "POST",
@@ -569,6 +662,11 @@ export const api = {
     }),
   scmStatus: (t: Target, id: string) =>
     req<{ status: ScmStatus }>(t, `/api/sessions/${id}/scm/status`).then((r) => r.status),
+  scmDiscard: (t: Target, id: string, path: string) =>
+    req<{ path: string }>(t, `/api/sessions/${id}/scm/discard`, {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    }).then((r) => r.path),
   scmDiff: (t: Target, id: string, path: string, untracked: boolean, commit?: string) =>
     req<{ path: string; diff: string }>(
       t,
@@ -584,6 +682,16 @@ export const api = {
     getBlob(
       t,
       `/api/sessions/${id}/scm/file?path=${encodeURIComponent(path)}&side=${side}` +
+        (commit ? `&commit=${encodeURIComponent(commit)}` : ""),
+    ),
+  /**
+   * Whole-file text for the diff viewer's "view whole file" mode. `side` picks
+   * the same versions `scmFile` does; a side with no content rejects with 404.
+   */
+  scmContent: (t: Target, id: string, path: string, side: "before" | "after", commit?: string) =>
+    req<FileContent>(
+      t,
+      `/api/sessions/${id}/scm/content?path=${encodeURIComponent(path)}&side=${side}` +
         (commit ? `&commit=${encodeURIComponent(commit)}` : ""),
     ),
   scmLog: (t: Target, id: string, limit = 30) =>
@@ -648,6 +756,26 @@ export const api = {
     }).then((r) => r.workspace),
   workspaceBranches: (t: Target, id: string) =>
     req<BranchList>(t, `/api/workspaces/${id}/branches`),
+  workspaceBranchOverview: (t: Target, id: string) =>
+    req<{ overview: WorkspaceBranches }>(
+      t,
+      `/api/workspaces/${id}/branches/overview`,
+    ).then((r) => r.overview),
+  deleteWorkspaceBranch: (t: Target, id: string, branch: string, force = false) =>
+    req<{ ok: boolean }>(t, `/api/workspaces/${id}/branches/delete`, {
+      method: "POST",
+      body: JSON.stringify({ branch, force }),
+    }),
+  mergeWorkspaceBranches: (t: Target, id: string, source: string, target: string) =>
+    req<{ output: string }>(t, `/api/workspaces/${id}/branches/merge`, {
+      method: "POST",
+      body: JSON.stringify({ source, target }),
+    }).then((r) => r.output),
+  rebaseWorkspaceBranch: (t: Target, id: string, branch: string, onto: string) =>
+    req<{ output: string }>(t, `/api/workspaces/${id}/branches/rebase`, {
+      method: "POST",
+      body: JSON.stringify({ branch, onto }),
+    }).then((r) => r.output),
   sessionWorkspace: (t: Target, id: string) =>
     req<{ instance: WorkspaceInstance | null }>(t, `/api/sessions/${id}/workspace`).then(
       (r) => r.instance,
@@ -663,6 +791,14 @@ export const api = {
       t,
       `/api/fs/list?path=${encodeURIComponent(path)}&show_hidden=${showHidden}`,
     ),
+  fsMkdir: (t: Target, parent: string, name: string) =>
+    req<{ path: string }>(t, "/api/fs/mkdir", {
+      method: "POST",
+      body: JSON.stringify({ parent, name }),
+    }).then((r) => r.path),
+  getConfig: (t: Target) => req<ConfigView>(t, "/api/config"),
+  putConfig: (t: Target, body: ConfigUpdate) =>
+    req<ConfigView>(t, "/api/config", { method: "PUT", body: JSON.stringify(body) }),
   enrollmentToken: (t: Target) =>
     req<{ enrollment_token: string }>(t, "/api/auth/enrollment-token").then(
       (r) => r.enrollment_token,
@@ -680,7 +816,92 @@ export const api = {
       `/api/sessions/${id}/paste` + (name ? `?name=${encodeURIComponent(name)}` : ""),
       blob,
     ),
+  /**
+   * Upload a file into the session's workspace, under `uploads/`. Unlike
+   * `uploadAttachment`, the stored name is the one given — no uuid — so the path
+   * stays predictable and the agent can find the file by listing the directory
+   * instead of being handed a path.
+   *
+   * That makes a name collision meaningful, so the daemon refuses one with `409`
+   * rather than overwriting: the caller's cue to confirm a replace and retry
+   * with `force`. A directory in the way comes back `400`, since no confirm
+   * would make that retry succeed.
+   */
+  uploadToWorkspace: (t: Target, id: string, blob: Blob, name: string, force = false) =>
+    postBlob<StoredAttachment>(
+      t,
+      `/api/sessions/${id}/upload?name=${encodeURIComponent(name)}` +
+        (force ? "&force=true" : ""),
+      blob,
+    ),
 };
+
+/**
+ * A host's saved startup configuration (`<data_dir>/startup.conf`), as the
+ * daemon's `GET /api/config` or the UI server's `GET /__asm/config` returns it.
+ * Secret keys are never sent back: `secrets` only says whether each is set.
+ */
+export interface ConfigView {
+  /** Who served it: a daemon, or the Vite server this page came from. */
+  source: "daemon" | "ui";
+  hostname: string;
+  /** The file on that host. */
+  path: string;
+  /** False until something saved it; `values` then reflect the process env. */
+  exists: boolean;
+  /** Change token to send back with an edit; null when there is no file. */
+  revision: string | null;
+  values: Partial<Record<ConfigKey, string>>;
+  secrets: Partial<Record<ConfigKey, boolean>>;
+  /** Saved but not yet applied by the scripts; null when unknown. */
+  pending: ConfigKey[] | null;
+  /** UI server only: whether scripts/start.sh launched it. */
+  managed?: boolean;
+}
+
+export interface ConfigUpdate {
+  revision: string | null;
+  /** Settings to change; a secret key that is absent keeps its value. */
+  values: Partial<Record<ConfigKey, string>>;
+}
+
+/** The UI server's endpoint (see client/vite.config-api.ts). */
+const UI_CONFIG_PATH = "/__asm/config";
+
+/**
+ * This page's own server's config, or null when that server has none — the
+ * daemon serving a packaged build, or a Vite from before the endpoint (whose
+ * SPA fallback answers with index.html, hence the content check).
+ */
+export async function getUiServerConfig(): Promise<ConfigView | null> {
+  let res: Response;
+  try {
+    res = await fetch(UI_CONFIG_PATH, { headers: { accept: "application/json" } });
+  } catch {
+    return null;
+  }
+  if (!res.ok || !(res.headers.get("content-type") ?? "").includes("application/json")) return null;
+  const body = (await res.json().catch(() => null)) as ConfigView | null;
+  return body?.source === "ui" ? body : null;
+}
+
+export async function putUiServerConfig(body: ConfigUpdate): Promise<ConfigView> {
+  let res: Response;
+  try {
+    res = await fetch(UI_CONFIG_PATH, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    throw unreachableError("");
+  }
+  if (!res.ok) {
+    const { msg } = await errorMessage(res);
+    throw Object.assign(new Error(msg), { status: res.status });
+  }
+  return res.json() as Promise<ConfigView>;
+}
 
 export function streamUrl(t: Target, id: string): string {
   let base: string;

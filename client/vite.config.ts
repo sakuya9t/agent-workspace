@@ -1,9 +1,17 @@
 import { defineConfig, createLogger } from "vite";
 import react from "@vitejs/plugin-react";
 import { createDaemonAwareLogger, respondDaemonDown } from "./vite.proxy-log";
+import { startupConfigApi } from "./vite.config-api";
 
 // Proxy API + WebSocket traffic to the local daemon during development.
 const daemon = process.env.ASM_DAEMON ?? "http://127.0.0.1:4600";
+// UI-only gateways may proxy to an off-host daemon, where loopback trust does
+// not apply. Inject an enrolled device token server-side for both HTTP and the
+// WebSocket upgrade, keeping it out of browser storage and URLs.
+const daemonToken = process.env.ASM_DAEMON_TOKEN;
+const daemonAuth = daemonToken
+  ? { headers: { Authorization: `Bearer ${daemonToken}` } }
+  : {};
 
 // Host the dev server binds to. Default `true` = all interfaces (0.0.0.0 + ::),
 // so the React client is reachable from other machines on the LAN — point a
@@ -16,6 +24,16 @@ const daemon = process.env.ASM_DAEMON ?? "http://127.0.0.1:4600";
 const host =
   process.env.ASM_CLIENT_HOST === undefined ? true : process.env.ASM_CLIENT_HOST;
 
+// Reverse proxies preserve their public Host header when dialing this local
+// HTTP server. Keep Vite's DNS-rebinding protection enabled and admit only the
+// exact hostnames the operator configured (for example a Tailscale Serve
+// `*.ts.net` name). The launcher validates and persists this comma-separated
+// list; an empty list retains Vite's localhost/IP defaults.
+const allowedHosts = (process.env.ASM_CLIENT_ALLOWED_HOSTS ?? "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
+
 // When the daemon isn't up, node-http-proxy raises a connection error on every
 // request (and /health is polled), which Vite would log as a full stack trace
 // on each one — flooding the console. Collapse that specific noise into one
@@ -24,21 +42,26 @@ const host =
 const customLogger = createDaemonAwareLogger(createLogger(), daemon);
 
 export default defineConfig({
-  plugins: [react()],
+  // startupConfigApi: `/__asm/config`, this UI host's saved startup settings
+  // for the Config dialog (daemons serve theirs at /api/config).
+  plugins: [react(), startupConfigApi()],
   customLogger,
   server: {
     host,
+    allowedHosts,
     port: 5273,
     proxy: {
       "/api": {
         target: daemon,
         changeOrigin: true,
         ws: true,
+        ...daemonAuth,
         configure: respondDaemonDown(daemon),
       },
       "/health": {
         target: daemon,
         changeOrigin: true,
+        ...daemonAuth,
         configure: respondDaemonDown(daemon),
       },
     },

@@ -21,13 +21,11 @@
 >
 > Read [`fork-session.md`](fork-session.md) for what actually exists.
 
-A session that ended still holds most of its value: a branch with work on it, a
-worktree with that work checked out, and a conversation in which an agent
-learned the shape of the problem. Today all three are stranded — the only way
-forward from a dead session is a new session that knows nothing. This document
-specifies **recovery**: continuing a terminated session's work in a fresh
-session, on the same branch, in the same worktree, with the old conversation
-carried across.
+At the time this design was written, a session that ended still held most of its
+value—a branch, worktree and learned conversation—but all three were stranded.
+This document specified **recovery**: continuing that work in a fresh session,
+on the same branch and worktree, with the old conversation carried across. The
+shipping fork feature now provides that path.
 
 Recovery is explicitly **not** resurrection. The PTY is gone; the child process
 is gone. We never pretend otherwise. What we recover is the *place* (branch +
@@ -115,13 +113,17 @@ All three providers can **fork** on resume. We always fork. This is an invariant
 | **claude** | `sessionId`, both the JSONL filename stem and a field on every line, in `~/.claude/projects/<encoded-cwd>/` — the exact file `claude_transcript_usage` already opens (`usage.rs:109`) | `claude --resume <id> --fork-session` | A |
 | **codex** | the UUID in the rollout filename `rollout-<ts>-<uuid>.jsonl`, under `~/.codex/sessions/**` — files `codex_usage` already collects (`usage.rs:403`) | `codex fork <id>` (subcommand leads argv) | A |
 | **opencode** | `~/.local/share/opencode/opencode.db` (SQLite) — no per-cwd file to discover | `opencode --session <id> --fork` | C |
+| **pi** | the `id` on the `session` header opening `~/.pi/agent/sessions/--<cwd>--/<ts>_<uuid>.jsonl` — the file `pi_usage` already opens | `pi --fork <id>` | A |
 | **shell** | no conversation | — | brief only |
 | **custom_command** | unknown by definition | — | brief only |
 
 Verified against the installed binaries: `codex fork` accepts
 `--dangerously-bypass-approvals-and-sandbox`, and `claude --fork-session` composes
 with `--resume`, so the existing danger-flag toggles survive a resume launch on
-both.
+both. `pi --fork` (0.84.2) resolves its argument as a path, then as an id in the
+current project, then as an id across every project — and forks a cross-project
+match straight into the current directory without asking, which `--session` does
+*not* do. That last step is what lets a pi fork land in a fresh worktree.
 
 Opencode is the reason this is a plugin capability and not two `if` branches: it
 has native resume, but its id is behind a SQLite read rather than a filesystem
@@ -173,15 +175,17 @@ not tolerable for choosing which conversation to resume:
   the directory", and the `sessionId` in the file is never read;
 - two agent sessions in one cwd (normal when worktree isolation is off) collapse
   onto whichever transcript was written last;
-- Codex falls back to `files.first()` — *any* newest rollout on the box — when the
-  cwd probe misses.
+- Codex must wait for an exact recorded-cwd match. Older releases fell back to
+  `files.first()` — any newest rollout on the box — when the cwd probe missed;
+  startup reconciliation repairs duplicate cross-cwd bindings from that bug.
 
 Resuming the wrong conversation is a much worse failure than reporting the wrong
 token count. So: **capture the native id once, while the session is alive and the
 heuristic is at its most reliable, and persist it.** The monitor already has the
-hooks; the first successful `native_session_id` for a session writes
-`sessions.agent_session_id` and never re-derives. Recovery then reads a column,
-not a filesystem race.
+hooks; the first unique `native_session_id` for a session writes
+`sessions.agent_session_id`. Recovery then reads a column, not a filesystem race.
+The only rewrite is a startup repair when the plugin proves a duplicate binding
+belongs to another cwd and resolves that session's exact replacement.
 
 (Persisting it also lets us *verify* rather than guess: for Claude we read the
 `sessionId` field out of the JSONL rather than trusting "newest file wins".)
@@ -264,29 +268,22 @@ if a recovery is itself recovered) and costs one nullable column.
 | origin has no conversation (shell) | brief (its scrollback is genuinely useful here) |
 | brief empty (no `terminal_events`) | recover anyway — place without context beats nothing |
 
-## Staging
+## Historical staging and current status
 
-- **Stage A — native resume for Claude + Codex.** The trait seam, `SCHEMA_V7`,
-  id capture in the monitor, `POST /api/sessions/:id/recover`, and the client
-  affordance on a terminal session. Both providers' ids are already discoverable
-  by code that exists.
-- **Stage B — the brief.** vt100 → prose, the `.asm/recovered-*.txt` file, the
-  pointer prompt. Covers shell, `custom_command`, and any Stage-A miss.
-- **Stage C — opencode native resume.** Read the id out of `opencode.db`. Pure
-  plugin change; the recovery flow is untouched.
-
-Stage A is small: the worktree reuse and the argv passthrough both already work
-(`args` flows `CreateSessionBody` → `AgentContext.extra_args` → `cli_launch` →
-`BackendSpawnSpec` → argv, `builtin.rs:231`), so most of Stage A is capture,
-persistence, and UI rather than new machinery.
+- **Stage A — shipped as fork.** The trait seam, `SCHEMA_V7`, monitor-time id
+  capture, client affordance, and native Claude/Codex continuation landed behind
+  `POST /api/sessions/:id/fork`.
+- **Stage B — mostly shipped, one follow-up.** Transcript-bearing agents get a
+  bounded deterministic digest, optional prose summary, file and pointer prompt.
+  The PTY-scrollback source for `shell`/`custom_command` remains **FORK-SHELL**.
+- **Stage C — pending as FORK-OC.** Read the conversation id from `opencode.db`
+  and launch its native fork. The general fork flow does not move.
 
 ## Open questions
 
-- **Recover into a *new* branch?** Recovering onto the origin's branch means the
-  new session commits onto the same line of work — usually right. A variant that
-  branches off the origin's tip instead would suit "retry this differently".
-  Deferred; the branch triple on `CreateSessionRequest` already expresses it if
-  we want it.
+- ~~**Recover into a new branch?**~~ Resolved by fork: the default creates a new
+  `asm-session/<id>` branch from the origin's tip; an explicit same-branch option
+  shares the origin's worktree after the origin stops.
 - **Recovering an `indeterminate` session whose process is secretly still alive.**
   The advisory says it may still be running as an orphan. Recovery would put a
   second agent in the same worktree. M4 Stage C's orphan reconciliation is the

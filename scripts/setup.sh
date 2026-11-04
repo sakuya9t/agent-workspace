@@ -10,8 +10,8 @@
 #   4. web client (optional): if Node/npm is present, install deps AND build
 #      client/dist so the daemon can serve the UI headlessly (ASM_STATIC_DIR) —
 #      no npm/vite needed on the serving box. Missing Node is a warning, not a
-#      failure: the daemon runs fine without a UI, and a pre-built client/dist
-#      copied in from a build machine is served as-is.
+#      failure: the daemon runs fine with `scripts/start.sh --no-ui`, and a
+#      pre-built client/dist copied in from a build machine is served as-is.
 #
 # Safe to re-run: every step is skipped when it's already satisfied.
 #
@@ -21,7 +21,8 @@
 #   ASM_NO_CLIENT=1 scripts/setup.sh  # skip the web client (npm) entirely
 #
 # After it finishes, run `source "$HOME/.cargo/env"` in your current shell (new
-# shells pick cargo up automatically) and then `scripts/start.sh`.
+# shells pick cargo up automatically) and then `scripts/start.sh` (or add
+# `--no-ui` when Node/client dependencies are unavailable).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,6 +31,8 @@ log()  { printf '\033[1;36m[setup]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[setup]\033[0m %s\n' "$*" >&2; }
 err()  { printf '\033[1;31m[setup]\033[0m %s\n' "$*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
+# Git Bash / MSYS2 on Windows (see scripts/setup.ps1 for a fresh Windows box).
+is_windows() { case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) return 0 ;; *) return 1 ;; esac; }
 
 # ---------------------------------------------------------------------------
 # sudo + package-manager detection. We only touch the system package manager
@@ -90,6 +93,22 @@ pm_install() {
 # ---------------------------------------------------------------------------
 ensure_system_deps() {
   local want=()
+  if is_windows; then
+    # Native Windows builds use the MSVC toolchain, which cargo finds on its
+    # own — there is no cc/make to look for, and no package manager here to
+    # install one. scripts/setup.ps1 installs the whole toolchain via winget.
+    if ! have cargo && [ -x "$HOME/.cargo/bin/cargo.exe" ]; then
+      export PATH="$HOME/.cargo/bin:$PATH"
+    fi
+    if ! have cargo; then
+      err "Rust is not installed. On Windows, bootstrap from PowerShell instead:"
+      err "    powershell -ExecutionPolicy Bypass -File scripts\\setup.ps1"
+      err "(installs Git, Visual Studio Build Tools, rustup and Node via winget, then builds)."
+      exit 1
+    fi
+    log "windows: using the MSVC toolchain cargo already has — skipping cc/make"
+    return 0
+  fi
   if ! have cc && ! have gcc && ! have clang; then want+=(toolchain); fi
   if ! have make && [[ " ${want[*]-} " != *" toolchain "* ]]; then want+=(toolchain); fi
   if ! have curl && ! have wget; then want+=(curl); fi
@@ -213,7 +232,7 @@ setup_client() {
       warn "The daemon serves a *pre-built* client with no Node toolchain needed:"
       warn "  • on a machine with Node 20+:  cd client && npm install && npm run build"
       warn "  • copy the resulting client/dist/ to this host, then start with"
-      warn "        ASM_STATIC_DIR=$dist scripts/start.sh"
+      warn "        ASM_STATIC_DIR=$dist scripts/start.sh --no-ui"
       warn "  (or install Node 20+ here once to build it — https://github.com/nvm-sh/nvm)"
     fi
     return 0
@@ -258,13 +277,14 @@ main() {
   if [ -n "$CLIENT_DIST" ]; then
     web_ui="Web UI is built (client/dist). Serve it straight from the daemon —
      no Node/npm/vite needed on this box:
-         ASM_STATIC_DIR=$CLIENT_DIST scripts/start.sh
-     …or for live-reload development:  cd client && npm run dev"
+         ASM_STATIC_DIR=$CLIENT_DIST scripts/start.sh --no-ui
+     …or, when Node is available, use the default managed live-reload UI:
+         scripts/start.sh"
   else
     web_ui="Web UI: build a servable bundle with 'cd client && npm run build'
      (needs Node 20+), or copy one in, then serve it headlessly via
-         ASM_STATIC_DIR=$ROOT/client/dist scripts/start.sh
-     …or for development instead:  cd client && npm run dev"
+         ASM_STATIC_DIR=$ROOT/client/dist scripts/start.sh --no-ui
+     …or for managed development instead:  scripts/start.sh"
   fi
 
   cat <<EOF
@@ -274,7 +294,7 @@ Next steps:
   1. This shell doesn't have cargo on PATH yet — run:
          source "\$HOME/.cargo/env"
      (new terminals pick it up automatically.)
-  2. Guided setup (start / stop / restart + how clients reach this host):
+  2. Guided setup (UI + relay/connectivity + start / stop / restart):
          scripts/wizard.sh
      …or drive it yourself: scripts/start.sh  (see --help for flags).
   3. Check it and grab this host's enrollment token:

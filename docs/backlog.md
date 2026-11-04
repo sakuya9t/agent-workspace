@@ -1,37 +1,59 @@
 # Backlog
 
-Last reconciled: **2026-07-11**, row by row against the code (not against this
-table's own claims). Every pending row below was re-verified; the three that had
-drifted are corrected here rather than carried forward.
+**2026-07-26 update (not a reconcile):** the minimal **RF-GATE** harness landed:
+a real router/AppState auth + health harness, attachment takeover units, a
+scripted `MockHolder` driving sidecar create/adopt/resync/end paths, asmux e2e
+coverage for readBuffer/detach/backpressure/takeover/malformed bodies, and CI
+running Rust + client gates with smoke/mobile-shell e2e. This clears the gate in
+front of **RF-FLOW** and **RF-LIFE**; RF-GATE remains open at P2 for the client
+lint expansion, generated-schema drift check, and migration/version-skew guard.
+
+**2026-07-25 update (not a reconcile):** the **FIX** row landed in full — all
+eight verified defects, each with a regression test that fails without its fix.
+Its row and sequencing entry below are struck through; the 2026-07-24 reconcile
+narrative that follows is left as written, so "all eight … remain open" there
+should be read as of that date.
+
+Last reconciled: **2026-07-24**, row by row against the code and history through
+`99814d9` (not against this table's own claims). The table has 42 rows: two
+completed rows retained for context, one decision folded into R5, and 39 open or
+explicitly deferred rows.
 
 **What this reconcile changed:**
 
-- **New row REC — session recovery** (P1, designed not implemented):
-  [`session-recovery.md`](session-recovery.md). Slotted **next** in the
-  suggested order — it is the only pending P1 that adds user-visible capability
-  with no decision gate in front of it.
-- **M4 Stage A + B landed** (2026-07-11); the M4 row now tracks only **Stage C**,
-  demoted to P2/P3. Correction: Stage C's *slow-attacher drop + resync* is
-  **already done** — it landed with Stage A (`sidecar.rs:389-404` re-attaches
-  `FromCursor` on `DETACH_BACKPRESSURE`). Removed from the row; the old text
-  claiming "the daemon policy does not [exist]" was stale.
-- **MOB-PWA is mostly shipped** — `f7c7640` (app icons) incidentally added
-  `client/public/site.webmanifest` (`display: standalone`, theme/bg, maskable
-  icons) and the apple-touch-icon/theme-color links. The row now covers only the
-  genuinely missing part: the iOS `apple-mobile-web-app-*` meta tags.
-- **A batch of landed work was never credited** in *Already done* — the attention
-  classifier fixes (including the new `error` state), git **merge + push**,
-  save-conversation download, terminal copy/paste under TUI mouse reporting, the
-  two-level connection dialog, and the daemon-served client. Added below, because
-  an index that understates what exists invites re-planning it.
-
-Everything else in the table was confirmed **still pending**, with evidence.
+- **REC landed as the more general session-fork feature** on 2026-07-14. The
+  stale reliability chain ending in `→ REC` is gone. `RF-REC` keeps its legacy
+  id but is now P2, non-blocking Git/API/UI consolidation; the two real recovery
+  follow-ups remain **FORK-SHELL** and **FORK-OC**.
+- **Post-reconcile product growth is now credited:** session/fork model choice,
+  workspace branch management, agent-driven commits, agent conflict resolution,
+  Agent Deck, managed UI + UI-only gateway startup, workspace uploads,
+  directory creation, and the mobile/tablet/session-attachment polish through
+  2026-07-23.
+- **The formal release status is explicit:** the Unix/web central loop is a
+  runnable alpha, but the written Alpha/MVP gates are not met while M5 Windows,
+  rich rendering, setup hooks/checkpoints, and Electron packaging remain.
+- **All eight FIX defects were re-verified in current code and remain open.**
+  RF-GATE is also still open: one pure `needs_live_session` unit test now exists,
+  but there is still no router/AppState harness, WS attachment unit suite, CI,
+  `MockHolder`, migration ladder, or generated-schema drift gate.
+- **DOC-1 landed in this reconcile:** architecture and the relay protocol comment
+  now describe the shipped dial-out-per-stream relay rather than yamux.
+- **Growth triggers were updated:** `RightPanel.tsx` is now 1,209 lines,
+  `Terminal.tsx` 1,087, and `api.ts` 837. The RF-REC/RF-HYG/RF-QUERY splits are
+  no longer hypothetical preparation; they are active maintenance debt.
+- **Session copilots are now designed, not implemented:** **COPILOT-REVIEW**
+  adds isolated same- or cross-provider review of an exact dirty-tree snapshot;
+  **COPILOT-GATE** adds stale-proof policy over ASM-owned promotion actions.
+  The design and honest enforcement boundary are in
+  [`copilot.md`](copilot.md).
 
 **2026-07-12 addition (rows added, not a full reconcile):** a five-subsystem
 tech-debt review ([`refactoring-plan.md`](refactoring-plan.md) → §6; every
 finding carries file:line evidence, the defect bundle hand-verified) added
 rows **FIX** (verified latent defects, P1), **RF-REC** (pre-REC refactor
-bundle, P1), **RF-GATE** (build gate & test safety net, P1/P2),
+bundle when introduced; now generic consolidation at P2), **RF-GATE** (build
+gate & test safety net, P1/P2),
 **RF-WSPROTO** (client↔daemon WS contract, P2) and **RF-HYG** (hygiene
 bundle, P3), and annotated the REC / M4-C / SEC-2 / R5 / M5 / MEAS /
 MOB-PUSH / MVP-RICH rows with its findings.
@@ -45,7 +67,8 @@ backend-config fail-open; and corrected stale transcript prose. See
 
 Earlier reconciles (context): 2026-07-06 added the **RF-\*** rows from
 [`refactoring-plan.md`](refactoring-plan.md); 2026-07-07 landed **R4** (gateway
-mode) and **RF-M4 #1/#3/#4**; 2026-07-08 landed **TERM-SCROLL**.
+mode) and **RF-M4 #1/#3/#4**; 2026-07-08 landed **TERM-SCROLL**; 2026-07-11
+landed M4 Stage A+B and designed REC; 2026-07-12 added the reliability reviews.
 
 This is the single cross-track index of work that is **designed but not yet
 implemented**. The detailed designs stay in their own documents
@@ -54,6 +77,7 @@ implemented**. The detailed designs stay in their own documents
 [`vscode-over-relay-plan.md`](vscode-over-relay-plan.md),
 [`mobile-ui.md`](mobile-ui.md),
 [`security-followups.md`](security-followups.md),
+[`copilot.md`](copilot.md),
 [`mvp-execution-plan.md`](mvp-execution-plan.md),
 [`refactoring-plan.md`](refactoring-plan.md),
 [`classifier-measurement.md`](classifier-measurement.md)); this file only records
@@ -72,6 +96,71 @@ pick it up**.
 
 ## Already done (context, do not re-plan)
 
+- **Agent Deck (2026-07-22).** `/deck` is a phone/Stream Deck-shaped,
+  button-first surface for live working/blocked sessions and provider-neutral
+  approval choices. `GET /api/sessions/:id/deck` parses the current screen;
+  revision-checked `POST …/deck/respond` sends only the arrow/Enter sequence
+  needed for the selected option and does not steal the terminal attachment.
+  The web UI supports 2×4, 4×4, and 4×6 layouts. Design + controller contract:
+  [`deck.md`](deck.md).
+- **Managed UI + UI-only gateway startup (2026-07-22).** `scripts/start.sh`
+  now manages the persistent Vite UI with the daemon/holder and records its
+  settings; `--ui-only` serves the same client without starting a local daemon,
+  optionally proxying one daemon same-origin. This gives a browser-only gateway
+  host a supported startup path. Setup and lifecycle commands are in
+  [`setup.md`](setup.md).
+- **Agent-driven commit action (2026-07-17).** The Git history panel can ask the
+  session's own coding agent to inspect and commit its changes; bounded launch,
+  provider-specific prompt submission, and discrete Enter handling avoid
+  borrowing a different agent or losing the prompt to Codex input suppression.
+- **Per-session model choice (2026-07-14, corrected 2026-07-23).** New sessions
+  and forks may select a discovered provider model or keep the provider default.
+  Codex discovery uses its initialized app-server model list (including
+  pagination); fork launch preserves the resolved worktree and model argument
+  ordering.
+- **Session/mobile/operations polish (2026-07-13 → 2026-07-23).** Sessions get
+  topic-derived titles; stop/archive confirm; archive navigates away; the
+  directory picker can create a folder; unborn repos get a real initial commit;
+  iPad gets copy/paste, a collapsible control panel and jump-to-end; session
+  restore has an explicit loading state; stale terminal attachments are released
+  and every attachment lifetime is logged. These are shipped refinements, not
+  pending roadmap work.
+- **Agent-driven conflict resolution (2026-07-17, refined 2026-09-07).** A
+  session rebase/merge first runs normally. A clean operation finishes without
+  interrupting the agent; an actual conflict is aborted and returned as 409, and
+  the client submits a retry-and-resolve prompt to that same live agent session
+  through the terminal path used by the commit action. The prompt tells the agent
+  to preserve both sides and leave difficult or ambiguous decisions to a human.
+  Only live coding agents receive prompts; shell, custom-command, and stopped
+  sessions keep manual resolution. Handoffs capture the initiating terminal,
+  so changing sessions cannot redirect input. The notice reports a handoff only
+  after both the prompt and Enter were written successfully.
+  Workspace-level branch operations, which have no owning session, retain the
+  headless resolver: it stages exactly the conflicted files, rejects leftover
+  conflict markers via `git diff --check`, and continues the operation. The
+  supporting machinery remains
+  `plugins::AgentPlugin::conflict_resolver` (+ `ConflictResolveSpec`),
+  `source_control::{ConflictResolver, ConflictContext, resolve_merge,
+  resolve_rebase}`, and `conflict_resolve::AgentConflictResolver`. Proof: Rust
+  units cover typed conflicts and both resolver loops; the sandbox browser E2E
+  verifies silent clean operations, merge/rebase handoffs, session-switch races,
+  disconnected input, and manual resolution for non-agent or stopped sessions.
+- **Workspace branch management (2026-07-15).** A workspace-level git branch view,
+  opened from an **(i)** icon next to each Git workspace in the tree
+  (`SessionList.tsx` `.tree-actions`, gated on `is_git`), rendered by a new global
+  `BranchManagerDialog`. For every local branch it shows (1) the sessions attached
+  to it (from `workspace_instances.branch`, the sole session→branch link — new
+  `db.list_active_instances_for_workspace`), (2) how far it is ahead of **its base**
+  — the *same* reflog-derived `BaseCommit` the right panel shows, so `base_commit`
+  was generalized to be branch-relative (not HEAD-relative) — and (3) how many of
+  its commits are **merged nowhere else** (new `source_control::unmerged_commit_count`
+  = `rev-list <branch> ^<every other ref>`). Management: **delete** (guarded — refused
+  while checked out in a worktree; 409+force for unmerged), **merge** and **rebase**
+  of arbitrary branches (new `source_control::{merge_branches,rebase_branch}` reuse
+  the existing temp-worktree + abort/cleanup machinery; both refuse a branch a *live*
+  session sits on). Endpoints `GET /api/workspaces/:id/branches/overview` +
+  `POST …/branches/{delete,merge,rebase}` (branch in the body — names contain `/`).
+  Proof: `scripts/branch-mgmt-test.mjs` (23 checks) + Rust units in `source_control.rs`.
 - **Fork a session (2026-07-14)** — [`fork-session.md`](fork-session.md).
   Continue a session's work in a new one, on its branch or a branch off it, with
   its context. **This landed row REC**: forking a *stopped* session onto its own
@@ -95,9 +184,10 @@ pick it up**.
   2. **asmux heals an unlinked socket** — a watchdog notices its path was removed
      or replaced and rebinds, so the PTYs survive instead of being orphaned.
      `server::serve_watched`.
-  3. **Tests are sandboxed** — `scripts/lib/testenv.mjs` (`createSandbox()`); all
-     11 e2e scripts spawn their own daemon/holder/Chrome in a tmpdir on a free
-     port. `scripts/holder-theft-test.mjs` replays the incident as a regression.
+  3. **Tests are sandboxed** — `scripts/lib/testenv.mjs` (`createSandbox()`); the
+     then-existing 11 e2e scripts were migrated and the current 25-script suite
+     follows the same isolated-daemon/holder/Chrome rule.
+     `scripts/holder-theft-test.mjs` replays the incident as a regression.
   Also: `asmux probe` (Live/Stale/Free), daemon waits for the holder instead of
   dying on the first refused connect (`ASM_ASMUX_WAIT_MS`) and logs at ERROR, and
   `start.sh`/`status.sh`/`restart-daemon.sh` check the *socket* rather than the
@@ -133,6 +223,16 @@ pick it up**.
   allowlist is gone and size is the only bound. Design + as-built:
   [`image-paste.md`](image-paste.md); proofs `scripts/paste-test.mjs` + a
   headless-Chrome click-through of the 📎 button (PNG *and* PDF).
+- Workspace upload (2026-07-21): an "Upload files" button + panel-wide drop zone
+  in Details copies files to `<cwd>/uploads/<name>` (`POST
+  /api/sessions/:id/upload`), so the agent finds them by listing a directory
+  instead of needing a path pasted into the prompt. Keeps the user's filename —
+  no uuid — which makes a collision meaningful, so the daemon answers `409` and
+  the client confirms before replacing; a forced replace unlinks first so a
+  planted symlink can't be written through. Design + as-built:
+  [`image-paste.md`](image-paste.md) → *Workspace upload*; proofs
+  `scripts/workspace-upload-test.mjs` (22 checks) +
+  `scripts/workspace-upload-ui-test.mjs` (15 checks, headless Chrome).
 - Code-quality cleanup pass (2026-07-06, zero functional change): shared
   backend snapshot/attach helpers, one git runner + `current_branch`, one CLI
   `build_launch` helper, db.rs idiom alignment, client `api.ts` error/URL
@@ -239,6 +339,20 @@ pick it up**.
   was handed are counted and handed back as wheel-DOWNs (it clamps at its own
   bottom, so overshoot is free — which is what makes an approximate counter
   safe). `scripts/term-jump-test.mjs` drives a real shell into each shape.
+- **Soft return** (2026-07-24, client-only): **Shift+Enter** puts a newline in
+  the agent's composer instead of sending the message; plain Enter still sends.
+  xterm maps the chord to a bare CR — byte-identical to Enter — so the key every
+  agent's own footer advertises for "newline" was silently submitting. The wire
+  form is `SOFT_RETURN` = **ESC+CR** (`terminalTypes.ts`), which is Claude Code's
+  own choice (`/terminal-setup` writes exactly that sequence into VS Code's
+  keybindings) and which codex + opencode also read as a newline. A bare LF works
+  in all three too and is still wrong: a `shell` session has no composer, and to
+  readline LF *is* accept-line — Shift+Enter would RUN the half-typed command,
+  where ESC+CR is merely unbound. Soft keyboards can't type the chord at all, so
+  the phone key bar and the iPad control panel grow a `⇧⏎` key.
+  `scripts/soft-return-test.mjs` proves both halves: the frame on the wire (and
+  that xterm's CR is swallowed, not sent alongside) and the ESC arriving at the
+  pty, via a `cat -v` session where control bytes are visible.
 - **Client polish, uncredited:** `97cfe0d`/`3dad62e` two-level connection dialog
   (Existing/Add × Daemon/Relay); `f7c7640` app icons + blocked-session favicon
   blink and `d291a4e` tab-title blink (`f7c7640` also shipped most of MOB-PWA —
@@ -275,17 +389,20 @@ pick it up**.
 | ~~REC~~ | **Session recovery — landed, as the more general [fork](fork-session.md).** Forking a *stopped* session onto its *own* branch is exactly recovery, so one feature covers both, and it also does what REC could not: fork a **live** session, and fork onto a **different agent**. Shipped: the `AgentPlugin` fork seam, SCHEMA_V7 (`agent_session_id` + `forked_from`), native-id capture while live, `POST /api/sessions/:id/fork`, native fork for claude + codex, the digest/summary brief, and the UI. Two pieces of the old design remain, split out as **FORK-SHELL** and **FORK-OC** below. | ~~P1~~ **done** | — | fork-session.md |
 | FORK-SHELL | Fork a **shell / custom_command** origin usefully: it keeps no transcript, so it gets a brief with no digest today. Its real context is its scrollback (`terminal_events` → vt100 → ANSI-stripped prose) — the one source where a shell's brief is genuinely *good* (a shell has real scrollback; the TUI agents have none, which is why they use their own transcripts). This is REC Stage B. | **P3** | fork (done) | session-recovery.md → §3; fork-session.md |
 | FORK-OC | **opencode native fork**: read its conversation id out of `~/.local/share/opencode/opencode.db` and launch `opencode --session <id> --fork`. Pure plugin change — `native_session_id` + `build_fork`; the fork flow does not move. An opencode fork gets the brief meanwhile. This is REC Stage C. | **P3** | fork (done) | session-recovery.md → §2; fork-session.md |
-| FIX | **Verified latent defects** (2026-07-12 review, all hand-verified): `pull` credential-prompt hang; adopt→reconnect cursor-0 rewind; worktree created before create-validation, no rollback; asmux silent ring-alloc output drop; `exit_signal` never populated; fabricated adopt defaults; server/client disagreement over whether `indeterminate` is terminal; invalid `ASM_BACKEND` silently selects non-durable native mode | **P1** | — (~2–3 days incl. regression tests) | refactoring-plan.md → §6.1 |
+| ~~FIX~~ | **Verified latent defects — all eight landed 2026-07-25**, each with a regression test: `pull` credential-prompt hang (one `git_command` builder owns `GIT_TERMINAL_PROMPT=0`, guarded by a test that no git child bypasses it); adopt→reconnect cursor-0 rewind (routes are seeded with the cursor their attach uses, and the drain's duplicate tracker is gone); worktree created before create-validation (validate first, roll the instance back on any later failure incl. a failed spawn); asmux silent ring-alloc output drop (logged, counted, and reported to the attacher as `ALLOC_FAILED`); `exit_signal` never populated (`waitpid` decomposes the real wait status); fabricated adopt defaults (a vanished row is logged and skipped); `indeterminate` authorizing destruction (new `is_definitively_ended` gates archive / cleanup / workspace-unregister, matching the client); invalid `ASM_BACKEND` (rejected at startup instead of silently selecting non-durable native) | ~~P1~~ **done** | — | refactoring-plan.md → §6.1 |
 | RF-FLOW | **Bounded terminal flow + durable persistence:** byte-budget output/command queues with explicit overload semantics; writer health + retry/degraded state + shutdown flush; acknowledged input/kill semantics; streaming history/transcripts; retention/compaction; disk-full/slow-consumer fault tests | **P1** | FIX + minimal RF-GATE harness | refactoring-plan.md → §7.1 |
-| RF-LIFE | **Explicit lifecycle state machine + units of work:** named status capabilities, conditional transitions/per-session serialization, atomic metadata/migrations, create+teardown sagas, central `go_live`/`finish`, concurrency/failure-step tests | **P1** | FIX + minimal RF-GATE harness; before REC | refactoring-plan.md → §7.2 |
-| RF-REC | Recovery-specific pre-REC bundle: one deadline/output-bounded `GitRunner`; `require_session` + typed `run_blocking`; client `ScmPanel` split out of `RightPanel`. Generic `go_live`, transaction and teardown work moved to RF-LIFE. | **P1** | RF-LIFE; pairs with RF-ERR on API helpers | refactoring-plan.md → §6.2 |
+| RF-LIFE | **Explicit lifecycle state machine + units of work:** named status capabilities, conditional transitions/per-session serialization, atomic metadata/migrations, create+teardown sagas, central `go_live`/`finish`, concurrency/failure-step tests | **P1** | FIX + minimal RF-GATE harness | refactoring-plan.md → §7.2 |
+| RF-REC | **Generic Git/API/UI consolidation (legacy id; no longer blocks recovery):** one deadline/output-bounded `GitRunner`; `require_session` + typed `run_blocking`; split `ScmPanel` / session metadata / VS Code blocks out of the now-1,209-line `RightPanel`. | **P2** | FIX #1 for the immediate pull guard; pairs with RF-ERR on API helpers | refactoring-plan.md → §6.2 |
 | M4-C | Holder hardening **Stage C**: soft-reboot (hash drift + confirm), orphan surfacing/adopt UI, `purge`, metadata RPCs, `readBuffer`, periodic `(snapshot, cursor)` store (bounds cold-stitch replay cost). *(Slow-attacher drop + resync — previously listed here — landed with Stage A.)* | **P2/P3** | M4 A/B (done) | durable-sessions.md → M4 Stage C |
 | MOB-PWA | Mobile UI phase 4: **iOS `apple-mobile-web-app-*` meta tags only** — the web manifest, maskable icons, apple-touch-icon and theme-color already shipped in `f7c7640` | **P3** (was P2; mostly done) | MOB (done) | mobile-ui.md → Packaging path |
 | MOB-PUSH | Web Push for attention states | **P3** | MOB (done); RF-WSPROTO (server→client frame type); daemon push plumbing (relay as carrier) | mobile-ui.md → Follow-ups |
-| IMG-2 | Attachment follow-ups: `.asm/pastes/` cleanup policy (more pressing now that a 10 MiB zip can land there), multi-file select/drop, per-agent capability hint | **P3** | attachments + 📎 button (done) | image-paste.md → Follow-ups |
+| IMG-2 | Attachment follow-ups: `.asm/pastes/` cleanup policy (more pressing now that a 10 MiB zip can land there), multi-file select/drop **on the 📎/paste path** (the Details-panel workspace upload already takes several at once), per-agent capability hint | **P3** | attachments + 📎 button (done) | image-paste.md → Follow-ups |
 | RF-ERR | Typed daemon error → HTTP status mapping (RelayError-style) | **P2** | — (pair with SEC-2 or RF-REC) | refactoring-plan.md → RF-ERR |
-| RF-GATE | Build gate & test safety net: react-hooks + recommended eslint, minimal CI, HTTP-router test harness, `MockHolder`, asmux e2e for readBuffer/detach/backpressure/takeover, `generated.rs` drift check, migration-ladder test + `user_version` guard | **P1/P2** | — (before REC ideally; before M4-C wiring definitely) | refactoring-plan.md → §6.4 |
+| RF-GATE | **Minimal P1 harness landed 2026-07-26:** CI; real router/AppState + attachment tests; scripted `MockHolder`; asmux e2e for readBuffer/detach/backpressure/takeover/malformed bodies. Remaining: react-hooks + recommended eslint, `generated.rs` drift check, migration-ladder test + `user_version` guard. | **P2 remainder** | — (remaining guards before their affected work) | refactoring-plan.md → §6.4 |
 | RF-OPS | **Truthful health, deadlines and task supervision:** liveness/readiness probes for DB writer + holder; cancellation tree for background tasks; blocking-work boundary; child/client request deadlines; jittered reconnect; structured reliability metrics | **P2** | minimal RF-GATE; Git deadline implementation shares RF-REC | refactoring-plan.md → §7.3 |
+| COPILOT-REVIEW | **Session copilot, manual advisory MVP:** select any capable installed agent plugin + model; capture committed/staged/unstaged/untracked code into an immutable disposable Git worktree; run a bounded structured review; persist evidence/findings/checks; show current/stale history in a standalone panel; explicitly send a review file to the main agent | **P2** | FIX + minimal RF-GATE; shared `GitTreeSnapshot` slice of MVP-CKPT; RF-OPS child runner; pair UI/API work with RF-REC + RF-QUERY | copilot.md → Stages 0–1 |
+| COPILOT-GATE | **Automatic copilot + gatekeeper:** debounced idle review, fingerprint deduplication, budgets and bounded feedback; then require a current passing review + deterministic checks before ASM promotes the exact reviewed commit. Gate ASM actions only; direct terminal Git remains bypassable unless a remote required check enforces it. | **P2** after advisory proof | COPILOT-REVIEW; RF-ERR; relevant RF-LIFE SCM serialization; exact-commit promotion | copilot.md → Stages 2–4 |
+| ~~CONFIG-UI~~ | **Saved startup config + web Config dialog — landed 2026-09-28:** one persistent, git-ignored `<data_dir>/startup.conf` per install (plain `ASM_*=value` lines) replaces the reboot-volatile `.reg` records as the source of a flagless `start.sh` / `restart-daemon.sh`; flags patch it per key and are saved back. The daemon, relay and web UI are independent components (any non-empty subset); the daemon's enrollment token and all relay keys are settable (write-only) and scrubbed from session envs. Edited from a new Config dialog that lists the UI host (Vite `/__asm/config`) and every connected daemon (`GET/PUT /api/config`, secrets write-only, revision-checked); a runtime `startup.applied` snapshot drives the "not applied yet" hint. Proofs: `scripts/startup-config-test.mjs` (55 checks through the real scripts), `scripts/config-ui-test.mjs` (headless Chrome over a real Vite + 2 daemons), Rust + client unit tests. | ~~P2~~ **done** | — | setup.md → Saved startup config; security-followups.md → 12 |
 | SEC-2 | Constrain `/api/fs/list` + workspace roots | **P1** | RF-ERR recommended (403 mapping) | security-followups.md → 2 (HIGH) |
 | SEC-1 | Transport encryption off-loopback. **DECIDED 2026-07-12: the LAN direct path is plaintext by design.** TLS was built end to end (`1dcb15e`: agent `wss://`, relay rustls, daemon HTTPS) and **reverted** (`a36fdfa`): a self-signed daemon cert is refused by the browser on the client's cross-origin `fetch` (no interstitial, no API) — unreachable by construction — and both escapes (a public name + ACME; a private CA installed per device) violate the product constraints: no external dependencies, no per-device setup, journey immutable. Encryption returns at the **relay** when R5 gives it a real name + ACME cert (resurrect the relay half of `1dcb15e`); SSH port-forward is the encrypted path meanwhile | **folded into R5** (was P1/P2) | R5 | security-followups.md → 1 |
 | V0 | Web-editor de-risking spike (scratchpad only) | **P2** | R1–R3 (done) | vscode-over-relay-plan.md → V0 |
@@ -302,64 +419,35 @@ pick it up**.
 | MVP-RICH | Rich output pipeline (viewer/diff/markdown/transcripts) | **P2** | client-stack decision DEC-1; RF-QUERY; RF-WSPROTO (server→client frame type) | mvp-execution-plan.md → Workstream 4 |
 | MVP-HOOKS | Workspace setup hooks (copy/symlink/bootstrap) | **P3** | — | mvp-execution-plan.md → Workstream 6 |
 | MVP-CKPT | Checkpoints + "New segment" | **P3** | — | mvp-execution-plan.md → Workstream 7 |
-| M5 | Windows support (ConPTY, transport, ACLs) | **P3** | M4 (sequenced) | durable-sessions.md → M5 |
+| M5 | Windows support (ConPTY, transport, ACLs) — core **landed** 2026-11-03; pipe DACL hardening open | **P3** | M4 (sequenced) | durable-sessions.md → M5 |
 | MVP-PKG | Electron shell + packaging + service install | **P3** | DEC-1; M5 for the Windows gate | mvp-execution-plan.md → Workstreams 3/11 |
 | SEC-7 | Auth rate limiting + lifecycle audit log | **P3** | overlaps R5 | security-followups.md → 7 (LOW) |
 | SEC-8 | Terminal-escape policy at capture/replay + fuzzing | **P3** | — | security-followups.md → 8 (LOW) |
 | DEC-1 | Decide: adopt planned client stack (shadcn/Tailwind/Dockview/Electron) or amend the plan | **P2** (decision, cheap) | — | mvp-execution-plan.md → Baseline Technology |
-| RF-HYG | Hygiene bundle (hours-each, pick per need): backend constants hoist, `AttentionState::is_sticky()`, classifier parser dedup, **`MonitorState` extraction (before MEAS)**, write-loop + attach-resync dedup, asmux consistency items, `theme.ts` + dead-CSS sweep, `TerminalHeader`, **Terminal.tsx split** (before next terminal feature / xterm bump), `createTopology()` e2e helper | **P3** | — (two named items have ordering triggers) | refactoring-plan.md → §6.5 |
+| RF-HYG | Hygiene bundle (hours-each, pick per need): backend constants hoist, `AttentionState::is_sticky()`, classifier parser dedup, **`MonitorState` extraction (before MEAS)**, write-loop + attach-resync dedup, asmux consistency items, `theme.ts` + dead-CSS sweep, `TerminalHeader`, **overdue Terminal.tsx split** (the file reached 1,087 lines after more terminal features), `createTopology()` e2e helper | **P3** | — (`MonitorState` blocks MEAS; Terminal split trigger has fired) | refactoring-plan.md → §6.5 |
 | RF-VT100 | Terminal emulator dependency review (`vt100` 0.15 unmaintained) | **P3** | — (trigger: M4 cold-stitch work or upstream CVE) | refactoring-plan.md → RF-VT100 |
 | MEAS | Classifier measurement: local-LLM shadow classification of any registered heuristic (attention first), disagreement snapshots + triage (dev-only, default-off) | **P2** | RF-HYG's `MonitorState` extraction first (RF-M4 landed; the hooks observe its `Classification` output); needs a local Ollama/llama-server on the dev host | classifier-measurement.md → Milestones |
-| DOC-1 | Doc sync: architecture.md still calls yamux the relay default | **P3** (one-liner) | — | architecture.md → Open Decisions |
+| ~~DOC-1~~ | Relay framing docs corrected to the shipped **dial-out-per-stream** design; stale yamux references removed from architecture and the protocol comment. | ~~P3~~ **done 2026-07-24** | — | architecture.md; asm-relay/src/protocol.rs |
 | I18N-2 | Additional locales beyond `en` | **P4** (deferred by user) | — | i18n.md → Adding a locale |
 
 ## Detail
 
-### REC — Session recovery (P1)
+### REC — session recovery via fork (done)
 
-Full design: [`session-recovery.md`](session-recovery.md).
+Full as-built design: [`fork-session.md`](fork-session.md). Historical recovery
+reasoning: [`session-recovery.md`](session-recovery.md).
 
-A terminated session strands three things worth keeping: a branch, a worktree
-with the work checked out, and a conversation in which an agent learned the
-problem. Recovery continues all three in a **new** session — it is not
-resurrection (the PTY is gone and we never pretend otherwise). Recoverable
-states are `stopped`/`exited`/`failed`/`indeterminate`; live states must be
-attached or stopped, and archive already deletes the worktree *and* the branch,
-so there is no place to recover into.
+Recovery shipped on 2026-07-14 as a strict superset: fork a stopped session onto
+its own branch to recover it, or fork a live/stopped origin onto a new branch or
+different agent. SCHEMA_V7 persists `agent_session_id` and `forked_from`; the
+monitor captures provider identity while the origin lives; Claude and Codex
+resume/fork natively; other paths get a bounded deterministic transcript digest
+plus an optional locally generated prose summary. The API is
+`POST /api/sessions/:id/fork`.
 
-Most of the plumbing exists. Worktree reuse is the `shared`-isolation
-short-circuit in `resolve_workspace` (`workspaces.rs:54-80`) — post the origin's
-branch with `create_branch: false` and it reuses the directory in place, refcounted
-by `count_active_instances_at_path`. Extra argv already flows end-to-end
-(`CreateSessionBody.args` → `AgentContext.extra_args` → `cli_launch` →
-`BackendSpawnSpec` → PTY argv); the client just never sends it.
-
-The genuinely new work: an `AgentPlugin` resume seam (`native_session_id` +
-`build_resume`, both defaulting to "no capability" like `usage`/`idle_error`),
-because the providers' shapes differ structurally — **codex's resume is a
-subcommand that must lead argv**, claude's and opencode's are flags. All three
-can **fork**, and we always fork: *recovery never mutates the origin's history.*
-
-Native ids must be **captured while the session is alive and persisted**
-(`SCHEMA_V7`: `agent_session_id`, `recovered_from`; V6 is already used), not
-re-derived at recovery time — `usage.rs`'s `(cwd, mtime)` match has no identity check (claude's is
-literally "newest `*.jsonl` in the dir"; codex falls back to *any* newest rollout
-on the box). Wrong token count is survivable; resuming the **wrong conversation**
-is not.
-
-Fallback brief (Stage B) takes the **best source available**: the agent's own
-JSONL where one exists but native resume can't be used, else the PTY byte log
-from `terminal_events` (ANSI-stripped via `seed_from_cold`). Either way it is
-written to `.asm/recovered-<id>.txt` in the worktree and pointed at by a small
-opening prompt — never pasted into the agent's TUI (bracketed-paste/input caps
-make a big paste fail exactly on the long sessions that need it). Known weakness,
-stated in the design: alt-screen agents expose zero scrollback to vt100, so their
-*byte log* is redraw frames rather than a conversation — which is why native
-resume leads for those agents, and why the JSONL outranks the PTY as a source.
-Note `GET /api/sessions/:id/transcript` ("Save conversation") now serves the
-provider's rendered Markdown by default (`78437a9`). The raw PTY byte log remains
-available via `?format=raw` and is the fallback when a provider has no structured
-transcript; REC must request/read that source explicitly when it needs it.
+Only two pieces of the old REC staging remain: **FORK-SHELL** (derive a useful
+brief from PTY scrollback when no agent transcript exists) and **FORK-OC**
+(opencode native conversation fork). Neither blocks the shipped recovery path.
 
 ### FIX — verified latent defects (P1)
 
@@ -410,13 +498,15 @@ atomic metadata/migrations, retryable create/teardown sagas and central
 `go_live`/`finish` seams. Both include fault/concurrency tests. Full evidence and
 acceptance criteria: refactoring-plan.md → §7.1–§7.2.
 
-### RF-REC — recovery-specific pre-REC refactor bundle (P1)
+### RF-REC — generic Git/API/UI consolidation (legacy id, P2)
 
-After RF-LIFE owns generic lifecycle structure, RF-REC is ~2 days: one
-deadline/output-bounded **`GitRunner`** (also closes FIX #1 structurally),
-**`require_session` + typed `run_blocking`** for the repeated API spine, and a
-client **`ScmPanel`** split out of the 943-line `RightPanel`. Detail:
-refactoring-plan.md → §6.2.
+REC shipped without this bundle, so it is no longer a recovery prerequisite.
+The work remains valuable and has grown: a deadline/output-bounded
+**`GitRunner`** (also closes FIX #1 structurally), **`require_session` + typed
+`run_blocking`** for the repeated API spine, and `ScmPanel` / session metadata /
+VS Code extraction from the now-1,209-line `RightPanel`. Keep the legacy id so
+existing references do not churn; sequence it as consolidation after the
+immediate P1 defect and lifecycle work. Detail: refactoring-plan.md → §6.2.
 
 ### RF-OPS — operability and bounded waits (P2)
 
@@ -425,6 +515,33 @@ long-lived tasks; isolate synchronous DB/Git/filesystem work from async workers;
 apply deadlines/kill/output caps to children and requests; pass TanStack abort
 signals through the client; use capped jittered WS reconnect; expose reliability
 metrics. Detail and acceptance criteria: refactoring-plan.md → §7.3.
+
+### COPILOT-REVIEW / COPILOT-GATE — independent session review (P2)
+
+Full design: [`copilot.md`](copilot.md).
+
+A copilot is a policy attached to a session, not a second PTY or terminal
+attacher. Each run materializes the exact Git tree—including committed, staged,
+unstaged, and non-ignored untracked work—through a private temporary index, then
+gives a disposable detached worktree plus a deterministic session digest to a
+selected plugin/model. The reviewer cannot race or rewrite the main agent's
+worktree. Parsed findings carry severity, path/line evidence, recommendations,
+and daemon-recorded deterministic checks; a changed base/HEAD/tree or policy
+makes the prior verdict stale.
+
+Stage 1 is deliberately manual and advisory. Stage 2 adds debounced idle
+triggers and an opt-in, bounded feedback loop. Stage 3 gives a configured
+gatekeeper authority over ASM-owned promotion, beginning with pushing the exact
+reviewed clean commit. This is not universal repository protection: a user or
+agent can still run Git directly in the terminal. Protected remote branches and
+a required status adapter are the later enforcement boundary.
+
+The snapshot capture is the minimum shared Git plumbing slice of MVP-CKPT, not
+a reason to build all checkpoint UI first. The reviewer needs a dedicated
+model-aware `AgentPlugin` capability: the existing fork summarizer has an empty
+cwd/no model selection, while conflict resolution deliberately bypasses
+guardrails in the real worktree. Reuse RF-OPS process supervision and keep the
+new client surface out of `RightPanel.tsx` from its first commit.
 
 ### M4-C — Holder hardening Stage C (P2/P3)
 
@@ -497,15 +614,16 @@ The net everything else in this table relies on, and it is much thinner than
 it looks: client eslint enforces a **single** i18n rule (no
 `react-hooks/exhaustive-deps`, no recommended set — in a codebase leaning on
 the ref-to-dodge-a-dep pattern); there is **no CI at all** (`npm test` runs
-only the proxy test; the 11 e2e scripts run when a human remembers); **zero
-Rust tests** construct the `api/` router or cover `ws.rs`'s takeover logic
-(which needs no I/O to test); the `Holder` trait has **no mock**, so the
+only the proxy test; the 25 e2e scripts run when a human remembers); one pure
+unit test covers `needs_live_session`, but **no Rust test constructs the
+`api/` router/AppState or covers `ws.rs`'s takeover logic**; the `Holder` trait
+has **no mock**, so the
 drain-loop / adopt / backpressure branches are unit-untested (the one
 integration test would not catch FIX #2); asmux's
 readBuffer/detach/backpressure-eviction/takeover paths have **no e2e** (the
 first two also have no caller — land these tests before M4-C wires the
 daemon side); the committed `generated.rs` has **no schema-drift check**
-(and `asmux-protocol.md` claims a `build.rs` that does not exist); the DB
+(the protocol doc now correctly records manual generation); the DB
 migration ladder is untested and a forward-rolled `user_version` is silently
 accepted. ~2–3 days. Detail: refactoring-plan.md → §6.4.
 
@@ -618,14 +736,28 @@ exists in the daemon today.
 
 ### M5 — Windows (P3)
 
-ConPTY via portable_pty, AF_UNIX-or-named-pipe transport (tokio has no AF_UNIX
-on Windows), `0600` → owner-only ACL. Note the R-track deliberately added no
-new UDS surface, so M5 scope did not grow. Prerequisite for the MVP gate's
-"works on Windows" and for MVP-PKG's Windows packaging. 2026-07-12 note:
-AF_UNIX is hard-typed on the daemon side with no transport seam
-(`main.rs:344-433` probe/spawn; `asmux_client.rs` read/write halves) —
-budget a small `HolderTransport` (probe/connect) abstraction into the
-estimate; not worth pre-building at P3. refactoring-plan.md → §6.6.
+**Landed 2026-11-03 (core).** The transport seam is `asmux::socket`: a UDS on
+Unix, a named pipe on Windows (`\\.\pipe\asmux-<hash of the socket path>`, so
+`ASMUX_SOCK`/runtime-dir sandboxing is unchanged), used by the holder, the
+daemon client, `asmux probe` and the e2e tests. ConPTY sessions get a waiter
+thread that reaps the child and closes the pseudoconsole — ConPTY otherwise
+never EOFs, and a finished session stayed "alive" forever — in both the holder
+and the native backend. The service scripts run under Git Bash, starting
+components through the new `asm-launch` (own console, process group and job;
+real Windows pids) and renaming locked `.exe`s aside so rebuild-while-running
+works; `scripts\asm.cmd` and `scripts\setup.ps1` are the PowerShell entry
+points. Also fixed on the way: `\\?\` canonical paths, git's `C:/` worktree
+paths, rooted-relative paths escaping `guard_path`, PATHEXT lookup, and npm
+`.cmd` shims (agents are launched as the `node <script>` they wrap, so prompt
+arguments never pass through `cmd.exe`). PowerShell is the Windows Shell agent.
+All of `cargo test`, smoke, durable-restart, startup-config and the browser
+tests pass on Windows. See setup.md → Windows.
+
+Still open: an explicit owner-only pipe DACL plus server-identity check
+(security-followups.md → 13); per-user startup (Task Scheduler) and Windows
+packaging, which are MVP-PKG; and graceful stop (the scripts terminate
+outright — harmless today, since the holder-backed daemon's clean exit does
+nothing extra).
 
 ### MVP-PKG — Electron + packaging (P3)
 
@@ -670,15 +802,16 @@ four subtly different sites — REC/M4-C would clone a fifth). asmux/relay
 consistency: answer malformed RPC bodies with `Error` instead of 10 silent
 drops; narrow `Registry::create`'s lock (held across `openpty`/fork —
 spawning stalls keystrokes to live sessions); `WATCHDOG_IDLE_MS`
-implement-or-delete; `Superseded.last_cursor` semantics; the stale `yamux`
-comment; the "TEMPORARY diagnostic" test label. Client/scripts: `theme.ts`
+implement-or-delete; `Superseded.last_cursor` semantics; the "TEMPORARY
+diagnostic" test label. Client/scripts: `theme.ts`
 (palette tri-defined: CSS vars + ~40 raw hexes + three TS color maps) +
 dead-CSS sweep (structural CSS split gated on DEC-1); `TerminalHeader`
 extraction (the header/UsageModal block is pasted into both shells);
 **Terminal.tsx split — before the next terminal feature or xterm bump**
-(~1.5 d: one ~640-line effect mixing five subsystems, plus three private
-`_core` monkeypatches that silently no-op if an xterm upgrade moves the
-internals — wrap in one typed shim with a dev-time assertion);
+(trigger fired: the file is now 1,087 lines and its main effect spans roughly
+198–1001, mixing five-plus subsystems and three private `_core` monkeypatches
+that silently no-op if an xterm upgrade moves the internals — wrap in one typed
+shim with a dev-time assertion);
 `createTopology()` e2e helper (the three multi-node tests hand-roll ~120
 lines of process lifecycle each — the exact code class the holder-theft
 incident hardened). Detail: refactoring-plan.md → §6.5.
@@ -698,11 +831,10 @@ history branch is now dead in production, exercised only by tests). A replacemen
 with correct region-scrollback would let TERM-SCROLL's normal-buffer branch fold
 back to a compact rendered repaint. Detail: refactoring-plan.md → RF-VT100.
 
-### DOC-1 — stale relay-framing line (P3, one-liner)
+### DOC-1 — relay-framing doc sync (done 2026-07-24)
 
-`architecture.md` → Open Decisions still says the relay stream-multiplexing
-default is yamux with dial-out as fallback. R1 locked **dial-out-per-stream**
-(recorded in connectivity-execution-plan.md); fix the architecture.md line.
+`architecture.md` and `asm-relay/src/protocol.rs` now describe R1's shipped
+**dial-out-per-stream** design. The obsolete yamux-default language is gone.
 
 ### MEAS — classifier measurement / shadow classification (P2, dev-only)
 
@@ -733,60 +865,52 @@ parity gate, typed keys); adding a locale is the 3-step recipe in `i18n.md`.
 
 ## Suggested order (cross-track)
 
-1. ~~**MOB** phases 1–3~~ ✅ landed 2026-07-06 (RF-MOB + phases 1–3). Remaining
-   mobile work: **MOB-PWA** (phase 4) then **MOB-PUSH** (needs daemon push
-   plumbing) — see item 8.
-2. ~~**R4** — gateway mode~~ ✅ landed 2026-07-07 (daemon probe loop feeding the
-   relay agent over a `watch` channel; relay fast-fail; client `via` label).
-   Finishes the connectivity story the product is built around. Proof:
-   `scripts/gateway-test.mjs`.
-3. ~~**RF-M4** #1/#3/#4~~ ✅ 2026-07-07 → ~~**M4 Stage A + B**~~ ✅ landed
-   2026-07-11 — durability hardening closed the last gap in the headline restart
-   promise: the reconnect supervisor + idle watchdog + `list`-reconcile + `Holder`
-   trait (Stage A, absorbing RF-M4 #2), and exact cold-stitch adopt + gap marker
-   (Stage B). Proof: `scripts/durable-restart-test.mjs` (cold-stitch discriminator).
-   **M4 Stage C** (M4-C row) — soft-reboot, `purge`, metadata RPCs, `readBuffer`,
-   orphan UI, periodic snapshot store — remains, demoted to P2/P3 (pick per need).
-   - ~~**TERM-SCROLL**~~ ✅ landed 2026-07-08 (codex attach scrollback; per-buffer
-     -model attach strategy + raw-history ring). Independent of M4; on the same
-     snapshot/attach surface. Proof: `scripts/termscroll-test.mjs`.
-4. **FIX** → **RF-GATE** (at minimum the router harness + `MockHolder` + asmux
-   e2e halves) → **RF-FLOW** → **RF-LIFE** + **RF-REC** → **REC**. FIX repairs
-   the concrete defects; RF-FLOW makes the cold-history/input promises real
-   under overload and disk failure; RF-LIFE owns transitions, atomicity and
-   compensation; RF-REC then adds only recovery-specific Git/API/UI seams.
-   Worktree reuse and argv passthrough already exist, so REC remains the next
-   user-visible capability after these P1 foundations. M4-C's orphan surfacing
-   is still the full fix for recovering an `indeterminate` session whose process
-   is secretly alive. Stage B/C can trail.
-5. **MEAS-1** — right after RF-HYG's `MonitorState` extraction settles the
-   `on_output`/`on_idle` seams it hooks (RF-M4's split already landed;
-   landing MEAS earlier just makes the refactor carry the hooks). Dev-only
-   and parallel-friendly: once enabled on a dev daemon it accrues
-   heuristic-disagreement data passively while every later item proceeds, so
-   earlier = more signal for free. MEAS-2/3 ride along opportunistically
-   (item 11 tier).
-6. **SEC-2 + RF-ERR** (together) — before any exposure beyond trusted
-   networks. Note this got *more* urgent, not less: the daemon now serves the
-   client itself (`c6ad936`) on `0.0.0.0` (`dda8354`). SEC-1(direct) is
-   **decided, not pending** — the LAN is plaintext by design (2026-07-12,
-   security-followups.md → 1); the relay-side encryption work rides with R5.
-7. **DEC-1** (an hour of thought) → **RF-QUERY** + **RF-WSPROTO** →
-   **MVP-RICH**. RF-WSPROTO slots before *whichever* of MOB-PUSH / MVP-RICH /
-   V3 comes first — it is ~1 day while there are exactly two WS frame types
-   and each of those items needs a server→client frame.
-8. **V0** spike → V1–V3 as a block.
-9. **MOB-PWA** (now just the iOS metas), then **MOB-PUSH** (RF-WSPROTO first
-   if it hasn't landed; design the push plumbing first).
-10. **RF-OPS** can run after the minimal gate or alongside feature work; land
-    truthful readiness before deployment/packaging and client deadlines before
-    adding more polling endpoints. Then take **R5** items as deployment needs
-    them (TLS/ops first, ACLs next, E2E-crypto decision when V-track ships).
-11. **MVP-HOOKS**, **MVP-CKPT**, **MEAS-2/3**, and **RF-HYG** items
-    opportunistically — except RF-HYG's `MonitorState` (precedes MEAS-1,
-    item 5) and its Terminal.tsx split (precedes the next significant
-    terminal feature or xterm bump).
-12. **M5** → **MVP-PKG** when cross-platform/packaging becomes the goal.
+Completed path, retained as sequencing context: ~~**MOB phases 1–3**~~ ✅
+2026-07-06; ~~**R4 gateway mode**~~ ✅ 2026-07-07; ~~**RF-M4 + M4 Stage
+A/B**~~ ✅ 2026-07-07 → 07-11; ~~**TERM-SCROLL**~~ ✅ 2026-07-08; ~~**REC
+via fork**~~ ✅ 2026-07-14.
+
+1. ~~**FIX**~~ (landed 2026-07-25) → ~~the minimal **RF-GATE** harness~~
+   (landed 2026-07-26) → **RF-FLOW** → **RF-LIFE**. RF-FLOW now makes
+   cold-history/input promises explicit under overload and disk failure;
+   RF-LIFE owns transitions, atomicity, and compensation. Recovery is already
+   shipped and is not the end of this chain. The P2 RF-GATE remainder can land
+   alongside the work it guards.
+2. **SEC-2 + RF-ERR** together — before exposure beyond trusted networks.
+   The daemon-managed UI and UI-only gateway make the allowed-roots gap more
+   consequential. SEC-1(direct) is decided: LAN direct is plaintext by design;
+   relay-side encryption rides with R5.
+3. **DEC-1** → **RF-QUERY** + **RF-WSPROTO** → **MVP-RICH**. The shipped client
+   has committed to plain React/Vite in practice without resolving the planned
+   shadcn/Tailwind/Dockview/Electron baseline. Decide that first. RF-WSPROTO
+   must precede whichever of MOB-PUSH / MVP-RICH / V3 adds the first new
+   server→client frame.
+4. **RF-REC** (legacy id) is now generic consolidation, not a feature gate.
+   Fold the immediate pull-prompt fix into FIX, then take the bounded
+   `GitRunner`, typed API helpers, and overdue `RightPanel` split alongside
+   RF-QUERY/RF-ERR or the next work touching those files.
+5. **RF-OPS** can run after the minimal gate or alongside feature work. Land
+   truthful readiness before deployment/packaging and bounded child/client
+   requests before adding more polling or agent-driven operations.
+6. **COPILOT-REVIEW** after its `GitTreeSnapshot` + bounded child-runner slices.
+   Ship manual advisory review first. Add automatic idle review only after
+   fingerprint deduplication/budgets; add **COPILOT-GATE** only after RF-ERR and
+   the relevant RF-LIFE SCM unit-of-work, beginning with exact-commit push.
+7. **MEAS-1** after RF-HYG's `MonitorState` extraction. It is dev-only and can
+   accrue classifier-disagreement data while later feature work proceeds;
+   MEAS-2/3 remain opportunistic.
+8. **V0** spike → V1–V3 as a block when browser editing becomes a product goal.
+9. **MOB-PWA** (only the iOS metas remain), then **MOB-PUSH** after
+   RF-WSPROTO and a daemon push-transport design.
+10. Take **R5** by deployment need: TLS/443 + ops first, ACL/key rotation next,
+   pairing and the splice-point confidentiality decision with the V-track.
+11. **M4-C**, **MVP-HOOKS**, the remaining **MVP-CKPT** product surface,
+    **FORK-SHELL**, **FORK-OC**, and
+    smaller **RF-HYG** items opportunistically. The RF-HYG Terminal split trigger
+    has already fired; do it before another substantial terminal feature or
+    xterm upgrade.
+12. **M5** → **MVP-PKG** when formal cross-platform/packaging gates become the
+    goal. Additional locales (**I18N-2**) stay explicitly deferred.
 
 Constraints to respect when reordering: nothing in R-track may assume M4
 features exist; V1's relay change must not add daemon-API parsing to the

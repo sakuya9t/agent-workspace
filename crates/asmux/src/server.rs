@@ -1,4 +1,4 @@
-//! The UDS server: accept loop, per-connection framing, and RPC/event dispatch.
+//! The holder server (a UDS; a named pipe on Windows): accept loop, per-connection framing, and RPC/event dispatch.
 //!
 //! Each connection gets a writer task draining two channels — a **control**
 //! channel (responses, events, errors, heartbeats) the writer biases toward, and
@@ -17,14 +17,13 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use planus::ReadAsRoot;
 use tokio::io::AsyncWriteExt;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, Notify};
 
 use crate::frame::{self, code, ord, FrameError, Incoming};
 use crate::registry::{launch_fingerprint, CreateError, CreateOutcome, PurgeOutcome, Registry};
 use crate::ring::ReadOutcome;
 use crate::session::{Attacher, InputOutcome, Session, SpawnSpec, Status};
+use crate::socket::{Listener, ServerRead, ServerStream, ServerWrite};
 use crate::wire;
 use crate::{
     HEARTBEAT_INTERVAL_MS, PROTOCOL_V1, RING_DEFAULT_BYTES, RING_MAX_BYTES, RING_MIN_BYTES,
@@ -82,7 +81,7 @@ const SOCKET_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// Rebinding preserves every PTY — the sessions live in this process, not in the
 /// socket. That is why healing beats restarting: a restart would kill them all.
 pub async fn serve_watched(
-    listener: UnixListener,
+    listener: Listener,
     bound_ino: u64,
     sock_path: std::path::PathBuf,
     ctx: Arc<ServerCtx>,
@@ -150,7 +149,7 @@ pub async fn serve_watched(
 }
 
 /// Accept connections forever, one task per connection.
-pub async fn serve(listener: UnixListener, ctx: Arc<ServerCtx>) {
+pub async fn serve(mut listener: Listener, ctx: Arc<ServerCtx>) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
@@ -167,8 +166,8 @@ pub async fn serve(listener: UnixListener, ctx: Arc<ServerCtx>) {
     }
 }
 
-async fn handle_conn(stream: UnixStream, ctx: Arc<ServerCtx>, id: u64) {
-    let (mut rd, wr) = stream.into_split();
+async fn handle_conn(stream: ServerStream, ctx: Arc<ServerCtx>, id: u64) {
+    let (mut rd, wr) = crate::socket::split_server(stream);
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<Vec<u8>>(CTRL_CHANNEL_CAP);
     let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(DATA_CHANNEL_CAP);
 
@@ -197,7 +196,7 @@ async fn handle_conn(stream: UnixStream, ctx: Arc<ServerCtx>, id: u64) {
     tracing::debug!(conn = id, "connection closed");
 }
 
-async fn read_loop(rd: &mut OwnedReadHalf, conn: &Arc<Conn>) {
+async fn read_loop(rd: &mut ServerRead, conn: &Arc<Conn>) {
     loop {
         match frame::read_frame(rd).await {
             Ok(Incoming::Eof) => return,
@@ -345,10 +344,31 @@ async fn handle_hello(conn: &Arc<Conn>, body: &[u8]) -> bool {
     true
 }
 
+/// A valid frame envelope with a body that does not decode as the request named
+/// by its ordinal is still a protocol error. Every request path must answer it:
+/// silently returning leaves an RPC caller parked until its timeout and makes a
+/// corrupt fire-and-forget frame indistinguishable from a successfully accepted
+/// command.
+async fn reject_malformed_body(conn: &Arc<Conn>, request: &str) {
+    let message = format!("malformed {request} request body");
+    send_error(
+        &conn.ctrl_tx,
+        0,
+        code::INVALID_ARGUMENT,
+        None,
+        None,
+        &message,
+    )
+    .await;
+}
+
 async fn handle_create(conn: &Arc<Conn>, body: &[u8]) {
     let r = match wire::CreateRequestRef::read_as_root(body) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            reject_malformed_body(conn, "create").await;
+            return;
+        }
     };
     let rpc_id = r.rpc_id().unwrap_or(0);
 
@@ -442,7 +462,10 @@ async fn handle_create(conn: &Arc<Conn>, body: &[u8]) {
 async fn handle_kill(conn: &Arc<Conn>, body: &[u8]) {
     let r = match wire::KillRequestRef::read_as_root(body) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            reject_malformed_body(conn, "kill").await;
+            return;
+        }
     };
     let rpc_id = r.rpc_id().unwrap_or(0);
     let sid = r.session_id().ok().flatten().unwrap_or("");
@@ -462,7 +485,10 @@ async fn handle_kill(conn: &Arc<Conn>, body: &[u8]) {
 async fn handle_purge(conn: &Arc<Conn>, body: &[u8]) {
     let r = match wire::PurgeRequestRef::read_as_root(body) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            reject_malformed_body(conn, "purge").await;
+            return;
+        }
     };
     let rpc_id = r.rpc_id().unwrap_or(0);
     let sid = r.session_id().ok().flatten().unwrap_or("");
@@ -483,7 +509,10 @@ async fn handle_purge(conn: &Arc<Conn>, body: &[u8]) {
 async fn handle_list(conn: &Arc<Conn>, body: &[u8]) {
     let r = match wire::ListRequestRef::read_as_root(body) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            reject_malformed_body(conn, "list").await;
+            return;
+        }
     };
     let rpc_id = r.rpc_id().unwrap_or(0);
     let sessions: Vec<wire::SessionRecord> =
@@ -498,7 +527,10 @@ async fn handle_list(conn: &Arc<Conn>, body: &[u8]) {
 async fn handle_update_metadata(conn: &Arc<Conn>, body: &[u8]) {
     let r = match wire::UpdateMetadataRequestRef::read_as_root(body) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            reject_malformed_body(conn, "updateMetadata").await;
+            return;
+        }
     };
     let rpc_id = r.rpc_id().unwrap_or(0);
     let sid = r.session_id().ok().flatten().unwrap_or("");
@@ -521,7 +553,10 @@ async fn handle_update_metadata(conn: &Arc<Conn>, body: &[u8]) {
 async fn handle_resize(conn: &Arc<Conn>, body: &[u8]) {
     let r = match wire::ResizeRequestRef::read_as_root(body) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            reject_malformed_body(conn, "resize").await;
+            return;
+        }
     };
     let rpc_id = r.rpc_id().unwrap_or(0);
     let sid = r.session_id().ok().flatten().unwrap_or("");
@@ -546,7 +581,10 @@ async fn handle_resize(conn: &Arc<Conn>, body: &[u8]) {
 async fn handle_read_buffer(conn: &Arc<Conn>, body: &[u8]) {
     let r = match wire::ReadBufferRequestRef::read_as_root(body) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            reject_malformed_body(conn, "readBuffer").await;
+            return;
+        }
     };
     let rpc_id = r.rpc_id().unwrap_or(0);
     let sid = r.session_id().ok().flatten().unwrap_or("");
@@ -583,7 +621,10 @@ async fn handle_read_buffer(conn: &Arc<Conn>, body: &[u8]) {
 async fn handle_attach(conn: &Arc<Conn>, body: &[u8]) {
     let r = match wire::AttachRequestRef::read_as_root(body) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            reject_malformed_body(conn, "attach").await;
+            return;
+        }
     };
     let rpc_id = r.rpc_id().unwrap_or(0);
     let sid = r.session_id().ok().flatten().unwrap_or("").to_string();
@@ -659,7 +700,10 @@ async fn handle_attach(conn: &Arc<Conn>, body: &[u8]) {
 async fn handle_detach(conn: &Arc<Conn>, body: &[u8]) {
     let r = match wire::DetachRequestRef::read_as_root(body) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            reject_malformed_body(conn, "detach").await;
+            return;
+        }
     };
     let rpc_id = r.rpc_id().unwrap_or(0);
     let sid = r.session_id().ok().flatten().unwrap_or("");
@@ -682,7 +726,10 @@ async fn handle_detach(conn: &Arc<Conn>, body: &[u8]) {
 async fn handle_input(conn: &Arc<Conn>, body: &[u8]) {
     let r = match wire::SessionInputRef::read_as_root(body) {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            reject_malformed_body(conn, "input").await;
+            return;
+        }
     };
     let sid = r.session_id().ok().flatten().unwrap_or("");
     let data = r.data().ok().flatten();
@@ -720,10 +767,28 @@ async fn stream_session(
     live_attach: bool,
 ) {
     let mut cursor = start;
+    // Output the holder had to discard before this stream existed is already
+    // missing from the replay it is about to send; what this stream owes the
+    // attacher is every drop that happens *while it is watching*, because those
+    // leave no cursor gap to notice (a failed push doesn't advance `head`).
+    let mut reported_drops = session.dropped_events();
     loop {
         // Created before the read so a wake that races it is not lost (`Notify`
         // stores a permit).
         let woken = session.notified();
+        let drops = session.dropped_events();
+        if drops != reported_drops {
+            reported_drops = drops;
+            send_error(
+                &conn.ctrl_tx,
+                0,
+                code::ALLOC_FAILED,
+                Some(&sid),
+                None,
+                "output was dropped: the holder could not allocate ring space",
+            )
+            .await;
+        }
         match session.read_at(cursor, 0) {
             ReadOutcome::Invalid => break,
             ReadOutcome::Gap { earliest: _ } => {
@@ -818,7 +883,7 @@ async fn send_error(
 /// Per-connection writer: bias control frames over data so an eviction event
 /// always has headroom even when the data channel is backed up.
 async fn writer_task(
-    mut wr: OwnedWriteHalf,
+    mut wr: ServerWrite,
     mut ctrl_rx: mpsc::Receiver<Vec<u8>>,
     mut data_rx: mpsc::Receiver<Vec<u8>>,
 ) {

@@ -1,7 +1,9 @@
 # Forking a session
 
-**Status:** implemented. Supersedes most of [`session-recovery.md`](session-recovery.md)
-(backlog row **REC**) — see [What this leaves of REC](#what-this-leaves-of-rec).
+**Status:** implemented 2026-07-14; model selection/worktree launch corrections
+current through 2026-07-23. Supersedes most of
+[`session-recovery.md`](session-recovery.md) (backlog row **REC**) — see
+[What this leaves of REC](#what-this-leaves-of-rec).
 
 A session in flight holds three things worth keeping: a branch, a working
 directory, and an agent that has learned the shape of the problem. **Forking**
@@ -61,6 +63,7 @@ order to decide what happens next; it does not silently resume the old task.
 | **claude** | `--resume <id> --fork-session` | **cwd** (`~/.claude/projects/<encoded-cwd>/`) | **cannot** resume — falls back to the brief |
 | **codex** | `codex fork <id>` | **uuid**, globally (`~/.codex/sessions/**`) | resumes fine |
 | **opencode** | — (see follow-ups) | a SQLite db | brief |
+| **pi** | `pi --fork <id>` | **uuid**, current project first, then globally (`~/.pi/agent/sessions/**`) | resumes fine |
 
 That is what `AgentPlugin::native_fork_requires_same_cwd` encodes, and why a
 same-agent fork is *not* automatically a native one.
@@ -137,13 +140,19 @@ be readable by any process on the box via `/proc`. A pointer is bounded and safe
 and it degrades: if the agent ignores it, the context is still sitting in the
 worktree for a human.
 
-Only agents that take a positional prompt get one (`accepts_seed_prompt`). A shell
-would *execute* a trailing argument as a script rather than read it.
+Only agents that can be seeded on their launch line get one, and each encodes it
+its own way (`seed_prompt_args`): Claude, Codex and pi read a bare positional as
+the opening message, but opencode's positional is a *project directory* — a prompt
+there is taken as a path and the launch dies with "Failed to change directory
+to …", so it goes through `--prompt`. A shell gets nothing: it would *execute* a
+trailing argument as a script rather than read it.
 
 ## Capturing the conversation id — while the session is alive
 
 `sessions.agent_session_id` (SCHEMA_V7) is written by the monitor, polling every
-5 s until it lands, and **never re-derived**.
+5 s until the first unique match lands. It stays fixed unless a plugin can prove
+that an older duplicate binding belongs to another session and find an exact
+replacement.
 
 This is deliberate. The transcript-matching in `plugins/usage.rs` is a heuristic —
 Claude's is literally *"the newest `*.jsonl` in this cwd's directory"* — and two
@@ -152,6 +161,8 @@ sessions sharing a working directory (normal with worktree isolation off, and
 written last. Reporting the wrong token count is survivable. *Resuming the wrong
 conversation* is not. So we capture early, when this session is the only recent
 writer, and read Claude's `sessionId` **field** rather than trusting the filename.
+Codex additionally requires an exact recorded-cwd match; if its rollout has not
+appeared yet, the monitor waits rather than using another session on the host.
 
 The id stays on the host: the API exposes only `has_agent_conversation`, which is
 all a client needs to say whether a fork carries the whole conversation or a
@@ -159,7 +170,8 @@ summary of it.
 
 ## Surface
 
-* `POST /api/sessions/:id/fork` — `{ agent_plugin_id, same_branch?, options? }`.
+* `POST /api/sessions/:id/fork` —
+  `{ agent_plugin_id, same_branch?, options?, model?, rows?, cols? }`.
   Runs in `spawn_blocking`: it does `git worktree add` and may run an agent for
   tens of seconds, either of which would stall the whole daemon on the async
   runtime.

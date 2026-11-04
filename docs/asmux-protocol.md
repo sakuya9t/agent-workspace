@@ -1,10 +1,10 @@
 # asmux Wire Protocol (Frozen Contract)
 
-Status: **draft, pre-freeze** — changeable until asmux ships. After that the
-contract is **append-only**: no ordinal is reused, no FlatBuffers field `id` is
-removed or renumbered, no enum value repurposed, no error code changed in
-meaning. New capability is added only as new ordinals, new trailing fields with
-new ids, or new enum/error values.
+Status: **shipped and frozen** (M1 landed; reconciled 2026-07-24). The contract
+is **append-only**: no ordinal is reused, no FlatBuffers field `id` is removed or
+renumbered, no enum value repurposed, and no error code changed in meaning. New
+capability is added only as new ordinals, new trailing fields with new ids, or
+new enum/error values.
 
 Companion: [`durable-sessions.md`](durable-sessions.md) (architecture & rationale).
 
@@ -35,9 +35,13 @@ mechanisms bound that:
 
 - **Unix domain socket** at `<runtime_dir>/asmux.sock` on Linux/macOS
   (socket file `0600`; parent dir `0700`). On Windows the same framing runs over
-  **AF_UNIX where reliable, or a named pipe** as the native fallback; the
-  `0600`/`0700` guarantee becomes an equivalent ACL restricting the socket/pipe
-  to the owning user. No TCP, ever.
+  a **named pipe**, `\\.\pipe\asmux-<16 hex>`: the FNV-1a 64 hash of the
+  socket path's normalised location (runtime dir canonicalised, separators
+  unified, case folded), so a socket *path* still names the holder everywhere
+  and an explicit `\\.\pipe\…` `ASMUX_SOCK` is used as is. The first instance
+  claims the name exclusively and remote clients are refused; access is the
+  default pipe DACL (owner/SYSTEM/admins), an explicit owner-only ACL being a
+  tracked hardening item (security-followups.md → 13). No TCP, ever.
 - One connection may drive many sessions (multiplexed): every data-plane and
   event frame carries `session_id`.
 
@@ -487,9 +491,11 @@ an in-place mutation).
 
 ## Resolved protocol decisions
 
-1. **Toolchain: `planus`** (pure-Rust FlatBuffers), codegen from `schema/
-   asmux.fbs` via `build.rs`. Falls back to `flatc` + the `flatbuffers` crate if
-   needed; wire bytes are identical, so this is not part of the frozen contract.
+1. **Toolchain: `planus`** (pure-Rust FlatBuffers), manually generated from
+   `crates/asmux-wire/schema/asmux.fbs` with the command recorded in
+   `crates/asmux-wire/src/lib.rs`. There is no `build.rs`; RF-GATE tracks a CI
+   drift check. `flatc` + the `flatbuffers` crate remains a fallback if needed;
+   wire bytes are identical, so this is not part of the frozen contract.
 2. **Single holder for all sessions**, bounded by a total-memory cap and made
    recoverable by the two-tier model (see [Failure domain](#failure-domain-one-holder-bounded-recoverable)),
    in place of a per-session sidecar.
@@ -525,5 +531,6 @@ an in-place mutation).
   not an asmux concern — and it collides with Git's rule that a branch can be
   checked out in only one worktree at once (we already surface that as a clean
   error). Tracked in `durable-sessions.md`/the branch model.
-- **Windows transport specifics** (AF_UNIX vs named pipe, ACL model) are settled
-  in intent above but the concrete Win32 wrappers land in M5.
+- **Windows ACL model**: the named-pipe transport landed with M5 (see
+  Transport); an explicit owner-only DACL and a server-identity check remain
+  (security-followups.md → 13).

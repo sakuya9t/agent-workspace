@@ -10,7 +10,7 @@
 //! the session started), so callers should treat the result as best-effort.
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -29,6 +29,11 @@ pub struct TranscriptContext {
     pub cwd: PathBuf,
     /// Session `created_at` in unix milliseconds.
     pub started_at_ms: i64,
+    /// The agent's own persisted conversation id, once the session monitor has
+    /// captured it. This is the authoritative transcript binding: cwd/time are
+    /// only a launch-time heuristic and stop being unique when several sessions
+    /// use the same workspace.
+    pub native_session_id: Option<String>,
 }
 
 /// Normalized usage snapshot for one session, shaped for the client.
@@ -42,8 +47,10 @@ pub struct AgentUsage {
     pub model: Option<String>,
     /// Context-window occupancy for the most recent turn (tokens).
     pub context_tokens: Option<u64>,
-    /// Model context-window size (real for Codex, estimated for Claude).
+    /// Session context budget (reported by Codex, estimated for Claude).
     pub context_window: Option<u64>,
+    /// Model maximum from local metadata, distinct from the session budget.
+    pub model_max_context_window: Option<u64>,
     /// Cumulative fresh (non-cached) input tokens for the session.
     pub input_tokens: Option<u64>,
     /// Cumulative cached / cache-read input tokens for the session.
@@ -409,28 +416,139 @@ fn iso8601_to_unix_secs(s: &str) -> Option<i64> {
 
 // ---------- Codex ----------
 
+/// Codex quota snapshots are account-wide, but a session routed to a
+/// model-specific pool can stop receiving updates for the general pool. Merge
+/// recent rollout tails so every session sees the freshest snapshot per pool.
+const CODEX_RL_CACHE_TTL: Duration = Duration::from_secs(4);
+const CODEX_RL_LOOKBACK_MS: i64 = 8 * 24 * 60 * 60 * 1000;
+const CODEX_RL_TAIL_BYTES: usize = 256 * 1024;
+
+type CodexRateLimitSnapshots = std::collections::BTreeMap<String, (String, Value)>;
+
+static CODEX_RL_CACHE: Mutex<Option<(Instant, CodexRateLimitSnapshots)>> = Mutex::new(None);
+
 /// The Codex rollout file this asm session most likely owns, from
 /// `~/.codex/sessions/**/rollout-*.jsonl`.
 pub fn codex_rollout_path(cx: &TranscriptContext) -> Option<PathBuf> {
+    let files = codex_rollout_files()?;
+    choose_codex_rollout(cx, files)
+}
+
+fn codex_rollout_files() -> Option<Vec<(i64, PathBuf)>> {
     let root = home_dir()?.join(".codex").join("sessions");
     if !root.is_dir() {
         return None;
     }
     let mut files = Vec::new();
     collect_jsonl(&root, &mut files, 0);
+    Some(files)
+}
+
+/// Recover from the old global-newest fallback, which could persist another
+/// Codex session's id before this session had created its own rollout. A
+/// replacement is returned only when the bound rollout exists and records a
+/// different cwd, and an exact-cwd candidate exists for this session.
+pub fn codex_replacement_native_id(cx: &TranscriptContext) -> Option<String> {
+    codex_replacement_native_id_from(cx, codex_rollout_files()?)
+}
+
+fn codex_replacement_native_id_from(
+    cx: &TranscriptContext,
+    files: Vec<(i64, PathBuf)>,
+) -> Option<String> {
+    let existing = cx.native_session_id.as_deref()?;
+    let want = cx.cwd.to_string_lossy().to_string();
+    let belongs_elsewhere = files.iter().any(|(_, path)| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(existing))
+            && read_head(path, 64 * 1024).is_some_and(|head| {
+                codex_file_id(&head).as_deref() == Some(existing)
+                    && codex_file_cwd(&head)
+                        .as_deref()
+                        .is_some_and(|cwd| cwd != want.as_str())
+            })
+    });
+    if !belongs_elsewhere {
+        return None;
+    }
+
+    let unbound = TranscriptContext {
+        cwd: cx.cwd.clone(),
+        started_at_ms: cx.started_at_ms,
+        native_session_id: None,
+    };
+    let replacement = choose_codex_rollout(&unbound, files)
+        .and_then(|path| read_head(&path, 64 * 1024))
+        .and_then(|head| codex_file_id(&head))?;
+    (replacement != existing).then_some(replacement)
+}
+
+fn choose_codex_rollout(
+    cx: &TranscriptContext,
+    mut files: Vec<(i64, PathBuf)>,
+) -> Option<PathBuf> {
+    let want = cx.cwd.to_string_lossy().to_string();
+
+    // Once the monitor has captured Codex's id, never re-guess by cwd. A later
+    // session in the same worktree otherwise steals this session's title,
+    // transcript and usage merely by being written more recently. Codex embeds
+    // the id in both the rollout filename and its session_meta header; use the
+    // filename to narrow cheaply and the header to verify both the id and cwd.
+    // Checking cwd also contains a stale or corrupt binding instead of serving
+    // another session's conversation through it.
+    if let Some(id) = cx.native_session_id.as_deref() {
+        return files
+            .iter()
+            .find(|(_, path)| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(id))
+                    && read_head(path, 64 * 1024).is_some_and(|head| {
+                        codex_file_id(&head).as_deref() == Some(id)
+                            && codex_file_cwd(&head).as_deref() == Some(want.as_str())
+                    })
+            })
+            .map(|(_, path)| path.clone());
+    }
+
     let min = cx.started_at_ms - SLACK_MS;
     files.retain(|(m, _)| *m >= min);
     files.sort_by_key(|(m, _)| std::cmp::Reverse(*m)); // newest first
 
-    // Prefer the rollout whose recorded cwd matches this session; otherwise take
-    // the most recently written candidate.
-    let want = cx.cwd.to_string_lossy().to_string();
+    // A rollout from another cwd can be very recent when another Codex session
+    // is active. It is never a safe fallback: Codex can create this session's
+    // own rollout lazily, so wait for an exact cwd match and let the monitor poll
+    // again instead of permanently capturing the unrelated conversation id.
     files
         .iter()
-        .take(20)
-        .find(|(_, p)| read_head(p, 64 * 1024).and_then(|h| codex_file_cwd(&h)).as_deref() == Some(want.as_str()))
-        .or_else(|| files.first())
+        .find(|(_, path)| {
+            read_head(path, 64 * 1024)
+                .and_then(|head| codex_file_cwd(&head))
+                .as_deref()
+                == Some(want.as_str())
+        })
         .map(|(_, p)| p.clone())
+}
+
+/// Extract Codex's conversation id from the session_meta record that opens a
+/// rollout. Reading the record keeps callers independent of filename details.
+pub(crate) fn codex_file_id(head: &str) -> Option<String> {
+    for line in head.lines() {
+        if !line.contains("session_meta") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["type"] == "session_meta" {
+            return v["payload"]["id"]
+                .as_str()
+                .or_else(|| v["payload"]["session_id"].as_str())
+                .map(str::to_string);
+        }
+    }
+    None
 }
 
 /// Read usage for a Codex session from its rollout file.
@@ -438,13 +556,37 @@ pub fn codex_usage(cx: &TranscriptContext) -> Option<AgentUsage> {
     let chosen = codex_rollout_path(cx)?;
     let text = fs::read_to_string(&chosen).ok()?;
     let mut u = parse_codex_text(&text)?;
+    let mut limits = codex_rate_limit_snapshots_from_text(&text);
+    merge_codex_rate_limit_snapshots(&mut limits, codex_account_rate_limit_snapshots());
+    u.rate_limits = codex_rate_limit_rows(limits);
+    if let Some(model) = u.model.as_deref() {
+        let root = std::env::var_os("CODEX_HOME")
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home_dir().map(|p| p.join(".codex")));
+        u.model_max_context_window = root
+            .and_then(|root| fs::read_to_string(root.join("models_cache.json")).ok())
+            .and_then(|text| codex_model_max_context(&text, model));
+    }
     u.source = Some(format!("Codex rollout {}", chosen.display()));
     Some(u)
+}
+
+fn codex_model_max_context(text: &str, model: &str) -> Option<u64> {
+    let cache: Value = serde_json::from_str(text).ok()?;
+    cache["models"]
+        .as_array()?
+        .iter()
+        .find(|entry| entry["slug"].as_str() == Some(model))?
+        .get("max_context_window")?
+        .as_u64()
+        .filter(|n| *n > 0)
 }
 
 fn parse_codex_text(text: &str) -> Option<AgentUsage> {
     let mut last: Option<Value> = None;
     let mut model: Option<String> = None;
+    let mut rate_limits = CodexRateLimitSnapshots::new();
 
     for line in text.lines() {
         let has_model = line.contains("\"model\"");
@@ -464,11 +606,19 @@ fn parse_codex_text(text: &str) -> Option<AgentUsage> {
             }
         }
         if has_tc && v["payload"]["type"] == "token_count" {
-            last = Some(v);
+            // Rate-limit pools arrive independently, sometimes without token
+            // info. Keep the latest snapshot of each pool and token usage.
+            record_codex_rate_limit_snapshot(&mut rate_limits, &v);
+            if v["payload"]["info"].is_object() {
+                last = Some(v);
+            }
         }
     }
 
-    let v = last?;
+    if last.is_none() && rate_limits.is_empty() {
+        return None;
+    }
+    let v = last.unwrap_or(Value::Null);
     let info = &v["payload"]["info"];
     let total = &info["total_token_usage"];
     let last_turn = &info["last_token_usage"];
@@ -489,21 +639,112 @@ fn parse_codex_text(text: &str) -> Option<AgentUsage> {
         ..Default::default()
     };
 
-    let limits = &v["payload"]["rate_limits"];
-    for key in ["primary", "secondary"] {
-        let w = &limits[key];
-        if let Some(pct) = w["used_percent"].as_f64() {
-            let window_minutes = w["window_minutes"].as_u64();
-            u.rate_limits.push(RateLimitWindow {
-                label: window_minutes.map(window_label).unwrap_or_else(|| key.to_string()),
-                used_percent: pct,
-                window_minutes,
-                resets_at: w["resets_at"].as_i64(),
-            });
-        }
-    }
+    u.rate_limits = codex_rate_limit_rows(rate_limits);
     u.note = Some("Read from the on-disk Codex session rollout.".into());
     Some(u)
+}
+
+fn record_codex_rate_limit_snapshot(snapshots: &mut CodexRateLimitSnapshots, event: &Value) {
+    let limits = &event["payload"]["rate_limits"];
+    if !limits.is_object() {
+        return;
+    }
+    let id = limits["limit_id"].as_str().unwrap_or("codex").to_string();
+    let timestamp = event["timestamp"].as_str().unwrap_or("").to_string();
+    if snapshots
+        .get(&id)
+        .is_none_or(|(current, _)| timestamp >= *current)
+    {
+        snapshots.insert(id, (timestamp, limits.clone()));
+    }
+}
+
+fn codex_rate_limit_snapshots_from_text(text: &str) -> CodexRateLimitSnapshots {
+    let mut snapshots = CodexRateLimitSnapshots::new();
+    for line in text.lines().filter(|line| line.contains("token_count")) {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if event["payload"]["type"] == "token_count" {
+            record_codex_rate_limit_snapshot(&mut snapshots, &event);
+        }
+    }
+    snapshots
+}
+
+fn merge_codex_rate_limit_snapshots(
+    target: &mut CodexRateLimitSnapshots,
+    incoming: CodexRateLimitSnapshots,
+) {
+    for (id, (timestamp, limits)) in incoming {
+        if target
+            .get(&id)
+            .is_none_or(|(current, _)| timestamp >= *current)
+        {
+            target.insert(id, (timestamp, limits));
+        }
+    }
+}
+
+fn codex_rate_limit_rows(rate_limits: CodexRateLimitSnapshots) -> Vec<RateLimitWindow> {
+    let mut rows = Vec::new();
+    for (id, (_, limits)) in rate_limits {
+        for key in ["primary", "secondary"] {
+            let w = &limits[key];
+            if let Some(pct) = w["used_percent"].as_f64() {
+                let window_minutes = w["window_minutes"].as_u64();
+                rows.push(RateLimitWindow {
+                    label: {
+                        let window = window_minutes
+                            .map(window_label)
+                            .unwrap_or_else(|| key.to_string());
+                        let pool = limits["limit_name"].as_str().filter(|name| !name.is_empty());
+                        match pool.or_else(|| (id != "codex").then_some(id.as_str())) {
+                            Some(pool) => format!("{pool} · {window}"),
+                            None => window,
+                        }
+                    },
+                    used_percent: pct,
+                    window_minutes,
+                    resets_at: w["resets_at"].as_i64(),
+                });
+            }
+        }
+    }
+    rows
+}
+
+fn codex_account_rate_limit_snapshots() -> CodexRateLimitSnapshots {
+    if let Ok(guard) = CODEX_RL_CACHE.lock() {
+        if let Some((at, cached)) = guard.as_ref() {
+            if at.elapsed() < CODEX_RL_CACHE_TTL {
+                return cached.clone();
+            }
+        }
+    }
+
+    let mut snapshots = CodexRateLimitSnapshots::new();
+    if let Some(root) = home_dir().map(|h| h.join(".codex").join("sessions")) {
+        let mut files = Vec::new();
+        collect_jsonl(&root, &mut files, 0);
+        files.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+        if let Some((newest_mtime, _)) = files.first() {
+            let cutoff = newest_mtime.saturating_sub(CODEX_RL_LOOKBACK_MS);
+            for (_, path) in files.iter().take_while(|(mtime, _)| *mtime >= cutoff) {
+                if let Some(tail) = read_tail(path, CODEX_RL_TAIL_BYTES) {
+                    merge_codex_rate_limit_snapshots(
+                        &mut snapshots,
+                        codex_rate_limit_snapshots_from_text(&tail),
+                    );
+                }
+            }
+        }
+    }
+
+    if let Ok(mut guard) = CODEX_RL_CACHE.lock() {
+        *guard = Some((Instant::now(), snapshots.clone()));
+    }
+    snapshots
 }
 
 /// Extract the recorded cwd from the head of a Codex rollout (session_meta /
@@ -540,13 +781,138 @@ fn window_label(minutes: u64) -> String {
     }
 }
 
+// ---------- pi ----------
+
+/// pi's config directory: `$PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
+pub(crate) fn pi_agent_dir() -> Option<PathBuf> {
+    match std::env::var("PI_CODING_AGENT_DIR") {
+        Ok(d) if !d.trim().is_empty() => Some(PathBuf::from(d)),
+        _ => Some(home_dir()?.join(".pi").join("agent")),
+    }
+}
+
+/// The pi session file this asm session most likely owns:
+/// `<agent dir>/sessions/--<encoded cwd>--/<timestamp>_<uuid>.jsonl`.
+///
+/// `$PI_CODING_AGENT_SESSION_DIR` (and `--session-dir`) can move this elsewhere;
+/// we don't chase either, so such a session simply reports no usage rather than
+/// picking up an unrelated file.
+pub fn pi_session_path(cx: &TranscriptContext) -> Option<PathBuf> {
+    let dir = pi_agent_dir()?.join("sessions").join(encode_pi_dir(&cx.cwd));
+    if !dir.is_dir() {
+        return None;
+    }
+    newest_jsonl_in(&dir, cx.started_at_ms - SLACK_MS)
+}
+
+/// pi keys its session directories by working directory: the leading separator
+/// is dropped, the remaining path separators (and a Windows drive colon) become
+/// `-`, and the result is wrapped in `--…--`. Unlike Claude's encoder, dots are
+/// left alone.
+fn encode_pi_dir(cwd: &Path) -> String {
+    let path = cwd.to_string_lossy();
+    let stripped = path.trim_start_matches(['/', '\\']);
+    let body: String = stripped
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' => '-',
+            other => other,
+        })
+        .collect();
+    format!("--{body}--")
+}
+
+/// Read per-session token usage from pi's own session JSONL.
+pub fn pi_usage(cx: &TranscriptContext) -> Option<AgentUsage> {
+    let file = pi_session_path(cx)?;
+    let text = fs::read_to_string(&file).ok()?;
+    let mut u = parse_pi_text(&text)?;
+    u.source = Some(format!("pi session {}", file.display()));
+    Some(u)
+}
+
+/// pi records one `usage` object per assistant message — `{input, output,
+/// cacheRead, cacheWrite, totalTokens}` — but never the model's context window,
+/// so unlike Codex (which reports one) and Claude (whose model id we can
+/// estimate from) that field stays empty rather than guessed: pi front-ends
+/// dozens of providers, so the model id alone doesn't imply a window.
+///
+/// The file is a *tree* (`/tree` branches in place), and this walks it linearly,
+/// so tokens spent on branches the user later abandoned are still counted. That
+/// matches what the session cost you; it is not what the live context holds.
+///
+/// Only the assistant turns are summed. pi also records usage for work it did
+/// *around* the conversation — a compaction or branch summary it generated, and
+/// LLM calls nested inside a tool — which its own `/session` total includes and
+/// this does not, so these numbers can read a little low on a long session.
+fn parse_pi_text(text: &str) -> Option<AgentUsage> {
+    let mut u = AgentUsage::default();
+    let (mut in_sum, mut out_sum, mut cr_sum, mut cw_sum) = (0u64, 0u64, 0u64, 0u64);
+    let (mut last_in, mut last_cr, mut last_cw) = (0u64, 0u64, 0u64);
+    let mut found = false;
+
+    for line in text.lines() {
+        if !line.contains("\"usage\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let msg = &v["message"];
+        if msg["role"] != "assistant" {
+            continue;
+        }
+        let usage = &msg["usage"];
+        if !usage.is_object() {
+            continue;
+        }
+        let ii = usage["input"].as_u64().unwrap_or(0);
+        let oo = usage["output"].as_u64().unwrap_or(0);
+        let cr = usage["cacheRead"].as_u64().unwrap_or(0);
+        let cw = usage["cacheWrite"].as_u64().unwrap_or(0);
+        in_sum += ii;
+        out_sum += oo;
+        cr_sum += cr;
+        cw_sum += cw;
+        last_in = ii;
+        last_cr = cr;
+        last_cw = cw;
+        // `provider/model` is how pi itself names a model (`--model openai/gpt-4o`).
+        if let Some(m) = msg["model"].as_str().filter(|m| !m.is_empty()) {
+            u.model = Some(match msg["provider"].as_str().filter(|p| !p.is_empty()) {
+                Some(p) => format!("{p}/{m}"),
+                None => m.to_string(),
+            });
+        }
+        if let Some(ts) = v["timestamp"].as_str() {
+            u.updated_at = Some(ts.to_string());
+        }
+        found = true;
+    }
+
+    if !found {
+        return None;
+    }
+    u.available = true;
+    u.context_tokens = Some(last_in + last_cr + last_cw);
+    u.input_tokens = Some(in_sum);
+    // Cache writes are fresh input billed at a premium; pi counts them apart from
+    // `input`, and the client has no separate row for them, so they ride along
+    // with the cached total they will be read from next turn.
+    u.cached_input_tokens = Some(cr_sum + cw_sum);
+    u.output_tokens = Some(out_sum);
+    u.note = Some(
+        "Cumulative tokens read from pi's own session file, summed over its assistant turns; pi \
+         records no context-window size, and branches abandoned via /tree are still counted."
+            .into(),
+    );
+    Some(u)
+}
+
 // ---------- shared fs helpers ----------
 
 pub(crate) fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
+    crate::util::home_dir()
 }
 
 fn mtime_ms(meta: &fs::Metadata) -> i64 {
@@ -606,6 +972,22 @@ pub(crate) fn read_head(path: &Path, max: usize) -> Option<String> {
     let mut buf = vec![0u8; max];
     let n = f.read(&mut buf).ok()?;
     buf.truncate(n);
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Read up to `max` bytes from the end of a file. When seeking into the file,
+/// discard the first partial JSONL record before parsing the remainder.
+fn read_tail(path: &Path, max: usize) -> Option<String> {
+    let mut f = fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(max as u64);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    f.read_to_end(&mut buf).ok()?;
+    if start > 0 {
+        let newline = buf.iter().position(|b| *b == b'\n')?;
+        buf.drain(..=newline);
+    }
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
@@ -687,6 +1069,217 @@ mod tests {
     }
 
     #[test]
+    fn codex_model_maximum_is_separate_from_default_budget() {
+        let cache = r#"{"models":[{"slug":"gpt-6-astra","context_window":272000,"max_context_window":872000,"effective_context_window_percent":95},{"slug":"unknown-max","context_window":272000}]}"#;
+        assert_eq!(codex_model_max_context(cache, "gpt-6-astra"), Some(872000));
+        assert_eq!(codex_model_max_context(cache, "unknown-max"), None);
+        assert_eq!(codex_model_max_context(cache, "missing"), None);
+        assert_eq!(codex_model_max_context("broken", "gpt-6-astra"), None);
+    }
+
+    #[test]
+    fn codex_preserves_tokens_and_independent_rate_limit_pools() {
+        let text = [
+            serde_json::json!({"payload": {"type": "token_count", "info": {
+                "total_token_usage": {"total_tokens": 12345},
+                "last_token_usage": {"input_tokens": 9000},
+                "model_context_window": 258400
+            }, "rate_limits": {"limit_id": "codex", "primary": {"used_percent": 10.0, "window_minutes": 10080}}}}),
+            serde_json::json!({"payload": {"type": "token_count", "info": null,
+                "rate_limits": {"limit_id": "codex", "primary": {"used_percent": 16.0, "window_minutes": 10080}}}}),
+            serde_json::json!({"payload": {"type": "token_count", "info": null,
+                "rate_limits": {"limit_id": "codex_bengalfox", "limit_name": "GPT-5.3-Codex-Spark",
+                    "primary": {"used_percent": 0.0, "window_minutes": 300}}}}),
+            serde_json::json!({"payload": {"type": "token_count", "info": null, "rate_limits": null}}),
+        ].iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        let u = parse_codex_text(&text).expect("usage");
+        assert_eq!(u.total_tokens, Some(12345));
+        assert_eq!(u.context_tokens, Some(9000));
+        assert_eq!(u.context_window, Some(258400));
+        assert_eq!(u.rate_limits.len(), 2);
+        assert_eq!(u.rate_limits[0].label, "weekly");
+        assert_eq!(u.rate_limits[0].used_percent, 16.0);
+        assert_eq!(u.rate_limits[1].label, "GPT-5.3-Codex-Spark · 5-hour");
+        assert_eq!(u.rate_limits[1].used_percent, 0.0);
+    }
+
+    #[test]
+    fn codex_uses_freshest_account_limit_across_session_rollouts() {
+        let routed_session = [
+            serde_json::json!({"timestamp": "2026-09-08T14:29:37Z", "payload": {
+                "type": "token_count", "rate_limits": {"limit_id": "codex",
+                    "primary": {"used_percent": 16.0, "window_minutes": 10080}}
+            }}),
+            serde_json::json!({"timestamp": "2026-09-11T05:40:46Z", "payload": {
+                "type": "token_count", "rate_limits": {"limit_id": "codex_bengalfox",
+                    "limit_name": "GPT-5.3-Codex-Spark",
+                    "primary": {"used_percent": 0.0, "window_minutes": 300}}
+            }}),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        let general_session = serde_json::json!({
+            "timestamp": "2026-09-11T05:40:45Z", "payload": {
+                "type": "token_count", "rate_limits": {"limit_id": "codex",
+                    "primary": {"used_percent": 90.0, "window_minutes": 10080}}
+            }
+        })
+        .to_string();
+
+        let mut limits = codex_rate_limit_snapshots_from_text(&routed_session);
+        merge_codex_rate_limit_snapshots(
+            &mut limits,
+            codex_rate_limit_snapshots_from_text(&general_session),
+        );
+        let rows = codex_rate_limit_rows(limits);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "weekly");
+        assert_eq!(rows[0].used_percent, 90.0);
+        assert_eq!(rows[1].label, "GPT-5.3-Codex-Spark · 5-hour");
+        assert_eq!(rows[1].used_percent, 0.0);
+    }
+
+    #[test]
+    fn codex_rollout_uses_the_persisted_id_in_a_shared_worktree() {
+        let dir = std::env::temp_dir().join(format!(
+            "asm-codex-rollout-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let original_id = "11111111-1111-1111-1111-111111111111";
+        let later_id = "22222222-2222-2222-2222-222222222222";
+        let original = dir.join(format!("rollout-old-{original_id}.jsonl"));
+        let later = dir.join(format!("rollout-new-{later_id}.jsonl"));
+        fs::write(
+            &original,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{original_id}","cwd":"/repo"}}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &later,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{later_id}","cwd":"/repo"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let files = vec![(100, original.clone()), (200, later.clone())];
+        let bound = TranscriptContext {
+            cwd: PathBuf::from("/repo"),
+            started_at_ms: 0,
+            native_session_id: Some(original_id.into()),
+        };
+        assert_eq!(choose_codex_rollout(&bound, files.clone()), Some(original));
+
+        let unbound = TranscriptContext {
+            cwd: PathBuf::from("/repo"),
+            started_at_ms: 0,
+            native_session_id: None,
+        };
+        assert_eq!(choose_codex_rollout(&unbound, files), Some(later));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn codex_rollout_waits_for_its_own_cwd_instead_of_stealing_a_recent_session() {
+        let dir = std::env::temp_dir().join(format!(
+            "asm-codex-rollout-cwd-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let other_id = "33333333-3333-3333-3333-333333333333";
+        let other = dir.join(format!("rollout-new-{other_id}.jsonl"));
+        fs::write(
+            &other,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{other_id}","cwd":"/other-repo"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let cx = TranscriptContext {
+            cwd: PathBuf::from("/our-repo"),
+            started_at_ms: 100,
+            native_session_id: None,
+        };
+        assert_eq!(choose_codex_rollout(&cx, vec![(200, other)]), None);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn codex_rollout_rejects_a_persisted_id_from_another_cwd() {
+        let dir = std::env::temp_dir().join(format!(
+            "asm-codex-rollout-binding-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let other_id = "44444444-4444-4444-4444-444444444444";
+        let other = dir.join(format!("rollout-old-{other_id}.jsonl"));
+        fs::write(
+            &other,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{other_id}","cwd":"/other-repo"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let cx = TranscriptContext {
+            cwd: PathBuf::from("/our-repo"),
+            started_at_ms: 100,
+            native_session_id: Some(other_id.into()),
+        };
+        assert_eq!(choose_codex_rollout(&cx, vec![(200, other)]), None);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn codex_replaces_a_cross_cwd_duplicate_with_the_exact_cwd_rollout() {
+        let dir = std::env::temp_dir().join(format!(
+            "asm-codex-rollout-repair-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let wrong_id = "55555555-5555-5555-5555-555555555555";
+        let right_id = "66666666-6666-6666-6666-666666666666";
+        let wrong = dir.join(format!("rollout-old-{wrong_id}.jsonl"));
+        let right = dir.join(format!("rollout-new-{right_id}.jsonl"));
+        fs::write(
+            &wrong,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{wrong_id}","cwd":"/other-repo"}}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &right,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{right_id}","cwd":"/our-repo"}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let cx = TranscriptContext {
+            cwd: PathBuf::from("/our-repo"),
+            started_at_ms: 100,
+            native_session_id: Some(wrong_id.into()),
+        };
+        assert_eq!(
+            codex_replacement_native_id_from(&cx, vec![(300, wrong), (200, right)]),
+            Some(right_id.into())
+        );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn window_labels() {
         assert_eq!(window_label(300), "5-hour");
         assert_eq!(window_label(10080), "weekly");
@@ -758,6 +1351,59 @@ mod tests {
         // Pre-epoch dates stay correct (div_euclid, not integer division).
         assert_eq!(iso8601_to_unix_secs("1969-12-31T23:59:59Z"), Some(-1));
         assert_eq!(iso8601_to_unix_secs("garbage"), None);
+    }
+
+    #[test]
+    fn parses_pi_session() {
+        let text = concat!(
+            r#"{"type":"session","version":3,"id":"11111111-2222-3333-4444-555555555555","timestamp":"2026-08-20T10:00:00.000Z","cwd":"/home/x/proj"}"#,
+            "\n",
+            r#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-08-20T10:00:01.000Z","message":{"role":"user","content":"hi"}}"#,
+            "\n",
+            r#"{"type":"message","id":"b2","parentId":"a1","timestamp":"2026-08-20T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"hello"}],"provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":10,"output":50,"cacheRead":1000,"cacheWrite":100,"totalTokens":1160},"stopReason":"stop"}}"#,
+            "\n",
+            r#"{"type":"message","id":"c3","parentId":"b2","timestamp":"2026-08-20T10:00:09.000Z","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":2,"output":80,"cacheRead":2000,"cacheWrite":0,"totalTokens":2082},"stopReason":"stop"}}"#,
+        );
+        let u = parse_pi_text(text).expect("usage");
+        assert!(u.available);
+        // pi names a model `provider/id`, the same form its `--model` flag takes.
+        assert_eq!(u.model.as_deref(), Some("anthropic/claude-sonnet-4-5"));
+        // Last turn context = 2 + 2000 + 0.
+        assert_eq!(u.context_tokens, Some(2002));
+        assert_eq!(u.input_tokens, Some(12));
+        assert_eq!(u.output_tokens, Some(130));
+        // Cache reads and writes share the client's one "cached" row.
+        assert_eq!(u.cached_input_tokens, Some(3100));
+        // pi records no window, so none is claimed.
+        assert_eq!(u.context_window, None);
+        assert_eq!(u.updated_at.as_deref(), Some("2026-08-20T10:00:09.000Z"));
+    }
+
+    #[test]
+    fn pi_session_without_assistant_turn_has_no_usage() {
+        // A session whose only entries are the header and the opening prompt has
+        // nothing to report — `None`, not a zeroed reading.
+        let text = concat!(
+            r#"{"type":"session","version":3,"id":"u","cwd":"/home/x/proj"}"#,
+            "\n",
+            r#"{"type":"message","id":"a1","parentId":null,"message":{"role":"user","content":"hi"}}"#,
+        );
+        assert!(parse_pi_text(text).is_none());
+    }
+
+    #[test]
+    fn pi_dir_encoding() {
+        // Leading slash dropped, separators to `-`, wrapped in `--…--`, dots kept.
+        assert_eq!(
+            encode_pi_dir(Path::new("/home/sakuya/dev/agent.workspace")),
+            "--home-sakuya-dev-agent.workspace--"
+        );
+        // Windows: the drive colon and each separator both become `-`, so the
+        // drive letter is followed by two of them.
+        assert_eq!(
+            encode_pi_dir(Path::new("C:\\Users\\x")),
+            "--C--Users-x--"
+        );
     }
 
     #[test]

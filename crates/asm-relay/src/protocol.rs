@@ -46,8 +46,9 @@ pub const DATA_STREAM_QUERY: &str = "stream_id";
 pub const REGISTER_PATH: &str = "/register";
 pub const DATA_PATH: &str = "/data";
 
-/// The node opens the control stream first; every other yamux stream is a proxy
-/// stream. Node → relay control messages are JSON Lines tagged by `t`.
+/// The node opens the control stream first. Each proxy request then gets its own
+/// dial-back data WebSocket correlated by [`DATA_STREAM_QUERY`]. Node → relay
+/// control messages are JSON Lines tagged by `t`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum NodeMsg {

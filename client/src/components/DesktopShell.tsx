@@ -1,15 +1,17 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { fitPanels, RESIZER_W, useUiStore } from "../store";
 import { daemonLabel } from "../connectionStore";
 import { useActiveSession } from "../useActiveSession";
-import { USAGE_AGENTS } from "../agents";
+import { PROMPT_AGENTS, USAGE_AGENTS } from "../agents";
 import { statusLabel } from "../i18n/labels";
+import { TerminalHandle, submitPrompt } from "../terminalTypes";
 import { SessionList } from "./SessionList";
 import { TerminalView } from "./Terminal";
 import { RightPanel } from "./RightPanel";
 import { PanelResizer } from "./PanelResizer";
 import { UsageModal } from "./UsageModal";
+import { DeckModeLink } from "./DeckModeLink";
 
 /**
  * Desktop shell: the classic 3-pane workspace (session tree · terminal ·
@@ -19,6 +21,7 @@ import { UsageModal } from "./UsageModal";
 export function DesktopShell() {
   const { t } = useTranslation();
   const setShowConnection = useUiStore((s) => s.setShowConnection);
+  const setShowConfig = useUiStore((s) => s.setShowConfig);
   const leftWidth = useUiStore((s) => s.leftWidth);
   const rightWidth = useUiStore((s) => s.rightWidth);
   const setLeftWidth = useUiStore((s) => s.setLeftWidth);
@@ -27,6 +30,14 @@ export function DesktopShell() {
   const setShowUsage = useUiStore((s) => s.setShowUsage);
   const { states, reachable, totalLive, active, activeState, activeSession, target, live } =
     useActiveSession();
+  const terminalHandleRef = useRef<TerminalHandle | null>(null);
+  const onTerminalReady = useCallback((handle: TerminalHandle | null) => {
+    terminalHandleRef.current = handle;
+  }, []);
+  const prepareAgentPrompt = useCallback(() => {
+    const handle = terminalHandleRef.current;
+    return (prompt: string) => submitPrompt(handle, prompt);
+  }, []);
 
   // Fit the stored side-panel widths to the live viewport so the terminal keeps
   // a usable minimum. Tracks window resizes; the resizers drive off these
@@ -46,12 +57,20 @@ export function DesktopShell() {
         <div className="health">
           <span className={"dot " + (reachable > 0 ? "ok" : "bad")} />
           {t("app.daemonSummary", { count: states.length, reachable, live: totalLive })}
+          <DeckModeLink />
           <button
             className="btn tiny conn-btn"
             onClick={() => setShowConnection(true)}
             title={t("app.manageTitle")}
           >
             {t("app.manage")}
+          </button>
+          <button
+            className="btn tiny conn-btn config-btn"
+            onClick={() => setShowConfig(true)}
+            title={t("app.configTitle")}
+          >
+            {t("app.config")}
           </button>
         </div>
       </header>
@@ -101,6 +120,7 @@ export function DesktopShell() {
                 target={target}
                 sessionId={activeSession.id}
                 live={live}
+                onReady={onTerminalReady}
               />
             ) : (
               <div className="empty big">{t("app.emptyTerminal")}</div>
@@ -115,7 +135,15 @@ export function DesktopShell() {
           label={t("app.resizeRight")}
         />
 
-        <RightPanel target={target} session={activeSession} />
+        <RightPanel
+          target={target}
+          session={activeSession}
+          preparePrompt={
+            live && activeSession && PROMPT_AGENTS.has(activeSession.agent_plugin_id)
+              ? prepareAgentPrompt
+              : undefined
+          }
+        />
       </div>
 
       {showUsage && activeSession && target && (

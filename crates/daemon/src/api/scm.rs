@@ -7,7 +7,7 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::source_control::MergeConflict;
+use crate::source_control::{MergeConflict, RebaseConflict};
 
 use super::paste::sniff_image_mime;
 use super::{AppError, AppState};
@@ -39,6 +39,27 @@ pub async fn status(
     let scm = state.scm.clone();
     let status = run_blocking(move || scm.status(&cwd)).await?;
     Ok(Json(json!({ "status": status })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DiscardBody {
+    path: String,
+}
+
+/// Discard all staged and unstaged changes for one entry in the current change
+/// set. The provider re-resolves the entry before mutating so the client cannot
+/// use this as a general-purpose file deletion endpoint.
+pub async fn discard(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<DiscardBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let cwd = session_cwd(&state, &id).await?;
+    let scm = state.scm.clone();
+    let path = body.path;
+    let result_path = path.clone();
+    run_blocking(move || scm.discard(&cwd, &path)).await?;
+    Ok(Json(json!({ "path": result_path })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,13 +111,53 @@ pub struct FileParams {
     side: DiffSide,
 }
 
+/// A client-supplied commit reaches git as a positional argument and, for the
+/// "before" side, as the base of a `<hash>^` parent expression. Restricting it
+/// to a bare hash here blocks both option injection and revision expressions.
+fn check_commit(commit: Option<&str>) -> Result<(), AppError> {
+    match commit {
+        Some(h) if !crate::source_control::is_commit_hash(h) => Err(AppError(
+            StatusCode::BAD_REQUEST,
+            "invalid commit hash".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Read one side of a file, as `file_bytes` wants it: `Ok(None)` both for a side
+/// that has no version at all (a new file's "before", a root commit's parent)
+/// and for a path absent at the resolved revision. Callers turn that into a 404.
+/// `resolve_commit` only ever sees controlled expressions.
+fn read_side(
+    scm: &dyn crate::source_control::SourceControl,
+    cwd: &std::path::Path,
+    path: &str,
+    side: DiffSide,
+    commit: Option<&str>,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let rev: Option<String> = match (side, commit) {
+        (DiffSide::After, None) => None,
+        (DiffSide::After, Some(h)) => Some(h.to_string()),
+        (DiffSide::Before, None) => match scm.resolve_commit(cwd, "HEAD")? {
+            Some(h) => Some(h),
+            None => return Ok(None), // empty repo — no prior version
+        },
+        (DiffSide::Before, Some(h)) => match scm.resolve_commit(cwd, &format!("{h}^"))? {
+            Some(h) => Some(h),
+            None => return Ok(None), // root commit — no parent version
+        },
+    };
+    scm.file_bytes(cwd, path, rev.as_deref())
+}
+
 /// Serve one side of a changed file's inline preview (images in the diff
 /// panel). Only recognised image types are returned: the `Content-Type` is
 /// sniffed from the leading bytes — never guessed from the path — and anything
-/// that isn't a known image is refused, so this can't be turned into a generic
-/// file reader or an XSS vector via a mislabelled extension. A side that has no
-/// content (a new file's "before", or a deleted file's "after") is a 404 the
-/// client renders as a one-sided diff.
+/// that isn't a known image is refused, so this can't be turned into an XSS
+/// vector via a mislabelled extension. (Whole-file *text* is served as JSON by
+/// `content` below, where no Content-Type is under the caller's influence.) A
+/// side that has no content (a new file's "before", or a deleted file's "after")
+/// is a 404 the client renders as a one-sided diff.
 pub async fn file(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -107,35 +168,11 @@ pub async fn file(
     let path = params.path.clone();
     let side = params.side;
     let commit = params.commit.clone();
+    check_commit(commit.as_deref())?;
 
-    // Validate a client-supplied commit up front: the "before" side builds a
-    // `<hash>^` parent expression from it, so it must be a bare hash and never
-    // anything git could read as an option.
-    if let Some(h) = commit.as_deref() {
-        if !crate::source_control::is_commit_hash(h) {
-            return Err(AppError(StatusCode::BAD_REQUEST, "invalid commit hash".into()));
-        }
-    }
-
-    let bytes = run_blocking(move || -> anyhow::Result<Option<Vec<u8>>> {
-        // Resolve the revision this side reads from; `None` means the working
-        // tree. `resolve_commit` only ever sees controlled expressions.
-        let rev: Option<String> = match (side, commit.as_deref()) {
-            (DiffSide::After, None) => None,
-            (DiffSide::After, Some(h)) => Some(h.to_string()),
-            (DiffSide::Before, None) => match scm.resolve_commit(&cwd, "HEAD")? {
-                Some(h) => Some(h),
-                None => return Ok(None), // empty repo — no prior version
-            },
-            (DiffSide::Before, Some(h)) => match scm.resolve_commit(&cwd, &format!("{h}^"))? {
-                Some(h) => Some(h),
-                None => return Ok(None), // root commit — no parent version
-            },
-        };
-        scm.file_bytes(&cwd, &path, rev.as_deref())
-    })
-    .await?
-    .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "no such file version".into()))?;
+    let bytes = run_blocking(move || read_side(&*scm, &cwd, &path, side, commit.as_deref()))
+        .await?
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "no such file version".into()))?;
 
     let mime = sniff_image_mime(&bytes).ok_or_else(|| {
         AppError(
@@ -154,6 +191,75 @@ pub async fn file(
         bytes,
     )
         .into_response())
+}
+
+/// A diff answers "what changed"; reading the file answers "what does this look
+/// like now". Rendering it costs a DOM node per line, so cap what we hand the
+/// browser well below `file_bytes`' 10 MB ceiling and say when we truncated —
+/// a silently short file reads as a corrupt one.
+const MAX_TEXT_BYTES: usize = 1024 * 1024;
+
+/// How much of the head of a file to search for a NUL before calling it text.
+/// Git's own binary heuristic looks at a comparable prefix.
+const BINARY_SNIFF_BYTES: usize = 8000;
+
+/// Whole-file text behind the diff viewer's "view whole file" mode, for both a
+/// working-tree file and a file as of a commit.
+///
+/// Unlike `file` this deliberately serves non-image content, so it is worth
+/// being explicit about why that is not the generic file reader `file` refuses
+/// to become: it reads through `file_bytes`, which rejects absolute paths and
+/// `..`, and confines the canonicalized result to the session's own working
+/// directory, so a symlink committed in the repo cannot walk out of it. The
+/// content comes back as a JSON string — never as a response body whose
+/// `Content-Type` a mislabelled extension could steer — and the same bytes are
+/// already reachable through `diff`, which renders an untracked file in full.
+pub async fn content(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<FileParams>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let cwd = session_cwd(&state, &id).await?;
+    let scm = state.scm.clone();
+    let path = params.path.clone();
+    let side = params.side;
+    let commit = params.commit.clone();
+    check_commit(commit.as_deref())?;
+
+    let bytes = run_blocking(move || read_side(&*scm, &cwd, &path, side, commit.as_deref()))
+        .await?
+        .ok_or_else(|| AppError(StatusCode::NOT_FOUND, "no such file version".into()))?;
+
+    // A NUL in the head is the signal that rendering this as lines of text would
+    // produce noise; report it as binary and let the client say so plainly.
+    if bytes.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0) {
+        return Ok(Json(json!({
+            "path": params.path,
+            "content": "",
+            "binary": true,
+            "truncated": false,
+        })));
+    }
+
+    let truncated = bytes.len() > MAX_TEXT_BYTES;
+    // Cut back to the last newline inside the cap so the final line shown is a
+    // whole one, rather than a line the file never contained.
+    let end = if truncated {
+        bytes[..MAX_TEXT_BYTES]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(MAX_TEXT_BYTES)
+    } else {
+        bytes.len()
+    };
+
+    Ok(Json(json!({
+        "path": params.path,
+        "content": String::from_utf8_lossy(&bytes[..end]),
+        "binary": false,
+        "truncated": truncated,
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -269,7 +375,9 @@ pub struct RebaseBody {
     onto: String,
 }
 
-/// Rebase the session's current branch onto another local branch.
+/// Rebase the session's current branch onto another local branch. A conflict is
+/// aborted and returned as 409 so the client can ask the live session itself to
+/// retry and resolve it, through the same terminal-input path as the commit action.
 pub async fn rebase(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -278,8 +386,16 @@ pub async fn rebase(
     let cwd = session_cwd(&state, &id).await?;
     let scm = state.scm.clone();
     let onto = body.onto;
-    let output = run_blocking(move || scm.rebase(&cwd, &onto)).await?;
-    Ok(Json(json!({ "output": output })))
+    let result = tokio::task::spawn_blocking(move || scm.rebase(&cwd, &onto, None))
+        .await
+        .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("task join: {e}")))?;
+    match result {
+        Ok(output) => Ok(Json(json!({ "output": output }))),
+        Err(e) if e.downcast_ref::<RebaseConflict>().is_some() => {
+            Err(AppError(StatusCode::CONFLICT, format!("{e:#}")))
+        }
+        Err(e) => Err(AppError::from(e)),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -287,7 +403,9 @@ pub struct MergeBody {
     target: String,
 }
 
-/// Merge the session's current branch into another local branch.
+/// Merge the session's current branch into another local branch. A conflict is
+/// aborted and returned as 409 so the client can hand the operation to the live
+/// session itself. Clean merges complete here without sending the agent anything.
 pub async fn merge(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -296,7 +414,7 @@ pub async fn merge(
     let cwd = session_cwd(&state, &id).await?;
     let scm = state.scm.clone();
     let target = body.target;
-    let result = tokio::task::spawn_blocking(move || scm.merge_to_branch(&cwd, &target))
+    let result = tokio::task::spawn_blocking(move || scm.merge_to_branch(&cwd, &target, None))
         .await
         .map_err(|e| AppError(StatusCode::INTERNAL_SERVER_ERROR, format!("task join: {e}")))?;
     match result {

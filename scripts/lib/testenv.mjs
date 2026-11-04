@@ -23,16 +23,34 @@
 // XDG_RUNTIME_DIR / XDG_DATA_HOME / XDG_CONFIG_HOME are repointed into the
 // sandbox so that even *default* path resolution cannot escape it.
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, existsSync, openSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
-import { join, dirname, resolve } from "node:path";
+import { join, dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer } from "node:net";
 
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
-export const DAEMON_BIN = join(ROOT, "target", "debug", "asm-daemon");
-export const ASMUX_BIN = join(ROOT, "target", "debug", "asmux");
+export const IS_WINDOWS = process.platform === "win32";
+const EXE = IS_WINDOWS ? ".exe" : "";
+
+/**
+ * The bash that runs the service scripts. On Windows that is Git Bash — and
+ * explicitly so: a bare `bash` on PATH can be System32's WSL launcher, which
+ * would run them inside Linux against a different filesystem.
+ */
+export const BASH = (() => {
+  if (process.env.ASM_BASH) return process.env.ASM_BASH;
+  if (!IS_WINDOWS) return "bash";
+  const roots = [process.env.ProgramFiles, process.env["ProgramFiles(x86)"], process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, "Programs")];
+  for (const root of roots.filter(Boolean)) {
+    const candidate = join(root, "Git", "bin", "bash.exe");
+    if (existsSync(candidate)) return candidate;
+  }
+  return "bash";
+})();
+export const DAEMON_BIN = join(ROOT, "target", "debug", `asm-daemon${EXE}`);
+export const ASMUX_BIN = join(ROOT, "target", "debug", `asmux${EXE}`);
 /** The built web client. Serve it from the daemon (ASM_STATIC_DIR) for same-origin UI tests. */
 export const CLIENT_DIST = join(ROOT, "client", "dist");
 
@@ -45,12 +63,18 @@ export const TINY_PNG = Buffer.from(
 );
 
 function findChrome() {
+  const programFiles = [process.env.ProgramFiles, process.env["ProgramFiles(x86)"], process.env.LOCALAPPDATA];
   const candidates = [
     process.env.CHROME_BIN,
     "/opt/google/chrome/chrome",
     "/usr/bin/google-chrome",
     "/usr/bin/chromium",
     "/usr/bin/chromium-browser",
+    // Windows: Chrome, else Edge (also Chromium, so the same CDP flags work).
+    ...programFiles.filter(Boolean).flatMap((d) => [
+      join(d, "Google", "Chrome", "Application", "chrome.exe"),
+      join(d, "Microsoft", "Edge", "Application", "msedge.exe"),
+    ]),
   ].filter(Boolean);
   for (const c of candidates) if (existsSync(c)) return c;
   throw new Error("no Chrome found — install one or set CHROME_BIN");
@@ -81,7 +105,10 @@ export function cdpConnect(wsUrl) {
 
 /** The real, live installation. Nothing a test spawns may touch these. */
 export function prodPaths() {
-  const xdgRun = process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid?.() ?? 1000}`;
+  // Windows has no /run/user: the service scripts (Git Bash) default to
+  // $XDG_RUNTIME_DIR, else /tmp — which MSYS maps to the user's %TEMP%.
+  const defaultRun = IS_WINDOWS ? tmpdir() : `/run/user/${process.getuid?.() ?? 1000}`;
+  const xdgRun = process.env.XDG_RUNTIME_DIR || defaultRun;
   return {
     socket: resolve(xdgRun, "asm", "asmux.sock"),
     runtimeDir: resolve(xdgRun, "asm"),
@@ -160,7 +187,7 @@ export async function createSandbox(name = "asm-test") {
   // Tripwire. If any of this is ever false we are about to touch the real
   // install, and it is better to fail the test than to eat someone's sessions.
   const guard = () => {
-    const under = (p) => resolve(p).startsWith(resolve(tmp) + "/");
+    const under = (p) => resolve(p).startsWith(resolve(tmp) + sep);
     if (!under(socket) || !under(dataDir) || !under(runDir)) {
       throw new Error(`sandbox escaped its tmpdir: socket=${socket} data=${dataDir}`);
     }
@@ -175,7 +202,8 @@ export async function createSandbox(name = "asm-test") {
   /** Hermetic child env: clean base, private XDG, explicit ASM_* on top. */
   const env = (extra = {}) => ({
     ...cleanEnv(),
-    HOME: process.env.HOME, // keep: git/agent binaries need it
+    // keep: git/agent binaries need it (Windows keeps USERPROFILE via cleanEnv)
+    ...(process.env.HOME !== undefined && { HOME: process.env.HOME }),
     XDG_RUNTIME_DIR: xdgDir,
     XDG_DATA_HOME: join(xdgDir, "data"),
     XDG_CONFIG_HOME: join(xdgDir, "config"),
@@ -218,9 +246,21 @@ export async function createSandbox(name = "asm-test") {
     /** The holder. Only sidecar/durability tests need this. Detached: it must outlive the daemon. */
     async startAsmux() {
       startProc("asmux", ASMUX_BIN, {}, { detached: true });
-      for (let i = 0; i < 50 && !existsSync(socket); i++) await sleep(100);
-      if (!existsSync(socket)) throw new Error(`asmux socket never appeared at ${socket}`);
+      for (let i = 0; i < 50 && !sb.holderUp(); i++) await sleep(100);
+      if (!sb.holderUp()) {
+        throw new Error(`asmux never came up at ${socket} — see ${sb.logPath("asmux")}`);
+      }
       return socket;
+    },
+
+    /**
+     * Is the sandbox's holder up? A UDS shows up as a file. A Windows named
+     * pipe does not, so there ask the holder itself (`asmux probe` exits 0
+     * once a live holder answers on this sandbox's socket path).
+     */
+    holderUp() {
+      if (!IS_WINDOWS) return existsSync(socket);
+      return spawnSync(ASMUX_BIN, ["probe"], { env: env(), stdio: "ignore" }).status === 0;
     },
 
     /** Spawn a daemon and wait for /health. `backend` defaults to native (no holder needed). */
@@ -262,6 +302,13 @@ export async function createSandbox(name = "asm-test") {
           "--disable-dev-shm-usage",
           "--no-first-run",
           "--noerrdialogs",
+          // Layout must not depend on the host: a fixed desktop window, 1x
+          // pixels, and a mouse-like pointer — on a touchscreen machine Chrome
+          // otherwise reports `pointer: coarse` and the client (rightly) picks
+          // its touch layout. Mobile tests opt in through CDP emulation.
+          "--window-size=1280,800",
+          "--force-device-scale-factor=1",
+          "--blink-settings=primaryPointerType=4,availablePointerTypes=4,primaryHoverType=2,availableHoverTypes=2",
           `--remote-debugging-port=${cdpPort}`,
           `--user-data-dir=${profile}`,
           "about:blank",
@@ -413,7 +460,8 @@ export async function createSandbox(name = "asm-test") {
         }
       }
       try {
-        rmSync(tmp, { recursive: true, force: true });
+        // Retries: Windows keeps a killed process's files locked for a moment.
+        rmSync(tmp, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
       } catch {
         /* best effort */
       }

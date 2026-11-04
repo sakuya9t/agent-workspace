@@ -4,14 +4,15 @@ import { useUiStore } from "../store";
 import { daemonLabel } from "../connectionStore";
 import { useActiveSession } from "../useActiveSession";
 import { useVisualViewportHeight } from "../useVisualViewportHeight";
-import { USAGE_AGENTS } from "../agents";
-import { CtrlLatch, TerminalHandle } from "../terminalTypes";
+import { PROMPT_AGENTS, USAGE_AGENTS } from "../agents";
+import { CtrlLatch, TerminalHandle, submitPrompt } from "../terminalTypes";
 import { statusLabel } from "../i18n/labels";
 import { SessionList } from "./SessionList";
 import { TerminalView } from "./Terminal";
 import { TermKeyBar } from "./TermKeyBar";
 import { RightPanel } from "./RightPanel";
 import { UsageModal } from "./UsageModal";
+import { DeckModeLink } from "./DeckModeLink";
 
 /**
  * Mirror the mobile UI layer stack (home → terminal → details sheet) onto the
@@ -95,6 +96,10 @@ export function MobileShell() {
     handleRef.current = h;
     if (!h) setScrolledAway(false); // terminal went away; so did its scroll
   }, []);
+  const prepareAgentPrompt = useCallback(() => {
+    const handle = handleRef.current;
+    return (prompt: string) => submitPrompt(handle, prompt);
+  }, []);
 
   // Track the visual viewport so the key bar stays above the soft keyboard.
   const vh = useVisualViewportHeight();
@@ -110,6 +115,7 @@ export function MobileShell() {
       <div className="mobile-shell" style={shellStyle}>
         <header className="mobile-home-header">
           <span className="brand">{t("app.title")}</span>
+          <DeckModeLink />
           <span className="health">
             <span className={"dot " + (reachable > 0 ? "ok" : "bad")} />
             {t("app.daemonSummary", { count: states.length, reachable, live: totalLive })}
@@ -192,7 +198,15 @@ export function MobileShell() {
             onClick={(e) => e.stopPropagation()}
           >
             <button className="details-sheet-handle" onClick={back} aria-label={t("common.close")} />
-            <RightPanel target={target} session={activeSession} />
+            <RightPanel
+              target={target}
+              session={activeSession}
+              preparePrompt={
+                live && activeSession && PROMPT_AGENTS.has(activeSession.agent_plugin_id)
+                  ? prepareAgentPrompt
+                  : undefined
+              }
+            />
           </div>
         </div>
       )}

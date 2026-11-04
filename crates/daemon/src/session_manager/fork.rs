@@ -188,7 +188,7 @@ impl SessionManager {
         // `build_fork` returning `Some` *is* the capability — probing it keeps
         // "can this agent fork natively" from drifting away from "how".
         let can_fork_natively = target
-            .build_fork(&AgentContext::default(), "probe", "probe")
+            .build_fork(&AgentContext::default(), "probe", "probe", Path::new("."))
             .is_some();
         // Claude finds a conversation by cwd, so it can only resume one when the
         // fork lands in the origin's directory. Codex addresses rollouts by uuid
@@ -225,6 +225,7 @@ impl SessionManager {
         let cx = TranscriptContext {
             cwd: PathBuf::from(&origin.working_directory),
             started_at_ms: origin.created_at,
+            native_session_id: origin.agent_session_id.clone(),
         };
 
         let digest = origin_plugin.as_ref().and_then(|p| p.digest(&cx));
@@ -268,16 +269,17 @@ impl SessionManager {
     ) -> Result<LaunchSpec> {
         match &plan.seed {
             ForkSeed::Native { native_id } => plugin
-                .build_fork(ctx, native_id, SEED_NATIVE)
+                .build_fork(ctx, native_id, SEED_NATIVE, Path::new(cwd))
                 .ok_or_else(|| anyhow!("`{}` cannot fork a conversation natively", plugin.id()))?,
             ForkSeed::Brief { markdown } => {
                 let rel = write_brief(Path::new(cwd), &plan.origin_id, markdown)?;
                 // A shell would run a trailing argument as a script rather than
-                // read it, so only agents that take an opening prompt get one. The
-                // brief is on disk either way, which is exactly what a shell needs:
-                // a file to `cat`.
-                if plugin.accepts_seed_prompt() {
-                    ctx.extra_args.push(seed_brief(&rel));
+                // read it, so only agents that take an opening prompt get one — and
+                // each encodes it its own way (see `seed_prompt_args`). The brief is
+                // on disk either way, which is exactly what a shell needs: a file to
+                // `cat`.
+                if let Some(seed_args) = plugin.seed_prompt_args(&seed_brief(&rel)) {
+                    ctx.extra_args.extend(seed_args);
                 }
                 plugin.build_launch(ctx)
             }

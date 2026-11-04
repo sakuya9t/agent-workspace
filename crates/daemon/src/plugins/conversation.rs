@@ -1,7 +1,8 @@
 //! Readable conversation export — what "Save conversation" hands the user.
 //!
 //! The recorded PTY stream is *not* a transcript. It is what a TUI sent a
-//! terminal, and both agents drive one (see `docs/terminal-scrollback.md`):
+//! terminal, and every one of these agents drives one (see
+//! `docs/terminal-scrollback.md`):
 //! Claude paints from the **alternate screen**, which by definition has no
 //! scrollback, so its stream is a repaint movie — tens of MB of frames of the
 //! same screen, of which only the last frame is coherent. Codex scrolls the
@@ -10,10 +11,10 @@
 //! user a wall of `ESC[38;2;…m` and `ESC[60G`, and stripping the escapes just
 //! turns that into noise: the frames stay, the prose doesn't appear.
 //!
-//! So the export reads the agent's own file instead. Both agents persist a
-//! structured per-session JSONL, and [`super::usage`] already locates it for the
-//! token counters; this module renders that same file to Markdown — user turns,
-//! agent turns, and the tool calls between them.
+//! So the export reads the agent's own file instead. Claude, Codex and pi each
+//! persist a structured per-session JSONL, and [`super::usage`] already locates
+//! it for the token counters; this module renders that same file to Markdown —
+//! user turns, agent turns, and the tool calls between them.
 //!
 //! Tool inputs and outputs are clipped ([`CLIP_LINES`] / [`CLIP_CHARS`]). The
 //! export is meant to be read — and pasted into a fresh session to carry context
@@ -26,7 +27,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::title::clip_title;
-use super::usage::{claude_transcript_path, codex_rollout_path, TranscriptContext};
+use super::usage::{claude_transcript_path, codex_rollout_path, pi_session_path, TranscriptContext};
 
 /// Per-block clip for tool inputs and outputs: enough to see what ran and how it
 /// came back, without pasting a whole file listing into the document.
@@ -220,6 +221,120 @@ fn first_user_line(body: &str) -> Option<String> {
     clip_title(first)
 }
 
+// ---------- pi ----------
+
+/// Render a pi session's own JSONL as Markdown. `None` as above.
+pub fn pi_conversation(cx: &TranscriptContext) -> Option<String> {
+    let path = pi_session_path(cx)?;
+    let text = fs::read_to_string(&path).ok()?;
+    let body = render_pi(&text, "pi");
+    if body.trim().is_empty() {
+        return None;
+    }
+    let title = pi_title(&text)
+        .or_else(|| first_user_line(&body))
+        .unwrap_or_else(|| "pi session".into());
+    Some(document(&title, "pi", &cx.cwd, &path, &body))
+}
+
+/// The name the user gave the session (`/name`, `--name`), from the last
+/// `session_info` entry. Shared with [`super::title`]. pi never names a session
+/// on its own, so most sessions have none.
+pub(crate) fn pi_title(text: &str) -> Option<String> {
+    let mut title = None;
+    for line in text.lines() {
+        if !line.contains("session_info") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["type"] == "session_info" {
+            if let Some(t) = v["name"].as_str().filter(|t| !t.is_empty()) {
+                title = Some(t.to_string());
+            }
+        }
+    }
+    title
+}
+
+/// pi's JSONL: a `session` header, then one `message` entry per turn whose
+/// `message` is the whole `AgentMessage` — an assistant turn carries its text,
+/// thinking and tool calls as one content array, and each tool's answer arrives
+/// as a separate `toolResult` entry.
+///
+/// The entries form a *tree* (`/tree` branches in place, keeping both paths in
+/// one file), and this renders them in file order, so a session the user
+/// branched shows every path it explored rather than just the live one.
+fn render_pi(text: &str, agent: &str) -> String {
+    let mut md = Md::new(agent);
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["type"] != "message" {
+            continue;
+        }
+        let ts = v["timestamp"].as_str();
+        let m = &v["message"];
+        let content = &m["content"];
+
+        match m["role"].as_str().unwrap_or_default() {
+            // `content` is a bare string for a typed prompt, an array once it
+            // carries attachments.
+            "user" | "custom" => match content {
+                Value::String(s) => md.turn(Speaker::User, ts, s),
+                Value::Array(blocks) => {
+                    for b in blocks {
+                        match b["type"].as_str() {
+                            Some("text") => {
+                                md.turn(Speaker::User, ts, b["text"].as_str().unwrap_or_default())
+                            }
+                            Some("image") => md.tool_result("[image]"),
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            },
+            "assistant" => {
+                if let Value::Array(blocks) = content {
+                    for b in blocks {
+                        match b["type"].as_str() {
+                            Some("text") => {
+                                md.turn(Speaker::Agent, ts, b["text"].as_str().unwrap_or_default())
+                            }
+                            Some("toolCall") => {
+                                md.speak(Speaker::Agent, ts);
+                                md.tool_call(
+                                    b["name"].as_str().unwrap_or("tool"),
+                                    &b["arguments"],
+                                );
+                            }
+                            // `thinking` is reasoning, not conversation.
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            "toolResult" => md.tool_result(&block_text(content)),
+            // A `!command` the *user* ran in pi's own shell — the command and its
+            // output, with no model turn between them.
+            "bashExecution" => {
+                md.speak(Speaker::User, ts);
+                md.tool_call("bash", &m["command"]);
+                md.tool_result(m["output"].as_str().unwrap_or_default());
+            }
+            // A compaction or branch summary stands in for the turns it replaced.
+            "compactionSummary" | "branchSummary" => {
+                md.turn(Speaker::Agent, ts, m["summary"].as_str().unwrap_or_default())
+            }
+            _ => {}
+        }
+    }
+    md.out
+}
+
 // ---------- Markdown assembly ----------
 
 #[derive(Clone, Copy, PartialEq)]
@@ -299,16 +414,17 @@ impl Md {
     }
 }
 
-/// Render a tool's input as `(fence language, text)`. Handles both agents'
-/// shapes: Codex passes a bare string, Claude an object whose interesting field
-/// is usually a command or a path.
+/// Render a tool's input as `(fence language, text)`. Handles every agent's
+/// shape: Codex passes a bare string, while Claude and pi pass an object whose
+/// interesting field is usually a command or a path (`file_path` for Claude,
+/// `path` for pi).
 fn tool_input(input: &Value) -> (&'static str, String) {
     match input {
         Value::String(s) => ("", s.clone()),
         Value::Object(_) => {
             if let Some(cmd) = input["command"].as_str() {
                 ("sh", cmd.to_string())
-            } else if let Some(path) = input["file_path"].as_str() {
+            } else if let Some(path) = input["file_path"].as_str().or(input["path"].as_str()) {
                 ("", path.to_string())
             } else {
                 (
@@ -505,6 +621,44 @@ mod tests {
         assert!(out.trim_end().ends_with("\n````"), "{out}");
     }
 
+    const PI: &str = concat!(
+        r#"{"type":"session","version":3,"id":"7c9","timestamp":"2026-08-20T09:00:00.000Z","cwd":"/repo"}"#,
+        "\n",
+        r#"{"type":"session_info","id":"s1","parentId":null,"timestamp":"2026-08-20T09:00:00.000Z","name":"Refactor auth"}"#,
+        "\n",
+        r#"{"type":"message","id":"a1","parentId":"s1","timestamp":"2026-08-20T09:00:01.000Z","message":{"role":"user","content":"Rename the token helper."}}"#,
+        "\n",
+        r#"{"type":"message","id":"b2","parentId":"a1","timestamp":"2026-08-20T09:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"secret"},{"type":"text","text":"On it."},{"type":"toolCall","id":"t1","name":"bash","arguments":{"command":"grep -rn token src/"}}],"provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2},"stopReason":"toolUse"}}"#,
+        "\n",
+        r#"{"type":"message","id":"c3","parentId":"b2","timestamp":"2026-08-20T09:00:03.000Z","message":{"role":"toolResult","toolCallId":"t1","toolName":"bash","content":[{"type":"text","text":"src/auth.ts:12"}],"isError":false}}"#,
+        "\n",
+        r#"{"type":"message","id":"d4","parentId":"c3","timestamp":"2026-08-20T09:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Renamed it."}],"provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2},"stopReason":"stop"}}"#,
+        "\n",
+        r#"{"type":"custom","id":"e5","parentId":"d4","timestamp":"2026-08-20T09:00:05.000Z","customType":"my-ext","data":{"count":42}}"#,
+    );
+
+    #[test]
+    fn pi_renders_turns_tools_and_results() {
+        let md = render_pi(PI, "pi");
+        assert!(md.contains("## User \u{b7} 2026-08-20 09:00:01"), "{md}");
+        assert!(md.contains("Rename the token helper."));
+        assert!(md.contains("## pi \u{b7} 2026-08-20 09:00:02"), "{md}");
+        assert!(md.contains("**bash**"));
+        assert!(md.contains("grep -rn token src/"));
+        assert!(md.contains("src/auth.ts:12"));
+        assert!(md.contains("Renamed it."));
+        // Reasoning is not conversation, and a `custom` entry is extension state.
+        assert!(!md.contains("secret"), "reasoning leaked: {md}");
+        assert!(!md.contains("42"), "extension state leaked: {md}");
+    }
+
+    #[test]
+    fn pi_title_reads_the_last_session_name() {
+        assert_eq!(pi_title(PI).as_deref(), Some("Refactor auth"));
+        // A session the user never named has none.
+        assert_eq!(pi_title(r#"{"type":"session","id":"x"}"#), None);
+    }
+
     #[test]
     fn empty_transcript_renders_nothing() {
         assert!(
@@ -513,5 +667,12 @@ mod tests {
                 .is_empty()
         );
         assert!(render_codex("not json\n", "Codex").trim().is_empty());
+        // A header and an extension-state entry carry no conversation.
+        assert!(render_pi(
+            r#"{"type":"session","version":3,"id":"x","cwd":"/repo"}"#,
+            "pi"
+        )
+        .trim()
+        .is_empty());
     }
 }

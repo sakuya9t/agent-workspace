@@ -12,7 +12,7 @@
 //! daemon's job (see `docs/asmux-protocol.md` → Never-crash invariants).
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -102,6 +102,15 @@ pub struct Session {
     metadata: Mutex<Vec<(String, String)>>,
     /// Woken on every ring append and on child exit, so a streamer can flush.
     data_signal: Arc<Notify>,
+    /// How many times the reader thread had to discard PTY output because the
+    /// ring could not allocate space for it, and how many bytes that cost.
+    ///
+    /// A failed push leaves `head` where it was, so the loss produces no cursor
+    /// gap and no reader can infer it — under exactly the memory pressure the
+    /// never-crash design exists to survive, output would vanish with no log and
+    /// no signal. Counting it is what makes `ALLOC_FAILED` reportable.
+    dropped_events: AtomicU64,
+    dropped_bytes: AtomicU64,
 
     // Live-child handles. All three are released (set to `None`) by the reader
     // thread once the child is reaped, so a *tombstone* no longer pins a PTY
@@ -125,10 +134,22 @@ pub struct Session {
 /// Claude Code launched with them treats itself as a nested *child* session of
 /// the outer one and stops writing its own per-project transcript, which
 /// breaks per-session usage reporting (and any other transcript consumer).
+///
+/// The service scripts also export the install's startup secrets (relay keys,
+/// the UI proxy token, the enrollment token) to the processes they launch; an
+/// agent's shell has no business seeing them, so they are removed too.
 /// Explicit `SpawnSpec.env` entries are applied after this, so a caller can
 /// still set these deliberately.
 pub fn scrub_inherited_agent_env(cmd: &mut CommandBuilder) {
-    const EXACT: &[&str] = &["CLAUDECODE", "CLAUDE_EFFORT", "AI_AGENT"];
+    const EXACT: &[&str] = &[
+        "CLAUDECODE",
+        "CLAUDE_EFFORT",
+        "AI_AGENT",
+        "ASM_ENROLLMENT_TOKEN",
+        "ASM_RELAY_KEY",
+        "ASM_RELAY_KEYS",
+        "ASM_UI_DAEMON_TOKEN",
+    ];
     const PREFIXES: &[&str] = &["CLAUDE_CODE_", "CODEX_SANDBOX"];
     for (key, _) in std::env::vars_os() {
         let Some(k) = key.to_str() else { continue };
@@ -204,6 +225,8 @@ impl Session {
             status: Mutex::new(Status::Running),
             metadata: Mutex::new(spec.metadata),
             data_signal: data_signal.clone(),
+            dropped_events: AtomicU64::new(0),
+            dropped_bytes: AtomicU64::new(0),
             master: Mutex::new(Some(pair.master)),
             killer: Mutex::new(Some(killer)),
             input_tx: Mutex::new(Some(input_tx)),
@@ -211,13 +234,14 @@ impl Session {
             attacher: Mutex::new(None),
         });
 
-        // Reader thread.
+        // Reader thread (plus, on Windows, the waiter `exit_watch` starts).
         {
+            let final_status = exit_watch(&session, child)?;
             let session = session.clone();
             let id = spec.session_id.clone();
             std::thread::Builder::new()
                 .name(format!("asmux-rd-{}", short(&id)))
-                .spawn(move || reader_loop(reader, session, child))
+                .spawn(move || reader_loop(reader, session, final_status))
                 .map_err(|e| SpawnError::Spawn(format!("reader thread: {e}")))?;
         }
         // Writer thread.
@@ -276,6 +300,39 @@ impl Session {
     /// (`Notify` stores a single permit).
     pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.data_signal.notified()
+    }
+
+    /// Record that `bytes` of PTY output could not be stored, and say so.
+    ///
+    /// Called by the reader thread when the ring's fallible reserve fails. The
+    /// never-crash rule says drop the chunk rather than abort the holder; the
+    /// invariants also promise the loss surfaces as `ALLOC_FAILED`, and until
+    /// this existed only the first half was true. The counter is what a streamer
+    /// polls to turn the drop into an unsolicited `Error` frame for the
+    /// attacher, so the wake matters as much as the log.
+    pub fn note_output_dropped(&self, bytes: usize) {
+        let events = self
+            .dropped_events
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let total = self
+            .dropped_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed)
+            .saturating_add(bytes as u64);
+        tracing::error!(
+            session = %self.id,
+            bytes,
+            dropped_events = events,
+            dropped_bytes = total,
+            "ring allocation failed: PTY output dropped (recorded stream now has a hole)"
+        );
+        self.data_signal.notify_one();
+    }
+
+    /// How many times output has been dropped for this session. Monotonic; a
+    /// streamer reports every increase it observes.
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped_events.load(Ordering::Relaxed)
     }
 
     /// Copy up to `max` bytes at cursor `from` (0 => a default chunk).
@@ -353,6 +410,8 @@ impl Session {
                 return;
             }
         }
+        #[cfg(not(unix))]
+        let _ = signal; // no signals: every kill is a terminate
         // signal == 0, unknown signal, or non-unix: the default terminate.
         if let Some(k) = self.killer.lock().as_mut() {
             let _ = k.kill();
@@ -366,9 +425,13 @@ impl Session {
     /// from the reader thread after the child is reaped. The ring and status are
     /// deliberately left intact for the tombstone.
     fn release_child_handles(&self) {
-        *self.master.lock() = None;
-        *self.killer.lock() = None;
-        *self.input_tx.lock() = None;
+        // Take them out first and drop outside the locks: on Windows dropping the
+        // master closes the pseudoconsole, which waits for conhost to flush, and
+        // nothing (a racing `resize`) should be stuck behind the lock meanwhile.
+        let master = self.master.lock().take();
+        let killer = self.killer.lock().take();
+        let input = self.input_tx.lock().take();
+        drop((master, killer, input));
     }
 
     pub fn metadata(&self) -> Vec<(String, String)> {
@@ -430,17 +493,66 @@ impl Session {
     }
 }
 
-/// Reader thread: blocking PTY reads → ring, wake streamer, then reap.
-fn reader_loop(mut reader: Box<dyn Read + Send>, session: Arc<Session>, mut child: Box<dyn Child + Send + Sync>) {
+/// How the reader thread learns the child's exit status once output has ended.
+///
+/// On Unix the reader reaps the child itself: the slave side closes when the
+/// child exits, the master read hits EOF, and `waitpid` follows.
+#[cfg(not(windows))]
+fn exit_watch(
+    session: &Arc<Session>,
+    mut child: Box<dyn Child + Send + Sync>,
+) -> Result<impl FnOnce() -> Status + Send + 'static, SpawnError> {
+    let pid = session.pid;
+    Ok(move || reap(pid, &mut child))
+}
+
+/// On Windows the output never ends by itself: ConPTY holds its end of the
+/// output pipe open until the *pseudoconsole* is closed, which happens only when
+/// the last master/slave handle drops — so a reader waiting for EOF after the
+/// child exits waits forever (and the session reads as alive forever). A waiter
+/// thread therefore reaps the child and then releases the live handles,
+/// closing the pseudoconsole; conhost flushes, exits, and the reader's EOF
+/// follows. The reader still records the status, after it has drained every
+/// byte, exactly as on Unix.
+#[cfg(windows)]
+fn exit_watch(
+    session: &Arc<Session>,
+    mut child: Box<dyn Child + Send + Sync>,
+) -> Result<impl FnOnce() -> Status + Send + 'static, SpawnError> {
+    let (tx, rx) = std::sync::mpsc::channel::<Status>();
+    let waiter = session.clone();
+    std::thread::Builder::new()
+        .name(format!("asmux-wt-{}", short(&session.id)))
+        .spawn(move || {
+            let status = reap(waiter.pid, &mut child);
+            let _ = tx.send(status);
+            waiter.release_child_handles();
+        })
+        .map_err(|e| SpawnError::Spawn(format!("waiter thread: {e}")))?;
+    Ok(move || rx.recv().unwrap_or(Status::Exited { code: -1, signal: 0 }))
+}
+
+/// Reader thread: blocking PTY reads → ring, wake streamer, then record the exit.
+fn reader_loop(
+    mut reader: Box<dyn Read + Send>,
+    session: Arc<Session>,
+    final_status: impl FnOnce() -> Status,
+) {
     let mut buf = [0u8; READ_BUF];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
                 if let Some(chunk) = buf.get(..n) {
-                    // A failed ring alloc (ALLOC_FAILED territory) must not crash
-                    // the holder: drop the chunk, keep the session readable.
-                    let _ = session.ring.lock().push(chunk);
+                    // A failed ring alloc must not crash the holder: drop the
+                    // chunk, keep the session readable — but never silently.
+                    // `note_output_dropped` is what turns this into a logged,
+                    // reportable `ALLOC_FAILED` instead of output that simply
+                    // ceases to exist. (Logging happens outside the ring lock.)
+                    let dropped = session.ring.lock().push(chunk).is_err();
+                    if dropped {
+                        session.note_output_dropped(chunk.len());
+                    }
                     session.data_signal.notify_one();
                 }
             }
@@ -449,27 +561,7 @@ fn reader_loop(mut reader: Box<dyn Read + Send>, session: Arc<Session>, mut chil
         }
     }
 
-    let status = match child.wait() {
-        Ok(es) => {
-            if es.success() {
-                Status::Exited {
-                    code: 0,
-                    signal: 0,
-                }
-            } else {
-                // portable_pty does not surface the signal separately; record the
-                // raw code. Signal decomposition is a daemon-side refinement.
-                Status::Exited {
-                    code: es.exit_code() as i32,
-                    signal: 0,
-                }
-            }
-        }
-        Err(_) => Status::Exited {
-            code: -1,
-            signal: 0,
-        },
-    };
+    let status = final_status();
     *session.status.lock() = status;
     // The child is gone. Release the live-only handles so this tombstone stops
     // pinning a PTY master fd and an idle writer thread; the ring (recorded
@@ -477,6 +569,53 @@ fn reader_loop(mut reader: Box<dyn Read + Send>, session: Arc<Session>, mut chil
     session.release_child_handles();
     // Wake the streamer so it can flush the tail and emit SessionExited.
     session.data_signal.notify_one();
+}
+
+/// Reap the exited child and record **how** it died.
+///
+/// Not `portable_pty::Child::wait`, which flattens the wait status: a signalled
+/// child comes back as `code = 1` (indistinguishable from `exit(1)`) plus a
+/// locale-dependent signal *name* the crate exposes through nothing but
+/// `Display`. The wire contract is the opposite — `exit_signal != 0` means the
+/// child was signalled, and `exit_code` is meaningful only when it is zero — and
+/// the daemon classifies the session's outcome from exactly that field. Reported
+/// as `signal: 0`, a `kill -9`'d agent read as a clean exit all the way up into
+/// the UI.
+///
+/// `waitpid` on the pid we already keep for `kill` gives the real thing. It
+/// reaps no earlier than `child.wait()` did, on the same pid the killer uses, so
+/// it opens no window that did not already exist; `child` stays owned here so
+/// nothing else can race us to the corpse.
+fn reap(pid: i32, child: &mut Box<dyn Child + Send + Sync>) -> Status {
+    #[cfg(unix)]
+    {
+        use nix::sys::wait::{waitpid, WaitStatus};
+        match waitpid(nix::unistd::Pid::from_raw(pid), None) {
+            Ok(WaitStatus::Exited(_, code)) => return Status::Exited { code, signal: 0 },
+            Ok(WaitStatus::Signaled(_, sig, _)) => {
+                return Status::Exited {
+                    code: -1,
+                    signal: sig as i32,
+                }
+            }
+            // Stopped/Continued need WUNTRACED/WCONTINUED, which we don't pass,
+            // so anything else here means the child was already reaped (ECHILD)
+            // or the call failed. Fall through and take what portable_pty has.
+            Ok(_) | Err(_) => {}
+        }
+    }
+    let _ = pid; // only the reaping path above uses it
+    match child.wait() {
+        Ok(es) if es.success() => Status::Exited { code: 0, signal: 0 },
+        Ok(es) => Status::Exited {
+            code: es.exit_code() as i32,
+            signal: 0,
+        },
+        Err(_) => Status::Exited {
+            code: -1,
+            signal: 0,
+        },
+    }
 }
 
 /// Writer thread: drain the input queue into the PTY with blocking writes.
@@ -541,10 +680,15 @@ mod tests {
         std::env::set_var("CLAUDE_CODE_SESSION_ID", "outer-session");
         std::env::set_var("CLAUDECODE", "1");
         std::env::set_var("CLAUDE_CONFIG_DIR", "/keep/me");
+        std::env::set_var("ASM_RELAY_KEYS", "relay-secret");
+        std::env::set_var("ASM_ENROLLMENT_TOKEN", "enroll-secret");
         let mut cmd = CommandBuilder::new("true");
         scrub_inherited_agent_env(&mut cmd);
         assert_eq!(cmd.get_env("CLAUDE_CODE_SESSION_ID"), None);
         assert_eq!(cmd.get_env("CLAUDECODE"), None);
+        // Startup secrets exported by the service scripts never reach a session.
+        assert_eq!(cmd.get_env("ASM_RELAY_KEYS"), None);
+        assert_eq!(cmd.get_env("ASM_ENROLLMENT_TOKEN"), None);
         // User-level config vars survive the scrub…
         assert!(cmd.get_env("CLAUDE_CONFIG_DIR").is_some());
         // …and an explicit spec env applied afterwards still wins.
@@ -555,6 +699,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn tombstone_releases_pty_master_and_writer_thread() {
         let session = Session::spawn(spec("/bin/sh", &["-c", "exit 0"])).unwrap();
@@ -569,6 +714,33 @@ mod tests {
         assert!(!session.record().alive);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_normal_exit_records_its_code_and_no_signal() {
+        let session = Session::spawn(spec("/bin/sh", &["-c", "exit 7"])).unwrap();
+        assert!(wait_until(5, || !session.is_alive()));
+        assert_eq!(session.status(), Status::Exited { code: 7, signal: 0 });
+        let rec = session.record();
+        assert_eq!((rec.exit_code, rec.exit_signal), (7, 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_signalled_child_reports_the_signal_not_a_clean_exit() {
+        // The defect this guards: the holder recorded `signal: 0` for every
+        // outcome, so a killed agent arrived at the daemon — and the UI — as an
+        // ordinary exit. `cat` waits forever, so the only way out is the signal.
+        let session = Session::spawn(spec("/bin/cat", &[])).unwrap();
+        assert!(session.is_alive());
+        session.kill(9);
+        assert!(wait_until(5, || !session.is_alive()), "cat should be killed");
+        assert_eq!(session.status(), Status::Exited { code: -1, signal: 9 });
+        let rec = session.record();
+        assert!(!rec.alive);
+        assert_eq!(rec.exit_signal, 9, "SIGKILL must survive to the wire record");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn live_session_holds_handles_and_echoes() {
         // `cat` stays alive echoing stdin; handles must remain held while alive.
@@ -579,5 +751,51 @@ mod tests {
         session.kill(0);
         assert!(wait_until(5, || !session.is_alive()), "cat should exit on kill");
         assert!(wait_until(2, || !session.holds_child_handles()));
+    }
+
+    /// Everything the ring holds, as text.
+    #[cfg(windows)]
+    fn ring_text(session: &Session) -> String {
+        match session.read_at(session.tail(), 1024 * 1024) {
+            ReadOutcome::Data { data, .. } => String::from_utf8_lossy(&data).into_owned(),
+            _ => String::new(),
+        }
+    }
+
+    // The ConPTY regression: the pseudoconsole keeps the output pipe open after
+    // the child exits, so without the waiter a finished command stayed "alive"
+    // forever and its handles were never released.
+    #[cfg(windows)]
+    #[test]
+    fn an_exited_conpty_child_becomes_a_tombstone_with_its_code() {
+        let session = Session::spawn(spec("cmd.exe", &["/d", "/c", "echo done-marker & exit 7"])).unwrap();
+        assert!(wait_until(10, || !session.is_alive()), "child exit must end the session");
+        assert_eq!(session.status(), Status::Exited { code: 7, signal: 0 });
+        assert!(
+            wait_until(2, || !session.holds_child_handles()),
+            "tombstone must release the pseudoconsole and input channel"
+        );
+        // Output written just before exit was drained, not cut off.
+        assert!(ring_text(&session).contains("done-marker"), "{:?}", ring_text(&session));
+        assert_eq!(session.send_input(b"x"), InputOutcome::NotAlive);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_live_conpty_session_echoes_and_dies_on_kill() {
+        let session = Session::spawn(spec("cmd.exe", &["/d", "/q"])).unwrap();
+        assert!(session.is_alive());
+        assert!(session.holds_child_handles());
+        assert_eq!(session.send_input(b"echo ping-%USERNAME%-pong\r"), InputOutcome::Queued);
+        assert!(
+            wait_until(10, || ring_text(&session).contains("-pong")),
+            "no echo: {:?}",
+            ring_text(&session)
+        );
+        assert_eq!(session.resize(100, 30), InputOutcome::Queued);
+        session.kill(9);
+        assert!(wait_until(10, || !session.is_alive()), "cmd should exit on kill");
+        assert!(wait_until(2, || !session.holds_child_handles()));
+        assert_eq!(session.record().exit_signal, 0, "Windows has no signals to report");
     }
 }

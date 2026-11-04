@@ -48,6 +48,10 @@ impl SessionStatus {
     /// A session that is no longer producing live output. `indeterminate` counts:
     /// there is no live backend to attach to, so it behaves terminally (history
     /// only) even though its true outcome is unknown.
+    ///
+    /// This answers "is there anything to attach to?" — **not** "is it safe to
+    /// throw away?". For that, see
+    /// [`is_definitively_ended`](Self::is_definitively_ended).
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -56,6 +60,32 @@ impl SessionStatus {
                 | SessionStatus::Stopped
                 | SessionStatus::Archived
                 | SessionStatus::Indeterminate
+        )
+    }
+
+    /// The session is **known** to be over: the process is gone and will not
+    /// resume, so the work it owned (worktree, branch, workspace registration)
+    /// is ours to discard.
+    ///
+    /// `indeterminate` is deliberately excluded, which is the whole reason this
+    /// exists apart from [`is_terminal`](Self::is_terminal). An indeterminate
+    /// session lost its completion record when the holder died — the process may
+    /// have finished, or may still be running as an orphan writing to that very
+    /// worktree. Authorizing destruction on "not attachable" would delete a live
+    /// agent's branch. The client already draws this line (`isTerminal` in
+    /// `client/src/status.ts` excludes `indeterminate`, so the UI offers neither
+    /// archive nor cleanup); before this predicate existed, a direct API call
+    /// could do exactly what the UI called unsafe.
+    ///
+    /// RF-LIFE replaces both booleans with named per-transition capabilities;
+    /// until then, use this one for anything destructive.
+    pub fn is_definitively_ended(&self) -> bool {
+        matches!(
+            self,
+            SessionStatus::Exited
+                | SessionStatus::Failed
+                | SessionStatus::Stopped
+                | SessionStatus::Archived
         )
     }
 }
@@ -106,6 +136,41 @@ impl AttentionState {
             _ => AttentionState::None,
         }
     }
+
+    /// The agent is waiting on the user — a blocking prompt, an approval gate,
+    /// or a turn that died mid-flight. These are the states the monitor keeps
+    /// *sticky* (redraw noise must not demote them) and the client badges as
+    /// "needs attention"; the two definitions have to agree, so this is the
+    /// server-side twin of the client's `needsAttention` (`client/src/status.ts`).
+    pub fn needs_user(self) -> bool {
+        matches!(
+            self,
+            AttentionState::LikelyBlocked | AttentionState::ApprovalNeeded | AttentionState::Error
+        )
+    }
+
+    /// The agent has a turn in flight: it is producing output right now
+    /// (`activity` — "working"), or it is parked on a prompt waiting for the
+    /// user to let the turn it already started proceed (`likely_blocked` /
+    /// `approval_needed` — both render as "blocked"). Killing the process here
+    /// throws away work mid-flight, so [`SessionManager::stop_session`] refuses
+    /// without an explicit force.
+    ///
+    /// **Only working and blocked are protected.** Everything else stops
+    /// without ceremony: `idle` (parked at a ready prompt), `none` (silent — no
+    /// signal at all, which is every session under a plugin that opts out of
+    /// attention tracking, e.g. a plain shell), and `error` / `failed`, whose
+    /// turn has already aborted so there is nothing in flight to lose. That
+    /// makes this deliberately narrower than [`needs_user`](Self::needs_user),
+    /// which counts `error` — needing attention is not the same as being
+    /// mid-turn. The client's twin of this predicate is `isBusy`
+    /// (`client/src/status.ts`).
+    pub fn is_busy(self) -> bool {
+        matches!(
+            self,
+            AttentionState::Activity | AttentionState::LikelyBlocked | AttentionState::ApprovalNeeded
+        )
+    }
 }
 
 /// Persisted session record (subset of the full architecture model for MVP).
@@ -132,8 +197,9 @@ pub struct Session {
     /// bypass-sandbox). Surfaced as a risk badge in the UI.
     pub risky: bool,
     /// The agent's *own* conversation id (Claude's `sessionId`, Codex's rollout
-    /// uuid), captured while the session is alive and never re-derived. A fork
-    /// that keeps the same agent resumes this conversation natively.
+    /// uuid), captured while the session is alive. It changes only when a plugin
+    /// proves an older duplicate binding belongs to another session. A fork that
+    /// keeps the same agent resumes this conversation natively.
     ///
     /// Captured live rather than at fork time on purpose: the transcript-matching
     /// heuristics in [`crate::plugins::usage`] are "newest file in the directory"
@@ -151,6 +217,14 @@ pub struct Session {
     /// session started from scratch. Gives the UI a lineage, including a chain
     /// when a fork is itself forked.
     pub forked_from: Option<String>,
+    /// When the session entered the state it is in now — the timestamp behind the
+    /// list's "blocked 8m" / "idle 3m". Distinct from `last_activity_at`, which
+    /// is the last time it *printed* anything: a blocked agent redraws its TUI
+    /// continuously, so activity says "just now" for a session that has been
+    /// waiting on the user for a quarter of an hour. Moved only when the
+    /// `status`/`attention_state` pair changes, and deliberately *not* when the
+    /// user views the session (see [`crate::db::Db::clear_attention_for_view`]).
+    pub state_since: i64,
 }
 
 /// An enrolled client device. The `token` is the bearer credential and is
@@ -281,7 +355,41 @@ mod tests {
     }
 
     #[test]
+    fn indeterminate_is_terminal_but_never_definitively_ended() {
+        // The one status where the two predicates must disagree: nothing to
+        // attach to, but no proof the process is gone — so history, yes;
+        // deleting its worktree and branch, no.
+        assert!(SessionStatus::Indeterminate.is_terminal());
+        assert!(!SessionStatus::Indeterminate.is_definitively_ended());
+
+        for s in [
+            SessionStatus::Exited,
+            SessionStatus::Failed,
+            SessionStatus::Stopped,
+            SessionStatus::Archived,
+        ] {
+            assert!(s.is_definitively_ended(), "{s:?} is a known outcome");
+        }
+        assert!(!SessionStatus::Running.is_definitively_ended());
+        assert!(!SessionStatus::Starting.is_definitively_ended());
+    }
+
+    #[test]
     fn unknown_status_maps_to_failed() {
         assert_eq!(SessionStatus::from_str("bogus"), SessionStatus::Failed);
+    }
+
+    #[test]
+    fn busy_covers_working_and_blocked_only() {
+        assert!(AttentionState::Activity.is_busy());
+        assert!(AttentionState::LikelyBlocked.is_busy());
+        assert!(AttentionState::ApprovalNeeded.is_busy());
+        // Nothing in flight: a ready prompt, silence, or an aborted turn. A
+        // silent session (`none` — an untracked plugin, or one that has not been
+        // classified yet) counts as idle, not as work worth guarding.
+        assert!(!AttentionState::Idle.is_busy());
+        assert!(!AttentionState::None.is_busy());
+        assert!(!AttentionState::Error.is_busy());
+        assert!(!AttentionState::Failed.is_busy());
     }
 }

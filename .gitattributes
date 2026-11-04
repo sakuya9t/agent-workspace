@@ -1,0 +1,6 @@
+# Shell scripts always check out with LF, whatever core.autocrlf says (Git for
+# Windows installs with autocrlf=true). Git Bash tolerates CRLF, but MSYS2,
+# Cygwin and WSL bash reading the same checkout do not.
+*.sh text eol=lf
+# cmd.exe misparses batch files with bare-LF line endings (labels, goto).
+*.cmd text eol=crlf

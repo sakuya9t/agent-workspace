@@ -24,8 +24,9 @@ const ECHO_WINDOW: Duration = Duration::from_millis(1000);
 
 /// How often a live session is checked for the agent's own conversation id, until
 /// one is found. An agent writes its transcript shortly *after* it starts, so this
-/// cannot be a single attempt at spawn — but once captured it is never re-derived,
-/// and the polling stops. See [`SessionManager::capture_native_id`].
+/// cannot be a single attempt at spawn. Once captured, polling stops; the only
+/// later change is a plugin-proven repair of duplicate bindings left by an older
+/// matcher. See [`SessionManager::capture_native_id`].
 const CAPTURE_EVERY: Duration = Duration::from_secs(5);
 
 use crate::backend::{
@@ -42,6 +43,7 @@ use crate::workspace;
 
 mod fork;
 mod monitor;
+mod workspace_instructions;
 mod workspaces;
 
 pub use fork::ForkRequest;
@@ -59,6 +61,36 @@ impl std::fmt::Display for NeedsForce {
 }
 
 impl std::error::Error for NeedsForce {}
+
+/// A stop was refused because the agent has a turn in flight — it is working,
+/// or blocked on a prompt waiting for the user (see
+/// [`AttentionState::is_busy`]). Typed like [`NeedsForce`] so the API can answer
+/// `409 Conflict` and the client can offer the force-stop escape hatch, but kept
+/// distinct because the reason is different: nothing on disk is at risk here,
+/// the *running turn* is.
+#[derive(Debug)]
+pub struct SessionBusy(pub String);
+
+impl std::fmt::Display for SessionBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for SessionBusy {}
+
+/// A deck response named a prompt revision that is no longer on screen. Typed
+/// so the API can return 409 and make controllers refresh instead of guessing.
+#[derive(Debug)]
+pub struct StaleDeckPrompt;
+
+impl std::fmt::Display for StaleDeckPrompt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the approval prompt changed; refresh before responding")
+    }
+}
+
+impl std::error::Error for StaleDeckPrompt {}
 
 /// Request to start a new session.
 #[derive(Debug, Clone)]
@@ -143,7 +175,8 @@ pub struct SessionManager {
     registry: Arc<PluginRegistry>,
     backend: Arc<dyn SessionBackend>,
     live: Mutex<HashMap<String, Arc<dyn BackendSession>>>,
-    /// Base directory under which per-session Git worktrees are created.
+    /// Base directory under which per-session Git worktrees are created,
+    /// spelled the way git reports it (see [`resolve_worktree_root`]).
     worktree_root: PathBuf,
     /// Per-session interaction signals, keyed by session id (see [`Interaction`]).
     interactions: Mutex<HashMap<String, Arc<Interaction>>>,
@@ -169,7 +202,7 @@ impl SessionManager {
             registry,
             backend,
             live: Mutex::new(HashMap::new()),
-            worktree_root,
+            worktree_root: resolve_worktree_root(worktree_root),
             interactions: Mutex::new(HashMap::new()),
             reconcile_pass: Mutex::new(()),
             ready_tx: watch::channel(false).0,
@@ -221,9 +254,6 @@ impl SessionManager {
 
         let id = Uuid::new_v4().to_string();
 
-        // Resolve the working directory and (optionally) an isolated instance.
-        let (resolved_cwd, instance) = self.resolve_workspace(&id, &req)?;
-
         let mut ctx = AgentContext {
             command: req.command.clone(),
             extra_args: req.args.clone(),
@@ -232,13 +262,76 @@ impl SessionManager {
             model: req.model.clone(),
         };
 
+        // Validate before creating anything. `resolve_workspace` physically
+        // makes the worktree and branch, and an unknown plugin binary or an
+        // unapproved custom command used to bail *after* it — leaving a worktree
+        // and branch on disk with no DB row: precisely the orphan pair
+        // `cleanup_orphan_worktrees` exists to sweep, manufactured by the create
+        // path itself.
+        //
+        // A fork can't be checked this early: its launch line resumes into, or
+        // is written as a brief inside, the cwd we haven't resolved yet. That
+        // one is covered by the rollback below instead.
+        let prechecked = match &req.fork {
+            Some(_) => None,
+            None => {
+                let launch = plugin.build_launch(&ctx)?;
+                if launch.requires_approval && !req.approve_custom {
+                    bail!("launch requires explicit approval (custom command)");
+                }
+                Some(launch)
+            }
+        };
+
+        // Resolve the working directory and (optionally) an isolated instance.
+        let (resolved_cwd, instance) = self.resolve_workspace(&id, &req)?;
+
+        // Past this point a worktree may exist on disk. Every failure from here
+        // on has to put it back, so the fallible remainder runs as one unit and
+        // any error rolls the instance back before it propagates.
+        let created = self.create_in_instance(
+            &id,
+            &req,
+            &plugin,
+            &mut ctx,
+            prechecked,
+            &resolved_cwd,
+            instance.as_ref(),
+        );
+        match created {
+            Ok(session) => Ok(session),
+            Err(e) => {
+                self.rollback_new_instance(instance.as_ref());
+                Err(e)
+            }
+        }
+    }
+
+    /// The half of [`create_session`](Self::create_session) that runs once an
+    /// instance may exist on disk. Split out so a single `?` cannot skip the
+    /// rollback: every exit from here is either a live session or an error its
+    /// caller compensates.
+    #[allow(clippy::too_many_arguments)]
+    fn create_in_instance(
+        self: &Arc<Self>,
+        id: &str,
+        req: &CreateSessionRequest,
+        plugin: &Arc<dyn AgentPlugin>,
+        ctx: &mut AgentContext,
+        prechecked: Option<crate::plugins::LaunchSpec>,
+        resolved_cwd: &str,
+        instance: Option<&WorkspaceInstance>,
+    ) -> Result<Session> {
+        let id = id.to_string();
         // A fork's launch line differs from a fresh session's: either it resumes
         // the origin's conversation natively, or it opens pointed at a brief we
         // write into the working directory we just resolved. Both need the cwd,
         // which is why this happens here and not in `fork_session`.
-        let launch = match &req.fork {
-            Some(plan) => self.fork_launch(&plugin, &mut ctx, plan, &resolved_cwd)?,
-            None => plugin.build_launch(&ctx)?,
+        let mut launch = match (prechecked, &req.fork) {
+            (Some(launch), _) => launch,
+            (None, Some(plan)) => self.fork_launch(plugin, ctx, plan, resolved_cwd)?,
+            // Unreachable: a non-fork request is always prechecked above.
+            (None, None) => plugin.build_launch(ctx)?,
         };
 
         if launch.requires_approval && !req.approve_custom {
@@ -252,9 +345,23 @@ impl SessionManager {
             .iter()
             .any(|o| o.danger && ctx.opt(&o.key));
 
-        if !Path::new(&resolved_cwd).is_dir() {
+        if !Path::new(resolved_cwd).is_dir() {
             bail!("working directory does not exist: {resolved_cwd}");
         }
+
+        // Apply after both fresh and fork launches have been assembled, and
+        // before persisting argv / spawning. A fork must use its destination's
+        // branch, not instructions remembered from the origin conversation.
+        workspace_instructions::apply(
+            plugin.id(),
+            &mut launch,
+            Path::new(resolved_cwd),
+            instance.and_then(|inst| inst.branch.as_deref()),
+            &self
+                .worktree_root
+                .join(".instructions")
+                .join(format!("{id}.md")),
+        )?;
 
         let now = now_millis();
         let session = Session {
@@ -263,7 +370,7 @@ impl SessionManager {
             command: launch.command.clone(),
             args: launch.args.clone(),
             env: launch.env.clone(),
-            working_directory: resolved_cwd.clone(),
+            working_directory: resolved_cwd.to_string(),
             workspace_id: req.workspace_id.clone(),
             status: SessionStatus::Starting,
             rows: req.rows,
@@ -279,18 +386,22 @@ impl SessionManager {
             // Captured later, by the monitor, while this session is alive.
             agent_session_id: None,
             forked_from: req.fork.as_ref().map(|f| f.origin_id.clone()),
+            state_since: now,
         };
         self.db.insert_session(&session)?;
-        if let Some(inst) = &instance {
+        if let Some(inst) = instance {
             self.db.insert_instance(inst)?;
         }
 
+        // The stored session keeps the command as resolved (`codex.cmd`); what
+        // is spawned bypasses an npm shim's cmd.exe (see `direct_launch`).
+        let (command, args) = crate::plugins::direct_launch(&launch.command, launch.args);
         let spec = BackendSpawnSpec {
             session_id: id.clone(),
-            command: launch.command,
-            args: launch.args,
+            command,
+            args,
             env: launch.env,
-            cwd: resolved_cwd,
+            cwd: resolved_cwd.to_string(),
             rows: req.rows,
             cols: req.cols,
         };
@@ -298,6 +409,10 @@ impl SessionManager {
         let handle = match self.backend.create(spec) {
             Ok(h) => h,
             Err(e) => {
+                // The row stays, as `failed` with a reason — the user asked for
+                // this session and deserves to see why it never started. The
+                // *worktree* does not: nothing ever ran in it, and the caller's
+                // rollback reclaims it (and marks this instance released).
                 let now = now_millis();
                 let _ = self.db.update_status(&id, SessionStatus::Failed, None, now);
                 if plugin.tracks_attention() {
@@ -324,7 +439,90 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("session vanished after creation"))
     }
 
-    pub fn stop_session(&self, id: &str) -> Result<Session> {
+    /// Undo the on-disk half of a create that failed after `resolve_workspace`.
+    ///
+    /// Only the isolated-worktree path builds anything: `shared` and `direct`
+    /// instances point at a checkout that existed before this request, and
+    /// removing one would evict whoever actually owns it. So the isolation mode
+    /// recorded at creation — not the mere presence of an instance — decides
+    /// whether there is anything to reclaim.
+    ///
+    /// Best-effort and idempotent: it runs on a path that is already failing, so
+    /// a second failure is logged rather than propagated (it would mask the real
+    /// error), and it is safe whether or not the instance row was ever inserted.
+    /// `force` is unconditional here: nothing ever ran in this worktree, so the
+    /// only thing it can contain is what we put there moments ago.
+    fn rollback_new_instance(&self, instance: Option<&WorkspaceInstance>) {
+        let Some(inst) = instance else { return };
+        if inst.isolation != "worktree" {
+            return;
+        }
+        let ws = match self.db.get_workspace(&inst.workspace_id) {
+            Ok(Some(ws)) => ws,
+            other => {
+                tracing::warn!(
+                    instance = %inst.id,
+                    path = %inst.path,
+                    "cannot roll back new worktree: workspace record unavailable ({other:?})"
+                );
+                return;
+            }
+        };
+        let root = Path::new(&ws.root_path);
+        let path = Path::new(&inst.path);
+        if inst.owns_worktree && path.exists() {
+            if let Err(e) = workspace::remove_worktree(root, path, true) {
+                tracing::warn!(path = %inst.path, "rolling back new worktree failed: {e:#}");
+            }
+        }
+        if let Some(branch) = inst.branch.as_deref().filter(|_| inst.owns_branch) {
+            if workspace::branch_exists(root, branch) {
+                if let Err(e) = workspace::delete_branch(root, branch, true) {
+                    tracing::warn!(%branch, "rolling back new branch failed: {e:#}");
+                }
+            }
+        }
+        // No-op when the row was never inserted; when it was (a backend spawn
+        // failure), it must not keep claiming a worktree that is now gone.
+        let _ = self.db.set_instance_status(&inst.id, "released");
+        tracing::info!(
+            instance = %inst.id,
+            path = %inst.path,
+            "rolled back the worktree of a session that failed to start"
+        );
+    }
+
+    /// End a session: kill the backend child and record `stopped`.
+    ///
+    /// Guarded. A session whose agent is *working* or *blocked on a prompt* has
+    /// a turn in flight, and stopping it there loses that work — one mis-clicked
+    /// row and a long-running agent is gone. Such a stop is refused with a typed
+    /// [`SessionBusy`] (the API turns it into `409`) unless the caller passes
+    /// `force`, which is what the client's "force stop" checkbox sends. Idle,
+    /// errored, and unattended sessions stop without ceremony.
+    ///
+    /// The guard reads the *stored* attention state, so it is the daemon — not
+    /// the client's possibly-stale row — that decides whether a session is busy.
+    /// Daemon shutdown does not come through here (see
+    /// [`shutdown_all_live`](Self::shutdown_all_live)): it tears live sessions
+    /// down unconditionally, which is correct — the process is going away either
+    /// way, and refusing would leak children.
+    pub fn stop_session(&self, id: &str, force: bool) -> Result<Session> {
+        if !force {
+            if let Some(s) = self.db.get_session(id)? {
+                if !s.status.is_terminal() && s.attention_state.is_busy() {
+                    return Err(SessionBusy(format!(
+                        "the agent is {} — stopping now would kill the turn in flight; \
+                         use force stop to end it anyway",
+                        match s.attention_state {
+                            AttentionState::Activity => "still working",
+                            _ => "blocked waiting for you",
+                        }
+                    ))
+                    .into());
+                }
+            }
+        }
         let handle = self.live_handle(id);
         match handle {
             Some(h) => {
@@ -444,6 +642,10 @@ impl SessionManager {
     /// daemon runs it.
     pub fn startup_reconcile(self: &Arc<Self>) -> Result<()> {
         let _pass = self.reconcile_pass.lock();
+        let repaired = self.repair_duplicate_native_ids()?;
+        if repaired > 0 {
+            tracing::warn!("repaired {repaired} duplicate agent conversation binding(s)");
+        }
         if !self.backend.keep_sessions_on_shutdown() {
             let n = self.db.reconcile_orphans_on_startup(now_millis())?;
             if n > 0 {
@@ -465,6 +667,62 @@ impl SessionManager {
             }
         };
         self.reconcile_from_holder(holder)
+    }
+
+    /// Repair duplicates produced by the old Codex matcher, which fell back to
+    /// the newest rollout anywhere on the host before a new session had written
+    /// its own. Plugins opt in only when they can prove the stored id belongs to
+    /// another cwd and can resolve an exact replacement. A changed binding also
+    /// invalidates its persisted generated title in the database.
+    fn repair_duplicate_native_ids(&self) -> Result<usize> {
+        let sessions = self.db.list_sessions()?;
+        let mut counts = HashMap::<(String, String), usize>::new();
+        for session in &sessions {
+            if let Some(native_id) = &session.agent_session_id {
+                *counts
+                    .entry((session.agent_plugin_id.clone(), native_id.clone()))
+                    .or_default() += 1;
+            }
+        }
+
+        let mut repaired = 0;
+        for session in sessions {
+            let Some(previous) = session.agent_session_id.as_deref() else {
+                continue;
+            };
+            if counts
+                .get(&(session.agent_plugin_id.clone(), previous.to_string()))
+                .copied()
+                .unwrap_or_default()
+                < 2
+            {
+                continue;
+            }
+            let Some(plugin) = self.registry.get(&session.agent_plugin_id) else {
+                continue;
+            };
+            let cx = TranscriptContext {
+                cwd: PathBuf::from(&session.working_directory),
+                started_at_ms: session.created_at,
+                native_session_id: Some(previous.to_string()),
+            };
+            let Some(replacement) = plugin.replacement_native_session_id(&cx) else {
+                continue;
+            };
+            if self
+                .db
+                .replace_agent_session_id(&session.id, previous, &replacement)?
+            {
+                tracing::warn!(
+                    session = %session.id,
+                    old_native_id = %previous,
+                    new_native_id = %replacement,
+                    "repaired mismatched agent conversation binding"
+                );
+                repaired += 1;
+            }
+        }
+        Ok(repaired)
     }
 
     /// Re-run reconciliation after the daemon↔asmux connection dropped and came
@@ -499,26 +757,52 @@ impl SessionManager {
     /// - **absent from the holder** → `indeterminate` (no completion record); a
     ///   still-live one has its stream closed so its monitor stops.
     fn reconcile_from_holder(self: &Arc<Self>, holder: Vec<HolderEntry>) -> Result<()> {
+        self.reconcile_live_ids(self.db.live_session_ids()?, holder)
+    }
+
+    /// [`reconcile_from_holder`](Self::reconcile_from_holder) with the live id
+    /// set passed in. Split out so a test can present the one state the DB
+    /// cannot be asked for directly: an id the pass is told is live whose row is
+    /// no longer there.
+    fn reconcile_live_ids(
+        self: &Arc<Self>,
+        live_ids: Vec<String>,
+        holder: Vec<HolderEntry>,
+    ) -> Result<()> {
         let by_id: HashMap<String, HolderEntry> =
             holder.into_iter().map(|h| (h.id.clone(), h)).collect();
 
         let mut adopted = 0usize;
         let mut reconciled = 0usize;
-        for id in self.db.live_session_ids()? {
+        // Ids the reconcile refused to touch (see the vanished-row arm). Counted
+        // so a summary line can never read as a clean pass when it wasn't.
+        let mut skipped = 0usize;
+        for id in live_ids {
             let in_live = self.live.lock().contains_key(&id);
             match by_id.get(&id) {
                 Some(entry) if entry.alive => {
                     if in_live {
                         continue; // already running; the supervisor re-attached it
                     }
-                    let sess = self.db.get_session(&id)?;
-                    let (rows, cols) = sess.as_ref().map(|s| (s.rows, s.cols)).unwrap_or((24, 80));
-                    let created_at =
-                        sess.as_ref().map(|s| s.created_at).unwrap_or_else(now_millis);
-                    let plugin = sess
-                        .as_ref()
-                        .and_then(|s| self.registry.get(&s.agent_plugin_id));
-                    match self.backend.adopt(&id, rows, cols) {
+                    // `live_session_ids` returned this id moments ago, so a
+                    // missing row means the DB changed under the reconcile — an
+                    // invariant violation, not a session to guess at. The old
+                    // fallback adopted at 24×80 with `created_at = now`, which
+                    // turns that violation into a terminal sized wrong for the
+                    // program already drawing into it and a fabricated
+                    // `duration_ms` in the summary. Say so and leave the id
+                    // alone: the row is authoritative, and the next reconcile
+                    // gets another chance.
+                    let Some(sess) = self.db.get_session(&id)? else {
+                        tracing::error!(
+                            session = %id,
+                            "session row vanished mid-reconcile; not adopting on fabricated defaults"
+                        );
+                        skipped += 1;
+                        continue;
+                    };
+                    let plugin = self.registry.get(&sess.agent_plugin_id);
+                    match self.backend.adopt(&id, sess.rows, sess.cols) {
                         Ok(Some(handle)) => {
                             self.live.lock().insert(id.clone(), handle.clone());
                             self.db
@@ -526,7 +810,7 @@ impl SessionManager {
                             self.clone().spawn_monitor(
                                 id.clone(),
                                 handle,
-                                created_at,
+                                sess.created_at,
                                 plugin.clone(),
                             );
                             adopted += 1;
@@ -572,7 +856,14 @@ impl SessionManager {
                 }
             }
         }
-        tracing::info!("reconcile: adopted {adopted}, reconciled {reconciled} session(s)");
+        if skipped > 0 {
+            tracing::warn!(
+                "reconcile: adopted {adopted}, reconciled {reconciled}, \
+                 SKIPPED {skipped} session(s) whose rows vanished mid-pass"
+            );
+        } else {
+            tracing::info!("reconcile: adopted {adopted}, reconciled {reconciled} session(s)");
+        }
         Ok(())
     }
 
@@ -611,10 +902,75 @@ impl SessionManager {
         }
     }
 
+    /// Read the current approval as a provider-neutral button model. This is the
+    /// shared controller seam for the web deck and future physical hardware.
+    pub fn deck_prompt(&self, id: &str) -> Result<Option<crate::plugins::deck::DeckPrompt>> {
+        let session = self
+            .db
+            .get_session(id)?
+            .ok_or_else(|| anyhow!("no such session"))?;
+        if !session.attention_state.needs_user() {
+            return Ok(None);
+        }
+        let handle = self
+            .live_handle(id)
+            .ok_or_else(|| anyhow!("session is not live"))?;
+        Ok(crate::plugins::deck::parse_prompt(&handle.screen_text()))
+    }
+
+    /// Select one option on the live terminal menu without claiming its single
+    /// viewer attachment. The prompt is parsed again at tap time and revision-
+    /// checked so a delayed controller cannot answer the wrong question.
+    pub fn respond_to_deck_prompt(
+        &self,
+        id: &str,
+        revision: &str,
+        option_id: usize,
+    ) -> Result<Session> {
+        let session = self
+            .db
+            .get_session(id)?
+            .ok_or_else(|| anyhow!("no such session"))?;
+        if !session.attention_state.needs_user() {
+            bail!("session is not waiting for a response");
+        }
+        let handle = self
+            .live_handle(id)
+            .ok_or_else(|| anyhow!("session is not live"))?;
+        let prompt = crate::plugins::deck::parse_prompt(&handle.screen_text())
+            .ok_or_else(|| anyhow!("the current prompt has no button-addressable choices"))?;
+        if prompt.revision != revision {
+            return Err(StaleDeckPrompt.into());
+        }
+        let selected_at = prompt
+            .options
+            .iter()
+            .position(|o| o.id == prompt.selected)
+            .ok_or_else(|| anyhow!("selected option is no longer available"))?;
+        let target_at = prompt
+            .options
+            .iter()
+            .position(|o| o.id == option_id)
+            .ok_or_else(|| anyhow!("no such prompt option"))?;
+
+        let mut input = Vec::new();
+        let (sequence, steps) = if target_at >= selected_at {
+            (b"\x1b[B".as_slice(), target_at - selected_at)
+        } else {
+            (b"\x1b[A".as_slice(), selected_at - target_at)
+        };
+        for _ in 0..steps {
+            input.extend_from_slice(sequence);
+        }
+        input.push(b'\r');
+        handle.send_input(&input)?;
+        self.note_interaction(id, &input);
+        self.acknowledge_attention(id)
+    }
+
     /// Clear the attention flag when the user views/acknowledges a session.
     pub fn acknowledge_attention(&self, id: &str) -> Result<Session> {
-        self.db
-            .set_attention(id, AttentionState::None, None, now_millis())?;
+        self.db.clear_attention_for_view(id, now_millis())?;
         self.signal_attn_reset(id);
         self.db
             .get_session(id)?
@@ -642,9 +998,24 @@ impl SessionManager {
     }
 }
 
+/// Spell the worktree root the way git will report the worktrees under it.
+///
+/// Instances are matched to worktrees by path *string*: a session sharing a
+/// branch's worktree records the path `git worktree list` prints, and both the
+/// ownership it inherits and the last-one-out reclaim look that path up against
+/// the one the creating session stored. Git prints the real path — symlinks
+/// resolved and, on Windows, 8.3 short names (`C:\Users\RUNNER~1\…`) expanded.
+/// Built from a root spelled any other way, the owner and its sharers disagree,
+/// and archiving the owner reclaims a worktree a sharer is still working in.
+fn resolve_worktree_root(root: PathBuf) -> PathBuf {
+    // Only an existing path canonicalizes; the first worktree would create it.
+    let _ = std::fs::create_dir_all(&root);
+    crate::util::canonicalize(&root).unwrap_or(root)
+}
+
 /// Best-effort path canonicalization for allowlist comparisons.
 fn canonical(p: &str) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p))
+    crate::util::canonicalize(std::path::Path::new(p)).unwrap_or_else(|_| PathBuf::from(p))
 }
 
 /// What an orphan-worktree cleanup removed and what it left (needing `force`).
@@ -669,7 +1040,9 @@ fn delete_orphan_branch(
     report: &mut WorktreeCleanupReport,
 ) {
     if force || workspace::branch_is_merged(root, branch) {
-        if workspace::delete_branch(root, branch, force).is_ok() {
+        // The condition above is our safety gate. Avoid letting `git branch
+        // -d` substitute its upstream-based merge policy for that decision.
+        if workspace::delete_branch(root, branch, true).is_ok() {
             report.deleted_branches.push(branch.to_string());
         }
     } else if !report.skipped_unmerged.iter().any(|b| b == branch) {
@@ -894,6 +1267,9 @@ mod tests {
         /// Records `end_session_stream` calls as `(id, "exited"|"vanished")` so the
         /// reconnect-reconcile branches can be asserted without a real holder.
         end_calls: Arc<Mutex<Vec<(String, String)>>>,
+        /// Make `create()` fail — the last thing that can go wrong after a
+        /// worktree has already been built for the session.
+        create_fails: bool,
     }
 
     impl SessionBackend for MockBackend {
@@ -901,6 +1277,9 @@ mod tests {
             "mock"
         }
         fn create(&self, _spec: BackendSpawnSpec) -> Result<Arc<dyn BackendSession>> {
+            if self.create_fails {
+                bail!("mock spawn failure");
+            }
             Ok(mock_session())
         }
         fn keep_sessions_on_shutdown(&self) -> bool {
@@ -982,6 +1361,7 @@ mod tests {
             risky: false,
             agent_session_id: None,
             forked_from: None,
+            state_since: now,
         })
         .unwrap();
     }
@@ -1023,7 +1403,7 @@ mod tests {
         let s = manager.create_session(shell_req()).unwrap();
         assert_eq!(s.status, SessionStatus::Running);
 
-        let stopped = manager.stop_session(&s.id).unwrap();
+        let stopped = manager.stop_session(&s.id, false).unwrap();
         assert_eq!(stopped.status, SessionStatus::Stopped);
 
         // Let the monitor task observe the backend exit and finalize.
@@ -1036,6 +1416,70 @@ mod tests {
         assert!(summary.is_some(), "a structural summary must be written");
         assert_eq!(summary.unwrap().session_id, s.id);
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn busy_session_refuses_stop_without_force() {
+        let (manager, dir) = test_manager();
+        let s = manager.create_session(shell_req()).unwrap();
+        let set = |a| {
+            manager
+                .db
+                .set_attention(&s.id, a, None, now_millis())
+                .unwrap()
+        };
+
+        // Working, then blocked on a prompt: both have a turn in flight, so the
+        // stop is refused and the session is left running untouched.
+        for busy in [
+            AttentionState::Activity,
+            AttentionState::LikelyBlocked,
+            AttentionState::ApprovalNeeded,
+        ] {
+            set(busy);
+            let err = manager.stop_session(&s.id, false).unwrap_err();
+            assert!(
+                err.downcast_ref::<SessionBusy>().is_some(),
+                "{busy:?} must refuse an unforced stop, got: {err:#}"
+            );
+            assert_eq!(
+                manager.get_session(&s.id).unwrap().unwrap().status,
+                SessionStatus::Running
+            );
+        }
+
+        // Force is the escape hatch the client's checkbox sends.
+        assert_eq!(
+            manager.stop_session(&s.id, true).unwrap().status,
+            SessionStatus::Stopped
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn idle_silent_and_errored_sessions_stop_unforced() {
+        let (manager, dir) = test_manager();
+        // Only working and blocked are protected. An idle session never started
+        // a turn, a silent one (`none`) has no signal to go on, and an errored
+        // one already aborted — stopping is the ordinary way to end all three.
+        for a in [
+            AttentionState::Idle,
+            AttentionState::None,
+            AttentionState::Error,
+        ] {
+            let s = manager.create_session(shell_req()).unwrap();
+            manager
+                .db
+                .set_attention(&s.id, a, None, now_millis())
+                .unwrap();
+            assert_eq!(
+                manager.stop_session(&s.id, false).unwrap().status,
+                SessionStatus::Stopped,
+                "{a:?} must stop without force"
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1287,6 +1731,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_row_that_vanished_mid_reconcile_is_skipped_not_fabricated() {
+        // The invariant violation the old fallback papered over: the pass is
+        // handed an id it was told is live, the holder swears it is alive, and
+        // the row is gone. Adopting anyway meant 24×80 geometry and
+        // `created_at = now` — a terminal sized wrong for whatever is drawing
+        // into it, and a summary whose duration is invented.
+        let backend = Arc::new(MockBackend {
+            keep_on_shutdown: true,
+            adopt_ok: true, // would happily hand back a session if asked
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_with(backend);
+
+        manager
+            .reconcile_live_ids(
+                vec!["s-ghost".to_string()],
+                vec![holder_entry("s-ghost", true, 0, 0)],
+            )
+            .unwrap();
+
+        assert!(
+            manager.live_handle("s-ghost").is_none(),
+            "a session with no row must not be adopted"
+        );
+        assert!(
+            manager.get_session("s-ghost").unwrap().is_none(),
+            "reconcile must not manufacture a row either"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn reconnect_dead_entry_in_live_drives_exit_path() {
         // Exited while detached: reconcile drives the normal exit path (the
         // monitor writes the summary), so it must call end_session_stream(Exited).
@@ -1358,7 +1834,7 @@ mod tests {
         // Live session cannot be archived.
         assert!(manager.archive_session(&s.id, false).is_err());
         // After stop it can.
-        manager.stop_session(&s.id).unwrap();
+        manager.stop_session(&s.id, false).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         let archived = manager.archive_session(&s.id, false).unwrap();
         assert_eq!(archived.status, SessionStatus::Archived);
@@ -1399,6 +1875,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_instructions_are_persisted_for_the_resolved_destination() {
+        let (manager, dir) = test_manager_with(Arc::new(MockBackend::default()));
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+        for plugin_id in ["codex", "claude", "pi", "opencode"] {
+            for direct in [false, true] {
+                let mut req = ws_req(&ws.id);
+                req.agent_plugin_id = plugin_id.into();
+                req.direct_checkout = direct;
+                let id = Uuid::new_v4().to_string();
+                let (cwd, instance) = manager.resolve_workspace(&id, &req).unwrap();
+                let branch = crate::source_control::current_branch(Path::new(&cwd)).unwrap();
+                let plugin = manager.registry.get(plugin_id).unwrap();
+                // Bypass only binary detection; the real create path still
+                // resolves, decorates, persists and spawns through the backend.
+                let launch = crate::plugins::LaunchSpec {
+                    command: "test-agent".into(),
+                    args: vec![],
+                    env: vec![],
+                    requires_approval: false,
+                };
+                let session = manager
+                    .create_in_instance(
+                        &id,
+                        &req,
+                        &plugin,
+                        &mut AgentContext::default(),
+                        Some(launch),
+                        &cwd,
+                        instance.as_ref(),
+                    )
+                    .unwrap();
+                let stored = manager.get_session(&session.id).unwrap().unwrap();
+                let text = if plugin_id == "opencode" {
+                    let config: serde_json::Value = serde_json::from_str(&stored.env[0].1).unwrap();
+                    std::fs::read_to_string(config["instructions"][0].as_str().unwrap()).unwrap()
+                } else if plugin_id == "codex" {
+                    // A TOML string value: decode it, or a Windows cwd's escaped
+                    // backslashes never match the plain path.
+                    let value = stored
+                        .args
+                        .iter()
+                        .find_map(|a| a.strip_prefix("developer_instructions="))
+                        .expect("codex gets developer_instructions");
+                    serde_json::from_str::<String>(value).unwrap()
+                } else {
+                    stored.args.join(" ")
+                };
+                assert!(
+                    text.contains(&branch),
+                    "{plugin_id}: destination branch missing"
+                );
+                assert!(text.contains(&cwd), "{plugin_id}: destination cwd missing");
+                assert_eq!(git_in(Path::new(&cwd), &["status", "--porcelain"]), "");
+                manager.stop_session(&id, false).unwrap();
+            }
+        }
+        manager.shutdown_all_live();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Nothing is built until the request is known to be launchable. The bail on
+    /// an unapproved custom command used to run *after* `resolve_workspace`, so
+    /// a rejected request still left a worktree and branch on disk with no DB
+    /// row — the orphan class the sweep exists to clean up, produced by the
+    /// create path itself.
+    #[tokio::test]
+    async fn a_rejected_request_never_creates_a_worktree() {
+        let (manager, dir) = test_manager();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+
+        let mut req = ws_req(&ws.id);
+        req.agent_plugin_id = "custom_command".into();
+        req.command = Some("echo hi".into());
+        req.approve_custom = false;
+
+        let err = manager.create_session(req).unwrap_err();
+        assert!(err.to_string().contains("approval"), "{err:#}");
+
+        assert!(
+            !manager.worktree_root.exists()
+                || std::fs::read_dir(&manager.worktree_root).unwrap().next().is_none(),
+            "a refused create must leave no worktree behind"
+        );
+        assert!(
+            workspace::list_branches(&repo)
+                .unwrap()
+                .0
+                .iter()
+                .all(|b| !b.starts_with("asm-session/")),
+            "a refused create must leave no session branch behind"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A spawn failure is the one case where the worktree already exists when
+    /// things go wrong. The session row stays (as `failed`, with a reason — the
+    /// user asked for it and deserves to see why), but the worktree and branch
+    /// nothing ever ran in are reclaimed instead of leaked.
+    #[tokio::test]
+    async fn a_failed_spawn_rolls_back_the_worktree_it_created() {
+        let backend = Arc::new(MockBackend {
+            create_fails: true,
+            ..Default::default()
+        });
+        let (manager, dir) = test_manager_with(backend);
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+
+        let err = manager.create_session(ws_req(&ws.id)).unwrap_err();
+        assert!(err.to_string().contains("backend failed"), "{err:#}");
+
+        // The record survives so the failure is visible…
+        let failed: Vec<_> = manager
+            .list_sessions()
+            .unwrap()
+            .into_iter()
+            .filter(|s| s.status == SessionStatus::Failed)
+            .collect();
+        assert_eq!(failed.len(), 1, "the failed session must stay in history");
+
+        // …but nothing it created does.
+        let inst = manager
+            .get_instance_for_session(&failed[0].id)
+            .unwrap()
+            .expect("instance row was inserted before the spawn attempt");
+        assert!(
+            !Path::new(&inst.path).exists(),
+            "the worktree must be reclaimed, not leaked as an orphan"
+        );
+        assert_eq!(inst.status, "released");
+        if let Some(branch) = inst.branch.as_deref() {
+            assert!(
+                !workspace::branch_exists(&repo, branch),
+                "the branch created for a session that never ran must go too"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn archive_removes_worktree_and_branch() {
         let (manager, dir) = test_manager();
         let repo = dir.join("repo");
@@ -1415,7 +2045,7 @@ mod tests {
         assert!(Path::new(&inst.path).is_dir());
         assert!(workspace::branch_exists(&repo, &branch));
 
-        manager.stop_session(&s.id).unwrap();
+        manager.stop_session(&s.id, false).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         // Branch is merged (points at HEAD) and worktree is clean → archives
@@ -1446,7 +2076,7 @@ mod tests {
         // Add a commit on the session branch so it is no longer merged into HEAD.
         git_in(wt, &["commit", "-q", "--allow-empty", "-m", "work"]);
 
-        manager.stop_session(&s.id).unwrap();
+        manager.stop_session(&s.id, false).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         // Non-force archive refuses (unmerged) with a NeedsForce error, leaving
@@ -1465,6 +2095,130 @@ mod tests {
         assert_eq!(archived.status, SessionStatus::Archived);
         assert!(!wt.exists());
         assert!(!workspace::branch_exists(&repo, &branch));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// ASM decides whether archive is safe relative to the source checkout's
+    /// HEAD. `git branch -d` instead prefers a configured upstream and rejects
+    /// deletion when that upstream is stale, even after the session branch has
+    /// been merged locally. Archive must honor the safety decision it already
+    /// made rather than failing after it has removed the worktree.
+    #[tokio::test]
+    async fn archive_merged_branch_even_when_its_upstream_is_stale() {
+        let (manager, dir) = test_manager();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+        let base = git_in(&repo, &["rev-parse", "HEAD"]);
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+
+        let s = manager.create_session(ws_req(&ws.id)).unwrap();
+        let inst = manager.get_instance_for_session(&s.id).unwrap().unwrap();
+        let branch = inst.branch.clone().unwrap();
+        let wt = Path::new(&inst.path);
+        git_in(wt, &["commit", "-q", "--allow-empty", "-m", "work"]);
+
+        manager.stop_session(&s.id, false).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        git_in(&repo, &["merge", "-q", "--ff-only", &branch]);
+
+        // Simulate a published session branch whose remote-tracking ref has not
+        // caught up. In this state `git branch -d` refuses the local branch even
+        // though it is fully contained in the source checkout's HEAD.
+        let remote_ref = format!("refs/remotes/origin/{branch}");
+        git_in(&repo, &["update-ref", &remote_ref, base.trim()]);
+        git_in(
+            &repo,
+            &["config", &format!("branch.{branch}.remote"), "origin"],
+        );
+        git_in(
+            &repo,
+            &[
+                "config",
+                &format!("branch.{branch}.merge"),
+                &format!("refs/heads/{branch}"),
+            ],
+        );
+        assert!(workspace::branch_is_merged(&repo, &branch));
+
+        let archived = manager.archive_session(&s.id, false).unwrap();
+        assert_eq!(archived.status, SessionStatus::Archived);
+        assert!(!wt.exists(), "worktree reclaimed");
+        assert!(!workspace::branch_exists(&repo, &branch), "branch reclaimed");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An `indeterminate` session is unattachable but **not** known to be over —
+    /// its holder died without a completion record, so the process may still be
+    /// running as an orphan in its worktree. Every destructive path must refuse
+    /// it, which is what the client already assumes: `isTerminal` in
+    /// `client/src/status.ts` excludes `indeterminate`, so the UI offers neither
+    /// archive nor worktree cleanup. Before this, a direct API call did both.
+    #[tokio::test]
+    async fn indeterminate_is_not_a_licence_to_discard_work() {
+        let (manager, dir) = test_manager();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_init(&repo);
+        let ws = manager
+            .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
+            .unwrap();
+
+        let s = manager.create_session(ws_req(&ws.id)).unwrap();
+        let inst = manager.get_instance_for_session(&s.id).unwrap().unwrap();
+        let branch = inst.branch.clone().unwrap();
+        let wt = Path::new(&inst.path);
+
+        // The holder vanished mid-session: no completion record, no live handle.
+        manager.live.lock().remove(&s.id);
+        manager
+            .db
+            .update_status(&s.id, SessionStatus::Indeterminate, None, now_millis())
+            .unwrap();
+
+        let err = manager.archive_session(&s.id, false).unwrap_err();
+        assert!(
+            err.to_string().contains("outcome is unknown"),
+            "archive must name why it refuses, got: {err:#}"
+        );
+        // Not even with force: force answers "discard my work", not "the process
+        // is gone".
+        assert!(manager.archive_session(&s.id, true).is_err());
+
+        let err = manager.cleanup_instance(&s.id, false).unwrap_err();
+        assert!(
+            err.to_string().contains("definitively ended"),
+            "cleanup must refuse too, got: {err:#}"
+        );
+
+        let err = manager.remove_workspace(&ws.id).unwrap_err();
+        assert!(
+            err.to_string().contains("definitively ended"),
+            "unregistering the workspace must refuse too, got: {err:#}"
+        );
+
+        // Nothing was touched: the worktree and branch a possibly-live agent is
+        // still using are exactly where they were.
+        assert!(wt.is_dir(), "worktree must survive");
+        assert!(workspace::branch_exists(&repo, &branch), "branch must survive");
+        assert_eq!(
+            manager.get_session(&s.id).unwrap().unwrap().status,
+            SessionStatus::Indeterminate
+        );
+
+        // Resolving the outcome unblocks all three.
+        manager
+            .db
+            .update_status(&s.id, SessionStatus::Stopped, None, now_millis())
+            .unwrap();
+        assert_eq!(
+            manager.archive_session(&s.id, true).unwrap().status,
+            SessionStatus::Archived
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1499,7 +2253,7 @@ mod tests {
         assert!(inst.owns_worktree, "we created this worktree");
         assert!(!inst.owns_branch, "`main` was the user's, not ours");
 
-        manager.stop_session(&s.id).unwrap();
+        manager.stop_session(&s.id, false).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         // Archive succeeds and takes the worktree — but `main` survives.
@@ -1540,7 +2294,7 @@ mod tests {
         git_in(wt, &["commit", "-q", "--allow-empty", "-m", "shipped"]);
         std::fs::write(wt.join("dirty.txt"), "wip").unwrap();
 
-        manager.stop_session(&s.id).unwrap();
+        manager.stop_session(&s.id, false).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         let archived = manager.archive_session(&s.id, true).unwrap();
@@ -1583,10 +2337,15 @@ mod tests {
         let s = manager.create_session(req).unwrap();
         let inst = manager.get_instance_for_session(&s.id).unwrap().unwrap();
         assert_eq!(inst.isolation, "shared");
-        assert_eq!(Path::new(&inst.path), theirs.as_path());
+        // Where git says it is: the real path, which a temp dir need not be
+        // spelled as (Windows runners' `%TEMP%` is under `C:\Users\RUNNER~1`).
+        assert_eq!(
+            Path::new(&inst.path),
+            crate::util::canonicalize(&theirs).unwrap().as_path()
+        );
         assert!(!inst.owns_worktree && !inst.owns_branch);
 
-        manager.stop_session(&s.id).unwrap();
+        manager.stop_session(&s.id, false).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
         manager.archive_session(&s.id, true).unwrap();
@@ -1762,6 +2521,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    // ---- answering a block clears it (view/answer signal) ----
+
+    /// The Codex approval menu, exactly as captured from a live session.
+    const CODEX_APPROVAL_SCREEN: &str = " Would you like to run the following command?\n   $ cargo test --workspace\n \u{203a} 1. Yes, proceed (y)\n   2. No, and tell Codex what to do differently (esc)\n Press enter to confirm or esc to cancel";
+
+    #[test]
+    fn answering_a_codex_approval_clears_the_block() {
+        // The reported bug, replayed from a real capture (session 83ccfca5): the
+        // user pressed Enter on a Codex approval and the badge stayed "blocked"
+        // until they clicked to another session and back.
+        //
+        // Codex answers the keypress in *two* chunks, 2ms apart: first a
+        // window-title update alone — which leaves the approval menu fully
+        // rendered — and only then the erase that clears it. The view/answer
+        // signal used to be spent on the first chunk, whose unchanged screen
+        // reclassified straight back to `ApprovalNeeded`, so the erase hit the
+        // sticky rule with nothing left to release it.
+        let (manager, dir) = test_manager();
+        let codex = manager.registry.get("codex").unwrap();
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::ApprovalNeeded);
+        // The user pressed Enter: input noted, block pending release.
+        let sig = Interaction::default();
+        sig.reset.store(true, Ordering::Relaxed);
+        sig.last_input_ms.store(now_millis(), Ordering::Relaxed);
+        sig.submitted.store(true, Ordering::Relaxed);
+
+        // Chunk 1 — `ESC ] 0 ; ⠧ <title> BEL`: the menu is still on screen.
+        let titled = mock_handle_with_screen(CODEX_APPROVAL_SCREEN);
+        manager.on_chunk(
+            "sid", &titled, b"\x1b]0;\xe2\xa0\xa7 sid\x07", Some(&codex), &mut tail,
+            &mut last_write, &mut last_attn, &mut false, &sig,
+        );
+        assert_eq!(
+            last_attn,
+            AttentionState::ApprovalNeeded,
+            "the prompt is still rendered, so this chunk is still a block"
+        );
+
+        // Chunk 2 — `ESC[?2026h ESC[19;1H ESC[J`: the menu is gone, and the
+        // signal must still be live to release the sticky block.
+        let cleared = mock_handle_with_screen(
+            "\u{25e6} Working (3s \u{2022} esc to interrupt)\n\u{203a} Write tests for @filename",
+        );
+        manager.on_chunk(
+            "sid", &cleared, b"\x1b[?2026h\x1b[19;1H\x1b[J", Some(&codex), &mut tail,
+            &mut last_write, &mut last_attn, &mut false, &sig,
+        );
+        assert_eq!(last_attn, AttentionState::Activity);
+        assert!(
+            !sig.reset.load(Ordering::Relaxed),
+            "leaving the blocked state spends the signal"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn redraw_after_the_signal_is_spent_stays_sticky() {
+        // The guard on the above: once the block *has* been released, the signal
+        // is gone and the sticky rule is back on duty — a later approval must not
+        // be demoted by the redraw noise that follows it.
+        let (manager, dir) = test_manager();
+        let codex = manager.registry.get("codex").unwrap();
+        let (mut tail, mut last_write, mut last_attn) =
+            (String::new(), 0i64, AttentionState::ApprovalNeeded);
+        let sig = Interaction::default(); // no view, no answer
+
+        // A spinner repaint under a live approval menu: still blocked.
+        let handle = mock_handle_with_screen(CODEX_APPROVAL_SCREEN);
+        manager.on_chunk(
+            "sid", &handle, b"\x1b[2K", Some(&codex), &mut tail, &mut last_write,
+            &mut last_attn, &mut false, &sig,
+        );
+        assert_eq!(last_attn, AttentionState::ApprovalNeeded);
+
+        // Codex scrolled the menu off on its own (no answer from the user): the
+        // sticky rule holds the block until the user actually deals with it.
+        let scrolled = mock_handle_with_screen("\u{203a} Write tests for @filename");
+        manager.on_chunk(
+            "sid", &scrolled, b"\x1b[2K", Some(&codex), &mut tail, &mut last_write,
+            &mut last_attn, &mut false, &sig,
+        );
+        assert_eq!(last_attn, AttentionState::ApprovalNeeded);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     // ---- stalled-on-error settle (working -> error, not idle) ----
 
     #[test]
@@ -1922,6 +2767,33 @@ mod tests {
     #[tokio::test]
     async fn shared_worktree_survives_until_last_session_leaves() {
         let (manager, dir) = test_manager();
+        assert_shared_worktree_survives_until_last_session_leaves(&manager, &dir).await;
+    }
+
+    /// Git reports worktree paths resolved, so a worktree root reached through
+    /// a symlink (as through an 8.3 short name on Windows) is not how git spells
+    /// the worktrees under it. The owner and its sharer must still record one
+    /// path, or archiving the owner reclaims the worktree out from under the
+    /// sharer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_worktree_survives_under_a_symlinked_worktree_root() {
+        let dir = std::env::temp_dir().join(format!("asm-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink(dir.join("real"), dir.join("link")).unwrap();
+        let manager = Arc::new(SessionManager::new(
+            Db::open(&dir.join("test.sqlite3")).unwrap(),
+            Arc::new(PluginRegistry::with_builtins()),
+            Arc::new(MockBackend::default()),
+            dir.join("link").join("worktrees"),
+        ));
+        assert_shared_worktree_survives_until_last_session_leaves(&manager, &dir).await;
+    }
+
+    async fn assert_shared_worktree_survives_until_last_session_leaves(
+        manager: &Arc<SessionManager>,
+        dir: &Path,
+    ) {
         let repo = dir.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         git_init(&repo);
@@ -1944,7 +2816,7 @@ mod tests {
 
         // Archive the owner first while the sharer is still active: the shared
         // worktree and branch must survive — the sharer is still using them.
-        manager.stop_session(&a.id).unwrap();
+        manager.stop_session(&a.id, false).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         manager.archive_session(&a.id, false).unwrap();
         assert!(Path::new(&wt).is_dir(), "worktree kept while a sharer lives");
@@ -1954,7 +2826,7 @@ mod tests {
         );
 
         // The last session out reclaims both.
-        manager.stop_session(&b.id).unwrap();
+        manager.stop_session(&b.id, false).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         manager.archive_session(&b.id, false).unwrap();
         assert!(!Path::new(&wt).exists(), "last session removes the worktree");

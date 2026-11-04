@@ -6,19 +6,19 @@ import { Target } from "../connectionStore";
 import { useUiStore } from "../store";
 import { copyText } from "../clipboard";
 import { glog } from "../gestureLog";
-import { CtrlLatch, TerminalHandle } from "../terminalTypes";
+import { ALT_DOWN, ALT_UP, CtrlLatch, SOFT_RETURN, TerminalHandle } from "../terminalTypes";
 import { useIsPhone } from "../useIsPhone";
 import { useIsTouch } from "../useIsTouch";
 import { useTerminalPaste } from "../useTerminalPaste";
 import { PasteSheet } from "./PasteSheet";
 import { TermControlPanel } from "./TermControlPanel";
+import { formatBytes } from "../format";
 import i18n from "../i18n";
 
 /** WS close code the daemon uses when another client takes over the session. */
 const CLOSE_SUPERSEDED = 4001;
 
-/** Size for a human, only ever used on the attachment limit (always MB-scale). */
-const formatBytes = (n: number) => `${(n / (1024 * 1024)).toFixed(1)} MB`;
+type StreamState = "loading" | "ready" | "reconnecting";
 
 /** Map a single typed character to its control byte (Ctrl-A → \x01, etc.); pass
  *  anything else (multi-char sequences, non-mappable keys) through untouched. */
@@ -47,8 +47,8 @@ interface Props {
   target: Target;
   sessionId: string;
   live: boolean;
-  /** Mobile: receive an imperative handle when the terminal mounts, null on
-   *  unmount, so a key bar can inject input over the same WS path. */
+  /** Receive an imperative handle when the terminal mounts, and null on
+   *  unmount, so shell controls can inject input over the same WS path. */
   onReady?: (handle: TerminalHandle | null) => void;
   /** Mobile Ctrl latch, read on each typed key; when armed/locked the next
    *  soft-keyboard key is transformed to its control code. */
@@ -104,6 +104,11 @@ export function TerminalView({
   // jump affordance (rendered below, gated `isTouch && !isPhone`). Fed by the
   // scroll-state block inside the WS effect.
   const [scrolledAway, setScrolledAway] = useState(false);
+  // A newly mounted xterm is visually indistinguishable from a dead session
+  // until its first snapshot arrives. Keep that adoption/attach interval
+  // explicit; after a successful paint, later disconnects use a compact badge
+  // so existing terminal contents remain visible while the socket reconnects.
+  const [streamState, setStreamState] = useState<StreamState>("loading");
 
   // The iPad control panel's Ctrl latch. The phone shell hands TerminalView a
   // latch through ctrlRef; the desktop shell (an iPad) hands it none, so we own
@@ -324,6 +329,8 @@ export function TerminalView({
     let mounted = true;
     let ws: WebSocket | null = null;
     let reconnectTimer: number | undefined;
+    let hasPainted = false;
+    setStreamState("loading");
 
     const sendResize = () => {
       if (live && ws && ws.readyState === WebSocket.OPEN) {
@@ -353,6 +360,8 @@ export function TerminalView({
         sendResize();
       };
       socket.onmessage = (ev) => {
+        hasPainted = true;
+        setStreamState("ready");
         if (typeof ev.data === "string") term.write(ev.data);
         else term.write(new Uint8Array(ev.data as ArrayBuffer));
       };
@@ -362,6 +371,7 @@ export function TerminalView({
           // takeover ping-pong). Show why, then clear the selection so the
           // session can be reclaimed from the sidebar (which prompts again).
           term.write("\r\n\x1b[33m[" + i18n.t("terminal.takenOver") + "]\x1b[0m\r\n");
+          setStreamState("ready");
           reconnectTimer = window.setTimeout(() => {
             if (mounted) useUiStore.getState().setActive(null);
           }, 1800);
@@ -369,6 +379,7 @@ export function TerminalView({
         }
         if (mounted && live) {
           // Transient loss: reconnect; the snapshot repaints current state.
+          setStreamState(hasPainted ? "reconnecting" : "loading");
           reconnectTimer = window.setTimeout(connect, 1000);
         }
       };
@@ -386,11 +397,13 @@ export function TerminalView({
     const sendRaw = (d: string) => {
       if (batch) {
         batch.push(d);
-        return;
+        return true;
       }
-      if (live && ws && ws.readyState === WebSocket.OPEN) {
+      if (mounted && live && ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ t: "i", d }));
+        return true;
       }
+      return false;
     };
     // Soft-keyboard input honors a Ctrl latch; an "armed" one-shot is consumed
     // after a single key (bar/panel buttons send raw and bypass this). The phone
@@ -462,7 +475,42 @@ export function TerminalView({
     // quoted-insert, vim's visual-block) on Windows/Linux, the same trade Windows
     // Terminal and VS Code's terminal make — vim's own Ctrl-Q is the way back.
     term.attachCustomKeyEventHandler((e) => {
-      if (e.type !== "keydown" || isMac || !e.ctrlKey || e.altKey || e.metaKey) return true;
+      if (e.type !== "keydown") return true;
+      // xterm 5 maps Alt+Up/Down to Ctrl+Up/Down on non-Mac platforms.
+      // Agent TUIs use the actual Alt chords to open queued follow-up inputs.
+      if (
+        (e.key === "ArrowUp" || e.key === "ArrowDown") &&
+        e.altKey &&
+        !e.ctrlKey &&
+        !e.shiftKey &&
+        !e.metaKey &&
+        !e.isComposing
+      ) {
+        sendRaw(e.key === "ArrowUp" ? ALT_UP : ALT_DOWN);
+        e.preventDefault();
+        return false;
+      }
+      // Soft return, every platform. xterm maps Shift+Enter to a bare CR —
+      // byte-identical to Enter — so the chord every agent's own footer
+      // advertises for "newline" was silently sending the message instead.
+      // Claim it and send ESC+CR (see SOFT_RETURN); plain Enter never reaches
+      // this branch and still submits. IME composition is left alone: there
+      // Enter belongs to the candidate list, not to us.
+      if (
+        e.key === "Enter" &&
+        e.shiftKey &&
+        !e.ctrlKey &&
+        !e.altKey &&
+        !e.metaKey &&
+        !e.isComposing
+      ) {
+        // Raw, not typed: this is a hardware chord, so it must not consume the
+        // soft-keyboard Ctrl latch (which targets the NEXT single key).
+        sendRaw(SOFT_RETURN);
+        e.preventDefault();
+        return false; // swallow: don't let xterm forward it as a CR
+      }
+      if (isMac || !e.ctrlKey || e.altKey || e.metaKey) return true;
       if (e.shiftKey && (e.key === "c" || e.key === "C") && term.hasSelection()) {
         void copySelection();
         e.preventDefault();
@@ -925,8 +973,8 @@ export function TerminalView({
 
     connect();
 
-    // Hand a fresh input handle to the shell (the mobile key bar reads it) and
-    // keep it for our own touch overlay.
+    // Hand a fresh input handle to the shell (the mobile key bar and Git commit
+    // action read it) and keep it for our own touch overlay.
     const handle: TerminalHandle = {
       write: sendRaw,
       focus: () => term.focus(),
@@ -994,6 +1042,19 @@ export function TerminalView({
   return (
     <div className="terminal-host">
       <div className="terminal-mount" ref={containerRef} />
+      {streamState === "loading" && (
+        <div className="terminal-loading" role="status" aria-live="polite">
+          <span className="terminal-loading-spinner" aria-hidden="true" />
+          <span className="terminal-loading-title">{i18n.t("terminal.loading")}</span>
+          <span className="terminal-loading-hint">{i18n.t("terminal.loadingHint")}</span>
+        </div>
+      )}
+      {streamState === "reconnecting" && (
+        <div className="terminal-reconnecting" role="status" aria-live="polite">
+          <span className="terminal-loading-spinner small" aria-hidden="true" />
+          {i18n.t("terminal.reconnecting")}
+        </div>
+      )}
       {live && (
         <>
           {/* Attach as a standalone corner button for the phone key bar's users

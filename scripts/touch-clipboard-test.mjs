@@ -78,7 +78,9 @@ async function main() {
     await waitFor("!!document.querySelector('.session-row')");
     await evalJs("document.querySelector('.session-row').click()");
     await waitFor("!!document.querySelector('.terminal-host')");
-    await waitFor("(document.querySelector('.terminal-host')?.innerText||'').trim().length > 0");
+    await waitFor(
+      "!document.querySelector('.terminal-loading') && (document.querySelector('.terminal-mount .xterm-rows')?.innerText||'').trim().length > 0",
+    );
     await sleep(300);
   };
 

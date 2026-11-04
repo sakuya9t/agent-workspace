@@ -1,9 +1,12 @@
 # Mobile UI Design
 
 Goal: the full ASM control center on a phone — same features as the desktop web
-client, laid out for a narrow touch screen. **Status (2026-07-06): execution
-plan phases 1–3 shipped** (adaptive shell, touch/sheet CSS, terminal key bar);
-phase 4 (PWA packaging) and the follow-ups remain. See the Execution plan below.
+client, laid out for a narrow touch screen. **Status (2026-07-24): phases 1–3
+shipped; phase 4 is mostly shipped.** The adaptive shell, touch/sheet CSS,
+terminal key bar, jump-to-end, touch selection, tablet controls, manifest,
+maskable icons, apple-touch-icon, and theme-color are present. Only the three
+iOS `apple-mobile-web-app-*` meta tags remain in MOB-PWA; Web Push and the
+follow-ups remain. `/deck` is the complementary button-first approval surface.
 
 ## Constraints
 
@@ -74,7 +77,7 @@ terminal — and its WebSocket — stays mounted underneath).
 ┌─ Sessions (home) ─┐  tap session   ┌─ Terminal ────────┐  ⓘ   ┌─ Details sheet ─┐
 │ health · Daemons  │ ─────────────▶ │ ‹ agent·status ⓘ  │ ───▶ │ fields, cleanup │
 │ host ▸ ws ▸ rows  │ ◀───────────── │  xterm (fills)    │ ◀─── │ SCM, diffs,     │
-│ history (bottom)  │  ‹ back /      │ [Esc Tab ^ ⇧⇥ ↑↓] │ swipe│ pull/rebase,    │
+│ history (bottom)  │  ‹ back /      │ [Esc Tab Alt↑ ↑↓] │ swipe│ pull/rebase,    │
 └───────────────────┘  system back   └───────────────────┘ down └─ commit graph ──┘
 ```
 
@@ -116,8 +119,11 @@ Terminal screen.
   | `Esc` | `\x1b` | interrupt Claude Code / dismiss TUI prompts |
   | `Tab` | `\x09` | completion |
   | `⇧Tab` | `\x1b[Z` | Claude Code auto-accept toggle |
+  | `⇧⏎` | `\x1b\r` | soft return — a newline in the agent's composer instead of a send (`SOFT_RETURN`). A soft keyboard cannot type the Shift+Enter chord, so on a phone this button *is* the feature; a hardware keyboard gets the chord itself, claimed in `TerminalView` on every platform |
   | `Ctrl` | latch: next key → `\x01`–`\x1a` | any control chord; double-tap locks |
   | `^C` | `\x03` | dedicated because it's the most common chord |
+  | `Alt+↑` | `\x1b[1;3A` | open and move forward through Codex's queued follow-up questions |
+  | `Alt+↓` | `\x1b[1;3B` | move backward through queued questions and close the question panel |
   | `↑ ↓ ← →` | `\x1b[A/B/C/D` | history, TUI menus |
   | `⌨` | focus xterm textarea | summon/dismiss keyboard (iOS needs a gesture) |
   | `Paste` | `clipboard.readText()` → input, else the paste sheet | long-press paste is flaky in xterm; the read needs a secure context, which a phone does **not** have (below) |
@@ -335,14 +341,17 @@ desktop (select session on load).
 | Right panel: VS Code, fields, cleanup, summary | Details sheet, same component (VS Code hidden — see below) |
 | SCM: status, changed files, diff, pull, rebase, commit graph, commit detail | Details sheet, same components; modals as sheets |
 | New session / new workspace / directory picker / connection & relay manage / usage | Same dialogs as full-screen sheets |
+| Session list + terminal approval interaction | `/deck` button grid for glance/approval flows; terminal opens for anything unsafe to reduce to choices |
 | Panel resize | N/A on phone (no panels) — desktop unchanged |
 
 ## Packaging path for the future apps
 
-- Add a web-app manifest (`display: standalone`, `background_color/theme_color
-  #0b0e14`, icons) + iOS meta tags now: "Add to Home Screen" becomes the
-  zero-cost phone app immediately, and the eventual store apps are thin
-  WebView/Capacitor wrappers around the same origin — phone wrapper renders
+- The web-app manifest (`display: standalone`, theme/background colours,
+  maskable icons), apple-touch-icon and theme-color are shipped. Add the three
+  iOS metas (`apple-mobile-web-app-capable`, `-status-bar-style`, `-title`) to
+  finish MOB-PWA. "Add to Home Screen" is the zero-cost phone app, and eventual
+  store apps are thin WebView/Capacitor wrappers around the same origin — phone
+  wrapper renders
   the mobile shell, iPad wrapper renders the desktop shell purely by viewport
   size. No per-platform UI work ever.
 - Service worker / offline shell is deliberately out of scope (app is
@@ -364,15 +373,17 @@ desktop (select session on load).
    `useVisualViewportHeight` + `interactive-widget=resizes-content`. i18n
    `keybar.*`. *(new: TermKeyBar.tsx, terminalTypes.ts, useVisualViewportHeight.ts;
    touch: Terminal.tsx, MobileShell.tsx, clipboard.ts, en.json, index.html)*
-4. **PWA wrapper** — manifest, icons, theme-color, iOS metas. *(touch:
-   index.html; new: public/manifest.webmanifest, icons)*
+4. ◐ **PWA wrapper (mostly shipped)** — manifest, icons, apple-touch-icon and
+   theme-color shipped in `f7c7640`; only the three iOS metas remain. *(touch:
+   index.html)*
 5. ✅ **Verify** (for phases 1–3) — `scripts/mobile-shell-test.mjs`: headless
    Chrome at 390×844 against a live shell session drives device switch → session
    tap → key-bar/Ctrl-latch input over the WS → details sheet → back navigation
    (ALL PASS), plus desktop regression at 1280×800. Re-run after phase 4.
 
 Phases 1–2 make the app usable on a phone; 3 makes the terminal genuinely
-workable (all shipped); 4 is packaging. Each phase ships independently.
+workable (all shipped); 4 is packaging and is one small metadata patch short of
+complete. Each phase ships independently.
 
 ## Follow-ups (out of scope, noted so they aren't lost)
 

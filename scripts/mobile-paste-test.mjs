@@ -57,7 +57,9 @@ async function enterTerminal(page) {
   await waitFor("!!document.querySelector('.session-row')");
   await evalJs("document.querySelector('.session-row').click()");
   await waitFor("!!document.querySelector('.terminal-host')");
-  await waitFor("(document.querySelector('.terminal-host')?.innerText||'').trim().length > 0");
+  await waitFor(
+    "!document.querySelector('.terminal-loading') && (document.querySelector('.terminal-mount .xterm-rows')?.innerText||'').trim().length > 0",
+  );
 }
 
 /** Take the clipboard API away for every subsequent load: exactly what a browser
@@ -144,6 +146,31 @@ async function main() {
   );
   await tapKey(plain, "Paste");
   check("insecure: Paste opens the fallback sheet rather than failing silently", await sheetIsOpen(plain));
+  const sheetBounds = await plain.evalJs(`(() => {
+    const rect = (selector) => {
+      const r = document.querySelector(selector)?.getBoundingClientRect();
+      return r && { left: r.left, right: r.right, width: r.width };
+    };
+    const input = document.querySelector('.paste-sheet-input');
+    return {
+      viewport: window.visualViewport?.width ?? window.innerWidth,
+      sheet: rect('.paste-sheet'),
+      input: rect('.paste-sheet-input'),
+      inputFontSize: input ? parseFloat(getComputedStyle(input).fontSize) : null,
+    };
+  })()`);
+  check(
+    "insecure: paste sheet and input stay inside the phone viewport",
+    [sheetBounds.sheet, sheetBounds.input].every(
+      (r) => r && r.left >= -0.5 && r.right <= sheetBounds.viewport + 0.5,
+    ),
+    JSON.stringify(sheetBounds),
+  );
+  check(
+    "insecure: focused input does not trigger iOS Safari's viewport zoom",
+    sheetBounds.inputFontSize >= 16,
+    `${sheetBounds.inputFontSize}px`,
+  );
   check(
     "insecure: the sheet's input is focused, so the keyboard rises with it",
     await plain.evalJs("document.activeElement === document.querySelector('.paste-sheet-input')"),

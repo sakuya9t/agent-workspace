@@ -10,7 +10,7 @@ The core promise:
 start agent -> disconnect -> agent keeps running -> reconnect -> resume the same live session -> inspect code changes
 ```
 
-Supported agent targets include Codex, Claude Code, opencode, myclaw, Hermes, and custom terminal commands.
+Supported agent targets include Codex, Claude Code, opencode, pi, myclaw, Hermes, and custom terminal commands.
 
 ## Design Principles
 
@@ -22,6 +22,8 @@ Supported agent targets include Codex, Claude Code, opencode, myclaw, Hermes, an
 - Replaceable execution: agent runtimes, session backends, and source-control panels use plugin boundaries.
 - Native portability: the daemon runs natively on Linux, macOS, and Windows; Windows support does not depend on WSL.
 - Workspace isolation: independent agents never share one writable working tree by default.
+- Independent review: a copilot inspects an immutable snapshot in a disposable
+  worktree, never the main agent's live terminal or writable workspace.
 - Workspace setup: isolated instances receive explicit setup hooks for secrets, caches, dependencies, and repo-specific bootstrap.
 - Git-backed change tracking: MVP diff and checkpoint behavior is unified through Git.
 - Component leverage: mature dependencies are used behind product-owned interfaces.
@@ -32,6 +34,9 @@ Supported agent targets include Codex, Claude Code, opencode, myclaw, Hermes, an
 ### Personal Model
 
 A session belongs to one owner. The same owner can attach from multiple devices. The architecture does not support multi-person live terminal control, team roles, organization policy, or live session transfer.
+
+A session copilot is same-owner automation, not another collaborator or another
+terminal controller. Its findings and gate policy remain private to the owner.
 
 Repository collaboration remains outside the session layer:
 
@@ -47,7 +52,8 @@ Repository collaboration remains outside the session layer:
 | Desktop client | Electron shared web UI | Native mobile, richer editor UI |
 | Terminal renderer | xterm.js | Addons and renderer tuning |
 | Session backend | Single out-of-process holder (`asmux`) owning all PTYs; VT emulator in the daemon | tmux backend, future platform backends |
-| Agent runtime | Built-in Codex, Claude Code, opencode, custom command | myclaw, Hermes, third-party plugins |
+| Agent runtime | Built-in Codex, Claude Code, opencode, pi, custom command | myclaw, Hermes, third-party plugins |
+| Independent review | Not in the core MVP | One-shot local plugin/model over an immutable Git snapshot; later multiple reviewers, remote runners, required-check adapters |
 | Source control | Git plugin | SVN, Mercurial, Perforce, custom panels |
 | Workspace isolation | Git worktrees | Clone, reflink, full-copy, provider-specific isolation |
 | Change tracking | Git checkpoints | Provider-specific checkpoint models |
@@ -231,6 +237,7 @@ Agent plugins define:
 - transcript location and parser behavior when the agent writes structured transcripts,
 - memory injection adapter,
 - readiness and health detection,
+- optional non-interactive, model-aware review job construction,
 - UI actions.
 
 Built-in agent plugins:
@@ -238,29 +245,51 @@ Built-in agent plugins:
 ```text
 codex
 claude
+opencode
 custom_command
 ```
 
 Planned built-ins:
 
 ```text
-opencode
 myclaw
 hermes
 ```
 
 Agent plugins do not own session lifetime. They provide launch and interpretation behavior to the daemon and selected session backend.
 
+### Copilot Review Jobs
+
+A copilot is a daemon-owned policy attached to a session. It selects an agent
+plugin and optional model, review trigger, rubric, deterministic checks, and
+advisory or gatekeeper role. A review run is not a session backend object: it is
+a bounded non-interactive child process with closed stdin, captured output, a
+deadline, and explicit cancellation.
+
+For every run the daemon captures the session's exact committed and dirty Git
+tree with a private temporary index, retains it under an ephemeral private ref,
+and checks it out into a detached disposable worktree. The reviewer receives
+that repository plus a deterministic session digest and must return a versioned
+structured verdict. It never attaches to the main PTY and never shares the
+main workspace. See [`copilot.md`](copilot.md) for the snapshot algorithm,
+result schema, stale-result rules, and enforcement limits.
+
+Gatekeeping is a source-control policy above the agent plugin. Before an
+ASM-owned promotion, the daemon recomputes the review fingerprint and promotes
+the exact reviewed object only when the configured verdict and deterministic
+checks pass. Direct Git commands in the terminal are outside this local policy;
+universal enforcement requires a remote protected-branch/required-check
+boundary.
+
 ### Session Backend Plugins
 
-> **Superseded in part by asmux** (see docs/durable-sessions.md and
-> docs/asmux-protocol.md): the native backend is a **single out-of-process holder
-> for all sessions** (`asmux`), not one sidecar per session; the **VT emulator
-> lives in the daemon**, not the holder; and attach is **single-client with
-> takeover**. The per-session-sidecar prose below predates that decision; where it
-> conflicts with the asmux docs, the asmux docs are authoritative.
-
-Session backend plugins own live terminal mechanics under daemon policy. The native backend uses one out-of-process sidecar per live session. Each sidecar holds that session's PTY master or ConPTY handle, child process handle, terminal emulator state, and backend-local output spool.
+Session backend plugins own live terminal mechanics under daemon policy. The
+native durable backend is one out-of-process holder, **asmux**, for all live
+sessions owned by that daemon user. asmux owns PTY masters/child handles and a
+bounded raw-byte ring per session; the daemon owns VT emulation, SQLite terminal
+events, attention classification and product lifecycle. The frozen contract is
+[`asmux-protocol.md`](asmux-protocol.md); durability and failure reasoning are in
+[`durable-sessions.md`](durable-sessions.md).
 
 Backend responsibilities:
 
@@ -269,70 +298,81 @@ Backend responsibilities:
 - stream terminal output,
 - accept terminal input,
 - resize terminals,
-- maintain a headless terminal emulator screen model,
-- export terminal screen snapshots,
 - report health and exit status,
 - preserve backend-local continuity while clients are disconnected,
-- provide durable event drain or a backend-local append-only output spool.
+- retain bounded hot output for reconnect/adoption,
+- leave live children running when the daemon disconnects or restarts.
+
+Daemon responsibilities above the backend:
+
+- maintain a headless terminal emulator screen model,
+- persist terminal events and exact backend cursors,
+- synthesize attach repaint/history streams,
+- cold-stitch SQLite history to the holder tail after daemon restart,
+- classify attention and commit lifecycle/summary state.
 
 Backend IPC operations:
 
 ```text
-RegisterBackend
-CreateBackendSession
-AttachBackendSession
-QueryBackendSession
-StreamBackendOutput
-DrainBackendEvents
-SendBackendInput
-ResizeBackendSession
-StopBackendSession
-ExportBackendSnapshot
-DetachDaemon
+Hello
+Create / List
+Attach / Detach
+SessionInput / SessionOutput
+Resize / Kill
+Purge / UpdateMetadata / ReadBuffer
+Heartbeat
+SessionExited / SessionDetached / Error
 ```
 
 No-gap rules:
 
 - client disconnect never stops a backend session,
-- daemon restart reattaches to live per-session sidecars,
-- daemon upgrade leaves existing sidecars and live PTYs running,
-- backend output generated during daemon reconnect is drained into the terminal event store,
+- daemon restart reconnects to the same holder and adopts live sessions,
+- output produced while the daemon is away remains in asmux's bounded ring,
+- adoption seeds the daemon from SQLite cold history, then attaches from the
+  exact persisted holder cursor,
+- a wrapped holder ring produces an explicit visible gap marker rather than
+  silently pretending continuity,
 - exited or failed processes are recorded as terminal states,
-- rerunning an agent creates an explicit follow-up session.
+- rerunning/continuing work creates an explicit forked session.
 
-Native sidecar lifetime:
+Native holder lifetime:
 
-- one sidecar per live session is the default MVP model,
-- daemon restart leaves per-session sidecars and live PTYs running,
-- daemon upgrade leaves existing sidecars running on their original binary until their sessions exit,
-- new sessions use the currently installed sidecar binary,
-- systemd user units keep sidecar processes outside daemon restart kill paths,
+- one asmux process owns every live native session for the user/daemon,
+- daemon restart leaves asmux and all live PTYs running,
+- a reconnect supervisor re-dials, reattaches each route from its last cursor,
+  and reconciles `list` after every connection recovery,
+- systemd deployments keep asmux outside the daemon restart kill path,
 - Windows user-scoped startup avoids placing live session processes in a daemon job object that is torn down on daemon restart,
-- sidecar crash marks its owned session failed,
-- sidecar maintenance that terminates a live session is explicit and session-scoped.
+- an asmux crash loses all live PTYs but preserves SQLite history and reconciles
+  affected sessions to `indeterminate`,
+- holder binary-drift soft reboot and orphan adoption UI remain M4 Stage C.
 
-Sidecar rendezvous:
+Holder rendezvous:
 
-- sidecar IPC sockets live in a well-known per-user runtime directory,
-- socket names are derived from session IDs,
-- session records persist the expected sidecar socket path and sidecar process metadata,
-- daemon startup scans the runtime directory before reconciling session records,
-- live sidecars without matching session records become orphaned sidecar records,
-- orphaned sidecars are surfaced in diagnostics and the session list,
-- the owner can adopt an orphan as a recovered session or terminate it.
+- one `0600` socket lives in a `0700` per-user runtime directory,
+- asmux refuses to displace a live holder unless explicitly overridden,
+- a watchdog rebinds if the live socket path is unlinked or replaced,
+- daemon startup listens first, then reconciles DB live rows against asmux
+  `list`, so ordinary API/history reads are available during adoption,
+- holder sessions missing DB ownership are the pending M4-C orphan-surfacing
+  case.
 
 Resume model:
 
-- the sidecar runs a headless VT emulator for every live session,
-- live attach requests fetch a fresh emulator snapshot from the session sidecar,
-- terminal snapshots are exported as a synthesized ANSI repaint stream with cursor and mode metadata,
+- the daemon runs a headless VT emulator for every live session,
+- alternate-screen/self-scrolling agents attach with a synthesized ANSI repaint,
+- normal-buffer agents attach with bounded raw-history replay so xterm.js
+  reconstructs scrollback as well as the current screen,
 - fresh clients resume by writing the repaint stream through the same xterm.js path as live output,
-- event replay fills only the tail after the snapshot,
-- persisted snapshots support exited-session history, inspection, search, diagnostics, and fallback recovery,
-- replay from an arbitrary raw byte offset is not a resume mechanism,
+- daemon restart uses exact SQLite cold-stitch plus the holder tail,
+- persisted terminal events support exited-session history, inspection,
+  transcript fallback, diagnostics and restart recovery,
 - resize repaint requests are available as a pragmatic TUI refresh trigger.
 
-The native PTY sidecar is the MVP backend. A tmux backend is a normal backend plugin that maps product sessions to tmux sessions, windows, or panes and uses tmux's server-side screen state. Windows-native operation does not depend on tmux or WSL.
+asmux is the native MVP backend. A future tmux backend remains a normal backend
+plugin mapping product sessions to tmux sessions/windows/panes. Windows-native
+operation will use ConPTY and does not depend on tmux or WSL (M5).
 
 ### Source-Control Plugins
 
@@ -549,6 +589,8 @@ Git workspace behavior:
 - the explicit "New segment" UI action sends the agent command and advances the active checkpoint,
 - plugin input sniffing is an optional session-boundary capability,
 - dirty checkpoint capture uses temporary-index plumbing to write a tree and update an app-managed ref,
+- dirty copilot-review capture reuses the same tree-snapshot primitive but keeps
+  only an ephemeral `refs/asm/reviews/*` ref,
 - checkpoint policy defines whether untracked files are captured,
 - changed files are clickable and open a diff.
 
@@ -932,6 +974,18 @@ ChangeTrackingService
   CreateCheckpoint
   UpdateCheckpoint
 
+ReviewService
+  ListSessionCopilots
+  CreateSessionCopilot
+  UpdateSessionCopilot
+  DeleteSessionCopilot
+  StartReview
+  ListReviews
+  GetReview
+  CancelReview
+  DeliverReview
+  CheckPromotionGate
+
 MemoryService
   GetAgentProfile
   UpdateAgentMemory
@@ -992,13 +1046,17 @@ placement_decisions
 repo_identities
 ```
 
+The post-MVP copilot extension adds `session_copilots`, `review_runs`,
+`review_findings`, `review_checks`, and `review_gate_events`.
+
 ## Security Model
 
 Baseline security:
 
 - device enrollment,
 - per-server identity,
-- encrypted transport,
+- authenticated transport; encryption through SSH tunneling or the production
+  relay (trusted-LAN direct mode remains plaintext by explicit decision),
 - scoped access tokens,
 - workspace allowlist,
 - explicit approval before arbitrary custom commands,
@@ -1027,7 +1085,11 @@ MVP storage disclosure:
 - API and protocol compatibility across client/daemon version skew.
 - Cross-machine repository identity and clone/sync metadata.
 - Git checkpoint and worktree naming, retention, and garbage collection.
+- Remote copilot runners, multi-reviewer quorum, and required-check attestation
+  format; local single-reviewer semantics are defined in `copilot.md`.
 - Binary, large-file, generated-file, and ignored-path diff behavior.
 - Placement policy defaults across locality, latency, load, cost, and power state.
-- Relay stream-multiplexing framing: default is yamux over the registration WSS, with frp-style dial-out-per-stream as the documented fallback (see connectivity-execution-plan.md → Locked decisions).
+- Relay transport hardening beyond the shipped dial-out-per-stream design
+  (TLS/443 deployment, ACLs, key rotation, pairing, and splice-point
+  confidentiality); see `connectivity-execution-plan.md` → R5.
 - Pairing-code enrollment brokered through the relay to replace manual token paste.

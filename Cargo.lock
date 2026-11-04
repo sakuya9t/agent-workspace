@@ -58,6 +58,7 @@ name = "asm-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "asm-launch",
  "asm-relay",
  "asmux",
  "async-trait",
@@ -80,6 +81,10 @@ dependencies = [
  "uuid",
  "vt100",
 ]
+
+[[package]]
+name = "asm-launch"
+version = "0.1.0"
 
 [[package]]
 name = "asm-relay"

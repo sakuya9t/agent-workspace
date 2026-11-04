@@ -69,7 +69,9 @@ impl SessionBackend for SidecarBackend {
 
         let session = block_on(async move {
             client.create(&spec).await?;
-            let rx = client.route(&session_id);
+            // Fresh session: the attach below starts at the very beginning, so
+            // that is also where a reconnect must resume from.
+            let rx = client.route(&session_id, 0);
             match client
                 .attach(&session_id, wire::AttachMode::FromEarliest, 0)
                 .await
@@ -126,7 +128,12 @@ impl SessionBackend for SidecarBackend {
             // Reconstruct both the screen (vt100) and the normal-buffer raw
             // scrollback (HistoryRing) from cold history.
             let (parser, history) = seed_from_cold(rows, cols, &cold);
-            let rx = client.route(&sid);
+            // Seeded with the same cursor the attach below uses. A socket drop
+            // in the window before the first post-adopt chunk arrives would
+            // otherwise re-attach from 0 and replay the whole ring — through the
+            // emulator and history ring, not just the (already gated) persist —
+            // duplicating the scrollback cold-stitch adopt just made exact.
+            let rx = client.route(&sid, consumed);
             let persist_from = match client
                 .attach(&sid, wire::AttachMode::FromCursor, consumed)
                 .await
@@ -147,6 +154,11 @@ impl SessionBackend for SidecarBackend {
                         Err(AttachError::Conn(e)) => return Err(e),
                         Err(_) => {}
                     }
+                    // We did not land where we asked: the stream now resumes at
+                    // the ring tail, so that — not `consumed` — is what a
+                    // reconnect must ask for. (`persist_from` stays `consumed`:
+                    // everything past it is genuinely new to cold history.)
+                    client.set_stream_cursor(&sid, earliest);
                     consumed
                 }
                 Err(AttachError::Code(c)) => {
@@ -335,12 +347,10 @@ async fn drain_loop(ctx: DrainCtx) {
         persist_from,
     } = ctx;
     let mut parser_ok = true;
-    let mut last_cursor = persist_from;
 
     while let Some(ev) = rx.recv().await {
         match ev {
             StreamEvent::Output { data, cursor } => {
-                last_cursor = cursor;
                 // Feed the emulator (isolate a parser panic to this session).
                 {
                     let mut p = parser.lock();
@@ -389,11 +399,14 @@ async fn drain_loop(ctx: DrainCtx) {
             StreamEvent::Detached { reason } => {
                 if reason == DETACH_BACKPRESSURE {
                     // This session's stream fell behind and was evicted. Resync
-                    // in place from the last cursor we saw; a socket drop during
-                    // this is fine — the supervisor re-attaches on reconnect.
-                    tracing::warn!(session = %session_id, "asmux backpressure eviction; resyncing");
+                    // in place from where the route says it stopped — the same
+                    // number a reconnect would resume from, asked of its one
+                    // owner rather than tracked again here. A socket drop during
+                    // this is fine: the supervisor re-attaches on reconnect.
+                    let from = client.stream_cursor(&session_id);
+                    tracing::warn!(session = %session_id, from, "asmux backpressure eviction; resyncing");
                     match client
-                        .attach(&session_id, wire::AttachMode::FromCursor, last_cursor)
+                        .attach(&session_id, wire::AttachMode::FromCursor, from)
                         .await
                     {
                         Ok(_) => {}
@@ -402,6 +415,7 @@ async fn drain_loop(ctx: DrainCtx) {
                             let _ = client
                                 .attach(&session_id, wire::AttachMode::FromEarliest, 0)
                                 .await;
+                            client.set_stream_cursor(&session_id, earliest);
                         }
                         // A connection error here is recovered by the supervisor's
                         // reconnect + reattach; keep draining the same route.
@@ -429,6 +443,210 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, VecDeque};
+
+    use async_trait::async_trait;
+
+    use crate::domain::{AttentionState, Session, SessionStatus};
+    use uuid::Uuid;
+
+    #[derive(Clone, Copy)]
+    enum AttachStep {
+        Ok(u64),
+        Gap(u64),
+        Code(u32),
+    }
+
+    struct MockRoute {
+        tx: mpsc::UnboundedSender<StreamEvent>,
+        cursor: u64,
+    }
+
+    /// Scriptable holder test double. It deliberately models the two pieces the
+    /// sidecar relies on independently: RPC outcomes and the asynchronous event
+    /// route. This makes attach gaps, detach/resync, exits, and vanished routes
+    /// deterministic without a real socket or PTY.
+    #[derive(Default)]
+    struct MockHolder {
+        attach_steps: Mutex<VecDeque<AttachStep>>,
+        attach_calls: Mutex<Vec<(String, wire::AttachMode, u64)>>,
+        creates: Mutex<Vec<BackendSpawnSpec>>,
+        routes: Mutex<HashMap<String, MockRoute>>,
+        inputs: Mutex<Vec<(String, Vec<u8>)>>,
+        resizes: Mutex<Vec<(String, u16, u16)>>,
+        kills: Mutex<Vec<(String, i32)>>,
+        unroutes: Mutex<Vec<String>>,
+    }
+
+    impl MockHolder {
+        fn with_attach_steps(steps: impl IntoIterator<Item = AttachStep>) -> Arc<Self> {
+            Arc::new(Self {
+                attach_steps: Mutex::new(steps.into_iter().collect()),
+                ..Self::default()
+            })
+        }
+
+        fn emit(&self, session_id: &str, event: StreamEvent) {
+            let mut routes = self.routes.lock();
+            let route = routes.get_mut(session_id).expect("route must exist");
+            if let StreamEvent::Output { cursor, .. } = &event {
+                route.cursor = *cursor;
+            }
+            route.tx.send(event).expect("drain route must be open");
+        }
+    }
+
+    #[async_trait]
+    impl Holder for MockHolder {
+        async fn create(&self, spec: &BackendSpawnSpec) -> Result<super::super::asmux_client::HolderSessionInfo> {
+            self.creates.lock().push(spec.clone());
+            Ok(super::super::asmux_client::HolderSessionInfo {
+                id: spec.session_id.clone(),
+                alive: true,
+                exit_code: 0,
+                exit_signal: 0,
+                head_cursor: 0,
+            })
+        }
+
+        async fn list(&self) -> Result<Vec<super::super::asmux_client::HolderSessionInfo>> {
+            Ok(vec![])
+        }
+
+        async fn attach(
+            &self,
+            session_id: &str,
+            mode: wire::AttachMode,
+            from_cursor: u64,
+        ) -> std::result::Result<u64, AttachError> {
+            self.attach_calls
+                .lock()
+                .push((session_id.to_string(), mode, from_cursor));
+            match self
+                .attach_steps
+                .lock()
+                .pop_front()
+                .unwrap_or(AttachStep::Ok(from_cursor))
+            {
+                AttachStep::Ok(head) => Ok(head),
+                AttachStep::Gap(earliest) => Err(AttachError::Gap { earliest }),
+                AttachStep::Code(code) => Err(AttachError::Code(code)),
+            }
+        }
+
+        fn send_input(&self, session_id: &str, data: &[u8]) {
+            self.inputs
+                .lock()
+                .push((session_id.to_string(), data.to_vec()));
+        }
+
+        fn resize(&self, session_id: &str, cols: u16, rows: u16) {
+            self.resizes
+                .lock()
+                .push((session_id.to_string(), cols, rows));
+        }
+
+        fn kill(&self, session_id: &str, signal: i32) {
+            self.kills.lock().push((session_id.to_string(), signal));
+        }
+
+        fn route(
+            &self,
+            session_id: &str,
+            from_cursor: u64,
+        ) -> mpsc::UnboundedReceiver<StreamEvent> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            self.routes.lock().insert(
+                session_id.to_string(),
+                MockRoute {
+                    tx,
+                    cursor: from_cursor,
+                },
+            );
+            rx
+        }
+
+        fn unroute(&self, session_id: &str) {
+            self.routes.lock().remove(session_id);
+            self.unroutes.lock().push(session_id.to_string());
+        }
+
+        fn set_stream_cursor(&self, session_id: &str, cursor: u64) {
+            if let Some(route) = self.routes.lock().get_mut(session_id) {
+                route.cursor = cursor;
+            }
+        }
+
+        fn stream_cursor(&self, session_id: &str) -> u64 {
+            self.routes
+                .lock()
+                .get(session_id)
+                .map(|route| route.cursor)
+                .unwrap_or(0)
+        }
+
+        fn inject_exit(&self, session_id: &str, code: i32, signal: i32) {
+            if let Some(route) = self.routes.lock().get(session_id) {
+                let _ = route.tx.send(StreamEvent::Exited { code, signal });
+            }
+        }
+    }
+
+    fn test_db() -> (Db, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("asm-sidecar-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        (Db::open(&dir.join("test.sqlite3")).unwrap(), dir)
+    }
+
+    fn seed_session(db: &Db, id: &str) {
+        let now = now_millis();
+        db.insert_session(&Session {
+            id: id.into(),
+            agent_plugin_id: "shell".into(),
+            command: "sh".into(),
+            args: vec![],
+            env: vec![],
+            working_directory: std::env::temp_dir().to_string_lossy().into_owned(),
+            workspace_id: None,
+            status: SessionStatus::Running,
+            rows: 24,
+            cols: 80,
+            last_event_seq: 0,
+            exit_code: None,
+            attention_state: AttentionState::None,
+            attention_reason: None,
+            created_at: now,
+            updated_at: now,
+            last_activity_at: now,
+            risky: false,
+            agent_session_id: None,
+            forked_from: None,
+            state_since: now,
+        })
+        .unwrap();
+    }
+
+    fn spawn_spec(id: &str) -> BackendSpawnSpec {
+        BackendSpawnSpec {
+            session_id: id.into(),
+            command: "cat".into(),
+            args: vec![],
+            env: vec![],
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            rows: 24,
+            cols: 80,
+        }
+    }
+
+    async fn wait_until(mut predicate: impl FnMut() -> bool, message: &str) {
+        for _ in 0..100 {
+            if predicate() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {message}");
+    }
 
     fn ring_bytes(history: &Mutex<HistoryRing>) -> Vec<u8> {
         let mut out = Vec::new();
@@ -475,5 +693,188 @@ mod tests {
             .contains("not recorded during the restart gap"));
         let ring = String::from_utf8_lossy(&ring_bytes(&history)).into_owned();
         assert!(ring.contains("4096 bytes"), "byte count shown: {ring:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mock_holder_drives_create_output_commands_and_exit() {
+        let (db, dir) = test_db();
+        seed_session(&db, "fresh");
+        let holder = MockHolder::with_attach_steps([AttachStep::Ok(0)]);
+        let backend = SidecarBackend::new(holder.clone(), db.events(), db.clone());
+
+        let session = backend.create(spawn_spec("fresh")).unwrap();
+        assert_eq!(holder.creates.lock().len(), 1);
+        assert_eq!(
+            holder.attach_calls.lock().as_slice(),
+            &[("fresh".into(), wire::AttachMode::FromEarliest, 0)]
+        );
+
+        holder.emit(
+            "fresh",
+            StreamEvent::Output {
+                data: b"hello from holder\r\n".to_vec(),
+                cursor: 19,
+            },
+        );
+        wait_until(
+            || session.screen_text().contains("hello from holder"),
+            "mock output to reach the emulator",
+        )
+        .await;
+        assert_eq!(session.last_seq(), 1);
+        wait_until(
+            || {
+                db.read_events_after("fresh", 0).unwrap()
+                    == b"hello from holder\r\n"
+            },
+            "mock output persistence",
+        )
+        .await;
+
+        session.send_input(b"input").unwrap();
+        session.resize(40, 120).unwrap();
+        session.stop().unwrap();
+        assert_eq!(holder.inputs.lock().as_slice(), &[("fresh".into(), b"input".to_vec())]);
+        assert_eq!(holder.resizes.lock().as_slice(), &[("fresh".into(), 120, 40)]);
+        assert_eq!(holder.kills.lock().as_slice(), &[("fresh".into(), 0)]);
+
+        holder.emit("fresh", StreamEvent::Exited { code: 7, signal: 0 });
+        let mut status = session.watch_status();
+        wait_until(
+            || {
+                status.borrow_and_update().clone() == BackendStatus::Exited(7)
+            },
+            "exit status",
+        )
+        .await;
+
+        drop(session);
+        drop(backend);
+        drop(holder);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mock_holder_drives_backpressure_gap_resync() {
+        let (db, dir) = test_db();
+        let holder = MockHolder::with_attach_steps([
+            AttachStep::Ok(0),
+            AttachStep::Gap(7),
+            AttachStep::Ok(12),
+        ]);
+        let backend = SidecarBackend::new(holder.clone(), db.events(), db);
+        let session = backend.create(spawn_spec("resync")).unwrap();
+
+        holder.emit(
+            "resync",
+            StreamEvent::Detached {
+                reason: DETACH_BACKPRESSURE,
+            },
+        );
+        wait_until(
+            || holder.attach_calls.lock().len() == 3,
+            "backpressure reattach sequence",
+        )
+        .await;
+        assert_eq!(
+            holder.attach_calls.lock().as_slice(),
+            &[
+                ("resync".into(), wire::AttachMode::FromEarliest, 0),
+                ("resync".into(), wire::AttachMode::FromCursor, 0),
+                ("resync".into(), wire::AttachMode::FromEarliest, 0),
+            ]
+        );
+        assert_eq!(holder.stream_cursor("resync"), 7);
+
+        holder.emit("resync", StreamEvent::Exited { code: 0, signal: 0 });
+        drop(session);
+        drop(backend);
+        drop(holder);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mock_holder_drives_cold_adopt_gap_and_end_stream() {
+        let (db, dir) = test_db();
+        seed_session(&db, "adopted");
+        db.events().send(EventMsg {
+            session_id: "adopted".into(),
+            seq: 1,
+            ts_ms: now_millis(),
+            stream: 0,
+            bytes: b"cold history\r\n".to_vec(),
+            head_cursor: 14,
+        });
+        wait_until(
+            || db.get_backend_cursor("adopted").unwrap() == 14,
+            "cold event persistence",
+        )
+        .await;
+
+        let holder =
+            MockHolder::with_attach_steps([AttachStep::Gap(20), AttachStep::Ok(24)]);
+        let backend = SidecarBackend::new(holder.clone(), db.events(), db);
+        let session = backend
+            .adopt("adopted", 24, 80)
+            .unwrap()
+            .expect("gap falls back to the earliest retained output");
+
+        assert_eq!(
+            holder.attach_calls.lock().as_slice(),
+            &[
+                ("adopted".into(), wire::AttachMode::FromCursor, 14),
+                ("adopted".into(), wire::AttachMode::FromEarliest, 0),
+            ]
+        );
+        assert_eq!(holder.stream_cursor("adopted"), 20);
+        let screen = session.screen_text();
+        assert!(screen.contains("cold history"), "cold screen: {screen:?}");
+        assert!(
+            screen.contains("not recorded during the restart gap"),
+            "gap marker: {screen:?}"
+        );
+
+        backend.end_session_stream(
+            "adopted",
+            StreamEnd::Exited {
+                code: -1,
+                signal: 9,
+            },
+        );
+        let mut status = session.watch_status();
+        wait_until(
+            || {
+                matches!(
+                    &*status.borrow_and_update(),
+                    BackendStatus::Failed(reason) if reason == "signalled (9)"
+                )
+            },
+            "synthetic holder exit",
+        )
+        .await;
+
+        backend.end_session_stream("vanished", StreamEnd::Vanished);
+        assert_eq!(holder.unroutes.lock().as_slice(), &["vanished".to_string()]);
+
+        drop(session);
+        drop(backend);
+        drop(holder);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attach_error_unroutes_and_declines_adoption() {
+        let (db, dir) = test_db();
+        seed_session(&db, "gone");
+        let holder = MockHolder::with_attach_steps([AttachStep::Code(404)]);
+        let backend = SidecarBackend::new(holder.clone(), db.events(), db);
+
+        assert!(backend.adopt("gone", 24, 80).unwrap().is_none());
+        assert_eq!(holder.unroutes.lock().as_slice(), &["gone".to_string()]);
+
+        drop(backend);
+        drop(holder);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
