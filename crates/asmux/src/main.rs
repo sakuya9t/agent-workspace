@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
     let ctx = ServerCtx::new(registry, server_pid, String::new());
 
     tracing::info!(
-        socket = %sock_path.display(),
+        socket = %asmux::socket::endpoint(&sock_path),
         instance_id = %instance_id,
         pid = server_pid,
         memory_limit_mib = memory_limit / (1024 * 1024),
@@ -78,7 +78,9 @@ async fn main() -> Result<()> {
 }
 
 /// Complete on SIGINT or SIGTERM. SIGTERM is the systemd/`docker stop` signal,
-/// so asmux must handle it (not just Ctrl-C) to unlink its socket on exit.
+/// so asmux must handle it (not just Ctrl-C) to unlink its socket on exit. On
+/// Windows, Ctrl-C or Ctrl-Break (the only console signal a process started in
+/// its own group receives); there is no socket file to clean up there.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -95,7 +97,21 @@ async fn shutdown_signal() {
             _ = term.recv() => {}
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        match tokio::signal::windows::ctrl_break() {
+            Ok(mut brk) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = brk.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = tokio::signal::ctrl_c().await;
     }

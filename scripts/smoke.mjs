@@ -63,6 +63,12 @@ async function j(path, init) {
   return res.json();
 }
 
+/** Resolve once `cond()` holds, or after `ms` regardless (the caller checks). */
+async function until(cond, ms) {
+  const deadline = Date.now() + ms;
+  while (!cond() && Date.now() < deadline) await sleep(100);
+}
+
 function wsCollect(id) {
   const ws = new WebSocket(`ws://${base}/api/sessions/${id}/stream`);
   ws.binaryType = "arraybuffer";
@@ -95,14 +101,17 @@ async function main() {
   await new Promise((res) => (c1.ws.onopen = res));
   await sleep(500);
   c1.ws.send(JSON.stringify({ t: "i", d: `echo ${marker}\r` }));
-  await sleep(700);
+  // Poll rather than guess: a shell's startup time varies (PowerShell in a
+  // fresh Windows console takes a second or two before it reads input).
+  await until(() => c1.buf.includes(marker), 15000);
+  await sleep(300);
   c1.ws.close();
   check("live output shows command", c1.buf.includes(marker));
 
   // reconnect: snapshot should reflect prior output
   const c2 = wsCollect(session.id);
   await new Promise((res) => (c2.ws.onopen = res));
-  await sleep(600);
+  await until(() => c2.buf.includes(marker), 5000);
   c2.ws.close();
   check("reconnect snapshot resumes", c2.buf.includes(marker));
 

@@ -7,6 +7,7 @@
 //! lints don't apply here; `unwrap`/`panic` are fine in test scaffolding.
 
 use std::sync::Arc;
+#[cfg(unix)] // only the Unix-only tests below time out
 use std::time::Duration;
 
 use asmux::frame::{self, ord, Incoming};
@@ -16,8 +17,16 @@ use asmux::wire;
 use asmux::MEMORY_LIMIT_DEFAULT_BYTES;
 use planus::ReadAsRoot;
 use tokio::io::AsyncWriteExt;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{UnixListener, UnixStream};
+// The transport halves: a UDS on Unix, a named pipe on Windows.
+use asmux::socket::{ClientRead as OwnedReadHalf, ClientWrite as OwnedWriteHalf};
+
+/// A command that echoes what is typed at it: `cat` on Unix; on Windows the
+/// console echoes input typed at a `cmd.exe` prompt.
+const ECHO_CMD: &str = if cfg!(windows) { "cmd.exe" } else { "cat" };
+
+async fn listen(sock: &std::path::Path) -> asmux::socket::Listener {
+    asmux::socket::bind(sock, false).await.unwrap().0
+}
 
 async fn write_frame(wr: &mut OwnedWriteHalf, bytes: Vec<u8>) {
     wr.write_all(&bytes).await.unwrap();
@@ -73,7 +82,7 @@ async fn start_test_server(name: &str) -> (std::path::PathBuf, std::path::PathBu
         std::env::temp_dir().join(format!("asmux-{name}-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let sock = dir.join("asmux.sock");
-    let listener = UnixListener::bind(&sock).unwrap();
+    let listener = listen(&sock).await;
     let registry = Arc::new(Registry::new(
         format!("{name}-instance"),
         123,
@@ -85,8 +94,8 @@ async fn start_test_server(name: &str) -> (std::path::PathBuf, std::path::PathBu
 }
 
 async fn connect_and_hello(sock: &std::path::Path) -> (OwnedReadHalf, OwnedWriteHalf) {
-    let stream = UnixStream::connect(sock).await.unwrap();
-    let (mut rd, mut wr) = stream.into_split();
+    let stream = asmux::socket::connect(sock).await.unwrap();
+    let (mut rd, mut wr) = asmux::socket::split_client(stream);
     let hello = wire::HelloRequest {
         rpc_id: 1,
         client_pid: std::process::id() as i32,
@@ -137,7 +146,7 @@ async fn end_to_end_m1_lifecycle() {
     std::fs::create_dir_all(&dir).unwrap();
     let sock = dir.join("asmux.sock");
 
-    let listener = UnixListener::bind(&sock).unwrap();
+    let listener = listen(&sock).await;
     let registry = Arc::new(Registry::new(
         "test-instance".to_string(),
         123,
@@ -146,8 +155,8 @@ async fn end_to_end_m1_lifecycle() {
     let ctx = ServerCtx::new(registry, std::process::id() as i32, String::new());
     tokio::spawn(serve(listener, ctx));
 
-    let stream = UnixStream::connect(&sock).await.unwrap();
-    let (mut rd, mut wr) = stream.into_split();
+    let stream = asmux::socket::connect(&sock).await.unwrap();
+    let (mut rd, mut wr) = asmux::socket::split_client(stream);
 
     // --- hello ---
     let hello = wire::HelloRequest {
@@ -168,7 +177,7 @@ async fn end_to_end_m1_lifecycle() {
     // --- create (explicit id, `cat` echoes stdin) ---
     let create = wire::CreateRequest {
         rpc_id: 2,
-        command: Some("cat".to_string()),
+        command: Some(ECHO_CMD.to_string()),
         args: None,
         cwd: None,
         env: None,
@@ -193,7 +202,7 @@ async fn end_to_end_m1_lifecycle() {
     // --- idempotent re-create (same id + spec) returns the same session ---
     let create2 = wire::CreateRequest {
         rpc_id: 3,
-        command: Some("cat".to_string()),
+        command: Some(ECHO_CMD.to_string()),
         args: None,
         cwd: None,
         env: None,
@@ -346,7 +355,7 @@ async fn dropped_output_is_reported_to_the_attacher() {
     let dir = std::env::temp_dir().join(format!("asmux-e2e-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let sock = dir.join("asmux.sock");
-    let listener = UnixListener::bind(&sock).unwrap();
+    let listener = listen(&sock).await;
     let registry = Arc::new(Registry::new(
         "drop-instance".to_string(),
         0,
@@ -355,8 +364,8 @@ async fn dropped_output_is_reported_to_the_attacher() {
     let ctx = ServerCtx::new(registry.clone(), std::process::id() as i32, String::new());
     tokio::spawn(serve(listener, ctx));
 
-    let stream = UnixStream::connect(&sock).await.unwrap();
-    let (mut rd, mut wr) = stream.into_split();
+    let stream = asmux::socket::connect(&sock).await.unwrap();
+    let (mut rd, mut wr) = asmux::socket::split_client(stream);
 
     let hello = wire::HelloRequest {
         rpc_id: 1,
@@ -371,7 +380,7 @@ async fn dropped_output_is_reported_to_the_attacher() {
 
     let create = wire::CreateRequest {
         rpc_id: 2,
-        command: Some("cat".to_string()),
+        command: Some(ECHO_CMD.to_string()),
         args: None,
         cwd: None,
         env: None,
@@ -415,13 +424,13 @@ async fn hello_required_first() {
     let dir = std::env::temp_dir().join(format!("asmux-e2e-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let sock = dir.join("asmux.sock");
-    let listener = UnixListener::bind(&sock).unwrap();
+    let listener = listen(&sock).await;
     let registry = Arc::new(Registry::new("i".to_string(), 0, MEMORY_LIMIT_DEFAULT_BYTES));
     let ctx = ServerCtx::new(registry, 0, String::new());
     tokio::spawn(serve(listener, ctx));
 
-    let stream = UnixStream::connect(&sock).await.unwrap();
-    let (mut rd, mut wr) = stream.into_split();
+    let stream = asmux::socket::connect(&sock).await.unwrap();
+    let (mut rd, mut wr) = asmux::socket::split_client(stream);
 
     // A non-hello first frame is a protocol error.
     let list = wire::ListRequest { rpc_id: 1 };
@@ -434,6 +443,9 @@ async fn hello_required_first() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// Unix only: it needs a byte-exact producer. ConPTY re-renders the console
+// rather than passing child bytes through, so output sizes are not exact.
+#[cfg(unix)]
 #[tokio::test]
 async fn read_buffer_reports_partial_gap_and_invalid_cursors() {
     let (dir, sock, registry) = start_test_server("read-buffer").await;
@@ -530,7 +542,7 @@ async fn detach_is_owner_checked_and_cross_connection_attach_takes_over() {
         &mut first_wr,
         2,
         "s-takeover",
-        "cat",
+        ECHO_CMD,
         None,
         0,
     )
@@ -603,6 +615,8 @@ async fn detach_is_owner_checked_and_cross_connection_attach_takes_over() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+// Unix only: drives `sh`/`yes` as the flooding producer.
+#[cfg(unix)]
 #[tokio::test]
 async fn slow_stream_is_evicted_with_backpressure_reason() {
     let (dir, sock, registry) = start_test_server("backpressure").await;

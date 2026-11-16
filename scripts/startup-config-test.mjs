@@ -20,8 +20,8 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { createSandbox, checker, cleanEnv, freePort, sleep, ROOT } from "./lib/testenv.mjs";
+import { delimiter, join } from "node:path";
+import { createSandbox, checker, cleanEnv, freePort, sleep, ROOT, BASH, IS_WINDOWS } from "./lib/testenv.mjs";
 
 const { check, report } = checker();
 const sb = await createSandbox("asm-startcfg");
@@ -31,9 +31,12 @@ const base = sb.http;
 
 // The scripts shell out to cargo; make sure it is reachable without a login shell.
 const cargoBin = join(homedir(), ".cargo", "bin");
+// Windows spells it `Path`; reuse whatever key the environment has, so the
+// child does not end up with two differently-cased copies.
+const pathKey = Object.keys(process.env).find((k) => k.toUpperCase() === "PATH") ?? "PATH";
 const scriptEnv = (extra = {}) => ({
   ...cleanEnv(),
-  PATH: existsSync(cargoBin) ? `${cargoBin}:${process.env.PATH}` : process.env.PATH,
+  [pathKey]: existsSync(cargoBin) ? `${cargoBin}${delimiter}${process.env[pathKey]}` : process.env[pathKey],
   XDG_RUNTIME_DIR: join(sb.tmp, "xdg"),
   XDG_DATA_HOME: join(sb.tmp, "xdg", "data"),
   XDG_CONFIG_HOME: join(sb.tmp, "xdg", "config"),
@@ -44,7 +47,7 @@ const scriptEnv = (extra = {}) => ({
 const DIRS = ["--data-dir", sb.dataDir, "--runtime-dir", sb.runDir];
 
 function run(script, args = [], extraEnv = {}) {
-  const r = spawnSync("bash", [join(ROOT, "scripts", script), ...DIRS, ...args], {
+  const r = spawnSync(BASH, [join(ROOT, "scripts", script), ...DIRS, ...args], {
     env: scriptEnv(extraEnv),
     encoding: "utf8",
     timeout: 240_000,
@@ -87,7 +90,8 @@ async function putConfig(values) {
 
 async function main() {
   for (const bin of ["asm-daemon", "asmux", "asm-relay"]) {
-    if (!existsSync(join(ROOT, "target", "debug", bin))) throw new Error(`missing target/debug/${bin} — run cargo build`);
+    const exe = IS_WINDOWS ? `${bin}.exe` : bin;
+    if (!existsSync(join(ROOT, "target", "debug", exe))) throw new Error(`missing target/debug/${exe} — run cargo build`);
   }
 
   // ── first start: flags are resolved and saved ────────────────────────────
@@ -95,7 +99,8 @@ async function main() {
   let r = run("start.sh", ["--bind", sb.base, "--no-ui", "--label", "first", "--enrollment-token", TOKEN1]);
   check("first start succeeds", r.code === 0, r.code === 0 ? "" : r.out.slice(-800));
   check("…says the settings are new", /settings — defaults \+ flags/.test(r.out));
-  check("startup.conf saved, owner-only", existsSync(conf) && (statSync(conf).mode & 0o777) === 0o600);
+  // Windows has no mode bits to check: the file inherits the profile dir's owner-only ACL.
+  check("startup.conf saved, owner-only", existsSync(conf) && (IS_WINDOWS || (statSync(conf).mode & 0o777) === 0o600));
   let saved = parse(conf);
   check(
     "…with the resolved settings",
@@ -129,8 +134,10 @@ async function main() {
   let screen = "";
   term.onmessage = (ev) => (screen += typeof ev.data === "string" ? ev.data : Buffer.from(ev.data).toString());
   await new Promise((res) => (term.onopen = res));
-  term.send(JSON.stringify({ t: "i", d: 'echo "bind=[$ASM_BIND] enroll=[$ASM_ENROLLMENT_TOKEN]"\r' }));
-  for (let i = 0; i < 40 && !/bind=\[127/.test(screen); i++) await sleep(100);
+  // The Shell agent is PowerShell on Windows, where env vars read `$env:NAME`.
+  const envRef = (name) => (IS_WINDOWS ? `$env:${name}` : `$${name}`);
+  term.send(JSON.stringify({ t: "i", d: `echo "bind=[${envRef("ASM_BIND")}] enroll=[${envRef("ASM_ENROLLMENT_TOKEN")}]"\r` }));
+  for (let i = 0; i < 150 && !/bind=\[127/.test(screen); i++) await sleep(100);
   term.close();
   check("session env keeps plain settings", screen.includes(`bind=[${sb.base}]`));
   check("…but not the enrollment token", screen.includes("enroll=[]") && !screen.includes(TOKEN1.slice(0, 12) + "]"));

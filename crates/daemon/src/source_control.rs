@@ -525,13 +525,13 @@ impl SourceControl for GitSourceControl {
         // `cwd` additionally stops a symlink committed in the repo from serving a
         // file outside the session's working directory.
         let abs = cwd.join(path);
-        let real = match std::fs::canonicalize(&abs) {
+        let real = match crate::util::canonicalize(&abs) {
             Ok(p) => p,
             // A deleted file has no working-tree version — absent, not an error.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(anyhow!("resolve {path}: {e}")),
         };
-        let root = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        let root = crate::util::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         if !real.starts_with(&root) {
             bail!("path escapes the working directory");
         }
@@ -1626,7 +1626,14 @@ fn guard_path(path: &str) -> Result<()> {
     if path.is_empty() {
         bail!("empty path");
     }
-    if Path::new(path).is_absolute() {
+    // Not just `is_absolute()`: on Windows `\etc\passwd` (rooted, no drive) and
+    // `C:passwd` (a drive, no root) are both "relative", yet `cwd.join()` of
+    // either lands outside `cwd`. Any root or prefix component escapes.
+    if Path::new(path).is_absolute()
+        || Path::new(path)
+            .components()
+            .any(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Prefix(_)))
+    {
         bail!("absolute paths are not allowed");
     }
     if path.split(['/', '\\']).any(|c| c == "..") {
@@ -1707,6 +1714,9 @@ mod tests {
         git_test(&dir, &["init", "-q"]);
         git_test(&dir, &["config", "user.name", "ASM Test"]);
         git_test(&dir, &["config", "user.email", "asm-test@example.com"]);
+        // Byte-exact checkouts whatever the host's git says (Git for Windows
+        // installs with a system-wide `core.autocrlf=true`).
+        git_test(&dir, &["config", "core.autocrlf", "false"]);
         git_test(&dir, &["checkout", "-b", "main"]);
         dir
     }
@@ -1806,6 +1816,14 @@ mod tests {
         assert!(guard_path("../secret").is_err());
         assert!(guard_path("a/../../b").is_err());
         assert!(guard_path("/etc/passwd").is_err());
+        assert!(guard_path("a\\..\\..\\b").is_err());
+        // Windows spellings that are not `is_absolute()` but still escape a join.
+        if cfg!(windows) {
+            assert!(guard_path("\\Windows\\win.ini").is_err());
+            assert!(guard_path("C:\\Windows\\win.ini").is_err());
+            assert!(guard_path("C:win.ini").is_err());
+            assert!(guard_path("\\\\server\\share\\x").is_err());
+        }
     }
 
     #[test]

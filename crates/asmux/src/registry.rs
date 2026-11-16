@@ -219,10 +219,16 @@ mod tests {
     use super::*;
 
     fn spec(id: &str, cap: usize, fp: u64) -> SpawnSpec {
+        // Any command that exists and exits on its own.
+        let (command, args) = if cfg!(windows) {
+            ("cmd.exe", vec!["/d".to_string(), "/c".to_string(), "exit 0".to_string()])
+        } else {
+            ("true", vec![])
+        };
         SpawnSpec {
             session_id: id.to_string(),
-            command: "true".to_string(),
-            args: vec![],
+            command: command.to_string(),
+            args,
             cwd: String::new(),
             env: vec![],
             cols: 80,

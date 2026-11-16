@@ -912,10 +912,7 @@ fn parse_pi_text(text: &str) -> Option<AgentUsage> {
 // ---------- shared fs helpers ----------
 
 pub(crate) fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
+    crate::util::home_dir()
 }
 
 fn mtime_ms(meta: &fs::Metadata) -> i64 {

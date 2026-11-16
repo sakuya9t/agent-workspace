@@ -29,7 +29,7 @@
 
 use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -175,8 +175,7 @@ fn run(
     output_file: Option<PathBuf>,
     deadline: Duration,
 ) -> Option<String> {
-    let mut child = Command::new(command)
-        .args(args)
+    let mut child = crate::plugins::agent_command(command, args)
         .current_dir(cwd)
         // See the module docs: an open stdin wedges `codex exec` indefinitely.
         .stdin(Stdio::null())

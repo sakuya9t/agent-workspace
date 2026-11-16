@@ -19,11 +19,16 @@
 //
 // Requires the built binaries (`cargo build`) and Node 18+ (global WebSocket).
 
-import { existsSync } from "node:fs";
-import { createSandbox, checker, sleep } from "./lib/testenv.mjs";
+import { createSandbox, checker, sleep, IS_WINDOWS } from "./lib/testenv.mjs";
 
 const { check, report } = checker();
 const sb = await createSandbox("asm-dur");
+
+/** Resolve once `cond()` holds, or after `ms` regardless (the caller checks). */
+async function until(cond, ms) {
+  const deadline = Date.now() + ms;
+  while (!cond() && Date.now() < deadline) await sleep(100);
+}
 
 // Both daemons drive the holder rather than in-process PTYs.
 const SIDECAR = { ASM_BACKEND: "sidecar", ASM_ASMUX_AUTOSPAWN: "0" };
@@ -31,7 +36,7 @@ const SIDECAR = { ASM_BACKEND: "sidecar", ASM_ASMUX_AUTOSPAWN: "0" };
 async function main() {
   // 1. the holder, on the sandbox's private socket
   await sb.startAsmux();
-  check("holder (asmux) socket up", existsSync(sb.socket), sb.socket);
+  check("holder (asmux) socket up", sb.holderUp(), sb.socket);
 
   // 2. daemon #1, driving that holder
   const health = await sb.startDaemon("daemon1", SIDECAR);
@@ -50,7 +55,9 @@ async function main() {
   await new Promise((res) => (c1.ws.onopen = res));
   await sleep(500);
   c1.ws.send(JSON.stringify({ t: "i", d: `echo ${marker}\r` }));
-  await sleep(800);
+  // Poll: shell startup varies (PowerShell in a fresh console takes seconds).
+  await until(() => c1.buf.includes(marker), 15000);
+  await sleep(300);
   c1.ws.close();
   check("live output shows marker (pre-restart)", c1.buf.includes(marker));
 
@@ -64,17 +71,28 @@ async function main() {
   await sleep(300);
   cf.ws.send(JSON.stringify({ t: "i", d: `echo ${coldMarker}\r` }));
   await sleep(500);
-  // ~2.65 MiB (52000 lines * 51 bytes) — well past the 2 MiB default ring.
+  // ~2.65 MiB (52000 lines * 51 bytes) — well past the 2 MiB default ring —
+  // then a done-marker, so we know it has all been emitted. (On Windows the
+  // shell is PowerShell. ConPTY renders the console in frames rather than
+  // passing bytes through, so not every scrolled line need reach the ring —
+  // the discriminator is weaker there, the restart assertions are not.)
   const filler = "".padEnd(50, ".");
-  cf.ws.send(JSON.stringify({ t: "i", d: `yes ${filler} | head -n 52000\r` }));
-  await sleep(4500); // let it all emit AND flush to cold history
+  const filled = "FILLED-" + Math.random().toString(36).slice(2, 8).toUpperCase();
+  const flood = IS_WINDOWS
+    ? `1..52000 | % { '${filler}' }; echo ${filled}\r`
+    : `yes ${filler} | head -n 52000; echo ${filled}\r`;
+  cf.ws.send(JSON.stringify({ t: "i", d: flood }));
+  // The typed command line echoes the marker too: wait for its *output*,
+  // i.e. a second occurrence.
+  await until(() => cf.buf.split(filled).length > 2, 90000);
+  await sleep(1500); // let it flush to cold history
   cf.ws.close();
 
   // 4. kill daemon #1 — the holder must keep the PTY alive
   sb.stop("daemon1");
   await sb.waitExit("daemon1", 5000);
   check("daemon1 exited", true);
-  check("holder still alive after daemon exit", existsSync(sb.socket));
+  check("holder still alive after daemon exit", sb.holderUp());
 
   // 5. daemon #2 on the same data dir + holder socket
   await sb.startDaemon("daemon2", SIDECAR);
@@ -100,7 +118,7 @@ async function main() {
   // prove it is genuinely alive, not just a replayed corpse
   const marker2 = "ALIVE-" + Math.random().toString(36).slice(2, 8).toUpperCase();
   c2.ws.send(JSON.stringify({ t: "i", d: `echo ${marker2}\r` }));
-  await sleep(900);
+  await until(() => c2.buf.includes(marker2), 10000);
   c2.ws.close();
   check("session still accepts input after restart", c2.buf.includes(marker2), marker2);
 

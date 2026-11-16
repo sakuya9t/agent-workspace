@@ -1,4 +1,4 @@
-//! The UDS server: accept loop, per-connection framing, and RPC/event dispatch.
+//! The holder server (a UDS; a named pipe on Windows): accept loop, per-connection framing, and RPC/event dispatch.
 //!
 //! Each connection gets a writer task draining two channels — a **control**
 //! channel (responses, events, errors, heartbeats) the writer biases toward, and
@@ -17,14 +17,13 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use planus::ReadAsRoot;
 use tokio::io::AsyncWriteExt;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, Notify};
 
 use crate::frame::{self, code, ord, FrameError, Incoming};
 use crate::registry::{launch_fingerprint, CreateError, CreateOutcome, PurgeOutcome, Registry};
 use crate::ring::ReadOutcome;
 use crate::session::{Attacher, InputOutcome, Session, SpawnSpec, Status};
+use crate::socket::{Listener, ServerRead, ServerStream, ServerWrite};
 use crate::wire;
 use crate::{
     HEARTBEAT_INTERVAL_MS, PROTOCOL_V1, RING_DEFAULT_BYTES, RING_MAX_BYTES, RING_MIN_BYTES,
@@ -82,7 +81,7 @@ const SOCKET_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// Rebinding preserves every PTY — the sessions live in this process, not in the
 /// socket. That is why healing beats restarting: a restart would kill them all.
 pub async fn serve_watched(
-    listener: UnixListener,
+    listener: Listener,
     bound_ino: u64,
     sock_path: std::path::PathBuf,
     ctx: Arc<ServerCtx>,
@@ -150,7 +149,7 @@ pub async fn serve_watched(
 }
 
 /// Accept connections forever, one task per connection.
-pub async fn serve(listener: UnixListener, ctx: Arc<ServerCtx>) {
+pub async fn serve(mut listener: Listener, ctx: Arc<ServerCtx>) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
@@ -167,8 +166,8 @@ pub async fn serve(listener: UnixListener, ctx: Arc<ServerCtx>) {
     }
 }
 
-async fn handle_conn(stream: UnixStream, ctx: Arc<ServerCtx>, id: u64) {
-    let (mut rd, wr) = stream.into_split();
+async fn handle_conn(stream: ServerStream, ctx: Arc<ServerCtx>, id: u64) {
+    let (mut rd, wr) = crate::socket::split_server(stream);
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<Vec<u8>>(CTRL_CHANNEL_CAP);
     let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(DATA_CHANNEL_CAP);
 
@@ -197,7 +196,7 @@ async fn handle_conn(stream: UnixStream, ctx: Arc<ServerCtx>, id: u64) {
     tracing::debug!(conn = id, "connection closed");
 }
 
-async fn read_loop(rd: &mut OwnedReadHalf, conn: &Arc<Conn>) {
+async fn read_loop(rd: &mut ServerRead, conn: &Arc<Conn>) {
     loop {
         match frame::read_frame(rd).await {
             Ok(Incoming::Eof) => return,
@@ -884,7 +883,7 @@ async fn send_error(
 /// Per-connection writer: bias control frames over data so an eviction event
 /// always has headroom even when the data channel is backed up.
 async fn writer_task(
-    mut wr: OwnedWriteHalf,
+    mut wr: ServerWrite,
     mut ctrl_rx: mpsc::Receiver<Vec<u8>>,
     mut data_rx: mpsc::Receiver<Vec<u8>>,
 ) {

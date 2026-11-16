@@ -1,0 +1,19 @@
+[package]
+name = "asm-launch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Start an Agent Session Manager component detached from the terminal that launched it"
+
+[[bin]]
+name = "asm-launch"
+path = "src/main.rs"
+
+[lib]
+name = "asm_launch"
+path = "src/lib.rs"
+
+# No dependencies, deliberately: the Windows service scripts build this even on
+# hosts that run only the relay or the web UI.
+[dependencies]

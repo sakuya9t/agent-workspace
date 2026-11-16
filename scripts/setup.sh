@@ -31,6 +31,8 @@ log()  { printf '\033[1;36m[setup]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[setup]\033[0m %s\n' "$*" >&2; }
 err()  { printf '\033[1;31m[setup]\033[0m %s\n' "$*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
+# Git Bash / MSYS2 on Windows (see scripts/setup.ps1 for a fresh Windows box).
+is_windows() { case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) return 0 ;; *) return 1 ;; esac; }
 
 # ---------------------------------------------------------------------------
 # sudo + package-manager detection. We only touch the system package manager
@@ -91,6 +93,22 @@ pm_install() {
 # ---------------------------------------------------------------------------
 ensure_system_deps() {
   local want=()
+  if is_windows; then
+    # Native Windows builds use the MSVC toolchain, which cargo finds on its
+    # own — there is no cc/make to look for, and no package manager here to
+    # install one. scripts/setup.ps1 installs the whole toolchain via winget.
+    if ! have cargo && [ -x "$HOME/.cargo/bin/cargo.exe" ]; then
+      export PATH="$HOME/.cargo/bin:$PATH"
+    fi
+    if ! have cargo; then
+      err "Rust is not installed. On Windows, bootstrap from PowerShell instead:"
+      err "    powershell -ExecutionPolicy Bypass -File scripts\\setup.ps1"
+      err "(installs Git, Visual Studio Build Tools, rustup and Node via winget, then builds)."
+      exit 1
+    fi
+    log "windows: using the MSVC toolchain cargo already has — skipping cc/make"
+    return 0
+  fi
   if ! have cc && ! have gcc && ! have clang; then want+=(toolchain); fi
   if ! have make && [[ " ${want[*]-} " != *" toolchain "* ]]; then want+=(toolchain); fi
   if ! have curl && ! have wget; then want+=(curl); fi

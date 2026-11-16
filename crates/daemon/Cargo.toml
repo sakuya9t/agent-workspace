@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 asmux = { path = "../asmux" }
 asm-relay = { path = "../asm-relay" }
+asm-launch = { path = "../asm-launch" }
 planus.workspace = true
 tokio.workspace = true
 axum.workspace = true

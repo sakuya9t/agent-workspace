@@ -167,7 +167,9 @@ try {
     assert.equal(saved.exists, true);
     assert.equal(saved.values.ASM_UI_HOST, "0.0.0.0");
     assert.equal(saved.values.ASM_UI_DAEMON_TOKEN, undefined);
-    assert.equal(statSync(confPath).mode & 0o777, 0o600);
+    // Windows has no mode bits (Node reports 0o666); the profile dir's ACL
+    // is what keeps the file owner-only there.
+    if (process.platform !== "win32") assert.equal(statSync(confPath).mode & 0o777, 0o600);
     const onDisk = parseConfigFile(readFileSync(confPath, "utf8"));
     assert.equal(onDisk.ASM_UI_DAEMON_TOKEN, "seeded-token");
     assert.equal(onDisk.ASM_UI_PORT, "6000");

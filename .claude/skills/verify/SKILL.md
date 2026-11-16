@@ -43,3 +43,17 @@ status + History (`.commit-row`, `.commit-graph`) render for any git-repo cwd.
 ## Cleanup
 Kill daemon/Chrome **by PID** — a broad `pkill -f` can match your own shell or
 the user's live processes.
+
+## Windows (Git Bash)
+- No `~/.cargo/env`: `export PATH="$HOME/.cargo/bin:/c/Program Files/nodejs:$PATH"`.
+  Binaries are `target/debug/asm-daemon.exe` etc.
+- Don't `env -i`: Windows programs need `SystemRoot`, `USERPROFILE`, `TEMP`…
+  (without `SystemRoot` even sockets fail). Strip only `ASM_*`/`ASMUX_*`
+  (`env -u …`), or use `createSandbox()` from `scripts/lib/testenv.mjs`, which
+  does it for you and also finds Chrome/Edge under Program Files.
+- The real install is `%USERPROFILE%\.local\share\asm` + `%TEMP%\asm`
+  (holder pipe derived from `%TEMP%\asm\asmux.sock`) — never use those.
+- A running `.exe` can't be overwritten: stop your throwaway daemon before
+  `cargo build`, or the link fails with "Access is denied".
+- Kill by PID with `taskkill //F //PID <pid>` (the `//` keeps MSYS from
+  rewriting the switch into a path).
