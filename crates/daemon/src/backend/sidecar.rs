@@ -338,8 +338,12 @@ fn seed_from_cold(
 }
 
 impl BackendSession for SidecarSession {
-    fn attach(&self) -> (Snapshot, broadcast::Receiver<Arc<[u8]>>) {
-        super::attach_with_history(&self.parser, &self.history, &self.tx, &self.seq)
+    fn attach(&self, replay_cap: usize) -> (Snapshot, broadcast::Receiver<Arc<[u8]>>) {
+        super::attach_with_history(&self.parser, &self.history, &self.tx, &self.seq, replay_cap)
+    }
+
+    fn clear_history(&self) -> usize {
+        super::clear_history(&self.parser, &self.history)
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -411,7 +415,14 @@ async fn drain_loop(ctx: DrainCtx) {
     while let Some(ev) = rx.recv().await {
         match ev {
             StreamEvent::Output { data, cursor } => {
-                // Feed the emulator (isolate a parser panic to this session).
+                // Feed the emulator (isolate a parser panic to this session),
+                // then push the ring and broadcast under the ring lock so a
+                // normal-buffer attach (which reads the ring + subscribes under
+                // that lock) sees a single consistent stream. The ring push stays
+                // inside the parser lock — parser, then ring, the order attach
+                // and `clear_history` take them — so a clear's screen seed can
+                // never already contain a chunk the ring is about to receive.
+                let arc: Arc<[u8]> = Arc::from(data.clone().into_boxed_slice());
                 {
                     let mut p = parser.lock();
                     if parser_ok
@@ -420,12 +431,6 @@ async fn drain_loop(ctx: DrainCtx) {
                         parser_ok = false;
                         tracing::error!(session = %session_id, "terminal parser panicked; snapshots frozen for this session");
                     }
-                }
-                // Push the ring and broadcast under the ring lock so a
-                // normal-buffer attach (which reads the ring + subscribes under
-                // that lock) sees a single consistent stream.
-                let arc: Arc<[u8]> = Arc::from(data.clone().into_boxed_slice());
-                {
                     let mut h = history.lock();
                     h.push(arc.clone());
                     let _ = tx.send(arc);

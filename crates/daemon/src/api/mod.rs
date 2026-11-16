@@ -102,6 +102,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/:id/archive", post(archive_session))
         .route("/api/sessions/:id/cleanup", post(cleanup_instance))
         .route("/api/sessions/:id/resize", post(resize_session))
+        .route("/api/sessions/:id/clear-history", post(clear_terminal_history))
         .route(
             "/api/sessions/:id/paste",
             // Raw image body; raise the transport limit above the enforced
@@ -916,6 +917,21 @@ async fn resize_session(
 ) -> Result<Json<serde_json::Value>, AppError> {
     state.manager.resize_session(&id, body.rows, body.cols)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+/// Drop the terminal scrollback a live session replays on attach, keeping its
+/// current screen ("Clear history" in the terminal). Only the in-memory replay
+/// source shrinks: the recorded output and the agent's transcript — what "Save
+/// conversation" exports — keep everything. Ended sessions have no live replay
+/// source (their terminal replays a capped tail of the record), so 409.
+async fn clear_terminal_history(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    match state.manager.clear_terminal_history(&id) {
+        Some(dropped) => Ok(Json(json!({ "dropped_bytes": dropped }))),
+        None => Err(AppError(StatusCode::CONFLICT, "session is not live".into())),
+    }
 }
 
 async fn ack_attention(

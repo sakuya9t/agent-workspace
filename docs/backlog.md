@@ -431,6 +431,7 @@ pick it up**.
 | MEAS | Classifier measurement: local-LLM shadow classification of any registered heuristic (attention first), disagreement snapshots + triage (dev-only, default-off) | **P2** | RF-HYG's `MonitorState` extraction first (RF-M4 landed; the hooks observe its `Classification` output); needs a local Ollama/llama-server on the dev host | classifier-measurement.md → Milestones |
 | ~~DOC-1~~ | Relay framing docs corrected to the shipped **dial-out-per-stream** design; stale yamux references removed from architecture and the protocol comment. | ~~P3~~ **done 2026-07-24** | — | architecture.md; asm-relay/src/protocol.rs |
 | I18N-2 | Additional locales beyond `en` | **P4** (deferred by user) | — | i18n.md → Adding a locale |
+| ~~TERM-HISTORY~~ | **Terminal history limit + "Clear history" — landed 2026-11-15.** A per-browser limit (characters) bounds both xterm scrollback and the attach replay (`?replay=`); ended sessions replay only a capped tail with a "not shown here" marker (they used to send the whole record — 20–44 MB for long claude sessions); 🧹 resets the live replay ring to the current screen and re-attaches. Export is untouched. Also caps SCM status at 200 files (`changed_files_total`). Open: a daemon restart re-seeds cleared history from the recorded tail. | ~~P1~~ **done** | — | terminal-history-limit.md |
 
 ## Detail
 

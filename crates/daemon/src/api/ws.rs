@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::Response;
 use futures::{SinkExt, StreamExt};
 use parking_lot::Mutex;
@@ -93,18 +93,30 @@ enum ClientMsg {
     Resize { rows: u16, cols: u16 },
 }
 
+/// Stream-socket query. `replay` is the client's terminal-history budget in
+/// bytes — how much raw history the attach snapshot (live) or the history
+/// frame (ended) may carry. Clamped by [`crate::backend::replay_budget`]; absent
+/// means the whole in-memory ring. Unknown params (`access_token`,
+/// `relay_key`) are ignored here — auth reads them on its own.
+#[derive(Debug, Default, Deserialize)]
+pub struct StreamQuery {
+    replay: Option<usize>,
+}
+
 pub async fn stream(
     ws: WebSocketUpgrade,
     Path(id): Path<String>,
+    Query(q): Query<StreamQuery>,
     State(state): State<AppState>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle(socket, id, state))
+    let budget = crate::backend::replay_budget(q.replay);
+    ws.on_upgrade(move |socket| handle(socket, id, state, budget))
 }
 
-async fn handle(socket: WebSocket, id: String, state: AppState) {
+async fn handle(socket: WebSocket, id: String, state: AppState, budget: usize) {
     match state.manager.live_handle(&id) {
-        Some(handle) => handle_live(socket, id, state, handle).await,
-        None => handle_history(socket, id, state).await,
+        Some(handle) => handle_live(socket, id, state, handle, budget).await,
+        None => handle_history(socket, id, state, budget).await,
     }
 }
 
@@ -116,6 +128,7 @@ async fn handle_live(
     id: String,
     state: AppState,
     handle: Arc<dyn crate::backend::BackendSession>,
+    budget: usize,
 ) {
     // Acknowledge attention as soon as a client actually attaches.
     let _ = state.manager.acknowledge_attention(&id);
@@ -138,7 +151,7 @@ async fn handle_live(
         prev.notify_one();
     }
 
-    let (snapshot, mut out_rx) = handle.attach();
+    let (snapshot, mut out_rx) = handle.attach(budget);
     let (mut sender, mut receiver) = socket.split();
 
     // Liveness clock for this attachment. The inbound loop stamps `last_seen`
@@ -301,12 +314,32 @@ async fn handle_live(
 }
 
 /// Exited session: replay persisted output as a diagnostic history frame.
-async fn handle_history(socket: WebSocket, id: String, state: AppState) {
+///
+/// Only the newest `budget` bytes are sent. A long session's full record runs
+/// to tens of MB (a week of claude repaints is 40 MB), and one frame that size
+/// stalls or crashes the browser tab while xterm.js parses it — and past 50 MB
+/// xterm.js drops the excess anyway. When older output is left out, the replay
+/// starts from a clean terminal and says so; the full record is still what
+/// "Save conversation" exports.
+async fn handle_history(socket: WebSocket, id: String, state: AppState, budget: usize) {
     let (mut sender, mut receiver) = socket.split();
 
-    match state.manager.db().read_events_after(&id, 0) {
-        Ok(bytes) if !bytes.is_empty() => {
-            let _ = sender.send(Message::Binary(bytes)).await;
+    let db = state.manager.db().clone();
+    let read = tokio::task::spawn_blocking(move || db.read_events_tail(&id, budget))
+        .await
+        .map_err(|e| anyhow::anyhow!("history task: {e}"))
+        .and_then(|r| r);
+    match read {
+        Ok((bytes, omitted)) if !bytes.is_empty() => {
+            let frame = if omitted > 0 {
+                let mut f = crate::backend::RAW_REPLAY_PREAMBLE.to_vec();
+                f.extend_from_slice(trimmed_history_marker(omitted).as_bytes());
+                f.extend_from_slice(&bytes);
+                f
+            } else {
+                bytes
+            };
+            let _ = sender.send(Message::Binary(frame)).await;
         }
         Ok(_) => {
             let _ = sender
@@ -328,6 +361,15 @@ async fn handle_history(socket: WebSocket, id: String, state: AppState) {
             break;
         }
     }
+}
+
+/// The dim notice an ended session's capped replay opens with.
+fn trimmed_history_marker(omitted: u64) -> String {
+    format!(
+        "\x1b[2m[asm: {:.1} MB of earlier output is not shown here. \
+         Save conversation exports all of it.]\x1b[m\r\n",
+        omitted as f64 / (1024.0 * 1024.0)
+    )
 }
 
 #[cfg(test)]

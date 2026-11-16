@@ -19,7 +19,8 @@ impl SessionManager {
         self.interactions.lock().insert(id.clone(), sig.clone());
         tokio::spawn(async move {
             let mut status_rx = handle.watch_status();
-            let (_snap, mut out_rx) = handle.attach();
+            // Only the stream is wanted; keep the unused snapshot small.
+            let (_snap, mut out_rx) = handle.attach(crate::backend::REPLAY_MIN_BYTES);
             let mut tail = String::new();
             let mut last_activity_write = 0i64;
             let mut last_attn = AttentionState::None;

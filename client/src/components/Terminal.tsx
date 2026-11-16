@@ -13,6 +13,7 @@ import { useTerminalPaste } from "../useTerminalPaste";
 import { PasteSheet } from "./PasteSheet";
 import { TermControlPanel } from "./TermControlPanel";
 import { formatBytes } from "../format";
+import { replayBytes, scrollbackLines, useTerminalPrefs } from "../terminalPrefs";
 import i18n from "../i18n";
 
 /** WS close code the daemon uses when another client takes over the session. */
@@ -96,6 +97,12 @@ export function TerminalView({
   // the socket; copy reads the selection through copySelRef's receipt path).
   const handleRef = useRef<TerminalHandle | null>(null);
   const copySelRef = useRef<() => void>(() => {});
+  // "Clear history": effect-local, because it has to re-attach the socket.
+  const clearHistoryRef = useRef<() => void>(() => {});
+  // Whether a full-screen TUI (claude, vim) holds the alternate buffer. Such an
+  // app keeps its own history and the terminal has none to clear, so the Clear
+  // button explains that instead of pretending to do something.
+  const [altScreen, setAltScreen] = useState(false);
   const isTouch = useIsTouch();
   const isPhone = useIsPhone();
   // Scrolled back from the live tail. The phone shell reads this out through
@@ -203,7 +210,9 @@ export function TerminalView({
       fontFamily:
         'ui-monospace, SFMono-Regular, Menlo, Monaco, "Cascadia Code", "Roboto Mono", monospace',
       fontSize: 13,
-      scrollback: 5000,
+      // Re-derived from the per-browser history limit once the width is known
+      // (applyScrollback below); this only covers the first paint.
+      scrollback: scrollbackLines(useTerminalPrefs.getState().historyChars, 80),
       cursorBlink: live,
       // macOS-native gesture for selecting while a TUI holds mouse reporting
       // (Shift+drag is also honored — see the shouldForceSelection patch below).
@@ -223,6 +232,18 @@ export function TerminalView({
     term.loadAddon(fit);
     term.open(container);
     safeFit(fit);
+
+    // The history limit is in characters (terminalPrefs.ts); xterm counts lines.
+    // Re-derive on every width change and whenever the setting changes — a
+    // smaller scrollback drops the oldest lines on the spot, so lowering the
+    // limit also relieves a terminal that is already full.
+    const applyScrollback = () => {
+      const lines = scrollbackLines(useTerminalPrefs.getState().historyChars, term.cols);
+      if (term.options.scrollback !== lines) term.options.scrollback = lines;
+    };
+    applyScrollback();
+    const resizeSub = term.onResize(applyScrollback);
+    const unsubPrefs = useTerminalPrefs.subscribe(applyScrollback);
 
     // WORKAROUND (@xterm/xterm 5.5.0): the Viewport schedules deferred
     // syncScrollArea() calls (a post-open setTimeout, plus dimensions-change and
@@ -340,7 +361,13 @@ export function TerminalView({
 
     const connect = () => {
       if (!mounted) return;
-      const socket = new WebSocket(streamUrl(target, sessionId));
+      // The replay budget is read per connect, so a changed limit takes effect
+      // on the next attach without rebuilding the terminal.
+      const socket = new WebSocket(
+        streamUrl(target, sessionId, {
+          replayBytes: replayBytes(useTerminalPrefs.getState().historyChars),
+        }),
+      );
       socket.binaryType = "arraybuffer";
       ws = socket;
       wsRef.current = socket;
@@ -455,6 +482,55 @@ export function TerminalView({
       flash(ok ? "ok" : "error", i18n.t(ok ? "terminal.copied" : "terminal.copyFailed"));
     };
     copySelRef.current = () => void copySelection();
+
+    // --- Clear history --------------------------------------------------------
+    // The daemon re-seeds this session's replay source with just the current
+    // screen (POST …/clear-history), then we re-attach: the fresh snapshot is
+    // that screen and nothing behind it, so the clear holds across reloads,
+    // reconnects and other devices. Re-attaching instead of erasing in place
+    // also keeps the output stream intact — an erase injected mid-stream could
+    // land inside a split escape sequence and print its tail as text. Nothing
+    // recorded is touched: "Save conversation" still exports everything.
+    let clearing = false;
+    const reattach = () => {
+      if (!mounted || !live) return;
+      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      const old = ws;
+      if (old) {
+        old.onclose = null;
+        old.onmessage = null;
+        old.onerror = null;
+        if (old.readyState === WebSocket.CONNECTING) old.onopen = () => old.close();
+        else {
+          old.onopen = null;
+          try {
+            old.close();
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      connect();
+    };
+    const clearHistory = async () => {
+      if (clearing) return;
+      if (term.buffer.active.type === "alternate") {
+        flash("error", i18n.t("terminal.clearHistoryAppOwned"));
+        return;
+      }
+      clearing = true;
+      try {
+        await api.clearTerminalHistory(target, sessionId);
+        if (!mounted) return;
+        reattach();
+        flash("ok", i18n.t("terminal.historyCleared"));
+      } catch (e) {
+        if (mounted) flash("error", i18n.t("terminal.clearHistoryFailed", { message: (e as Error).message }));
+      } finally {
+        clearing = false;
+      }
+    };
+    clearHistoryRef.current = () => void clearHistory();
 
     // Copy: on Windows/Linux we claim Ctrl-Shift-C here and leave Ctrl-C to xterm
     // so it still forwards \x03 (SIGINT). macOS ⌘-C needs nothing from us: xterm
@@ -949,6 +1025,7 @@ export function TerminalView({
     const bufferSub = term.buffer.onBufferChange(() => {
       wheelUp = 0; // a different app owns the screen now; its offset isn't ours
       scheduleScrollCheck();
+      setAltScreen(term.buffer.active.type === "alternate");
     });
     const viewportEl = term.element?.querySelector(".xterm-viewport") as HTMLElement | null;
     viewportEl?.addEventListener("scroll", scheduleScrollCheck, { passive: true });
@@ -1007,6 +1084,10 @@ export function TerminalView({
       viewportEl?.removeEventListener("scroll", scheduleScrollCheck);
       scrollSub.dispose();
       bufferSub.dispose();
+      resizeSub.dispose();
+      unsubPrefs();
+      clearHistoryRef.current = () => {};
+      setAltScreen(false);
       if (checkRaf !== undefined) cancelAnimationFrame(checkRaf);
       window.clearTimeout(pressTimer);
       window.clearTimeout(holdTimer);
@@ -1064,6 +1145,17 @@ export function TerminalView({
               bare string literal in JSX. */}
           {!(isTouch && !isPhone) && (
             <div className="term-actions">
+              {/* Clear history — drops the scrollback this terminal holds (and
+                  replays on attach), keeping the current screen. Dimmed while a
+                  full-screen app owns the screen: it keeps its own history, and
+                  a tap says so rather than doing nothing. */}
+              <button
+                type="button"
+                className={"term-act term-clear" + (altScreen ? " is-inert" : "")}
+                title={i18n.t(altScreen ? "terminal.clearHistoryAppOwned" : "terminal.clearHistoryTitle")}
+                aria-label={i18n.t("terminal.clearHistory")}
+                onClick={() => clearHistoryRef.current()}
+              />
               <button
                 type="button"
                 className="term-attach"
@@ -1085,6 +1177,7 @@ export function TerminalView({
               onCopy={() => copySelRef.current()}
               onPaste={onPasteTapped}
               onAttach={() => fileInputRef.current?.click()}
+              onClear={() => clearHistoryRef.current()}
             />
           )}
           {/* No `accept` — any file type is a valid attachment (PDF, zip, CSV,

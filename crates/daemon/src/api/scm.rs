@@ -31,14 +31,37 @@ where
         .map_err(AppError::from)
 }
 
+/// Most changed files a status response lists. The Details panel polls status
+/// every few seconds; a worktree that accumulates thousands of untracked
+/// outputs (training runs, build artifacts) would otherwise ship hundreds of KB
+/// per poll and make the panel re-render thousands of rows each time.
+/// `changed_files_total` carries the real count.
+pub(crate) const MAX_STATUS_FILES: usize = 200;
+
 pub async fn status(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let cwd = session_cwd(&state, &id).await?;
     let scm = state.scm.clone();
-    let status = run_blocking(move || scm.status(&cwd)).await?;
-    Ok(Json(json!({ "status": status })))
+    let mut status = run_blocking(move || scm.status(&cwd)).await?;
+    let total = cap_changed_files(&mut status.changed_files, MAX_STATUS_FILES);
+    let mut body = json!({ "status": status });
+    body["status"]["changed_files_total"] = json!(total);
+    Ok(Json(body))
+}
+
+/// Keep at most `max` entries, tracked changes before untracked ones (so a
+/// pile of new files never hides an edit), each group in git's order. Returns
+/// the count before capping.
+fn cap_changed_files(files: &mut Vec<crate::source_control::ChangedFile>, max: usize) -> usize {
+    let total = files.len();
+    if total > max {
+        // Stable: within each group git's (path) order survives.
+        files.sort_by_key(|f| f.untracked);
+        files.truncate(max);
+    }
+    total
 }
 
 #[derive(Debug, Deserialize)]
@@ -423,5 +446,45 @@ pub async fn merge(
             Err(AppError(StatusCode::CONFLICT, format!("{e:#}")))
         }
         Err(e) => Err(AppError::from(e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cap_changed_files;
+    use crate::source_control::ChangedFile;
+
+    fn file(path: &str, untracked: bool) -> ChangedFile {
+        ChangedFile {
+            path: path.into(),
+            status: if untracked { "?" } else { "M" }.into(),
+            staged: false,
+            untracked,
+            orig_path: None,
+        }
+    }
+
+    /// Over the cap, tracked edits come first (in git's order) and the rest is
+    /// filled with untracked files; the returned total is the uncapped count.
+    #[test]
+    fn cap_keeps_tracked_changes_ahead_of_untracked() {
+        let mut files = vec![
+            file("a-new", true),
+            file("b-edit", false),
+            file("c-new", true),
+            file("d-edit", false),
+            file("e-new", true),
+        ];
+        assert_eq!(cap_changed_files(&mut files, 3), 5);
+        let paths: Vec<_> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["b-edit", "d-edit", "a-new"]);
+    }
+
+    #[test]
+    fn cap_leaves_a_small_list_untouched() {
+        let mut files = vec![file("z-new", true), file("a-edit", false)];
+        assert_eq!(cap_changed_files(&mut files, 3), 2);
+        let paths: Vec<_> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["z-new", "a-edit"], "under the cap, git's order is kept");
     }
 }

@@ -327,6 +327,50 @@ impl Db {
         Ok(out)
     }
 
+    /// The newest recorded output that fits in `max_bytes`, as whole events
+    /// (oldest of them first), plus how many older bytes were left out. Always
+    /// includes the newest event, even when it alone is over `max_bytes`.
+    ///
+    /// This is what an ended session's terminal replays: a long session's full
+    /// record runs to tens of MB, which a browser terminal cannot take in one
+    /// frame. The full record stays available to `read_events_after` (export).
+    pub fn read_events_tail(&self, session_id: &str, max_bytes: usize) -> Result<(Vec<u8>, u64)> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT bytes FROM terminal_events WHERE session_id = ?1 ORDER BY seq DESC",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![session_id])?;
+        let mut newest_first: Vec<Vec<u8>> = Vec::new();
+        let mut taken = 0usize;
+        let mut truncated = false;
+        while let Some(row) = rows.next()? {
+            let bytes: Vec<u8> = row.get(0)?;
+            if !newest_first.is_empty() && taken + bytes.len() > max_bytes {
+                truncated = true;
+                break;
+            }
+            taken += bytes.len();
+            newest_first.push(bytes);
+        }
+        drop(rows);
+        drop(stmt);
+        let omitted = if truncated {
+            let total: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(length(bytes)), 0) FROM terminal_events WHERE session_id = ?1",
+                rusqlite::params![session_id],
+                |r| r.get(0),
+            )?;
+            (total as u64).saturating_sub(taken as u64)
+        } else {
+            0
+        };
+        let mut out = Vec::with_capacity(taken);
+        for chunk in newest_first.iter().rev() {
+            out.extend_from_slice(chunk);
+        }
+        Ok((out, omitted))
+    }
+
     pub fn insert_summary(&self, s: &SessionSummary) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(

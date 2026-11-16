@@ -359,6 +359,8 @@
     "baseAhead_other": "{{count}} commits on this branch since its base",
     "notRepo": "Not a Git repository. `{{cmd}}` support arrives with workspace isolation.",
     "treeClean": "Working tree clean.",
+    "moreChangedFiles_one": "{{count, number}} more changed file isn't listed ({{total, number}} in all).",
+    "moreChangedFiles_other": "{{count, number}} more changed files aren't listed ({{total, number}} in all).",
     "viewDiff": "View diff",
     "viewWholeFile": "View whole file",
     "discardChanges": "Discard changes",
@@ -469,7 +471,12 @@
     "pasteClipboard": "Paste",
     "copied": "Copied",
     "copyFailed": "Copy failed",
-    "nothingSelected": "Select some text first"
+    "nothingSelected": "Select some text first",
+    "clearHistory": "Clear history",
+    "clearHistoryTitle": "Clear history: drop the scrollback this terminal keeps and leave the current screen. Save conversation still exports everything.",
+    "clearHistoryAppOwned": "This app keeps its own history, so the terminal has none to clear.",
+    "historyCleared": "History cleared. Save conversation still has all of it.",
+    "clearHistoryFailed": "Couldn't clear history: {{message}}"
   },
   "mobile": {
     "back": "Back to sessions",
@@ -581,8 +588,13 @@
     "tip": "A relay lets this client reach a private host that dials out to it — no tunnels, so it works on any device."
   },
   "config": {
-    "title": "Startup settings",
+    "title": "Settings",
     "subtitle": "Saved on each host and used every time scripts/start.sh runs there without flags.",
+    "browserLabel": "This browser",
+    "historyLimit": "Terminal history",
+    "historyLimitHint": "How much text each terminal keeps on this device. Older lines drop off as new output arrives, so very long sessions stay responsive. Applies right away. Save conversation always exports everything.",
+    "historyChars": "{{n, number}} characters",
+    "historyCharsDefault": "{{n, number}} characters (default)",
     "hostsLabel": "Hosts",
     "hostTabs": "Hosts",
     "uiServer": "UI server",

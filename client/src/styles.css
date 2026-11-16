@@ -427,6 +427,15 @@ body.col-resizing iframe {
 .term-attach::before {
   content: "📎";
 }
+.term-clear::before {
+  content: "🧹";
+}
+/* A full-screen app owns the screen and its own history: nothing for the
+   terminal to clear. Stays tappable (it explains why) but reads as idle. */
+.term-act.is-inert,
+.term-act.is-inert:hover {
+  opacity: 0.25;
+}
 .term-copy::before {
   content: "⧉";
   font-size: 19px; /* the geometric glyph draws smaller than the emoji beside it */
@@ -577,6 +586,10 @@ body.col-resizing iframe {
 }
 .term-panel .kb.attach::before {
   content: "📎";
+  font-size: 15px;
+}
+.term-panel .kb.clear::before {
+  content: "🧹";
   font-size: 15px;
 }
 .term-panel-close {
@@ -1134,6 +1147,38 @@ body.col-resizing iframe {
 }
 .config-step {
   margin-top: 12px;
+}
+/* "This browser" — per-device preferences, applied on change (no Save). */
+.config-browser-field {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 7px 0 4px;
+}
+.config-browser-label {
+  flex: none;
+  font-size: 13px;
+}
+.config-browser-select {
+  flex: 1;
+  min-width: 0;
+  max-width: 260px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.config-browser-select:hover {
+  border-color: var(--accent);
+}
+.config-browser-hint {
+  margin-bottom: 13px;
+}
+.config-hosts-hint {
+  margin: 2px 0 0;
 }
 .config-components {
   grid-template-columns: repeat(3, 1fr);
@@ -2122,6 +2167,11 @@ body.col-resizing iframe {
   max-height: 30vh;
   overflow-y: auto;
   overscroll-behavior: contain;
+}
+/* The daemon lists at most a few hundred changed files; this says how many more
+   there are, as the list's last row. */
+.changed-files-more {
+  padding: 4px 6px;
 }
 .changed-file {
   display: flex;

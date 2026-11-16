@@ -183,7 +183,10 @@ export interface ScmStatus {
   branch: string | null;
   head: string | null;
   detached: boolean;
+  /** At most the daemon's cap (tracked changes first); see `changed_files_total`. */
   changed_files: ChangedFile[];
+  /** The real number of changed files. Absent from daemons that predate the cap. */
+  changed_files_total?: number;
   remotes: RemoteBranch[];
   base: BaseCommit | null;
 }
@@ -637,6 +640,13 @@ export const api = {
       `/api/sessions/${id}/archive${force ? "?force=true" : ""}`,
       { method: "POST" },
     ).then((r) => r.session),
+  /**
+   * Drop the scrollback a live session's terminal replays on attach, keeping the
+   * current screen. The recorded output and the agent's transcript keep
+   * everything, so a later "Save conversation" still exports it all.
+   */
+  clearTerminalHistory: (t: Target, id: string) =>
+    req<{ dropped_bytes: number }>(t, `/api/sessions/${id}/clear-history`, { method: "POST" }),
   ackAttention: (t: Target, id: string) =>
     req<{ session: Session }>(t, `/api/sessions/${id}/ack`, { method: "POST" }).then(
       (r) => r.session,
@@ -943,7 +953,12 @@ export async function putUiServerConfig(body: ConfigUpdate): Promise<ConfigView>
   return res.json() as Promise<ConfigView>;
 }
 
-export function streamUrl(t: Target, id: string): string {
+/**
+ * The session's terminal stream. `replayBytes` is this browser's replay budget
+ * (terminalPrefs.ts): how much raw history the attach snapshot, or an ended
+ * session's history frame, may carry. The daemon clamps it.
+ */
+export function streamUrl(t: Target, id: string, opts: { replayBytes?: number } = {}): string {
   let base: string;
   if (t.baseUrl) {
     const u = new URL(t.baseUrl);
@@ -961,6 +976,7 @@ export function streamUrl(t: Target, id: string): string {
   if (t.token) params.push(`access_token=${encodeURIComponent(t.token)}`);
   // Browsers cannot set WS headers, so the relay key rides as a query param.
   if (t.relayKey) params.push(`relay_key=${encodeURIComponent(t.relayKey)}`);
+  if (opts.replayBytes) params.push(`replay=${Math.floor(opts.replayBytes)}`);
   const query = params.length ? `?${params.join("&")}` : "";
   return `${base}/api/sessions/${id}/stream${query}`;
 }

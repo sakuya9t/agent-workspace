@@ -928,6 +928,14 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Forget the terminal scrollback a fresh attach would replay for a live
+    /// session, keeping its current screen. `None` when the session is not
+    /// live. The recorded output and the agent's transcript are untouched, so
+    /// "Save conversation" still exports everything.
+    pub fn clear_terminal_history(&self, id: &str) -> Option<usize> {
+        self.live_handle(id).map(|h| h.clear_history())
+    }
+
     pub fn resize_session(&self, id: &str, rows: u16, cols: u16) -> Result<()> {
         if let Some(h) = self.live_handle(id) {
             h.resize(rows, cols)?;
@@ -1218,8 +1226,11 @@ mod tests {
     }
 
     impl BackendSession for MockSession {
-        fn attach(&self) -> (Snapshot, broadcast::Receiver<Arc<[u8]>>) {
+        fn attach(&self, _replay_cap: usize) -> (Snapshot, broadcast::Receiver<Arc<[u8]>>) {
             (self.snapshot(), self.tx.subscribe())
+        }
+        fn clear_history(&self) -> usize {
+            0
         }
         fn snapshot(&self) -> Snapshot {
             Snapshot {

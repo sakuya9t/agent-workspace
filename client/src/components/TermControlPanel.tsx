@@ -18,6 +18,8 @@ interface Props {
   onCopy: () => void;
   onPaste: () => void;
   onAttach: () => void;
+  /** Clear the terminal's scrollback (TerminalView's "Clear history"). */
+  onClear: () => void;
 }
 
 /**
@@ -29,7 +31,15 @@ interface Props {
  * its equivalent. Buttons write raw bytes through the terminal handle (the same
  * WS path as typed keys); the Ctrl latch is applied in TerminalView.
  */
-export function TermControlPanel({ handleRef, ctrl, onCycleCtrl, onCopy, onPaste, onAttach }: Props) {
+export function TermControlPanel({
+  handleRef,
+  ctrl,
+  onCycleCtrl,
+  onCopy,
+  onPaste,
+  onAttach,
+  onClear,
+}: Props) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const send = (data: string) => () => handleRef.current?.write(data);
@@ -106,6 +116,12 @@ export function TermControlPanel({ handleRef, ctrl, onCycleCtrl, onCopy, onPaste
         {t("keybar.paste")}
       </button>
       <button className="kb attach" onClick={onAttach} aria-label={t("terminal.attachFile")} />
+      <button
+        className="kb clear"
+        onClick={onClear}
+        aria-label={t("terminal.clearHistory")}
+        title={t("terminal.clearHistoryTitle")}
+      />
       <button
         type="button"
         className="term-panel-close"

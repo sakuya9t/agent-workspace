@@ -23,6 +23,7 @@ import {
   SECRET_KEYS,
   validateConfig,
 } from "../startupConfig";
+import { DEFAULT_HISTORY_CHARS, HISTORY_LIMIT_CHOICES, useTerminalPrefs } from "../terminalPrefs";
 
 /**
  * Startup settings for the hosts this client can reach: the UI server that
@@ -348,15 +349,17 @@ function ConfigDialogBody() {
         <div className="conn-modal-head">
           <div>
             <div className="modal-title">{t("config.title")}</div>
-            <div className="dim small">{t("config.subtitle")}</div>
           </div>
         </div>
 
+        <BrowserSettings />
+
+        <div className="conn-add-step">{t("config.hostsLabel")}</div>
+        <div className="dim small config-hosts-hint">{t("config.subtitle")}</div>
         {hosts.length === 0 ? (
           <div className="conn-empty">{stillLoading ? t("config.loading") : t("config.noHosts")}</div>
         ) : (
           <>
-            <div className="conn-add-step">{t("config.hostsLabel")}</div>
             <div
               className="config-hosts"
               role="tablist"
@@ -458,6 +461,37 @@ function ConfigDialogBody() {
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * Preferences that belong to this browser rather than to any host: they live in
+ * localStorage and apply the moment they change, so they sit apart from the
+ * hosts' Save / Save & apply flow.
+ */
+function BrowserSettings() {
+  const { t } = useTranslation();
+  const historyChars = useTerminalPrefs((s) => s.historyChars);
+  const setHistoryChars = useTerminalPrefs((s) => s.setHistoryChars);
+  return (
+    <>
+      <div className="conn-add-step">{t("config.browserLabel")}</div>
+      <label className="config-browser-field">
+        <span className="config-browser-label">{t("config.historyLimit")}</span>
+        <select
+          className="config-browser-select"
+          value={historyChars}
+          onChange={(e) => setHistoryChars(Number(e.target.value))}
+        >
+          {HISTORY_LIMIT_CHOICES.map((n) => (
+            <option key={n} value={n}>
+              {t(n === DEFAULT_HISTORY_CHARS ? "config.historyCharsDefault" : "config.historyChars", { n })}
+            </option>
+          ))}
+        </select>
+      </label>
+      <div className="dim small config-browser-hint">{t("config.historyLimitHint")}</div>
+    </>
   );
 }
 

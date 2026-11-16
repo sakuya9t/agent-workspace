@@ -762,6 +762,16 @@ export function RightPanel({ target, session, preparePrompt }: Props) {
                 />
               </div>
             ))}
+            {/* The daemon caps the list (tracked changes first), so a worktree
+                full of untracked outputs can't flood every poll. */}
+            {(scm.changed_files_total ?? 0) > scm.changed_files.length && (
+              <div className="changed-files-more dim small">
+                {t("rightPanel.moreChangedFiles", {
+                  count: scm.changed_files_total! - scm.changed_files.length,
+                  total: scm.changed_files_total!,
+                })}
+              </div>
+            )}
           </div>
         )}
 

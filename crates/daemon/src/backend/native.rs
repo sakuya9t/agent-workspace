@@ -128,11 +128,15 @@ struct NativeSession {
 }
 
 impl BackendSession for NativeSession {
-    fn attach(&self) -> (Snapshot, broadcast::Receiver<Arc<[u8]>>) {
+    fn attach(&self, replay_cap: usize) -> (Snapshot, broadcast::Receiver<Arc<[u8]>>) {
         // The reader processes+broadcasts (and pushes the ring) under the locks
         // the helper holds, so the receiver starts exactly where the snapshot
         // ends.
-        super::attach_with_history(&self.parser, &self.history, &self.tx, &self.seq)
+        super::attach_with_history(&self.parser, &self.history, &self.tx, &self.seq, replay_cap)
+    }
+
+    fn clear_history(&self) -> usize {
+        super::clear_history(&self.parser, &self.history)
     }
 
     fn snapshot(&self) -> Snapshot {

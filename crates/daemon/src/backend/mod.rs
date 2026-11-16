@@ -18,6 +18,20 @@ pub mod asmux_client;
 /// cold-stitch territory). See `docs/terminal-scrollback.md`.
 pub(crate) const HISTORY_RING_BYTES: usize = 8 * 1024 * 1024;
 
+/// Floor for a client-requested replay budget (`?replay=` on the stream
+/// socket). Below this a replay cannot even carry one redraw of a large screen,
+/// so a smaller request is raised to it. The ceiling is `HISTORY_RING_BYTES`.
+/// See `docs/terminal-history-limit.md`.
+pub(crate) const REPLAY_MIN_BYTES: usize = 64 * 1024;
+
+/// Clamp a client's requested replay budget to `[REPLAY_MIN_BYTES,
+/// HISTORY_RING_BYTES]`; no request means the whole ring.
+pub(crate) fn replay_budget(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(HISTORY_RING_BYTES)
+        .clamp(REPLAY_MIN_BYTES, HISTORY_RING_BYTES)
+}
+
 /// A bounded ring of the raw PTY output chunks a session has produced, oldest
 /// first. Fed to a fresh client on attach (for normal-buffer agents) so its own
 /// terminal emulator reconstructs scrollback + screen exactly — the daemon's
@@ -51,10 +65,39 @@ impl HistoryRing {
         }
     }
 
+    #[cfg(test)]
     fn extend_into(&self, out: &mut Vec<u8>) {
         for c in &self.chunks {
             out.extend_from_slice(c);
         }
+    }
+
+    /// Append only the newest whole chunks that fit in `cap` bytes, oldest of
+    /// those first — the tail a capped replay sends. Always includes the newest
+    /// chunk, even when it alone exceeds `cap` (the same rule `push` keeps).
+    fn extend_tail_into(&self, cap: usize, out: &mut Vec<u8>) {
+        let mut taken = 0usize;
+        let mut first = self.chunks.len();
+        for (i, c) in self.chunks.iter().enumerate().rev() {
+            if first != self.chunks.len() && taken + c.len() > cap {
+                break;
+            }
+            taken += c.len();
+            first = i;
+        }
+        for c in self.chunks.iter().skip(first) {
+            out.extend_from_slice(c);
+        }
+    }
+
+    /// Drop everything and start over from `seed`, a repaint of the current
+    /// screen. Returns how many bytes were dropped.
+    fn reset_to(&mut self, seed: Arc<[u8]>) -> usize {
+        let dropped = self.bytes;
+        self.chunks.clear();
+        self.bytes = 0;
+        self.push(seed);
+        dropped
     }
 }
 
@@ -346,15 +389,62 @@ fn strip_terminal_queries(input: &[u8]) -> Vec<u8> {
 /// raw queries programs emitted would make the client's emulator answer them
 /// into the PTY, dumping report sequences (`;1R`, `10;rgb:…`, `2c`) at the shell
 /// prompt.
-fn raw_history_repaint(history: &HistoryRing) -> Vec<u8> {
-    let mut ring = Vec::with_capacity(history.bytes);
-    history.extend_into(&mut ring);
+///
+/// `cap` bounds the replay to the ring's newest whole chunks (the client's
+/// terminal-history limit, see `docs/terminal-history-limit.md`). A cut lands
+/// on a chunk boundary, exactly like a ring eviction, so it degrades the same
+/// way: recent history and the live screen intact, older lines simply absent.
+fn raw_history_repaint(history: &HistoryRing, cap: usize) -> Vec<u8> {
+    let mut ring = Vec::with_capacity(history.bytes.min(cap));
+    history.extend_tail_into(cap, &mut ring);
     let ring = strip_terminal_queries(&ring);
 
     let mut out = Vec::with_capacity(ring.len() + 16);
-    out.extend_from_slice(b"\x1b[?1049l\x1b[r\x1b[H\x1b[2J\x1b[3J\x1b[m");
+    out.extend_from_slice(RAW_REPLAY_PREAMBLE);
     out.extend_from_slice(&ring);
     out
+}
+
+/// Puts a client terminal into a known state before a raw replay: normal
+/// buffer, no scroll region, cursor home, screen AND scrollback erased, plain
+/// attributes. Shared by the live ring replay and the capped ended-session
+/// replay (`api/ws.rs`).
+pub(crate) const RAW_REPLAY_PREAMBLE: &[u8] = b"\x1b[?1049l\x1b[r\x1b[H\x1b[2J\x1b[3J\x1b[m";
+
+/// A history-free repaint of the emulator's current state: which buffer is
+/// active, the visible screen (contents, attributes, cursor), and the input
+/// modes. Replayed on its own into a cleared terminal it reproduces what the
+/// user sees right now, with nothing to scroll back to.
+fn screen_repaint(screen: &vt100::Screen) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(if screen.alternate_screen() {
+        b"\x1b[?1049h"
+    } else {
+        b"\x1b[?1049l"
+    });
+    out.extend_from_slice(&screen.contents_formatted());
+    out.extend_from_slice(&screen.input_mode_formatted());
+    out
+}
+
+/// Shared `BackendSession::clear_history` body: forget the raw-history ring
+/// and re-seed it with a repaint of the current screen, so the next attach
+/// (any client, any reconnect) shows the screen as it is with no scrollback
+/// behind it. Returns the bytes dropped.
+///
+/// Only the in-memory replay source is touched. The recorded output in
+/// `terminal_events` and the agent's own transcript are untouched, which is
+/// what "Save conversation" exports — so clearing never loses the record.
+///
+/// Locks parser, then ring — the order `attach_with_history` uses and the
+/// order the output writers hold them while processing a chunk, so a chunk is
+/// either already in the seeded screen or arrives after it, never both.
+pub(crate) fn clear_history(parser: &Mutex<vt100::Parser>, history: &Mutex<HistoryRing>) -> usize {
+    let parser = parser.lock();
+    let seed: Arc<[u8]> = Arc::from(screen_repaint(parser.screen()).into_boxed_slice());
+    let dropped = history.lock().reset_to(seed);
+    drop(parser);
+    dropped
 }
 
 /// Shared `BackendSession::attach` body for the emulator-holding backends.
@@ -373,11 +463,15 @@ fn raw_history_repaint(history: &HistoryRing) -> Vec<u8> {
 ///   same lock, so the live stream begins precisely where the ring ends.
 ///
 /// See `docs/terminal-scrollback.md`.
+///
+/// `replay_cap` bounds the normal-buffer raw replay (see `raw_history_repaint`);
+/// the alt-screen repaint is one screen and ignores it.
 pub(crate) fn attach_with_history(
     parser: &Mutex<vt100::Parser>,
     history: &Mutex<HistoryRing>,
     tx: &broadcast::Sender<Arc<[u8]>>,
     seq: &AtomicU64,
+    replay_cap: usize,
 ) -> (Snapshot, broadcast::Receiver<Arc<[u8]>>) {
     let mut parser = parser.lock();
     let (rows, cols) = parser.screen().size();
@@ -392,7 +486,8 @@ pub(crate) fn attach_with_history(
     }
 
     let history = history.lock();
-    let repaint: Arc<[u8]> = Arc::from(raw_history_repaint(&history).into_boxed_slice());
+    let repaint: Arc<[u8]> =
+        Arc::from(raw_history_repaint(&history, replay_cap).into_boxed_slice());
     let rx = tx.subscribe();
     let last_seq = seq.load(Ordering::SeqCst);
     drop(history);
@@ -494,7 +589,17 @@ pub trait BackendSession: Send + Sync {
     /// Atomically capture the current emulator snapshot and subscribe to the
     /// live output stream. Ordering between snapshot and stream is guaranteed
     /// so a fresh client never sees a gap or a duplicated byte range.
-    fn attach(&self) -> (Snapshot, broadcast::Receiver<Arc<[u8]>>);
+    ///
+    /// `replay_cap` bounds how many bytes of raw history the snapshot may
+    /// replay (the client's terminal-history limit, clamped by
+    /// [`replay_budget`]); a caller that ignores the snapshot passes
+    /// [`REPLAY_MIN_BYTES`].
+    fn attach(&self, replay_cap: usize) -> (Snapshot, broadcast::Receiver<Arc<[u8]>>);
+
+    /// Forget the scrollback a fresh attach would replay, keeping the current
+    /// screen (see [`clear_history`]). Recorded output is untouched. Returns
+    /// the bytes dropped from the replay source.
+    fn clear_history(&self) -> usize;
 
     /// Current emulator snapshot without subscribing.
     fn snapshot(&self) -> Snapshot;
@@ -515,8 +620,9 @@ pub trait BackendSession: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_with_history, raw_history_repaint, repaint_with_history, strip_terminal_queries,
-        HistoryRing, HISTORY_RING_BYTES,
+        attach_with_history, clear_history, raw_history_repaint, replay_budget,
+        repaint_with_history, strip_terminal_queries, HistoryRing, HISTORY_RING_BYTES,
+        RAW_REPLAY_PREAMBLE, REPLAY_MIN_BYTES,
     };
     use parking_lot::Mutex;
     use std::sync::atomic::AtomicU64;
@@ -670,7 +776,7 @@ mod tests {
         raw.extend_from_slice(b"\x1b[31mprompt>\x1b[m ");
 
         let (parser, history, tx, seq) = attach_fixture(&raw);
-        let (snap, _rx) = attach_with_history(&parser, &history, &tx, &seq);
+        let (snap, _rx) = attach_with_history(&parser, &history, &tx, &seq, HISTORY_RING_BYTES);
 
         assert!(snap.repaint.starts_with(PREAMBLE), "missing normal-buffer preamble");
         assert!(
@@ -702,7 +808,7 @@ mod tests {
     fn attach_alt_screen_stays_rendered_repaint() {
         let (parser, history, tx, seq) =
             attach_fixture(b"\x1b[?1049h\x1b[?1006h\x1b[Hfullscreen app");
-        let (snap, _rx) = attach_with_history(&parser, &history, &tx, &seq);
+        let (snap, _rx) = attach_with_history(&parser, &history, &tx, &seq, HISTORY_RING_BYTES);
 
         assert!(snap.repaint.starts_with(b"\x1b[?1049h"), "alt repaint must arm alt buffer");
         assert!(!snap.repaint.starts_with(PREAMBLE), "alt path must not raw-replay");
@@ -710,6 +816,100 @@ mod tests {
         let mut client = vt100::Parser::new(5, 20, 1000);
         client.process(&snap.repaint);
         assert!(client.screen().alternate_screen());
+    }
+
+    /// The preamble the tests spell out is the one the backend sends.
+    #[test]
+    fn raw_replay_preamble_matches_shared_constant() {
+        assert_eq!(PREAMBLE, RAW_REPLAY_PREAMBLE);
+    }
+
+    #[test]
+    fn replay_budget_clamps_to_floor_and_ring() {
+        assert_eq!(replay_budget(None), HISTORY_RING_BYTES);
+        assert_eq!(replay_budget(Some(1)), REPLAY_MIN_BYTES);
+        assert_eq!(replay_budget(Some(usize::MAX)), HISTORY_RING_BYTES);
+        assert_eq!(replay_budget(Some(1_000_000)), 1_000_000);
+    }
+
+    /// A capped tail is the newest whole chunks that fit, oldest of them first;
+    /// the newest chunk is kept even when it alone is over the cap.
+    #[test]
+    fn history_ring_tail_keeps_newest_whole_chunks() {
+        let mut ring = HistoryRing::new(1024);
+        for c in [&b"aaaa"[..], b"bbbb", b"cccc", b"dd"] {
+            ring.push(Arc::from(c.to_vec().into_boxed_slice()));
+        }
+        let tail = |cap| {
+            let mut out = Vec::new();
+            ring.extend_tail_into(cap, &mut out);
+            out
+        };
+        assert_eq!(tail(6), b"ccccdd");
+        assert_eq!(tail(9), b"ccccdd"); // "bbbb" would make 10
+        assert_eq!(tail(10), b"bbbbccccdd");
+        assert_eq!(tail(1024), b"aaaabbbbccccdd");
+        assert_eq!(tail(1), b"dd");
+    }
+
+    /// A normal-buffer attach under a cap replays only the newest output: the
+    /// recent lines come back, the old ones do not, and the screen still
+    /// matches a client that watched the whole stream.
+    #[test]
+    fn attach_normal_buffer_respects_replay_cap() {
+        let mut parser = vt100::Parser::new(5, 20, 1000);
+        let mut ring = HistoryRing::new(HISTORY_RING_BYTES);
+        for i in 1..=200 {
+            let chunk = format!("line {i:03}\r\n").into_bytes();
+            parser.process(&chunk);
+            ring.push(Arc::from(chunk.into_boxed_slice()));
+        }
+        let (tx, _keep) = broadcast::channel(16);
+        let (parser, history, seq) = (Mutex::new(parser), Mutex::new(ring), AtomicU64::new(0));
+
+        let (snap, _rx) = attach_with_history(&parser, &history, &tx, &seq, 100);
+        let text = String::from_utf8_lossy(&snap.repaint);
+        assert!(snap.repaint.starts_with(PREAMBLE));
+        assert!(text.contains("line 200"), "newest output must be replayed");
+        assert!(!text.contains("line 001"), "output past the cap must not be replayed");
+        assert!(snap.repaint.len() <= PREAMBLE.len() + 100);
+
+        let mut client = vt100::Parser::new(5, 20, 1000);
+        client.process(&snap.repaint);
+        assert_eq!(client.screen().contents(), parser.lock().screen().contents());
+    }
+
+    /// Clearing re-seeds the ring with the current screen only: a fresh attach
+    /// reproduces exactly what is on screen (contents, cursor, input modes) with
+    /// no scrollback behind it, and output after the clear still streams in.
+    #[test]
+    fn clear_history_keeps_screen_and_drops_scrollback() {
+        let mut raw = Vec::new();
+        for i in 1..=40 {
+            raw.extend_from_slice(format!("old {i:02}\r\n").as_bytes());
+        }
+        raw.extend_from_slice(b"\x1b[?2004h\x1b[32m$\x1b[m ");
+        let (parser, history, tx, seq) = attach_fixture(&raw);
+
+        let dropped = clear_history(&parser, &history);
+        assert_eq!(dropped, raw.len());
+
+        let after = b"typed";
+        parser.lock().process(after);
+        history.lock().push(Arc::from(after.to_vec().into_boxed_slice()));
+
+        let (snap, _rx) = attach_with_history(&parser, &history, &tx, &seq, HISTORY_RING_BYTES);
+        let text = String::from_utf8_lossy(&snap.repaint);
+        assert!(!text.contains("old 01"), "scrolled-off history must be gone");
+
+        let mut client = vt100::Parser::new(5, 20, 1000);
+        client.process(&snap.repaint);
+        let live = parser.lock();
+        assert_eq!(client.screen().contents(), live.screen().contents());
+        assert_eq!(client.screen().cursor_position(), live.screen().cursor_position());
+        assert!(client.screen().bracketed_paste(), "input modes must survive the clear");
+        client.set_scrollback(usize::MAX);
+        assert_eq!(client.screen().scrollback(), 0, "nothing left to scroll back to");
     }
 
     /// The four query families a shell/agent emits — DSR (`CSI…n`), primary and
@@ -753,7 +953,7 @@ mod tests {
         ring.push(Arc::from(b"\x1b]11;?\x07hello \x1b[".to_vec().into_boxed_slice()));
         ring.push(Arc::from(b"6n world\x1b[c!".to_vec().into_boxed_slice()));
 
-        let out = raw_history_repaint(&ring);
+        let out = raw_history_repaint(&ring, HISTORY_RING_BYTES);
         let mut expected = PREAMBLE.to_vec();
         expected.extend_from_slice(b"hello  world!");
         assert_eq!(out, expected);
