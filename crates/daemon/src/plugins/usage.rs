@@ -909,6 +909,281 @@ fn parse_pi_text(text: &str) -> Option<AgentUsage> {
     Some(u)
 }
 
+// ---------- Antigravity (agy) ----------
+
+/// agy's app data directory: `brain/<conversation id>/` holds each
+/// conversation's transcripts, and `conversation_summaries.db` is the index its
+/// `/resume` picker reads.
+pub(crate) fn agy_data_dir() -> Option<PathBuf> {
+    Some(home_dir()?.join(".gemini").join("antigravity-cli"))
+}
+
+/// One agy conversation, as its own index records it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgyConversation {
+    pub id: String,
+    /// The name agy's own model gave it. Empty until generated, and for good in
+    /// a `-p` run, which skips titling.
+    pub title: String,
+    /// The compact transcript, `brain/<id>/.system_generated/logs/transcript.jsonl`.
+    /// agy documents this file to its own agent; oversized fields in it are cut
+    /// and flagged `truncated_fields`, with the whole step kept in
+    /// `transcript_full.jsonl` beside it. Everything read here survives the cut.
+    pub transcript: PathBuf,
+}
+
+/// The agy conversation this asm session most likely owns.
+///
+/// agy's transcripts say nothing about where they ran: the working directory
+/// lives only in the index, as `file://` URIs in `workspace_uris`, so the match
+/// is a SQLite read — the newest top-level conversation in this cwd that was
+/// **created** at/after the session started. Creation, not last modification:
+/// a conversation created earlier belongs to another session, however recently
+/// it was written to (another agy left open in the same checkout), and binding
+/// it would serve that session's title, usage and transcript as this one's.
+pub fn locate_agy_conversation(cx: &TranscriptContext) -> Option<AgyConversation> {
+    let dir = agy_data_dir()?;
+    let rows = agy_index(&dir).unwrap_or_default();
+    match cx.native_session_id.as_deref() {
+        // Once captured, the id is the binding; the index only supplies a title.
+        Some(id) => {
+            let transcript = agy_transcript_path(&dir, id).filter(|p| p.is_file())?;
+            let title = rows
+                .into_iter()
+                .find(|r| r.id == id)
+                .map(|r| r.title)
+                .unwrap_or_default();
+            Some(AgyConversation {
+                id: id.to_string(),
+                title,
+                transcript,
+            })
+        }
+        None => choose_agy_conversation(&dir, &cx.cwd, cx.started_at_ms - SLACK_MS, rows),
+    }
+}
+
+/// A row of agy's conversation index.
+#[derive(Debug, Clone, PartialEq)]
+struct AgyIndexRow {
+    id: String,
+    title: String,
+    workspaces: Vec<String>,
+    modified_ms: i64,
+}
+
+fn agy_index(dir: &Path) -> Option<Vec<AgyIndexRow>> {
+    let conn = rusqlite::Connection::open_with_flags(
+        dir.join("conversation_summaries.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    agy_index_rows(&conn)
+}
+
+/// Every top-level conversation in the index. Subagents get conversations of
+/// their own (`nesting_depth` > 0) that share their parent's workspace; they
+/// are never the session's. A schema this doesn't fit yields `None`.
+fn agy_index_rows(conn: &rusqlite::Connection) -> Option<Vec<AgyIndexRow>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT conversation_id, title, workspace_uris, last_modified_time \
+             FROM conversation_summaries WHERE nesting_depth = 0",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let title: Option<String> = row.get(1).ok();
+            let uris: Option<String> = row.get(2).ok();
+            let modified: Option<String> = row.get(3).ok();
+            Ok(AgyIndexRow {
+                id,
+                title: title.unwrap_or_default(),
+                workspaces: uris
+                    .and_then(|u| serde_json::from_str(&u).ok())
+                    .unwrap_or_default(),
+                modified_ms: modified
+                    .as_deref()
+                    .and_then(iso8601_to_unix_secs)
+                    .map_or(0, |s| s * 1000),
+            })
+        })
+        .ok()?;
+    Some(rows.flatten().collect())
+}
+
+fn choose_agy_conversation(
+    dir: &Path,
+    cwd: &Path,
+    min_created_ms: i64,
+    mut rows: Vec<AgyIndexRow>,
+) -> Option<AgyConversation> {
+    // agy may record the directory it resolved rather than the one it was
+    // handed, so a symlinked cwd is compared both ways.
+    let real = fs::canonicalize(cwd).ok();
+    let here = |uri: &String| {
+        file_uri_path(uri).is_some_and(|p| {
+            same_dir(&p, cwd) || real.as_deref().is_some_and(|r| same_dir(&p, r))
+        })
+    };
+    rows.sort_by_key(|r| std::cmp::Reverse(r.modified_ms));
+    rows.into_iter().find_map(|row| {
+        if !row.workspaces.iter().any(here) {
+            return None;
+        }
+        let transcript = agy_transcript_path(dir, &row.id)?;
+        // Not written yet (the index can lead the file): skip it this time round.
+        let created = agy_created_ms(&transcript)?;
+        (created >= min_created_ms).then_some(AgyConversation {
+            id: row.id,
+            title: row.title,
+            transcript,
+        })
+    })
+}
+
+/// `brain/<id>/.system_generated/logs/transcript.jsonl`. The id comes from a
+/// database row or a persisted binding, so anything but a plain token (agy's
+/// are uuids) is refused rather than joined into a path.
+fn agy_transcript_path(dir: &Path, id: &str) -> Option<PathBuf> {
+    let plain = !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    plain.then(|| {
+        dir.join("brain")
+            .join(id)
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl")
+    })
+}
+
+/// When a conversation began: the `created_at` of its first step. Read by
+/// string scan from the head of the file, because that first step is the user's
+/// opening prompt and can be longer than the head — agy writes `created_at`
+/// ahead of `content`, so even a cut-off first line carries it.
+fn agy_created_ms(transcript: &Path) -> Option<i64> {
+    let head = read_head(transcript, 4096)?;
+    let first = head.lines().next()?;
+    let after = &first[first.find("\"created_at\"")? + "\"created_at\"".len()..];
+    let value = after.trim_start().strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    let ts = &value[..value.find('"')?];
+    Some(iso8601_to_unix_secs(ts)? * 1000)
+}
+
+/// The local path a `file://` URI names, percent-decoded. A Windows drive path
+/// comes back without the slash the URI puts in front of it (`/C:/x` → `C:/x`).
+fn file_uri_path(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    // Skip an authority (`file://localhost/x`); the usual form has none.
+    let path = percent_decode(&rest[rest.find('/')?..]);
+    let b = path.as_bytes();
+    if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+        return Some(path[1..].to_string());
+    }
+    Some(path)
+}
+
+/// `%XX` → that byte; anything else (including a malformed escape) as written.
+fn percent_decode(s: &str) -> String {
+    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(hi), Some(lo)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(hi << 4 | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Whether two spellings name the same directory: separators and a trailing
+/// slash don't matter, and on Windows neither does case.
+fn same_dir(a: &str, b: &Path) -> bool {
+    let norm = |p: &str| {
+        let p = p.replace('\\', "/");
+        let p = p.trim_end_matches('/');
+        if cfg!(windows) {
+            p.to_lowercase()
+        } else {
+            p.to_string()
+        }
+    };
+    norm(a) == norm(&b.to_string_lossy())
+}
+
+/// Token usage for an agy session, from its own transcript.
+pub fn agy_usage(cx: &TranscriptContext) -> Option<AgentUsage> {
+    let conv = locate_agy_conversation(cx)?;
+    let text = fs::read_to_string(&conv.transcript).ok()?;
+    let mut u = parse_agy_text(&text)?;
+    u.source = Some(format!("Antigravity transcript {}", conv.transcript.display()));
+    Some(u)
+}
+
+/// agy records usage on each model turn (`PLANNER_RESPONSE`): fresh
+/// `input_tokens`, `cache_read_tokens` and `output_tokens`. Their sums are
+/// exactly what `agy -p --output-format json` reports as the run's usage. No
+/// context-window size is recorded and the CLI fronts several model families,
+/// so — as for pi — the window is left empty rather than guessed. A subagent
+/// runs in a conversation of its own, so its tokens aren't in here.
+fn parse_agy_text(text: &str) -> Option<AgentUsage> {
+    let mut u = AgentUsage::default();
+    let (mut in_sum, mut cr_sum, mut out_sum) = (0u64, 0u64, 0u64);
+    let (mut last_in, mut last_cr) = (0u64, 0u64);
+    let mut found = false;
+    for line in text.lines() {
+        if !line.contains("PLANNER_RESPONSE") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v["type"] != "PLANNER_RESPONSE"
+            || (v.get("input_tokens").is_none() && v.get("output_tokens").is_none())
+        {
+            continue;
+        }
+        let ii = v["input_tokens"].as_u64().unwrap_or(0);
+        let cr = v["cache_read_tokens"].as_u64().unwrap_or(0);
+        in_sum += ii;
+        cr_sum += cr;
+        out_sum += v["output_tokens"].as_u64().unwrap_or(0);
+        last_in = ii;
+        last_cr = cr;
+        if let Some(m) = v["model"].as_str().filter(|m| !m.is_empty()) {
+            u.model = Some(m.to_string());
+        }
+        if let Some(ts) = v["created_at"].as_str() {
+            u.updated_at = Some(ts.to_string());
+        }
+        found = true;
+    }
+    if !found {
+        return None;
+    }
+    u.available = true;
+    u.context_tokens = Some(last_in + last_cr);
+    u.input_tokens = Some(in_sum);
+    u.cached_input_tokens = Some(cr_sum);
+    u.output_tokens = Some(out_sum);
+    u.note = Some(
+        "Cumulative tokens read from Antigravity's own transcript, summed over its model turns; \
+         agy records no context-window size, and subagents keep conversations of their own."
+            .into(),
+    );
+    Some(u)
+}
+
 // ---------- shared fs helpers ----------
 
 pub(crate) fn home_dir() -> Option<PathBuf> {
@@ -1412,5 +1687,151 @@ mod tests {
             encode_claude_dir(Path::new("/home/sakuya/dev/agent-workspace")),
             "-home-sakuya-dev-agent-workspace"
         );
+    }
+
+    // ---------- Antigravity (agy) ----------
+
+    /// A user turn, a tool call, its result and the closing reply, as agy 1.5.10
+    /// writes them (tool args in the compact transcript are JSON-encoded strings).
+    const AGY: &str = concat!(
+        r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-18T07:03:57Z","content":"<USER_REQUEST>\nedit notes\n</USER_REQUEST>"}"#,
+        "\n",
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-18T07:03:57Z","model":"gemini-3.8-flash-low","input_tokens":8916,"cache_read_tokens":0,"output_tokens":127,"tool_calls":[{"name":"write_file","args":{"Path":"\"/r/notes.md\""}}]}"#,
+        "\n",
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-11-18T07:03:59Z","content":"Created file."}"#,
+        "\n",
+        r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-18T07:04:00Z","model":"gemini-4-carbon-medium","input_tokens":2359,"cache_read_tokens":7086,"output_tokens":1,"content":"ok"}"#,
+    );
+
+    #[test]
+    fn parses_agy_transcript() {
+        let u = parse_agy_text(AGY).expect("usage");
+        assert!(u.available);
+        // The same sums `agy -p --output-format json` reports for the run.
+        assert_eq!(u.input_tokens, Some(8916 + 2359));
+        assert_eq!(u.cached_input_tokens, Some(7086));
+        assert_eq!(u.output_tokens, Some(128));
+        // Context is the last turn's prompt: fresh plus cached.
+        assert_eq!(u.context_tokens, Some(2359 + 7086));
+        // The latest model wins (`/model` mid-conversation), and no window is claimed.
+        assert_eq!(u.model.as_deref(), Some("gemini-4-carbon-medium"));
+        assert_eq!(u.context_window, None);
+        assert_eq!(u.updated_at.as_deref(), Some("2026-11-18T07:04:00Z"));
+    }
+
+    #[test]
+    fn agy_transcript_without_a_model_turn_has_no_usage() {
+        let first = AGY.lines().next().unwrap();
+        assert!(parse_agy_text(first).is_none());
+    }
+
+    #[test]
+    fn file_uris_decode_to_local_paths() {
+        assert_eq!(
+            file_uri_path("file:///home/x/my%20repo%23%E2%82%AC").as_deref(),
+            Some("/home/x/my repo#€")
+        );
+        assert_eq!(file_uri_path("file://localhost/srv/w").as_deref(), Some("/srv/w"));
+        assert_eq!(
+            file_uri_path("file:///C:/Users/x%20y").as_deref(),
+            Some("C:/Users/x y")
+        );
+        assert_eq!(file_uri_path("https://example.com/x"), None);
+        // A stray or truncated escape is kept as written.
+        assert_eq!(percent_decode("100%-%4"), "100%-%4");
+        assert!(same_dir("/w/repo/", Path::new("/w/repo")));
+        assert!(!same_dir("/w/repo2", Path::new("/w/repo")));
+    }
+
+    /// agy's index, reduced to the columns read here plus `nesting_depth`.
+    fn agy_index_db(rows: &[(&str, &str, &str, &str, i64)]) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversation_summaries (conversation_id text, title text NOT NULL \
+             DEFAULT '', workspace_uris text NOT NULL, last_modified_time datetime NOT NULL, \
+             nesting_depth integer NOT NULL DEFAULT 0)",
+        )
+        .unwrap();
+        for (id, title, uris, modified, depth) in rows {
+            conn.execute(
+                "INSERT INTO conversation_summaries VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![id, title, uris, modified, depth],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn write_agy_transcript(dir: &Path, id: &str, created: &str) {
+        let path = agy_transcript_path(dir, id).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A first line far longer than the head that is sniffed for its time.
+        let prompt = "x".repeat(10_000);
+        fs::write(
+            &path,
+            format!(
+                r#"{{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","created_at":"{created}","content":"{prompt}"}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn agy_index_reads_top_level_conversations_only() {
+        let conn = agy_index_db(&[
+            ("main", "Fix it", r#"["file:///w"]"#, "2026-11-18 06:52:37.28+00:00", 0),
+            ("sub", "", r#"["file:///w"]"#, "2026-11-18 06:53:00+00:00", 1),
+        ]);
+        let rows = agy_index_rows(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "main");
+        assert_eq!(rows[0].title, "Fix it");
+        assert_eq!(rows[0].workspaces, vec!["file:///w".to_string()]);
+        assert_eq!(rows[0].modified_ms, 1_794_984_757_000);
+        // A schema this doesn't fit (another agy version) degrades to None.
+        let other = rusqlite::Connection::open_in_memory().unwrap();
+        assert_eq!(agy_index_rows(&other), None);
+    }
+
+    #[test]
+    fn agy_conversation_is_the_newest_created_here_since_the_session_started() {
+        let dir = std::env::temp_dir().join(format!("asm-agy-{}", uuid::Uuid::new_v4()));
+        let started = iso8601_to_unix_secs("2026-11-18T07:00:00Z").unwrap() * 1000;
+        // Created before the session — however recently modified — is another
+        // session's; the session's own two are told apart by modification.
+        write_agy_transcript(&dir, "old", "2026-11-18T06:00:00Z");
+        write_agy_transcript(&dir, "mine-1", "2026-11-18T07:01:00Z");
+        write_agy_transcript(&dir, "mine-2", "2026-11-18T07:02:00Z");
+        write_agy_transcript(&dir, "elsewhere", "2026-11-18T07:03:00Z");
+        let conn = agy_index_db(&[
+            ("old", "", r#"["file:///w/repo"]"#, "2026-11-18 07:09:00+00:00", 0),
+            ("mine-1", "First", r#"["file:///w/repo"]"#, "2026-11-18 07:05:00+00:00", 0),
+            // A workspace with an extra `--add-dir` folder still matches.
+            (
+                "mine-2",
+                "Second",
+                r#"["file:///w/repo","file:///w/.instructions/s"]"#,
+                "2026-11-18 07:06:00+00:00",
+                0,
+            ),
+            ("elsewhere", "", r#"["file:///w/other"]"#, "2026-11-18 07:08:00+00:00", 0),
+            // In the index, but its transcript hasn't been written yet.
+            ("unwritten", "", r#"["file:///w/repo"]"#, "2026-11-18 07:07:00+00:00", 0),
+        ]);
+        let rows = agy_index_rows(&conn).unwrap();
+        let pick = |rows: &[AgyIndexRow], cwd: &str| {
+            choose_agy_conversation(&dir, Path::new(cwd), started - SLACK_MS, rows.to_vec())
+                .map(|c| (c.id, c.title))
+        };
+        assert_eq!(
+            pick(&rows, "/w/repo"),
+            Some(("mine-2".to_string(), "Second".to_string()))
+        );
+        assert_eq!(pick(&rows, "/w/nothing-here"), None);
+        // Only the pre-session conversation exists yet: wait rather than steal it.
+        let only_old: Vec<_> = rows.iter().filter(|r| r.id == "old").cloned().collect();
+        assert_eq!(pick(&only_old, "/w/repo"), None);
+        assert_eq!(agy_transcript_path(&dir, "../escape"), None);
+        let _ = fs::remove_dir_all(dir);
     }
 }

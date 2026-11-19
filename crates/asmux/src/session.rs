@@ -134,6 +134,10 @@ pub struct Session {
 /// Claude Code launched with them treats itself as a nested *child* session of
 /// the outer one and stops writing its own per-project transcript, which
 /// breaks per-session usage reporting (and any other transcript consumer).
+/// Antigravity (`agy`) does the same with its `ANTIGRAVITY_*` set, which points
+/// a child at the *outer* agy's language server and conversation, CSRF token
+/// included. Only the names agy sets for its children are removed: other
+/// `ANTIGRAVITY_*` vars are user configuration.
 ///
 /// The service scripts also export the install's startup secrets (relay keys,
 /// the UI proxy token, the enrollment token) to the processes they launch; an
@@ -149,6 +153,17 @@ pub fn scrub_inherited_agent_env(cmd: &mut CommandBuilder) {
         "ASM_RELAY_KEY",
         "ASM_RELAY_KEYS",
         "ASM_UI_DAEMON_TOKEN",
+        // What agy 1.5 exports into every command it runs.
+        "ANTIGRAVITY_AGENT",
+        "ANTIGRAVITY_AGENTAPI_EXE",
+        "ANTIGRAVITY_APP_DATA_DIR",
+        "ANTIGRAVITY_CONVERSATION_ID",
+        "ANTIGRAVITY_CSRF_TOKEN",
+        "ANTIGRAVITY_LS_ADDRESS",
+        "ANTIGRAVITY_LS_VERSION",
+        "ANTIGRAVITY_PROJECT_ID",
+        "ANTIGRAVITY_SOURCE_METADATA",
+        "ANTIGRAVITY_TRAJECTORY_ID",
     ];
     const PREFIXES: &[&str] = &["CLAUDE_CODE_", "CODEX_SANDBOX"];
     for (key, _) in std::env::vars_os() {
@@ -682,8 +697,16 @@ mod tests {
         std::env::set_var("CLAUDE_CONFIG_DIR", "/keep/me");
         std::env::set_var("ASM_RELAY_KEYS", "relay-secret");
         std::env::set_var("ASM_ENROLLMENT_TOKEN", "enroll-secret");
+        std::env::set_var("ANTIGRAVITY_LS_ADDRESS", "127.0.0.1:1");
+        std::env::set_var("ANTIGRAVITY_CSRF_TOKEN", "outer-csrf");
+        std::env::set_var("ANTIGRAVITY_SIDECAR_WEB_PORT", "9999");
         let mut cmd = CommandBuilder::new("true");
         scrub_inherited_agent_env(&mut cmd);
+        // An enclosing agy's session, and its token, don't leak into a child agy…
+        assert_eq!(cmd.get_env("ANTIGRAVITY_LS_ADDRESS"), None);
+        assert_eq!(cmd.get_env("ANTIGRAVITY_CSRF_TOKEN"), None);
+        // …but agy settings the user exported themselves do reach it.
+        assert!(cmd.get_env("ANTIGRAVITY_SIDECAR_WEB_PORT").is_some());
         assert_eq!(cmd.get_env("CLAUDE_CODE_SESSION_ID"), None);
         assert_eq!(cmd.get_env("CLAUDECODE"), None);
         // Startup secrets exported by the service scripts never reach a session.

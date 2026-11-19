@@ -114,6 +114,7 @@ All three providers can **fork** on resume. We always fork. This is an invariant
 | **codex** | the UUID in the rollout filename `rollout-<ts>-<uuid>.jsonl`, under `~/.codex/sessions/**` — files `codex_usage` already collects (`usage.rs:403`) | `codex fork <id>` (subcommand leads argv) | A |
 | **opencode** | `~/.local/share/opencode/opencode.db` (SQLite) — no per-cwd file to discover | `opencode --session <id> --fork` | C |
 | **pi** | the `id` on the `session` header opening `~/.pi/agent/sessions/--<cwd>--/<ts>_<uuid>.jsonl` — the file `pi_usage` already opens | `pi --fork <id>` | A |
+| **agy** | `conversation_id` in `~/.gemini/antigravity-cli/conversation_summaries.db`, matched by `workspace_uris` (its transcripts name no cwd) and the transcript's first-step time — the binding `agy_usage` already reads | in place: `agy --conversation <id>`; fork: brief only | A |
 | **shell** | no conversation | — | brief only |
 | **custom_command** | unknown by definition | — | brief only |
 
@@ -124,6 +125,9 @@ both. `pi --fork` (0.84.2) resolves its argument as a path, then as an id in the
 current project, then as an id across every project — and forks a cross-project
 match straight into the current directory without asking, which `--session` does
 *not* do. That last step is what lets a pi fork land in a fresh worktree.
+`agy --conversation <id>` (1.5) reopens a conversation from any directory, which
+is all an in-place relaunch needs; agy can only branch one through its `/fork`
+slash command, so forks of agy sessions take the brief.
 
 Opencode is the reason this is a plugin capability and not two `if` branches: it
 has native resume, but its id is behind a SQLite read rather than a filesystem

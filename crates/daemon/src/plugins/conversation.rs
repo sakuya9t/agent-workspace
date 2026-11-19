@@ -11,8 +11,8 @@
 //! user a wall of `ESC[38;2;…m` and `ESC[60G`, and stripping the escapes just
 //! turns that into noise: the frames stay, the prose doesn't appear.
 //!
-//! So the export reads the agent's own file instead. Claude, Codex and pi each
-//! persist a structured per-session JSONL, and [`super::usage`] already locates
+//! So the export reads the agent's own file instead. Claude, Codex, pi and
+//! Antigravity each persist a structured per-session JSONL, and [`super::usage`] already locates
 //! it for the token counters; this module renders that same file to Markdown —
 //! user turns, agent turns, and the tool calls between them.
 //!
@@ -27,7 +27,10 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::title::clip_title;
-use super::usage::{claude_transcript_path, codex_rollout_path, pi_session_path, TranscriptContext};
+use super::usage::{
+    claude_transcript_path, codex_rollout_path, locate_agy_conversation, pi_session_path,
+    TranscriptContext,
+};
 
 /// Per-block clip for tool inputs and outputs: enough to see what ran and how it
 /// came back, without pasting a whole file listing into the document.
@@ -333,6 +336,135 @@ fn render_pi(text: &str, agent: &str) -> String {
         }
     }
     md.out
+}
+
+// ---------- Antigravity (agy) ----------
+
+/// Render an agy conversation's own transcript as Markdown. `None` as above.
+pub fn agy_conversation(cx: &TranscriptContext) -> Option<String> {
+    let conv = locate_agy_conversation(cx)?;
+    let text = fs::read_to_string(&conv.transcript).ok()?;
+    let body = render_agy(&text, "Antigravity");
+    if body.trim().is_empty() {
+        return None;
+    }
+    let title = clip_title(&conv.title)
+        .or_else(|| first_user_line(&body))
+        .unwrap_or_else(|| "Antigravity session".into());
+    Some(document(&title, "Antigravity", &cx.cwd, &conv.transcript, &body))
+}
+
+/// What the user actually typed in an agy `USER_INPUT` step. agy wraps it as
+/// `<USER_REQUEST>…</USER_REQUEST>` and appends harness blocks after it (the
+/// local time, a `/model` change); with no request block, a step that opens
+/// with a tag is all harness. Shared with [`super::title`] and [`super::fork`].
+pub(crate) fn agy_user_request(content: &str) -> Option<String> {
+    const OPEN: &str = "<USER_REQUEST>";
+    const CLOSE: &str = "</USER_REQUEST>";
+    let text = match content.find(OPEN) {
+        Some(at) => {
+            let rest = &content[at + OPEN.len()..];
+            &rest[..rest.find(CLOSE).unwrap_or(rest.len())]
+        }
+        None if content.trim_start().starts_with('<') => return None,
+        None => content,
+    };
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+/// agy's tool arguments with each value decoded. The compact transcript writes
+/// every argument as a JSON-*encoded* string (`"Path": "\"/r/a.md\""`, `"WaitMs":
+/// "5000"`), the full one as plain JSON; this reads both. A value that isn't
+/// valid JSON once unwrapped is kept as the string it is.
+pub(crate) fn agy_tool_args(args: &Value) -> Value {
+    match args {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| {
+                    let decoded = v
+                        .as_str()
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                        .unwrap_or_else(|| v.clone());
+                    (k.clone(), decoded)
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// The file an agy tool acts on: its tools name the argument differently.
+pub(crate) fn agy_tool_path(args: &Value) -> Option<&str> {
+    ["Path", "TargetFile", "AbsolutePath", "FilePath"]
+        .iter()
+        .find_map(|k| args[*k].as_str())
+        .filter(|p| !p.is_empty())
+}
+
+/// agy's transcript: one JSON object per *step*. `USER_INPUT` is the user,
+/// `PLANNER_RESPONSE` a model turn (prose in `content`, calls in `tool_calls`,
+/// reasoning in `thinking`), and the other model-sourced steps are what the
+/// tools returned. System-sourced steps (checkpoints, ephemeral reminders) and
+/// implicit user input are harness, not conversation.
+fn render_agy(text: &str, agent: &str) -> String {
+    let mut md = Md::new(agent);
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let ts = v["created_at"].as_str();
+        let content = v["content"].as_str().unwrap_or_default();
+        match (v["type"].as_str().unwrap_or_default(), v["source"].as_str()) {
+            ("USER_INPUT", Some("USER_EXPLICIT")) => {
+                if let Some(request) = agy_user_request(content) {
+                    md.turn(Speaker::User, ts, &request);
+                }
+            }
+            ("PLANNER_RESPONSE", _) => {
+                md.turn(Speaker::Agent, ts, content);
+                for call in v["tool_calls"].as_array().into_iter().flatten() {
+                    md.speak(Speaker::Agent, ts);
+                    md.tool_call(
+                        call["name"].as_str().unwrap_or("tool"),
+                        &agy_tool_input(&call["args"]),
+                    );
+                }
+            }
+            (_, Some("MODEL")) => md.tool_result(&agy_tool_output(content)),
+            _ => {}
+        }
+    }
+    md.out
+}
+
+/// An agy call's arguments in the shape [`Md::tool_call`] reads: the command or
+/// the file it touches when there is one, its own `toolSummary` as the
+/// description, and otherwise the decoded arguments.
+fn agy_tool_input(args: &Value) -> Value {
+    let args = agy_tool_args(args);
+    let mut shown = serde_json::Map::new();
+    if let Some(cmd) = args["CommandLine"].as_str() {
+        shown.insert("command".into(), cmd.into());
+    } else if let Some(path) = agy_tool_path(&args) {
+        shown.insert("path".into(), path.into());
+    } else {
+        return args;
+    }
+    if let Some(summary) = args["toolSummary"].as_str() {
+        shown.insert("description".into(), summary.into());
+    }
+    Value::Object(shown)
+}
+
+/// A tool result without the `Created At:` / `Completed At:` stamps agy puts on
+/// every one (twice over, as of 1.5).
+fn agy_tool_output(content: &str) -> String {
+    content
+        .lines()
+        .filter(|l| !l.starts_with("Created At: ") && !l.starts_with("Completed At: "))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ---------- Markdown assembly ----------
@@ -674,5 +806,62 @@ mod tests {
         )
         .trim()
         .is_empty());
+    }
+
+    /// A user turn (with agy's harness blocks after the request), a model turn
+    /// with reasoning and a shell call, the call's result, an implicit system
+    /// nudge, and the reply — as agy 1.5.10 writes them.
+    const AGY: &str = concat!(
+        r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-18T06:56:44Z","content":"<USER_REQUEST>\nRemove the junk dir.\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: now.\n</ADDITIONAL_METADATA>"}"#,
+        "\n",
+        r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-18T06:56:44Z","model":"m","thinking":"secret plan","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"rm -rf ./junk\"","WaitMsBeforeAsync":"5000","toolSummary":"\"Remove junk\""}}]}"#,
+        "\n",
+        r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","created_at":"2026-11-18T06:56:52Z","content":"Created At: 2026-11-17T22:56:52-08:00\nCompleted At: 2026-11-17T22:56:54-08:00\nCommand exited with code 0."}"#,
+        "\n",
+        r#"{"step_index":3,"source":"SYSTEM","type":"EPHEMERAL_MESSAGE","status":"DONE","created_at":"2026-11-18T06:56:53Z","content":"harness reminder"}"#,
+        "\n",
+        r#"{"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-18T06:56:54Z","model":"m","content":"Done. Removed it."}"#,
+    );
+
+    #[test]
+    fn agy_renders_turns_tools_and_results() {
+        let md = render_agy(AGY, "Antigravity");
+        assert!(md.contains("## User \u{b7} 2026-11-18 06:56:44"), "{md}");
+        assert!(md.contains("Remove the junk dir."));
+        // The request alone: agy's harness blocks are not the user talking.
+        assert!(!md.contains("local time"), "harness leaked: {md}");
+        assert!(md.contains("## Antigravity \u{b7} 2026-11-18 06:56:44"), "{md}");
+        // The command, decoded from its JSON-string argument, under agy's own summary.
+        assert!(md.contains("**run_command** — Remove junk"), "{md}");
+        assert!(md.contains("```sh\nrm -rf ./junk\n```"), "{md}");
+        assert!(md.contains("Command exited with code 0."));
+        assert!(!md.contains("Created At"), "timestamps leaked: {md}");
+        assert!(md.contains("Done. Removed it."));
+        assert!(!md.contains("secret plan"), "reasoning leaked: {md}");
+        assert!(!md.contains("harness reminder"), "system step leaked: {md}");
+    }
+
+    #[test]
+    fn agy_user_request_is_the_text_inside_the_tags() {
+        assert_eq!(
+            agy_user_request("<USER_REQUEST>\n  fix it \n</USER_REQUEST>\n<X>y</X>").as_deref(),
+            Some("fix it")
+        );
+        // An untagged prompt is taken as typed; a tagged one with no request is harness.
+        assert_eq!(agy_user_request("plain").as_deref(), Some("plain"));
+        assert_eq!(agy_user_request("<ADDITIONAL_METADATA>x</ADDITIONAL_METADATA>"), None);
+        assert_eq!(agy_user_request("<USER_REQUEST>\n</USER_REQUEST>"), None);
+    }
+
+    #[test]
+    fn agy_tool_args_decode_both_transcript_forms() {
+        let compact = serde_json::json!({"Path": "\"/r/a.md\"", "Wait": "5000", "Raw": "not json"});
+        let args = agy_tool_args(&compact);
+        assert_eq!(args["Path"], "/r/a.md");
+        assert_eq!(args["Wait"], 5000);
+        assert_eq!(args["Raw"], "not json");
+        // `transcript_full.jsonl` already has plain values.
+        let full = serde_json::json!({"TargetFile": "/r/b.md"});
+        assert_eq!(agy_tool_path(&agy_tool_args(&full)), Some("/r/b.md"));
     }
 }

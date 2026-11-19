@@ -64,6 +64,7 @@ order to decide what happens next; it does not silently resume the old task.
 | **codex** | `codex fork <id>` | **uuid**, globally (`~/.codex/sessions/**`) | resumes fine |
 | **opencode** | — (see follow-ups) | a SQLite db | brief |
 | **pi** | `pi --fork <id>` | **uuid**, current project first, then globally (`~/.pi/agent/sessions/**`) | resumes fine |
+| **agy** | — (`/fork` is a slash command that takes no opening message) | **uuid**, globally (`~/.gemini/antigravity-cli/brain/<id>/`) | brief |
 
 That is what `AgentPlugin::native_fork_requires_same_cwd` encodes, and why a
 same-agent fork is *not* automatically a native one.
@@ -144,7 +145,9 @@ Only agents that can be seeded on their launch line get one, and each encodes it
 its own way (`seed_prompt_args`): Claude, Codex and pi read a bare positional as
 the opening message, but opencode's positional is a *project directory* — a prompt
 there is taken as a path and the launch dies with "Failed to change directory
-to …", so it goes through `--prompt`. A shell gets nothing: it would *execute* a
+to …", so it goes through `--prompt`. Antigravity (`agy`) takes no positional at
+all; its seed goes through `-i`, which sends it and stays interactive (`-p` would
+answer once and exit). A shell gets nothing: it would *execute* a
 trailing argument as a script rather than read it.
 
 ## Capturing the conversation id — while the session is alive

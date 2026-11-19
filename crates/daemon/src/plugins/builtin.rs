@@ -27,6 +27,7 @@ pub fn all() -> Vec<Arc<dyn AgentPlugin>> {
         Arc::new(ClaudePlugin),
         Arc::new(OpencodePlugin),
         Arc::new(PiPlugin),
+        Arc::new(AgyPlugin),
         Arc::new(CustomCommandPlugin),
     ]
 }
@@ -694,6 +695,175 @@ fn pi_headless_args(prompt: &str) -> Vec<String> {
 /// back the searching a read-only session still needs.
 const PI_READ_ONLY_TOOLS: &str = "read,grep,find,ls";
 
+/// Antigravity CLI agent (the `agy` TUI in the session's cwd).
+///
+/// agy reports its own state over OSC 7501, which is what attention reads (see
+/// `attention::agy`) — but only to a terminal that answers its support probe,
+/// so every launch sets [`AGY_OSC_ENV`]. Its conversations are global by id, so
+/// `--conversation <id>` reopens one from any directory; that is the in-place
+/// resume. There is no native *fork*: agy branches a conversation only through
+/// its `/fork` slash command, which takes no opening message, so a fork into agy
+/// is seeded with the brief like opencode.
+pub struct AgyPlugin;
+
+/// Forces OSC 7501 status reports on. agy otherwise probes the terminal
+/// (`OSC 7501 ; ?`) and stays silent when — as with xterm.js — nothing answers.
+const AGY_OSC_ENV: &str = "AGY_CLI_OSC7501";
+
+impl AgentPlugin for AgyPlugin {
+    fn id(&self) -> &'static str {
+        "agy"
+    }
+    fn display_name(&self) -> &'static str {
+        "Antigravity"
+    }
+    fn supported_platforms(&self) -> &'static [&'static str] {
+        ALL_PLATFORMS
+    }
+    fn detect_binary(&self) -> Option<String> {
+        find_in_path("agy")
+    }
+    fn supports_models(&self) -> bool {
+        true
+    }
+    fn model_args(&self, model: &str) -> Vec<String> {
+        // `--model` takes an id (`gemini-4-argon-high`) or its label
+        // (`Gemini 4 Argon (High)`), so a free-text "Custom…" entry can be either.
+        vec!["--model".to_string(), model.to_string()]
+    }
+    // `agy models` lists what this account can use right now — it varies by
+    // plan and sign-in method — so the dropdown shows the real set.
+    fn models(&self) -> Vec<AgentModel> {
+        list_agy_models(self.detect_binary().as_deref())
+    }
+    fn detect_default_model(&self) -> Option<String> {
+        detect_agy_model()
+    }
+    // `bell_means_attention` stays off and `attention_uses_screen` too: agy
+    // rings no bells, and its OSC 7501 status is in the output, not on screen.
+    fn attention(&self, tail: &str, bell: bool) -> (AttentionState, Option<String>) {
+        attention::agy_attention(tail, bell)
+    }
+    fn usage(&self, cx: &TranscriptContext) -> Option<AgentUsage> {
+        usage::agy_usage(cx)
+    }
+    fn conversation(&self, cx: &TranscriptContext) -> Option<String> {
+        conversation::agy_conversation(cx)
+    }
+    fn title(&self, cx: &TranscriptContext) -> Option<String> {
+        title::agy_session_title(cx)
+    }
+    fn native_session_id(&self, cx: &TranscriptContext) -> Option<String> {
+        fork::agy_native_id(cx)
+    }
+    fn digest(&self, cx: &TranscriptContext) -> Option<String> {
+        fork::agy_digest(cx)
+    }
+    fn seed_prompt_args(&self, prompt: &str) -> Option<Vec<String>> {
+        // agy takes no positional prompt: `-i` sends it as the first message and
+        // stays interactive (`-p` would print one answer and exit).
+        Some(vec!["-i".to_string(), prompt.to_string()])
+    }
+    fn options(&self) -> Vec<AgentOption> {
+        vec![AgentOption {
+            key: "skip_permissions".into(),
+            label: "Skip permission prompts".into(),
+            description: "Launch with --dangerously-skip-permissions: Antigravity won't ask before \
+                          any command or edit. Its default auto mode already runs edits and \
+                          commands it judges safe without asking."
+                .into(),
+            danger: true,
+            default: false,
+        }]
+    }
+    fn option_args(&self, key: &str) -> Vec<String> {
+        match key {
+            "skip_permissions" => vec!["--dangerously-skip-permissions".into()],
+            _ => Vec::new(),
+        }
+    }
+    fn build_launch(&self, ctx: &AgentContext) -> Result<LaunchSpec> {
+        let command = self
+            .detect_binary()
+            .ok_or_else(|| anyhow!("`agy` binary not found in PATH"))?;
+        let mut args = agy_common_args(ctx);
+        args.extend(ctx.extra_args.clone());
+        Ok(LaunchSpec {
+            command,
+            args,
+            env: agy_env(ctx),
+            requires_approval: false,
+        })
+    }
+    /// `agy --conversation <id>`: reopens the conversation under its own id,
+    /// showing its history, and waits.
+    fn build_resume(
+        &self,
+        ctx: &AgentContext,
+        native_id: &str,
+        _cwd: &Path,
+    ) -> Option<Result<LaunchSpec>> {
+        Some(
+            self.detect_binary()
+                .ok_or_else(|| anyhow!("`agy` binary not found in PATH"))
+                .map(|command| LaunchSpec {
+                    command,
+                    args: agy_resume_args(ctx, native_id),
+                    env: agy_env(ctx),
+                    requires_approval: false,
+                }),
+        )
+    }
+    fn headless(&self, prompt: &str, _out: &Path) -> Option<HeadlessSpec> {
+        // `-p` prints the final answer to stdout and exits. It does leave a
+        // conversation in agy's history, as `codex exec` leaves a rollout.
+        Some(HeadlessSpec {
+            command: self.detect_binary()?,
+            args: vec!["-p".into(), prompt.to_string()],
+            output_file: None,
+        })
+    }
+    fn conflict_resolver(&self, prompt: &str) -> Option<ConflictResolveSpec> {
+        // Headless, with every edit and git command it needs approved up front.
+        Some(ConflictResolveSpec {
+            command: self.detect_binary()?,
+            args: vec![
+                "-p".into(),
+                prompt.to_string(),
+                "--dangerously-skip-permissions".into(),
+            ],
+        })
+    }
+}
+
+/// `[--dangerously-skip-permissions] [--model …]`, which every agy launch opens with.
+fn agy_common_args(ctx: &AgentContext) -> Vec<String> {
+    let mut args = enabled_option_args(&AgyPlugin, ctx);
+    if let Some(model) = ctx.model.as_deref() {
+        args.extend(AgyPlugin.model_args(model));
+    }
+    args
+}
+
+/// `agy [flags] --conversation <id>`.
+fn agy_resume_args(ctx: &AgentContext, native_id: &str) -> Vec<String> {
+    let mut args = agy_common_args(ctx);
+    args.push("--conversation".to_string());
+    args.push(native_id.to_string());
+    args
+}
+
+/// The user's env with OSC 7501 status turned on — unless they set
+/// [`AGY_OSC_ENV`] themselves. A relaunch replays the env a session persisted,
+/// which already carries it, so it is never doubled up either.
+fn agy_env(ctx: &AgentContext) -> Vec<(String, String)> {
+    let mut env = ctx.extra_env.clone();
+    if !env.iter().any(|(k, _)| k == AGY_OSC_ENV) {
+        env.insert(0, (AGY_OSC_ENV.to_string(), "on".to_string()));
+    }
+    env
+}
+
 /// Arbitrary user-provided command. Requires explicit approval to launch.
 pub struct CustomCommandPlugin;
 
@@ -884,6 +1054,20 @@ fn detect_opencode_model() -> Option<String> {
 fn detect_pi_model() -> Option<String> {
     let text = std::fs::read_to_string(usage::pi_agent_dir()?.join("settings.json")).ok()?;
     parse_pi_settings_model(&text)
+}
+
+/// agy's default model: the `"model"` its `/model` picker saves to
+/// `settings.json`. agy stores the label it showed (`Gemini 4 Argon (Medium)`),
+/// which is also what the dropdown's "Default" entry should read.
+fn detect_agy_model() -> Option<String> {
+    let text = std::fs::read_to_string(usage::agy_data_dir()?.join("settings.json")).ok()?;
+    parse_agy_settings_model(&text)
+}
+
+fn parse_agy_settings_model(json: &str) -> Option<String> {
+    // Windows editors may save it with a BOM, which agy itself accepts.
+    let v: serde_json::Value = serde_json::from_str(json.trim_start_matches('\u{feff}')).ok()?;
+    non_empty(v.get("model")?.as_str()?)
 }
 
 /// Pull `defaultModel` (and `defaultProvider`) out of pi's `settings.json`.
@@ -1222,6 +1406,42 @@ fn parse_pi_models_output(stdout: &str) -> Vec<AgentModel> {
         .collect()
 }
 
+// ---- agy model enumeration (`agy models`) ----
+
+/// List the models this agy account can use by running `agy models`. Empty on
+/// any failure (missing binary, signed out, timeout) — the dropdown then falls
+/// back to the detected default plus a free-text "Custom…".
+fn list_agy_models(binary: Option<&str>) -> Vec<AgentModel> {
+    let Some(bin) = binary else {
+        return Vec::new();
+    };
+    let cmd = super::agent_command(bin, &["models".to_string()]);
+    // It asks the server, so allow for a slow network as well as startup.
+    match run_capture(cmd, Duration::from_secs(20)) {
+        Some(out) => parse_agy_models_output(&out),
+        None => Vec::new(),
+    }
+}
+
+/// Parse `agy models` stdout: one `<id>\t<label>` row per model. Its spinner
+/// goes to stderr, and anything without the tab is not a row.
+fn parse_agy_models_output(stdout: &str) -> Vec<AgentModel> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let (id, label) = line.split_once('\t')?;
+            let (id, label) = (id.trim(), label.trim());
+            if id.is_empty() || id.contains(char::is_whitespace) {
+                return None;
+            }
+            Some(AgentModel {
+                id: id.to_string(),
+                label: if label.is_empty() { id } else { label }.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// Run a command and capture its stdout as a UTF-8 string, killing it if it runs
 /// past `timeout`. `None` on spawn failure or timeout. Used off the async runtime.
 fn run_capture(mut cmd: Command, timeout: Duration) -> Option<String> {
@@ -1310,6 +1530,11 @@ mod tests {
         );
         // pi reads trailing positionals as the opening message, like Claude/Codex.
         assert_eq!(PiPlugin.seed_prompt_args("read the brief"), Some(vec!["read the brief".into()]));
+        // agy has no positional prompt; `-i` sends one and stays interactive.
+        assert_eq!(
+            AgyPlugin.seed_prompt_args("read the brief"),
+            Some(vec!["-i".into(), "read the brief".into()])
+        );
         // A shell must not be seeded at all — it would run the brief as a script.
         assert_eq!(ShellPlugin.seed_prompt_args("read the brief"), None);
     }
@@ -1449,6 +1674,22 @@ mod tests {
             ["--tools", PI_READ_ONLY_TOOLS, "--session", "conv-3"]
         );
 
+        let agy = AgentContext {
+            options: vec![("skip_permissions".into(), true)],
+            model: Some("gemini-4-argon-high".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            agy_resume_args(&agy, "conv-4"),
+            [
+                "--dangerously-skip-permissions",
+                "--model",
+                "gemini-4-argon-high",
+                "--conversation",
+                "conv-4"
+            ]
+        );
+
         // No conversation to reload: the caller relaunches these fresh.
         for plugin in [&ShellPlugin as &dyn AgentPlugin, &OpencodePlugin, &CustomCommandPlugin] {
             assert!(plugin
@@ -1459,6 +1700,93 @@ mod tests {
 
     /// Each option is spelled once, in `option_args`; the launch lines are built
     /// from it, which is what lets a persisted line be read back for it.
+    #[test]
+    fn agy_launch_turns_on_its_status_reports_without_overriding_the_user() {
+        let ctx = AgentContext {
+            options: vec![("skip_permissions".into(), true)],
+            model: Some("Gemini 3.8 Flash (Low)".into()),
+            extra_args: vec!["-i".into(), "read the brief".into()],
+            extra_env: vec![("K".into(), "V".into())],
+            ..Default::default()
+        };
+        let mut args = agy_common_args(&ctx);
+        args.extend(ctx.extra_args.clone());
+        // Flags first; the seed (a fork's `-i`) rides along after them.
+        assert_eq!(
+            args,
+            [
+                "--dangerously-skip-permissions",
+                "--model",
+                "Gemini 3.8 Flash (Low)",
+                "-i",
+                "read the brief"
+            ]
+        );
+        assert_eq!(
+            agy_env(&ctx),
+            [("AGY_CLI_OSC7501".into(), "on".into()), ("K".into(), "V".into())]
+        );
+        // A user's own setting wins, and a relaunch's persisted env isn't doubled.
+        let off = AgentContext {
+            extra_env: vec![("AGY_CLI_OSC7501".into(), "off".into())],
+            ..Default::default()
+        };
+        assert_eq!(agy_env(&off), off.extra_env);
+        let replayed = AgentContext {
+            extra_env: agy_env(&AgentContext::default()),
+            ..Default::default()
+        };
+        assert_eq!(agy_env(&replayed).len(), 1);
+    }
+
+    #[test]
+    fn agy_forks_by_brief_and_summarizes_headless() {
+        // `/fork` takes no opening message, so there is no native fork to offer.
+        assert!(AgyPlugin
+            .build_fork(&AgentContext::default(), "x", "seed", Path::new("/w"))
+            .is_none());
+        assert!(!AgyPlugin.attention_uses_screen());
+        assert!(!AgyPlugin.bell_means_attention());
+        if let Some(h) = AgyPlugin.headless("summarize", Path::new("/dev/null")) {
+            assert_eq!(h.args, ["-p", "summarize"]);
+            assert!(h.output_file.is_none());
+        }
+    }
+
+    #[test]
+    fn parse_agy_settings_reads_the_saved_model() {
+        assert_eq!(
+            parse_agy_settings_model(
+                "\u{feff}{\"model\": \"Gemini 4 Argon (Medium)\", \"trustedWorkspaces\": []}"
+            )
+            .as_deref(),
+            Some("Gemini 4 Argon (Medium)")
+        );
+        // Never picked one: agy uses its built-in default.
+        assert_eq!(parse_agy_settings_model(r#"{"trustedWorkspaces": ["/w"]}"#), None);
+        assert_eq!(parse_agy_settings_model(r#"{"model": "  "}"#), None);
+        assert_eq!(parse_agy_settings_model("not json"), None);
+    }
+
+    #[test]
+    fn parse_agy_models_reads_id_and_label_rows() {
+        let out = "gemini-4-carbon-medium\tGemini 4 Carbon (Medium)\n\
+                   gemini-pro-orchestrator\tOrchestrator (Carbon)\n\
+                   Fetching available models...\n\
+                   bare-id\t\n";
+        let models = parse_agy_models_output(out);
+        let pairs: Vec<_> = models.iter().map(|m| (m.id.as_str(), m.label.as_str())).collect();
+        assert_eq!(
+            pairs,
+            [
+                ("gemini-4-carbon-medium", "Gemini 4 Carbon (Medium)"),
+                ("gemini-pro-orchestrator", "Orchestrator (Carbon)"),
+                ("bare-id", "bare-id"),
+            ]
+        );
+        assert!(parse_agy_models_output("").is_empty());
+    }
+
     #[test]
     fn every_option_has_the_flag_its_launch_line_carries() {
         for plugin in all() {

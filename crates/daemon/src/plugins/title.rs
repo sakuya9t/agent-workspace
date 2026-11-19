@@ -5,7 +5,8 @@
 //! this module only reads what it wrote. Claude Code appends `ai-title` records
 //! to its per-session JSONL (last one wins), Codex keeps an id → `thread_name`
 //! index at `~/.codex/session_index.jsonl`, and opencode stores a `title`
-//! column in its sqlite db. pi is the exception: it never titles a session
+//! column in its sqlite db, as does Antigravity in the index beside its
+//! transcripts. pi is the exception: it never titles a session
 //! itself, and records only the name the *user* gave it (`/name`). When the
 //! agent hasn't titled the session (yet), the fallback is its first user prompt. All of these are undocumented internals
 //! of the CLIs and can shift between versions, so every reader is best-effort:
@@ -26,10 +27,10 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
-use super::conversation::{claude_title, pi_title, strip_reminders};
+use super::conversation::{agy_user_request, claude_title, pi_title, strip_reminders};
 use super::usage::{
-    claude_transcript_path, codex_file_id, codex_rollout_path, home_dir, pi_session_path,
-    read_head, TranscriptContext, SLACK_MS,
+    claude_transcript_path, codex_file_id, codex_rollout_path, home_dir, locate_agy_conversation,
+    pi_session_path, read_head, TranscriptContext, SLACK_MS,
 };
 
 const TITLE_TTL: Duration = Duration::from_secs(30);
@@ -93,6 +94,16 @@ pub fn pi_session_title(cx: &TranscriptContext) -> Option<String> {
     cached("pi", cx, || {
         let text = fs::read_to_string(pi_session_path(cx)?).ok()?;
         pi_title(&text).or_else(|| pi_first_prompt(&text))
+    })
+}
+
+/// Title of an Antigravity session: the name agy's own model gave the
+/// conversation (the `title` column of its index), else its first prompt.
+pub fn agy_session_title(cx: &TranscriptContext) -> Option<String> {
+    cached("agy", cx, || {
+        let conv = locate_agy_conversation(cx)?;
+        clip_title(&conv.title)
+            .or_else(|| agy_first_prompt(&fs::read_to_string(&conv.transcript).ok()?))
     })
 }
 
@@ -200,6 +211,16 @@ fn pi_first_prompt(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// First thing the user typed in an agy transcript. Only explicit input counts:
+/// agy also records implicit user-role steps the harness adds.
+fn agy_first_prompt(text: &str) -> Option<String> {
+    text.lines()
+        .filter(|l| l.contains("USER_INPUT"))
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["type"] == "USER_INPUT" && v["source"] == "USER_EXPLICIT")
+        .find_map(|v| agy_user_request(v["content"].as_str()?).and_then(|t| clip_title(&t)))
 }
 
 /// Codex appends an `{id, thread_name}` record to its index whenever it
@@ -388,5 +409,19 @@ mod tests {
         // A schema this query doesn't fit (older opencode) degrades to None.
         let empty = Connection::open_in_memory().unwrap();
         assert_eq!(opencode_title_from(&empty, "/repo", 0), None);
+    }
+
+    #[test]
+    fn agy_first_prompt_is_the_users_explicit_request() {
+        let text = concat!(
+            r#"{"step_index":0,"source":"USER_IMPLICIT","type":"USER_INPUT","content":"<USER_REQUEST>harness</USER_REQUEST>"}"#,
+            "\n",
+            r#"{"step_index":1,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_REQUEST>\nAdd a retry to the uploader\nand log it\n</USER_REQUEST>\n<ADDITIONAL_METADATA>t</ADDITIONAL_METADATA>"}"#,
+        );
+        assert_eq!(
+            agy_first_prompt(text).as_deref(),
+            Some("Add a retry to the uploader")
+        );
+        assert_eq!(agy_first_prompt("not json"), None);
     }
 }

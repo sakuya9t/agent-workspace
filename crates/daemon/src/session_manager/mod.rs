@@ -2014,7 +2014,7 @@ mod tests {
         let ws = manager
             .register_workspace("repo".into(), repo.to_string_lossy().into_owned())
             .unwrap();
-        for plugin_id in ["codex", "claude", "pi", "opencode"] {
+        for plugin_id in ["codex", "claude", "pi", "opencode", "agy"] {
             for direct in [false, true] {
                 let mut req = ws_req(&ws.id);
                 req.agent_plugin_id = plugin_id.into();
@@ -2043,7 +2043,15 @@ mod tests {
                     )
                     .unwrap();
                 let stored = manager.get_session(&session.id).unwrap().unwrap();
-                let text = if plugin_id == "opencode" {
+                let text = if plugin_id == "agy" {
+                    let at = stored.args.iter().position(|a| a == "--add-dir").unwrap();
+                    let folder = Path::new(&stored.args[at + 1]);
+                    assert!(
+                        !folder.starts_with(&cwd),
+                        "agy's instructions must stay outside the worktree"
+                    );
+                    std::fs::read_to_string(folder.join("AGENTS.md")).unwrap()
+                } else if plugin_id == "opencode" {
                     let config: serde_json::Value = serde_json::from_str(&stored.env[0].1).unwrap();
                     std::fs::read_to_string(config["instructions"][0].as_str().unwrap()).unwrap()
                 } else if plugin_id == "codex" {

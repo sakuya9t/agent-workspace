@@ -193,7 +193,7 @@ pick it up**.
   `start.sh`/`status.sh`/`restart-daemon.sh` check the *socket* rather than the
   pid — a pid-only check reported a healthy holder right through the outage.
 - MVP core loop end-to-end: sessions, attach/replay, snapshots, attention
-  signals, agent plugins (shell/codex/claude/**opencode**/custom), Git SCM panel
+  signals, agent plugins (shell/codex/claude/**opencode**/pi/**agy**/custom), Git SCM panel
   (status/diff/log/pull/rebase/**merge**/**push**), workspaces + per-session
   worktree isolation, device enrollment + bearer auth, multi-daemon client, i18n
   infrastructure (en-only), usage endpoint.

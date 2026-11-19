@@ -23,10 +23,10 @@ use std::fs;
 
 use serde_json::Value;
 
-use super::conversation::strip_reminders;
+use super::conversation::{agy_tool_args, agy_tool_path, agy_user_request, strip_reminders};
 use super::usage::{
-    claude_transcript_path, codex_file_id, codex_rollout_path, pi_session_path, read_head,
-    TranscriptContext,
+    claude_transcript_path, codex_file_id, codex_rollout_path, locate_agy_conversation,
+    pi_session_path, read_head, TranscriptContext,
 };
 
 /// Longest single user prompt carried verbatim. Prompts are the highest-signal
@@ -44,6 +44,17 @@ const TAIL_CHARS: usize = 2000;
 const CLAUDE_EDIT_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
 /// The same, for pi's built-in tools.
 const PI_EDIT_TOOLS: &[&str] = &["edit", "write"];
+/// The same, for Antigravity's. Its toolset varies by model and version, so
+/// every file-writing tool it ships is listed, not only the common pair.
+const AGY_EDIT_TOOLS: &[&str] = &[
+    "write_file",
+    "edit_file",
+    "write_to_file",
+    "replace_file_content",
+    "multi_replace_file_content",
+    "create_file",
+    "delete_file",
+];
 
 /// What a fork inherits, before rendering.
 #[derive(Debug, Default, PartialEq)]
@@ -178,6 +189,19 @@ pub fn pi_native_id(cx: &TranscriptContext) -> Option<String> {
         }
     }
     None
+}
+
+/// Digest of an Antigravity session, from its own transcript.
+pub fn agy_digest(cx: &TranscriptContext) -> Option<String> {
+    let text = fs::read_to_string(locate_agy_conversation(cx)?.transcript).ok()?;
+    parse_agy(&text).render()
+}
+
+/// agy's own conversation id — what `agy --conversation <id>` reopens, from any
+/// directory. Matched through agy's index by cwd and creation time (see
+/// [`locate_agy_conversation`]); the transcript itself names no directory.
+pub fn agy_native_id(cx: &TranscriptContext) -> Option<String> {
+    locate_agy_conversation(cx).map(|c| c.id)
 }
 
 /// Claude's own conversation id: the `sessionId` carried on every record. We read
@@ -405,6 +429,47 @@ fn parse_pi(text: &str) -> Digest {
     d
 }
 
+fn parse_agy(text: &str) -> Digest {
+    let mut d = Digest::default();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match v["type"].as_str() {
+            Some("USER_INPUT") if v["source"] == "USER_EXPLICIT" => {
+                // `prompt` drops a turn that opens with a tag, which every agy
+                // turn does (`<USER_REQUEST>`), so unwrap the request first.
+                if let Some(request) = v["content"].as_str().and_then(agy_user_request) {
+                    d.prompt(&request);
+                }
+            }
+            Some("PLANNER_RESPONSE") => {
+                if let Some(t) = v["content"].as_str() {
+                    d.message(t);
+                }
+                for call in v["tool_calls"].as_array().into_iter().flatten() {
+                    let args = agy_tool_args(&call["args"]);
+                    match call["name"].as_str().unwrap_or_default() {
+                        name if AGY_EDIT_TOOLS.contains(&name) => {
+                            if let Some(p) = agy_tool_path(&args) {
+                                d.file(p);
+                            }
+                        }
+                        "run_command" => {
+                            if let Some(c) = args["CommandLine"].as_str() {
+                                d.command(c);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    d
+}
+
 /// Clip to `max` **characters** (not bytes — this text is user prose and may be
 /// any script), marking the cut so nobody reads a truncated line as the whole
 /// thing.
@@ -560,6 +625,27 @@ mod tests {
         assert_eq!(d.files, vec![("/r/matcher.py".to_string(), 1)]);
         // The agent's `bash` call and the `!command` the user ran themselves.
         assert_eq!(d.commands, vec!["pytest -q", "git diff --stat"]);
+        assert_eq!(d.last_message, "Done.");
+    }
+
+    #[test]
+    fn agy_digest_reads_prompts_edits_and_commands() {
+        let text = concat!(
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_REQUEST>\nFix the matcher\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nlocal time\n</ADDITIONAL_METADATA>"}"#,
+            "\n",
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","tool_calls":[{"name":"edit_file","args":{"Path":"\"/r/matcher.py\"","Target":"\"a\"","Replacement":"\"b\""}},{"name":"run_command","args":{"CommandLine":"\"pytest -q\"","Cwd":"\"/r\""}},{"name":"view_file","args":{"AbsolutePath":"\"/r/untouched.py\""}}]}"#,
+            "\n",
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","content":"1 passed"}"#,
+            "\n",
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","tool_calls":[{"name":"write_to_file","args":{"TargetFile":"/r/matcher.py"}}]}"#,
+            "\n",
+            r#"{"step_index":4,"source":"MODEL","type":"PLANNER_RESPONSE","content":"Done."}"#,
+        );
+        let d = parse_agy(text);
+        assert_eq!(d.prompts, vec!["Fix the matcher"]);
+        // Both spellings of the edited path, decoded; `view_file` changed nothing.
+        assert_eq!(d.files, vec![("/r/matcher.py".to_string(), 2)]);
+        assert_eq!(d.commands, vec!["pytest -q"]);
         assert_eq!(d.last_message, "Done.");
     }
 

@@ -253,4 +253,31 @@ mod tests {
         let b = parse_prompt("Proceed?\n  1. Yes\n\u{203a} 2. No").unwrap();
         assert_ne!(a.revision, b.revision);
     }
+
+    #[test]
+    fn parses_antigravity_command_approval() {
+        // agy 1.5.10's permission prompt, as rendered at 120 columns.
+        let screen = "\
+> Use your shell tool to run exactly this command: rm -rf ./junk2
+\u{25cf} Ran (rm -rf ./junk2) (ctrl+o to expand)
+Command
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+Requesting permission for:
+   rm -rf ./junk2
+Run this command?
+> 1. Yes, run command
+  2. Yes, and always allow in this conversation for commands that start with 'rm -rf ./junk2'
+  3. Yes, and always allow for commands that start with 'rm -rf ./junk2' (Persist to
+settings.json)
+  4. No, cancel
+  \u{2191}/\u{2193} Navigate \u{b7} tab Amend \u{b7} ctrl+g edit/expand command
+esc to cancel                                                     Gemini 4 Carbon \u{b7} medium";
+        let prompt = parse_prompt(screen).expect("agy approval menu");
+        assert_eq!(prompt.question, "Run this command?");
+        assert!(prompt.detail.contains("rm -rf ./junk2"), "{}", prompt.detail);
+        assert_eq!(prompt.selected, 1);
+        let ids: Vec<_> = prompt.options.iter().map(|o| o.id).collect();
+        assert_eq!(ids, [1, 2, 3, 4]);
+        assert_eq!(prompt.options[3].label, "No, cancel");
+    }
 }

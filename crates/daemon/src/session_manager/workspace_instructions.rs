@@ -15,7 +15,7 @@ pub(super) fn apply(
     tracked_branch: Option<&str>,
     instruction_file: &Path,
 ) -> Result<()> {
-    if !matches!(plugin, "codex" | "claude" | "pi" | "opencode") {
+    if !matches!(plugin, "codex" | "claude" | "pi" | "opencode" | "agy") {
         return Ok(());
     }
     let branch = tracked_branch
@@ -112,6 +112,25 @@ pub(super) fn apply(
                 .push((KEY.into(), serde_json::to_string(&config)?));
             return Ok(());
         }
+        "agy" => {
+            // agy has no system-prompt flag, but it reads an `AGENTS.md` from
+            // every folder in its workspace as rules, and `--add-dir` adds one.
+            // So the guidance goes in a folder of ASM's own beside this
+            // session's instruction file — never in the worktree — and a
+            // relaunch, which rebuilds its argv, adds it again.
+            let dir = instruction_file.with_extension("");
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join("AGENTS.md"), instruction)?;
+            let dir = dir.to_string_lossy().into_owned();
+            if launch
+                .args
+                .windows(2)
+                .any(|w| w[0] == "--add-dir" && w[1] == dir)
+            {
+                return Ok(());
+            }
+            vec!["--add-dir".into(), dir]
+        }
         _ => unreachable!(),
     };
     // Global flags must precede subcommands, opening prompts and `--`.
@@ -204,13 +223,40 @@ mod tests {
     fn plain_directory_has_no_branch_instructions() {
         let dir = std::env::temp_dir().join(format!("asm-plain-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        for plugin in ["codex", "claude", "pi", "opencode"] {
+        for plugin in ["codex", "claude", "pi", "opencode", "agy"] {
             let mut spec = launch(&["user prompt"]);
             apply(plugin, &mut spec, &dir, None, &dir.join("unused.md")).unwrap();
             assert_eq!(spec.args, ["user prompt"]);
             assert!(spec.env.is_empty());
         }
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn agy_gets_an_agents_md_folder_outside_the_repo() {
+        let dir = std::env::temp_dir().join(format!("asm-instructions-{}", uuid::Uuid::new_v4()));
+        let file = dir.join("session-1.md");
+        let mut spec = launch(&["-i", "read brief"]);
+        apply(
+            "agy",
+            &mut spec,
+            Path::new("/workspace"),
+            Some("tracked"),
+            &file,
+        )
+        .unwrap();
+        let folder = dir.join("session-1");
+        assert_eq!(
+            spec.args,
+            ["--add-dir", folder.to_str().unwrap(), "-i", "read brief"]
+        );
+        let rules = std::fs::read_to_string(folder.join("AGENTS.md")).unwrap();
+        assert!(rules.contains("Tracked workspace branch: tracked"));
+        assert!(rules.contains("/workspace"));
+        // Applying twice (a relaunch of a persisted line) adds no second folder.
+        apply("agy", &mut spec, Path::new("/workspace"), Some("tracked"), &file).unwrap();
+        assert_eq!(spec.args.iter().filter(|a| *a == "--add-dir").count(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
